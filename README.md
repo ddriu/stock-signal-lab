@@ -25,7 +25,8 @@ La instalación local solicita las credenciales guardadas en
 ├── src/
 │   ├── data_loader.py        # yfinance, validación y normalización OHLCV
 │   ├── data_sources.py       # SEC EDGAR, BCE, Alpha Vantage y trazabilidad
-│   ├── auth.py               # Acceso por contraseña con hash PBKDF2
+│   ├── auth.py               # Cuentas, roles y contraseñas con hash PBKDF2
+│   ├── dashboard.py          # KPIs y valoración común de carteras
 │   ├── indicators.py         # SMA, RSI, MACD, volumen y ATR
 │   ├── signal_engine.py      # Momento de entrada y gestión de posición
 │   ├── fundamentals.py       # Calidad empresarial con cobertura de datos
@@ -75,6 +76,11 @@ El diario guarda compras y ventas con fecha, cantidad, precio, moneda y comisió
 el coste medio incluyendo las comisiones, admite ventas parciales y calcula beneficio realizado
 y beneficio neto si se vendiera al último cierre. Las posiciones guardadas se añaden
 automáticamente a la próxima descarga.
+
+Cada cuenta tiene una cartera separada. El panel del usuario resume capital pendiente,
+valor neto, beneficio latente y realizado, rentabilidad, comisiones y cobertura de precios.
+El rol administrador ve un resumen de las cuatro carteras, su concentración y actividad,
+y puede registrar operaciones para un usuario concreto.
 
 El comparador de cambios resta por defecto 1 € por vender y otro por comprar,
 muestra cuántas unidades de la alternativa podrían adquirirse y calcula la mejora técnica.

@@ -11,8 +11,15 @@ import pandas as pd
 import streamlit as st
 
 from config import BacktestConfig, StrategyConfig
-from src.auth import persistent_journal_enabled, require_login
+from src.auth import (
+    AuthConfig,
+    load_auth_accounts,
+    managed_usernames,
+    persistent_journal_enabled,
+    require_login,
+)
 from src.backtesting import BacktestResult, run_backtest
+from src.dashboard import build_position_dashboard
 from src.data_loader import (
     DataDownloadError,
     download_fundamental_snapshot,
@@ -31,6 +38,7 @@ from src.data_sources import (
 )
 from src.fundamentals import FundamentalResult, evaluate_fundamentals
 from src.indicators import add_indicators
+from src.journal import calculate_open_positions
 from src.supabase_journal import JournalStorageError
 from src.storage import create_journal
 from src.opportunity import (
@@ -985,6 +993,78 @@ def render_backtest(ticker: str, frame: pd.DataFrame, strategy: StrategyConfig, 
         )
 
 
+def render_operation_form(
+    journal: object,
+    *,
+    form_key: str,
+    fixed_fee: float,
+    owner_label: str | None = None,
+    flash_key: str = "_journal_flash",
+) -> None:
+    """Formulario común para que un usuario o el administrador registre operaciones."""
+
+    heading = (
+        f"Registrar operación para {owner_label}"
+        if owner_label
+        else "Registrar operación"
+    )
+    st.subheader(heading)
+    with st.form(form_key, clear_on_submit=True):
+        ticker = st.text_input("Ticker")
+        side = st.selectbox("Tipo", ["Compra", "Venta"])
+        quantity = st.number_input(
+            "Cantidad",
+            min_value=0.000001,
+            value=1.0,
+            format="%.6f",
+        )
+        price = st.number_input(
+            "Precio",
+            min_value=0.000001,
+            value=1.0,
+            format="%.4f",
+        )
+        currency = st.selectbox(
+            "Moneda",
+            ["EUR", "USD", "GBP", "CHF", "JPY", "CAD", "AUD"],
+        )
+        fees = st.number_input(
+            "Comisión pagada",
+            min_value=0.0,
+            value=float(fixed_fee),
+            format="%.2f",
+            help="Por defecto se utiliza 1 unidad monetaria por operación.",
+        )
+        executed_at = st.date_input("Fecha", value=date.today())
+        notes = st.text_area("Notas")
+        submitted = st.form_submit_button("Guardar", type="primary")
+    if not submitted:
+        return
+    if not ticker.strip():
+        st.error("El ticker es obligatorio.")
+        return
+    try:
+        journal.add_operation(
+            ticker,
+            side,
+            quantity,
+            price,
+            fees,
+            executed_at,
+            notes,
+            currency=currency,
+        )
+    except (ValueError, JournalStorageError) as exc:
+        st.error(str(exc))
+        return
+    st.session_state[flash_key] = (
+        f"Operación guardada para {owner_label}."
+        if owner_label
+        else f"Operación guardada en {getattr(journal, 'backend_name', 'el diario')}."
+    )
+    st.rerun()
+
+
 def render_journal(
     prepared: dict[str, pd.DataFrame],
     fundamental_results: dict[str, FundamentalResult],
@@ -995,6 +1075,9 @@ def render_journal(
 ) -> None:
     st.subheader("Mi cartera")
     st.caption(f"Almacenamiento: {getattr(journal, 'backend_name', 'diario')}")
+    flash_message = st.session_state.pop("_journal_flash", None)
+    if flash_message:
+        st.success(str(flash_message))
     fixed_fee = st.number_input(
         "Comisión fija por cada compra o venta",
         min_value=0.0,
@@ -1011,46 +1094,11 @@ def render_journal(
     )
 
     with register_tab:
-        st.subheader("Registrar operación")
-        with st.form("operation_form", clear_on_submit=True):
-            ticker = st.text_input("Ticker")
-            side = st.selectbox("Tipo", ["Compra", "Venta"])
-            quantity = st.number_input("Cantidad", min_value=0.000001, value=1.0, format="%.6f")
-            price = st.number_input("Precio", min_value=0.000001, value=1.0, format="%.4f")
-            currency = st.selectbox("Moneda", ["EUR", "USD", "GBP", "CHF", "JPY", "CAD", "AUD"])
-            fees = st.number_input(
-                "Comisión pagada",
-                min_value=0.0,
-                value=float(fixed_fee),
-                format="%.2f",
-                help="Por defecto se utiliza 1 unidad monetaria por operación.",
-            )
-            executed_at = st.date_input("Fecha", value=date.today())
-            notes = st.text_area("Notas")
-            submitted = st.form_submit_button("Guardar", type="primary")
-        if submitted:
-            if not ticker.strip():
-                st.error("El ticker es obligatorio.")
-            else:
-                try:
-                    journal.add_operation(
-                        ticker,
-                        side,
-                        quantity,
-                        price,
-                        fees,
-                        executed_at,
-                        notes,
-                        currency=currency,
-                    )
-                except ValueError as exc:
-                    st.error(str(exc))
-                else:
-                    st.success(
-                        f"Operación guardada en "
-                        f"{getattr(journal, 'backend_name', 'el diario')}."
-                    )
-                    st.rerun()
+        render_operation_form(
+            journal,
+            form_key="operation_form",
+            fixed_fee=float(fixed_fee),
+        )
 
     with history_tab:
         st.subheader("Histórico")
@@ -1071,6 +1119,18 @@ def render_journal(
                 st.rerun()
 
     positions = journal.open_positions()
+    latest_prices = {
+        ticker: float(frame["close"].iloc[-1])
+        for ticker, frame in prepared.items()
+        if not frame.empty
+    }
+    _, portfolio_kpis = build_position_dashboard(
+        operations,
+        positions,
+        latest_prices,
+        fx_snapshot.rates_per_eur,
+        sell_fee_eur=float(fixed_fee),
+    )
     analysis_rows: list[dict[str, object]] = []
     details: dict[str, dict[str, object]] = {}
     for position in positions.itertuples(index=False):
@@ -1154,6 +1214,37 @@ def render_journal(
         if positions.empty:
             st.info("Registra una compra para empezar a analizar tu cartera.")
         else:
+            portfolio_cols = st.columns(5)
+            portfolio_cols[0].metric(
+                "Capital pendiente",
+                f"{portfolio_kpis.invested_eur:,.2f} EUR",
+                help="Coste de las posiciones abiertas, incluidas las compras y sus comisiones.",
+            )
+            portfolio_cols[1].metric(
+                "Valor neto actual",
+                f"{portfolio_kpis.current_net_value_eur:,.2f} EUR",
+                help="Valor de las posiciones con precio disponible, descontando una comisión de salida.",
+            )
+            portfolio_cols[2].metric(
+                "Resultado latente",
+                f"{portfolio_kpis.unrealized_pnl_eur:+,.2f} EUR",
+                delta=f"{portfolio_kpis.unrealized_return_pct:+.2f}%",
+                help="Beneficio o pérdida si se cerrasen ahora las posiciones valoradas.",
+            )
+            portfolio_cols[3].metric(
+                "Resultado realizado",
+                f"{portfolio_kpis.realized_pnl_eur:+,.2f} EUR",
+                help="Resultado acumulado de las ventas registradas.",
+            )
+            portfolio_cols[4].metric(
+                "Comisiones pagadas",
+                f"{portfolio_kpis.fees_eur:,.2f} EUR",
+            )
+            st.caption(
+                f"{portfolio_kpis.priced_positions_count} de "
+                f"{portfolio_kpis.open_positions_count} posiciones tienen precio actualizado. "
+                "Los totales convierten monedas con el último tipo del BCE disponible."
+            )
             if analysis_rows:
                 st.dataframe(
                     pd.DataFrame(analysis_rows),
@@ -1424,6 +1515,200 @@ def render_journal(
                         )
 
 
+def render_admin_panel(
+    accounts: dict[str, AuthConfig],
+    prepared: dict[str, pd.DataFrame],
+    fx_snapshot: FxSnapshot,
+) -> None:
+    """Vista agregada y mantenimiento de las carteras de los usuarios."""
+
+    st.subheader("Administración de carteras")
+    st.caption(
+        "Vista privada del administrador. Cada usuario sólo puede consultar y modificar "
+        "su propia cartera."
+    )
+    flash_message = st.session_state.pop("_admin_flash", None)
+    if flash_message:
+        st.success(str(flash_message))
+
+    usernames = managed_usernames(accounts)
+    if not usernames:
+        st.warning("No hay cuentas de usuario configuradas.")
+        return
+
+    fixed_fee = st.number_input(
+        "Comisión orientativa para valoraciones administrativas",
+        min_value=0.0,
+        value=1.0,
+        step=0.5,
+        format="%.2f",
+        key="admin_fixed_fee",
+    )
+    latest_prices = {
+        ticker: float(frame["close"].iloc[-1])
+        for ticker, frame in prepared.items()
+        if not frame.empty
+    }
+    snapshots: dict[str, dict[str, object]] = {}
+    summary_rows: list[dict[str, object]] = []
+
+    for username in usernames:
+        journal = create_journal(username)
+        operations = journal.list_operations()
+        positions = calculate_open_positions(operations)
+        dashboard, kpis = build_position_dashboard(
+            operations,
+            positions,
+            latest_prices,
+            fx_snapshot.rates_per_eur,
+            sell_fee_eur=float(fixed_fee),
+        )
+        snapshots[username] = {
+            "journal": journal,
+            "operations": operations,
+            "positions": positions,
+            "dashboard": dashboard,
+            "kpis": kpis,
+        }
+        summary_rows.append(
+            {
+                "Usuario": username,
+                "Nombre": accounts[username].display_name,
+                "Operaciones": kpis.operations_count,
+                "Posiciones": kpis.open_positions_count,
+                "Con precio": (
+                    f"{kpis.priced_positions_count}/{kpis.open_positions_count}"
+                ),
+                "Capital pendiente EUR": kpis.invested_eur,
+                "Valor neto EUR": kpis.current_net_value_eur,
+                "Resultado latente EUR": kpis.unrealized_pnl_eur,
+                "Rentabilidad latente": kpis.unrealized_return_pct,
+                "Resultado realizado EUR": kpis.realized_pnl_eur,
+                "Comisiones EUR": kpis.fees_eur,
+                "Última actividad": kpis.latest_activity or "Sin operaciones",
+            }
+        )
+
+    active_users = sum(
+        1 for snapshot in snapshots.values() if len(snapshot["operations"]) > 0
+    )
+    total_operations = sum(
+        int(snapshot["kpis"].operations_count) for snapshot in snapshots.values()
+    )
+    total_positions = sum(
+        int(snapshot["kpis"].open_positions_count) for snapshot in snapshots.values()
+    )
+    total_invested = sum(
+        float(snapshot["kpis"].invested_eur) for snapshot in snapshots.values()
+    )
+    total_unrealized = sum(
+        float(snapshot["kpis"].unrealized_pnl_eur) for snapshot in snapshots.values()
+    )
+    admin_cols = st.columns(5)
+    admin_cols[0].metric("Usuarios", len(usernames))
+    admin_cols[1].metric("Con actividad", active_users)
+    admin_cols[2].metric("Operaciones", total_operations)
+    admin_cols[3].metric("Posiciones abiertas", total_positions)
+    admin_cols[4].metric(
+        "Resultado latente conjunto",
+        f"{total_unrealized:+,.2f} EUR",
+        help=f"Sobre {total_invested:,.2f} EUR de capital pendiente convertible.",
+    )
+
+    overview_tab, register_tab, detail_tab = st.tabs(
+        ["Resumen de usuarios", "Añadir posición", "Detalle e historial"]
+    )
+    with overview_tab:
+        st.dataframe(
+            pd.DataFrame(summary_rows),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Capital pendiente EUR": st.column_config.NumberColumn(format="%.2f"),
+                "Valor neto EUR": st.column_config.NumberColumn(format="%.2f"),
+                "Resultado latente EUR": st.column_config.NumberColumn(format="%+.2f"),
+                "Rentabilidad latente": st.column_config.NumberColumn(format="%+.2f%%"),
+                "Resultado realizado EUR": st.column_config.NumberColumn(format="%+.2f"),
+                "Comisiones EUR": st.column_config.NumberColumn(format="%.2f"),
+            },
+        )
+        if total_positions and not latest_prices:
+            st.info(
+                "Pulsa «Descargar / actualizar» para valorar las posiciones con precios "
+                "actuales y calcular sus rendimientos."
+            )
+
+    with register_tab:
+        selected_owner = st.selectbox(
+            "Usuario al que pertenece la operación",
+            usernames,
+            format_func=lambda value: (
+                f"{accounts[value].display_name} ({value})"
+            ),
+            key="admin_register_owner",
+        )
+        render_operation_form(
+            snapshots[selected_owner]["journal"],
+            form_key=f"admin_operation_form_{selected_owner}",
+            fixed_fee=float(fixed_fee),
+            owner_label=accounts[selected_owner].display_name,
+            flash_key="_admin_flash",
+        )
+
+    with detail_tab:
+        selected_detail = st.selectbox(
+            "Usuario que quieres revisar",
+            usernames,
+            format_func=lambda value: (
+                f"{accounts[value].display_name} ({value})"
+            ),
+            key="admin_detail_owner",
+        )
+        selected_snapshot = snapshots[selected_detail]
+        dashboard = selected_snapshot["dashboard"]
+        operations = selected_snapshot["operations"]
+        if dashboard.empty:
+            st.info("Este usuario no tiene posiciones abiertas.")
+        else:
+            visible_dashboard = dashboard.rename(
+                columns={
+                    "ticker": "Ticker",
+                    "currency": "Moneda",
+                    "quantity": "Cantidad",
+                    "average_cost": "Coste medio",
+                    "cost_basis": "Capital pendiente",
+                    "current_price": "Precio actual",
+                    "net_value_eur": "Valor neto EUR",
+                    "net_pnl_eur": "Resultado EUR",
+                    "net_return_pct": "Rentabilidad",
+                    "allocation_pct": "Peso en cartera",
+                }
+            )
+            st.dataframe(
+                visible_dashboard,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Coste medio": st.column_config.NumberColumn(format="%.2f"),
+                    "Capital pendiente": st.column_config.NumberColumn(format="%.2f"),
+                    "Precio actual": st.column_config.NumberColumn(format="%.2f"),
+                    "Valor neto EUR": st.column_config.NumberColumn(format="%.2f"),
+                    "Resultado EUR": st.column_config.NumberColumn(format="%+.2f"),
+                    "Rentabilidad": st.column_config.NumberColumn(format="%+.2f%%"),
+                    "Peso en cartera": st.column_config.ProgressColumn(
+                        min_value=0,
+                        max_value=100,
+                        format="%.1f%%",
+                    ),
+                },
+            )
+        st.markdown("#### Operaciones registradas")
+        if operations.empty:
+            st.caption("Todavía no hay operaciones.")
+        else:
+            st.dataframe(operations, width="stretch", hide_index=True)
+
+
 def render_methodology() -> None:
     st.subheader("Guía sencilla")
     st.markdown(
@@ -1489,13 +1774,21 @@ def render_methodology() -> None:
 
 def main() -> None:
     authenticated_user = require_login()
+    accounts = load_auth_accounts()
     try:
-        journal = create_journal(authenticated_user)
+        journal = create_journal(authenticated_user.username)
     except JournalStorageError as exc:
         st.error(str(exc))
         st.stop()
     st.title("Stock Signal Lab")
-    st.caption("Buscador local de oportunidades · Explica sus motivos · No ejecuta órdenes")
+    role_caption = (
+        "Panel administrador"
+        if authenticated_user.is_admin
+        else f"Cartera privada de {authenticated_user.display_name}"
+    )
+    st.caption(
+        f"{role_caption} · Buscador de oportunidades · No ejecuta órdenes"
+    )
     (
         tickers,
         start,
@@ -1514,18 +1807,25 @@ def main() -> None:
         st.stop()
 
     if load_clicked:
-        try:
-            saved_positions = journal.open_positions()
-        except JournalStorageError as exc:
-            saved_positions = pd.DataFrame()
-            st.sidebar.warning(
-                f"No se pudo consultar la cartera persistente: {exc}"
-            )
-        held_tickers = (
-            saved_positions["ticker"].astype(str).tolist()
-            if not saved_positions.empty
-            else []
-        )
+        held_tickers: list[str] = []
+        owners_to_load = [authenticated_user.username]
+        if authenticated_user.is_admin:
+            owners_to_load.extend(managed_usernames(accounts))
+        for owner in dict.fromkeys(owners_to_load):
+            try:
+                owner_journal = (
+                    journal
+                    if owner == authenticated_user.username
+                    else create_journal(owner)
+                )
+                saved_positions = owner_journal.open_positions()
+            except JournalStorageError as exc:
+                st.sidebar.warning(
+                    f"No se pudo consultar la cartera de {owner}: {exc}"
+                )
+                continue
+            if not saved_positions.empty:
+                held_tickers.extend(saved_positions["ticker"].astype(str).tolist())
         tickers_to_load = list(dict.fromkeys([*tickers, *held_tickers]))
         load_market_data(
             tickers_to_load,
@@ -1549,9 +1849,18 @@ def main() -> None:
         "fx_snapshot",
         FxSnapshot(as_of=None, rates_per_eur={"EUR": 1.0}),
     )
-    tab_analysis, tab_backtest, tab_journal, tab_methodology = st.tabs(
-        ["Oportunidades", "Prueba histórica", "Mi cartera", "Ayuda y riesgos"]
-    )
+    tab_labels = ["Oportunidades", "Prueba histórica", "Mi cartera"]
+    if authenticated_user.is_admin:
+        tab_labels.append("Administración")
+    tab_labels.append("Ayuda y riesgos")
+    app_tabs = st.tabs(tab_labels)
+    tab_analysis, tab_backtest, tab_journal = app_tabs[:3]
+    if authenticated_user.is_admin:
+        tab_admin = app_tabs[3]
+        tab_methodology = app_tabs[4]
+    else:
+        tab_admin = None
+        tab_methodology = app_tabs[3]
     (
         prepared,
         summary,
@@ -1729,6 +2038,18 @@ def main() -> None:
                 "backtests siguen disponibles. Para carteras persistentes se necesita "
                 "conectar una base de datos externa."
             )
+
+    if tab_admin is not None:
+        with tab_admin:
+            if persistent_journal_enabled():
+                try:
+                    render_admin_panel(accounts, prepared, fx_snapshot)
+                except JournalStorageError as exc:
+                    st.error(f"No se pudo cargar el panel administrador: {exc}")
+            else:
+                st.warning(
+                    "El panel multiusuario necesita almacenamiento persistente."
+                )
 
     with tab_methodology:
         render_methodology()

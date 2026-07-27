@@ -1,8 +1,8 @@
 # Publicación gratuita con Streamlit Community Cloud
 
 La aplicación está preparada para desplegarse desde un repositorio de GitHub.
-El acceso se protege con un usuario y un hash PBKDF2 guardados en los secretos
-del alojamiento. El archivo real `.streamlit/secrets.toml` está excluido de Git.
+El acceso se protege con cuentas independientes y hashes PBKDF2 guardados en los
+secretos del alojamiento. El archivo real `.streamlit/secrets.toml` está excluido de Git.
 
 ## 1. Preparar GitHub
 
@@ -24,9 +24,17 @@ del alojamiento. El archivo real `.streamlit/secrets.toml` está excluido de Git
 En **Advanced settings > Secrets**, pega el contenido equivalente a:
 
 ```toml
-[app_auth]
-username = "TU_USUARIO"
-password_hash = "TU_HASH_PBKDF2"
+[users.alberite]
+display_name = "Alberite"
+role = "admin"
+password_hash = "HASH_PBKDF2_DEL_ADMIN"
+
+[users.usuario1]
+display_name = "Usuario 1"
+role = "user"
+password_hash = "HASH_PBKDF2_DISTINTO"
+
+# Repite un bloque [users.nombre] por cada cuenta.
 
 [deployment]
 persistent_journal = false
@@ -56,14 +64,17 @@ No pegues la contraseña en GitHub y no subas el archivo local de secretos.
 
 La clave secreta evita las políticas RLS y por eso **nunca** debe publicarse en
 GitHub ni copiarse en código cliente. La tabla no concede permisos a las claves
-públicas. Cada fila queda asociada al usuario autenticado de la aplicación.
+públicas. Cada fila queda asociada al usuario autenticado de la aplicación. Las
+cuentas normales sólo construyen un diario para su propio nombre; el rol `admin`
+dispone además de la vista agregada y del formulario para registrar operaciones
+en nombre de los usuarios.
 
 Sin `[supabase]`, la instalación local continúa usando SQLite. En Community Cloud,
 `persistent_journal = false` mantiene el diario desactivado para evitar pérdidas.
 
 ## Seguridad
 
-El acceso incluido es una contraseña compartida, adecuada para familia, amigos o
-una demostración. No incluye recuperación de contraseña, segundo factor ni bloqueo
-global de intentos. Para usuarios individuales se recomienda el inicio de sesión
-OIDC de Streamlit con Google o Microsoft.
+El acceso incluido admite cuentas y roles separados, adecuado para un grupo privado
+pequeño. No incluye recuperación de contraseña, segundo factor ni bloqueo global de
+intentos. Para una comunidad más amplia se recomienda sustituirlo por OIDC con
+Google o Microsoft.
