@@ -30,6 +30,11 @@ password_hash = "TU_HASH_PBKDF2"
 
 [deployment]
 persistent_journal = false
+
+[supabase]
+url = "https://TU_PROYECTO.supabase.co"
+secret_key = "sb_secret_TU_CLAVE_DE_SERVIDOR"
+table = "operations"
 ```
 
 El hash de una contraseña nueva se genera localmente con:
@@ -41,16 +46,20 @@ python -c "from src.auth import hash_password; print(hash_password('TU_CONTRASE�
 
 No pegues la contraseña en GitHub y no subas el archivo local de secretos.
 
-## 4. Limitación del diario
+## 4. Activar el diario persistente gratuito
 
-Streamlit Community Cloud puede reiniciar o reconstruir el contenedor. Por ese
-motivo, `persistent_journal = false` desactiva el diario SQLite en la versión
-web antes de que alguien confíe en datos que podrían desaparecer.
+1. Crea un proyecto gratuito en Supabase.
+2. Abre **SQL Editor**, pega `supabase/schema.sql` y ejecútalo.
+3. Copia la **Project URL** y una clave secreta `sb_secret_*`.
+4. Añádelas al bloque `[supabase]` de los Secrets de Streamlit.
+5. Reinicia la aplicación.
 
-Para ofrecer carteras independientes y persistentes a varios amigos, la siguiente
-fase es conectar una base PostgreSQL externa, por ejemplo Supabase, y asociar cada
-operación a un identificador de usuario. El plan gratuito de Supabase es suficiente
-para una aplicación personal pequeña, aunque el proyecto puede pausarse por inactividad.
+La clave secreta evita las políticas RLS y por eso **nunca** debe publicarse en
+GitHub ni copiarse en código cliente. La tabla no concede permisos a las claves
+públicas. Cada fila queda asociada al usuario autenticado de la aplicación.
+
+Sin `[supabase]`, la instalación local continúa usando SQLite. En Community Cloud,
+`persistent_journal = false` mantiene el diario desactivado para evitar pérdidas.
 
 ## Seguridad
 

@@ -31,7 +31,8 @@ from src.data_sources import (
 )
 from src.fundamentals import FundamentalResult, evaluate_fundamentals
 from src.indicators import add_indicators
-from src.journal import TradingJournal
+from src.supabase_journal import JournalStorageError
+from src.storage import create_journal
 from src.opportunity import (
     OpportunityResult,
     RelativeStrengthResult,
@@ -990,9 +991,10 @@ def render_journal(
     opportunity_results: dict[str, OpportunityResult],
     strategy: StrategyConfig,
     fx_snapshot: FxSnapshot,
+    journal: object,
 ) -> None:
-    journal = TradingJournal()
     st.subheader("Mi cartera")
+    st.caption(f"Almacenamiento: {getattr(journal, 'backend_name', 'diario')}")
     fixed_fee = st.number_input(
         "Comisión fija por cada compra o venta",
         min_value=0.0,
@@ -1044,7 +1046,10 @@ def render_journal(
                 except ValueError as exc:
                     st.error(str(exc))
                 else:
-                    st.success("Operación guardada localmente.")
+                    st.success(
+                        f"Operación guardada en "
+                        f"{getattr(journal, 'backend_name', 'el diario')}."
+                    )
                     st.rerun()
 
     with history_tab:
@@ -1483,7 +1488,12 @@ def render_methodology() -> None:
 
 
 def main() -> None:
-    require_login()
+    authenticated_user = require_login()
+    try:
+        journal = create_journal(authenticated_user)
+    except JournalStorageError as exc:
+        st.error(str(exc))
+        st.stop()
     st.title("Stock Signal Lab")
     st.caption("Buscador local de oportunidades · Explica sus motivos · No ejecuta órdenes")
     (
@@ -1504,7 +1514,13 @@ def main() -> None:
         st.stop()
 
     if load_clicked:
-        saved_positions = TradingJournal().open_positions()
+        try:
+            saved_positions = journal.open_positions()
+        except JournalStorageError as exc:
+            saved_positions = pd.DataFrame()
+            st.sidebar.warning(
+                f"No se pudo consultar la cartera persistente: {exc}"
+            )
         held_tickers = (
             saved_positions["ticker"].astype(str).tolist()
             if not saved_positions.empty
@@ -1691,13 +1707,21 @@ def main() -> None:
 
     with tab_journal:
         if persistent_journal_enabled():
-            render_journal(
-                prepared,
-                fundamental_results,
-                opportunity_results,
-                strategy,
-                fx_snapshot,
-            )
+            try:
+                render_journal(
+                    prepared,
+                    fundamental_results,
+                    opportunity_results,
+                    strategy,
+                    fx_snapshot,
+                    journal,
+                )
+            except JournalStorageError as exc:
+                st.error(str(exc))
+                st.info(
+                    "Comprueba que ejecutaste supabase/schema.sql y que la URL y "
+                    "la clave secreta están guardadas en los Secrets de Streamlit."
+                )
         else:
             st.warning(
                 "El diario está desactivado en este alojamiento porque su disco no "
