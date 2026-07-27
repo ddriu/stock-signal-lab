@@ -1,0 +1,14 @@
+__pycache__/
+.pytest_cache/
+.streamlit/*
+!.streamlit/config.toml
+!.streamlit/secrets.toml.example
+.venv/
+.venv-win/
+build/
+dist/
+dist_installer/
+*.py[cod]
+data/*.db
+data/*.db-*
+.DS_Store
