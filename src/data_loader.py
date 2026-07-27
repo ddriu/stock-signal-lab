@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from io import StringIO
 
 import pandas as pd
+import requests
 import yfinance as yf
 
 from src.data_sources import (
@@ -15,6 +17,21 @@ from src.data_sources import (
 
 
 REQUIRED_COLUMNS = ("open", "high", "low", "close", "volume")
+STOOQ_DAILY_URL = "https://stooq.com/q/d/l/"
+STOOQ_SUFFIXES = {
+    "AS": "NL",
+    "L": "UK",
+    "MC": "ES",
+    "MI": "IT",
+    "PA": "FR",
+    "SW": "CH",
+    "TO": "CA",
+}
+STOOQ_INDEX_SYMBOLS = {
+    "^DJI": "^DJI",
+    "^GSPC": "^SPX",
+    "^IXIC": "^NDQ",
+}
 
 
 class DataDownloadError(RuntimeError):
@@ -26,6 +43,57 @@ def normalize_ticker(ticker: str) -> str:
     if not value:
         raise ValueError("El ticker no puede estar vacío.")
     return value
+
+
+def _stooq_symbol(symbol: str) -> str:
+    """Convierte tickers habituales de Yahoo al formato utilizado por Stooq."""
+
+    if symbol in STOOQ_INDEX_SYMBOLS:
+        return STOOQ_INDEX_SYMBOLS[symbol]
+    if symbol.startswith("^"):
+        return symbol
+    if "." not in symbol:
+        return f"{symbol}.US"
+    base, suffix = symbol.rsplit(".", 1)
+    return f"{base}.{STOOQ_SUFFIXES.get(suffix, suffix)}"
+
+
+def _download_stooq_prices(
+    symbol: str,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> pd.DataFrame:
+    """Obtiene CSV diario de Stooq como respaldo cuando Yahoo no responde."""
+
+    try:
+        response = requests.get(
+            STOOQ_DAILY_URL,
+            params={
+                "s": _stooq_symbol(symbol).lower(),
+                "d1": start_ts.strftime("%Y%m%d"),
+                "d2": end_ts.strftime("%Y%m%d"),
+                "i": "d",
+            },
+            headers={"User-Agent": "stock-signal-lab/1.0"},
+            timeout=20,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise DataDownloadError(f"Stooq no respondió para {symbol}: {exc}") from exc
+
+    text = response.text.strip()
+    if not text or text.lower().startswith("no data"):
+        raise DataDownloadError(f"Stooq no encontró precios para {symbol}.")
+    try:
+        frame = pd.read_csv(StringIO(text))
+    except (pd.errors.ParserError, UnicodeDecodeError) as exc:
+        raise DataDownloadError(f"Stooq devolvió datos inválidos para {symbol}.") from exc
+    if frame.empty or "Date" not in frame.columns:
+        raise DataDownloadError(f"Stooq no encontró precios para {symbol}.")
+
+    frame = frame.set_index("Date")
+    frame.attrs["provider"] = "Stooq"
+    return frame
 
 
 def download_prices(
@@ -47,6 +115,7 @@ def download_prices(
     if start_ts >= end_ts:
         raise ValueError("La fecha inicial debe ser anterior a la final.")
 
+    yahoo_error = ""
     try:
         frame = yf.download(
             symbol,
@@ -58,10 +127,22 @@ def download_prices(
             threads=False,
         )
     except Exception as exc:  # yfinance puede lanzar errores de red heterogéneos
-        raise DataDownloadError(f"No se pudieron descargar datos de {symbol}: {exc}") from exc
+        frame = pd.DataFrame()
+        yahoo_error = str(exc)
 
     if frame.empty:
-        raise DataDownloadError(f"No se encontraron precios para {symbol} en ese intervalo.")
+        try:
+            frame = _download_stooq_prices(symbol, start_ts, end_ts)
+        except DataDownloadError as exc:
+            detail = (
+                f" Yahoo indicó: {yahoo_error}."
+                if yahoo_error
+                else " Yahoo no devolvió precios."
+            )
+            raise DataDownloadError(
+                f"No se encontraron precios para {symbol} en ese intervalo."
+                f"{detail} {exc}"
+            ) from exc
 
     if isinstance(frame.columns, pd.MultiIndex):
         # yfinance reciente devuelve (campo, ticker) incluso para un símbolo.
@@ -79,6 +160,7 @@ def download_prices(
     result = result.dropna(subset=["open", "high", "low", "close"])
     result["volume"] = result["volume"].fillna(0.0)
     result.attrs["ticker"] = symbol
+    result.attrs["provider"] = frame.attrs.get("provider", "Yahoo Finance")
     return result
 
 
