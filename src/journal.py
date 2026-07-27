@@ -74,8 +74,12 @@ def normalize_operation(
     }
 
 
-def calculate_open_positions(operations: pd.DataFrame) -> pd.DataFrame:
-    """Reconstruye posiciones por coste medio desde un histórico normalizado."""
+def calculate_position_states(
+    operations: pd.DataFrame,
+    *,
+    include_closed: bool = True,
+) -> pd.DataFrame:
+    """Reconstruye el estado de cada posición, incluidas las ya cerradas."""
 
     columns = [
         "ticker",
@@ -129,13 +133,26 @@ def calculate_open_positions(operations: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, float | str]] = []
     for state in states.values():
         quantity = float(state["quantity"])
-        if quantity <= 1e-9:
+        if not include_closed and quantity <= 1e-9:
             continue
         cost_basis = float(state["cost_basis"])
-        rows.append({**state, "average_cost": cost_basis / quantity})
+        rows.append(
+            {
+                **state,
+                "average_cost": cost_basis / quantity if quantity > 1e-9 else 0.0,
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=columns)
     return pd.DataFrame(rows, columns=columns).sort_values(
         ["ticker", "currency"], ignore_index=True
     )
+
+
+def calculate_open_positions(operations: pd.DataFrame) -> pd.DataFrame:
+    """Reconstruye únicamente las posiciones todavía abiertas."""
+
+    return calculate_position_states(operations, include_closed=False)
 
 
 class TradingJournal:

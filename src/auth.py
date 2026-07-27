@@ -1,9 +1,8 @@
-"""Acceso sencillo por contraseña para despliegues privados pequeños.
+"""Acceso multiusuario sencillo para despliegues privados pequeños.
 
-La contraseña nunca se guarda en claro: se verifica mediante PBKDF2-HMAC-SHA256.
-Este acceso compartido es apropiado para una app familiar o de demostración. Para
-usuarios independientes y recuperación de contraseñas debe sustituirse por OIDC
-o un servicio de identidad.
+Las contraseñas nunca se guardan en claro: se verifican mediante
+PBKDF2-HMAC-SHA256. Los roles se configuran en los secretos del servidor y cada
+cuenta utiliza su nombre como propietario aislado del diario de operaciones.
 """
 
 from __future__ import annotations
@@ -24,6 +23,12 @@ HASH_ALGORITHM = "pbkdf2_sha256"
 class AuthConfig:
     username: str
     password_hash: str
+    role: str = "user"
+    display_name: str = ""
+
+    @property
+    def is_admin(self) -> bool:
+        return self.role == "admin"
 
 
 def hash_password(
@@ -84,21 +89,89 @@ def _secret_section(name: str) -> dict[str, object]:
     return dict(section) if section else {}
 
 
-def load_auth_config() -> AuthConfig | None:
-    """Carga credenciales desde secretos de Streamlit o variables de entorno."""
+def _normalize_account(
+    username: str,
+    values: object,
+) -> AuthConfig | None:
+    """Valida una cuenta procedente de TOML sin aceptar roles arbitrarios."""
 
-    section = _secret_section("app_auth")
+    if not isinstance(values, dict):
+        try:
+            values = dict(values)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+    normalized_username = username.strip().lower()
+    if (
+        not normalized_username
+        or len(normalized_username) > 40
+        or not normalized_username.replace("_", "").replace("-", "").isalnum()
+    ):
+        return None
+    password_hash = str(values.get("password_hash", "")).strip()
+    role = str(values.get("role", "user")).strip().lower()
+    if not password_hash or role not in {"user", "admin"}:
+        return None
+    display_name = str(values.get("display_name", normalized_username)).strip()
+    return AuthConfig(
+        username=normalized_username,
+        password_hash=password_hash,
+        role=role,
+        display_name=display_name or normalized_username,
+    )
+
+
+def load_auth_accounts() -> dict[str, AuthConfig]:
+    """Carga todas las cuentas desde secretos, conservando el formato antiguo."""
+
+    accounts: dict[str, AuthConfig] = {}
+    users_section = _secret_section("users")
+    for username, values in users_section.items():
+        account = _normalize_account(str(username), values)
+        if account is not None:
+            accounts[account.username] = account
+
+    if accounts:
+        return accounts
+
+    # Compatibilidad con instalaciones que todavía usan una sola cuenta.
+    legacy = _secret_section("app_auth")
     username = str(
-        section.get("username")
+        legacy.get("username")
         or os.getenv("STOCK_SIGNAL_LAB_USERNAME", "")
     ).strip()
     password_hash = str(
-        section.get("password_hash")
+        legacy.get("password_hash")
         or os.getenv("STOCK_SIGNAL_LAB_PASSWORD_HASH", "")
     ).strip()
-    if not username or not password_hash:
-        return None
-    return AuthConfig(username=username, password_hash=password_hash)
+    if username and password_hash:
+        account = _normalize_account(
+            username,
+            {
+                "password_hash": password_hash,
+                "role": str(legacy.get("role", "user")),
+                "display_name": str(legacy.get("display_name", username)),
+            },
+        )
+        if account is not None:
+            accounts[account.username] = account
+    return accounts
+
+
+def load_auth_config() -> AuthConfig | None:
+    """Compatibilidad: devuelve la primera cuenta configurada."""
+
+    accounts = load_auth_accounts()
+    return next(iter(accounts.values()), None)
+
+
+def managed_usernames(accounts: dict[str, AuthConfig]) -> list[str]:
+    """Devuelve las cuentas de inversión visibles en el panel administrador."""
+
+    return sorted(
+        account.username
+        for account in accounts.values()
+        if not account.is_admin
+    )
 
 
 def persistent_journal_enabled() -> bool:
@@ -128,27 +201,29 @@ def persistent_journal_enabled() -> bool:
     return bool(configured)
 
 
-def require_login() -> str:
+def require_login() -> AuthConfig:
     """Muestra la puerta de acceso y detiene la app hasta autenticar al usuario."""
 
-    config = load_auth_config()
-    if config is None:
+    accounts = load_auth_accounts()
+    if not accounts:
         st.error(
             "La aplicación está cerrada porque no se han configurado credenciales. "
-            "Añade [app_auth] en los secretos de Streamlit."
+            "Añade las cuentas [users.nombre] en los secretos de Streamlit."
         )
         st.stop()
 
     authenticated_user = st.session_state.get("_authenticated_user")
-    if authenticated_user == config.username:
-        st.sidebar.caption(f"Sesión: {config.username}")
+    account = accounts.get(str(authenticated_user).lower())
+    if account is not None:
+        role_text = "Administrador" if account.is_admin else "Usuario"
+        st.sidebar.caption(f"Sesión: {account.display_name} · {role_text}")
         if st.sidebar.button("Cerrar sesión", width="stretch"):
             st.session_state.pop("_authenticated_user", None)
             st.rerun()
-        return config.username
+        return account
 
     st.title("Stock Signal Lab")
-    st.caption("Acceso privado")
+    st.caption("Acceso privado · cada usuario tiene su propia cartera")
     with st.form("login_form"):
         username = st.text_input("Usuario", autocomplete="username")
         password = st.text_input(
@@ -158,14 +233,17 @@ def require_login() -> str:
         )
         submitted = st.form_submit_button("Entrar", type="primary", width="stretch")
     if submitted:
-        valid_user = hmac.compare_digest(username.strip(), config.username)
-        valid_password = verify_password(password, config.password_hash)
-        if valid_user and valid_password:
-            st.session_state["_authenticated_user"] = config.username
+        normalized_username = username.strip().lower()
+        candidate = accounts.get(normalized_username)
+        valid_password = bool(
+            candidate and verify_password(password, candidate.password_hash)
+        )
+        if candidate and valid_password:
+            st.session_state["_authenticated_user"] = candidate.username
             st.rerun()
         st.error("Usuario o contraseña incorrectos.")
     st.caption(
         "La contraseña se comprueba mediante un hash seguro y no aparece en el código."
     )
     st.stop()
-    return ""  # Ayuda al analizador de tipos; st.stop() interrumpe la ejecución.
+    return AuthConfig("", "")  # Ayuda al analizador; st.stop() interrumpe.

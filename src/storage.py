@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import re
 
 import streamlit as st
 
-from src.journal import TradingJournal
+from src.journal import TradingJournal, default_database_path
 from src.supabase_journal import JournalStorageError, SupabaseTradingJournal
 
 
@@ -52,7 +53,12 @@ def create_journal(owner: str) -> TradingJournal | SupabaseTradingJournal:
 
     config = load_supabase_config()
     if config is None:
-        return TradingJournal()
+        safe_owner = re.sub(r"[^a-zA-Z0-9_-]+", "_", owner.strip().lower()).strip("_")
+        if not safe_owner:
+            raise JournalStorageError("El nombre de usuario no permite crear un diario local.")
+        base_path = default_database_path()
+        user_path = base_path.with_name(f"{base_path.stem}_{safe_owner}{base_path.suffix}")
+        return TradingJournal(user_path)
     return SupabaseTradingJournal(
         config.url,
         config.secret_key,
