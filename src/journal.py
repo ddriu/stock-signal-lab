@@ -11,6 +11,20 @@ from pathlib import Path
 import pandas as pd
 
 
+OPERATION_COLUMNS = [
+    "id",
+    "ticker",
+    "side",
+    "quantity",
+    "price",
+    "fees",
+    "executed_at",
+    "notes",
+    "currency",
+    "created_at",
+]
+
+
 def default_database_path() -> Path:
     """Usa el proyecto en desarrollo y una carpeta privada al estar instalado."""
 
@@ -28,7 +42,105 @@ def default_database_path() -> Path:
 DEFAULT_DATABASE = default_database_path()
 
 
+def normalize_operation(
+    ticker: str,
+    side: str,
+    quantity: float,
+    price: float,
+    fees: float,
+    executed_at: date | datetime | str,
+    notes: str = "",
+    currency: str = "EUR",
+) -> dict[str, object]:
+    """Valida una operación y devuelve valores normalizados para cualquier backend."""
+
+    if side not in {"Compra", "Venta"}:
+        raise ValueError("El tipo debe ser Compra o Venta.")
+    if quantity <= 0 or price <= 0 or fees < 0:
+        raise ValueError("Cantidad/precio deben ser positivos y las comisiones no negativas.")
+    normalized_currency = currency.strip().upper()
+    if len(normalized_currency) != 3:
+        raise ValueError("La moneda debe tener tres letras, por ejemplo EUR o USD.")
+    return {
+        "ticker": ticker.strip().upper(),
+        "side": side,
+        "quantity": float(quantity),
+        "price": float(price),
+        "fees": float(fees),
+        "executed_at": pd.Timestamp(executed_at).isoformat(),
+        "notes": notes.strip(),
+        "currency": normalized_currency,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def calculate_open_positions(operations: pd.DataFrame) -> pd.DataFrame:
+    """Reconstruye posiciones por coste medio desde un histórico normalizado."""
+
+    columns = [
+        "ticker",
+        "currency",
+        "quantity",
+        "average_cost",
+        "cost_basis",
+        "realized_pnl",
+        "paid_fees",
+    ]
+    if operations.empty:
+        return pd.DataFrame(columns=columns)
+
+    operations = operations.sort_values(["executed_at", "id"])
+    states: dict[tuple[str, str], dict[str, float | str]] = {}
+    for operation in operations.itertuples(index=False):
+        currency = str(getattr(operation, "currency", "EUR") or "EUR").upper()
+        key = (str(operation.ticker), currency)
+        state = states.setdefault(
+            key,
+            {
+                "ticker": key[0],
+                "currency": key[1],
+                "quantity": 0.0,
+                "cost_basis": 0.0,
+                "realized_pnl": 0.0,
+                "paid_fees": 0.0,
+            },
+        )
+        quantity = float(operation.quantity)
+        price = float(operation.price)
+        fee = float(operation.fees)
+        state["paid_fees"] = float(state["paid_fees"]) + fee
+        if operation.side == "Compra":
+            state["quantity"] = float(state["quantity"]) + quantity
+            state["cost_basis"] = float(state["cost_basis"]) + quantity * price + fee
+            continue
+
+        available = float(state["quantity"])
+        sold = min(quantity, available)
+        if sold <= 0:
+            continue
+        average_cost = float(state["cost_basis"]) / available
+        allocated_fee = fee * (sold / quantity)
+        proceeds = sold * price - allocated_fee
+        removed_cost = average_cost * sold
+        state["realized_pnl"] = float(state["realized_pnl"]) + proceeds - removed_cost
+        state["quantity"] = available - sold
+        state["cost_basis"] = max(0.0, float(state["cost_basis"]) - removed_cost)
+
+    rows: list[dict[str, float | str]] = []
+    for state in states.values():
+        quantity = float(state["quantity"])
+        if quantity <= 1e-9:
+            continue
+        cost_basis = float(state["cost_basis"])
+        rows.append({**state, "average_cost": cost_basis / quantity})
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        ["ticker", "currency"], ignore_index=True
+    )
+
+
 class TradingJournal:
+    backend_name = "SQLite local"
+
     def __init__(self, database_path: str | Path = DEFAULT_DATABASE) -> None:
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -77,23 +189,25 @@ class TradingJournal:
         notes: str = "",
         currency: str = "EUR",
     ) -> int:
-        if side not in {"Compra", "Venta"}:
-            raise ValueError("El tipo debe ser Compra o Venta.")
-        if quantity <= 0 or price <= 0 or fees < 0:
-            raise ValueError("Cantidad/precio deben ser positivos y las comisiones no negativas.")
-        normalized_currency = currency.strip().upper()
-        if len(normalized_currency) != 3:
-            raise ValueError("La moneda debe tener tres letras, por ejemplo EUR o USD.")
+        operation = normalize_operation(
+            ticker,
+            side,
+            quantity,
+            price,
+            fees,
+            executed_at,
+            notes,
+            currency,
+        )
         if side == "Venta":
             positions = self.open_positions()
             available = positions.loc[
-                (positions["ticker"] == ticker.strip().upper())
-                & (positions["currency"] == normalized_currency),
+                (positions["ticker"] == operation["ticker"])
+                & (positions["currency"] == operation["currency"]),
                 "quantity",
             ]
             if available.empty or float(available.iloc[0]) + 1e-9 < quantity:
                 raise ValueError("La venta supera la cantidad registrada en cartera.")
-        timestamp = pd.Timestamp(executed_at).isoformat()
         with self._connect() as connection:
             cursor = connection.execute(
                 """
@@ -102,15 +216,15 @@ class TradingJournal:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    ticker.strip().upper(),
-                    side,
-                    float(quantity),
-                    float(price),
-                    float(fees),
-                    timestamp,
-                    notes.strip(),
-                    normalized_currency,
-                    datetime.now().isoformat(timespec="seconds"),
+                    operation["ticker"],
+                    operation["side"],
+                    operation["quantity"],
+                    operation["price"],
+                    operation["fees"],
+                    operation["executed_at"],
+                    operation["notes"],
+                    operation["currency"],
+                    operation["created_at"],
                 ),
             )
             return int(cursor.lastrowid)
@@ -128,71 +242,7 @@ class TradingJournal:
     def open_positions(self) -> pd.DataFrame:
         """Reconstruye posiciones mediante coste medio, incluidas comisiones pagadas."""
 
-        operations = self.list_operations()
-        columns = [
-            "ticker",
-            "currency",
-            "quantity",
-            "average_cost",
-            "cost_basis",
-            "realized_pnl",
-            "paid_fees",
-        ]
-        if operations.empty:
-            return pd.DataFrame(columns=columns)
-
-        operations = operations.sort_values(["executed_at", "id"])
-        states: dict[tuple[str, str], dict[str, float | str]] = {}
-        for operation in operations.itertuples(index=False):
-            currency = str(getattr(operation, "currency", "EUR") or "EUR").upper()
-            key = (str(operation.ticker), currency)
-            state = states.setdefault(
-                key,
-                {
-                    "ticker": key[0],
-                    "currency": key[1],
-                    "quantity": 0.0,
-                    "cost_basis": 0.0,
-                    "realized_pnl": 0.0,
-                    "paid_fees": 0.0,
-                },
-            )
-            quantity = float(operation.quantity)
-            price = float(operation.price)
-            fee = float(operation.fees)
-            state["paid_fees"] = float(state["paid_fees"]) + fee
-            if operation.side == "Compra":
-                state["quantity"] = float(state["quantity"]) + quantity
-                state["cost_basis"] = float(state["cost_basis"]) + quantity * price + fee
-                continue
-
-            available = float(state["quantity"])
-            sold = min(quantity, available)
-            if sold <= 0:
-                continue
-            average_cost = float(state["cost_basis"]) / available
-            allocated_fee = fee * (sold / quantity)
-            proceeds = sold * price - allocated_fee
-            removed_cost = average_cost * sold
-            state["realized_pnl"] = float(state["realized_pnl"]) + proceeds - removed_cost
-            state["quantity"] = available - sold
-            state["cost_basis"] = max(0.0, float(state["cost_basis"]) - removed_cost)
-
-        rows: list[dict[str, float | str]] = []
-        for state in states.values():
-            quantity = float(state["quantity"])
-            if quantity <= 1e-9:
-                continue
-            cost_basis = float(state["cost_basis"])
-            rows.append(
-                {
-                    **state,
-                    "average_cost": cost_basis / quantity,
-                }
-            )
-        return pd.DataFrame(rows, columns=columns).sort_values(
-            ["ticker", "currency"], ignore_index=True
-        )
+        return calculate_open_positions(self.list_operations())
 
     def portfolio_summary(self) -> pd.DataFrame:
         """Compatibilidad: devuelve ahora las posiciones abiertas calculadas."""

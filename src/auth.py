@@ -104,6 +104,19 @@ def load_auth_config() -> AuthConfig | None:
 def persistent_journal_enabled() -> bool:
     """Indica si el anfitrión garantiza almacenamiento local persistente."""
 
+    supabase = _secret_section("supabase")
+    supabase_url = str(
+        supabase.get("url") or os.getenv("SUPABASE_URL", "")
+    ).strip()
+    supabase_key = str(
+        supabase.get("secret_key")
+        or supabase.get("service_role_key")
+        or os.getenv("SUPABASE_SECRET_KEY", "")
+        or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+    ).strip()
+    if supabase_url and supabase_key:
+        return True
+
     section = _secret_section("deployment")
     configured = section.get("persistent_journal")
     if configured is None:
