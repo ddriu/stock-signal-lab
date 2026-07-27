@@ -29,8 +29,8 @@ display_name = "Alberite"
 role = "admin"
 password_hash = "HASH_PBKDF2_DEL_ADMIN"
 
-[users.usuario1]
-display_name = "Usuario 1"
+[users.luci]
+display_name = "Luci"
 role = "user"
 password_hash = "HASH_PBKDF2_DISTINTO"
 
