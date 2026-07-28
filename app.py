@@ -22,8 +22,10 @@ from src.backtesting import BacktestResult, run_backtest
 from src.dashboard import build_position_dashboard
 from src.data_loader import (
     DataDownloadError,
+    TickerSearchResult,
     download_fundamental_snapshot,
     download_prices,
+    search_instruments,
 )
 from src.data_sources import (
     ExternalDataError,
@@ -38,7 +40,7 @@ from src.data_sources import (
 )
 from src.fundamentals import FundamentalResult, evaluate_fundamentals
 from src.indicators import add_indicators
-from src.journal import calculate_open_positions
+from src.journal import MAX_FAVORITES, calculate_open_positions
 from src.supabase_journal import JournalStorageError
 from src.storage import GROUP_PORTFOLIO_OWNER, create_journal
 from src.opportunity import (
@@ -93,6 +95,13 @@ def cached_price_verification(ticker: str, api_key: str) -> PriceVerification:
     return download_alpha_vantage_latest_close(ticker, api_key)
 
 
+@st.cache_data(ttl=86_400, show_spinner=False)
+def cached_company_search(query: str) -> list[TickerSearchResult]:
+    """Evita repetir búsquedas iguales durante el día."""
+
+    return search_instruments(query)
+
+
 def parse_tickers(raw_value: str) -> list[str]:
     values = raw_value.replace(";", ",").replace("\n", ",").split(",")
     return list(dict.fromkeys(value.strip().upper() for value in values if value.strip()))
@@ -139,7 +148,42 @@ def friendly_factor(text: str) -> str:
     return text[:1].upper() + text[1:] if text else text
 
 
-def build_sidebar() -> tuple[
+def build_favorite_catalog(
+    private_favorites: pd.DataFrame,
+    group_favorites: pd.DataFrame,
+) -> tuple[list[str], dict[str, str]]:
+    """Une favoritos privados y compartidos sin duplicar empresas."""
+
+    sources: dict[str, set[str]] = {}
+    names: dict[str, str] = {}
+    for frame, source in (
+        (private_favorites, "privada"),
+        (group_favorites, "grupo"),
+    ):
+        if frame.empty:
+            continue
+        for favorite in frame.itertuples(index=False):
+            ticker = str(favorite.ticker).strip().upper()
+            if not ticker:
+                continue
+            sources.setdefault(ticker, set()).add(source)
+            name = str(getattr(favorite, "name", "") or ticker).strip()
+            names.setdefault(ticker, name)
+    tickers = sorted(names, key=lambda item: (names[item].casefold(), item))
+    labels = {
+        ticker: (
+            f"{names[ticker]} ({ticker}) · "
+            + " y ".join(sorted(sources[ticker]))
+        )
+        for ticker in tickers
+    }
+    return tickers, labels
+
+
+def build_sidebar(
+    favorite_tickers: list[str] | None = None,
+    favorite_labels: dict[str, str] | None = None,
+) -> tuple[
     list[str],
     date,
     date,
@@ -149,15 +193,32 @@ def build_sidebar() -> tuple[
     BacktestConfig,
     bool,
 ]:
+    favorite_tickers = favorite_tickers or []
+    favorite_labels = favorite_labels or {}
     st.sidebar.header("1. Empresas y periodo")
-    tickers = parse_tickers(
-        st.sidebar.text_area(
-            "Empresas que quieres comparar",
-            "AAPL, MSFT, SAN.MC",
-            height=80,
-            help="Escribe sus símbolos bursátiles separados por comas. SAN.MC indica la bolsa de Madrid.",
-        )
+    selected_favorites = st.sidebar.multiselect(
+        "Elegir de mis favoritos",
+        options=favorite_tickers,
+        format_func=lambda ticker: favorite_labels.get(ticker, ticker),
+        max_selections=25,
+        help=(
+            "Puedes guardar hasta 100 y analizar hasta 25 en profundidad cada vez. "
+            "Las posiciones abiertas se actualizan además en modo rápido."
+        ),
     )
+    with st.sidebar.expander("Añadir símbolos manualmente"):
+        manual_tickers = parse_tickers(
+            st.text_area(
+                "Símbolos bursátiles",
+                "" if favorite_tickers else "AAPL, MSFT, SAN.MC",
+                height=80,
+                help=(
+                    "Alternativa al buscador. Escribe símbolos separados por comas; "
+                    "SAN.MC indica la bolsa de Madrid."
+                ),
+            )
+        )
+    tickers = list(dict.fromkeys([*selected_favorites, *manual_tickers]))
     years = st.sidebar.select_slider(
         "Años de datos para analizar",
         options=[1, 2, 3, 5, 10],
@@ -413,38 +474,69 @@ def load_market_data(
     end: date,
     auto_adjust: bool,
     alpha_vantage_key: str = "",
+    *,
+    fundamental_tickers: set[str] | None = None,
 ) -> None:
     if not tickers:
-        st.sidebar.error("Introduce al menos un ticker.")
+        st.sidebar.error("Elige al menos una favorita o registra una posición.")
         return
-    if len(tickers) > 20:
-        st.sidebar.error("El prototipo limita cada consulta a 20 tickers.")
+    if len(tickers) > 200:
+        st.sidebar.error(
+            "La actualización admite hasta 200 empresas simultáneas. "
+            "Reduce temporalmente la selección de favoritos."
+        )
         return
+    deep_tickers = set(tickers if fundamental_tickers is None else fundamental_tickers)
+    if len(deep_tickers) > 25:
+        deep_tickers = set(
+            [ticker for ticker in tickers if ticker in deep_tickers][:25]
+        )
+        st.sidebar.warning(
+            "Se hará análisis empresarial profundo de las primeras 25 empresas. "
+            "Las demás conservarán valoración rápida de precio y tendencia."
+        )
     downloaded: dict[str, pd.DataFrame] = {}
     fundamentals: dict[str, dict[str, object]] = {}
     verifications: dict[str, PriceVerification] = {}
     errors: list[str] = []
     progress = st.progress(0, text="Descargando precios…")
     for position, ticker in enumerate(tickers, start=1):
+        ticker_start = (
+            start
+            if ticker in deep_tickers
+            else max(start, end - timedelta(days=420))
+        )
         try:
-            downloaded[ticker] = cached_download(ticker, start, end, auto_adjust)
+            downloaded[ticker] = cached_download(
+                ticker,
+                ticker_start,
+                end,
+                auto_adjust,
+            )
         except (DataDownloadError, ValueError) as exc:
             errors.append(str(exc))
-        try:
-            fundamentals[ticker] = cached_fundamentals(ticker)
-        except (DataDownloadError, ValueError) as exc:
-            fundamentals[ticker] = {"symbol": ticker}
-            errors.append(str(exc))
-        if alpha_vantage_key and ticker in downloaded:
+        if ticker in deep_tickers:
             try:
-                verification = cached_price_verification(ticker, alpha_vantage_key)
-                verifications[ticker] = compare_verified_price(
-                    downloaded[ticker],
-                    verification,
-                )
-            except (ExternalDataError, ValueError) as exc:
+                fundamentals[ticker] = cached_fundamentals(ticker)
+            except (DataDownloadError, ValueError) as exc:
+                fundamentals[ticker] = {"symbol": ticker}
                 errors.append(str(exc))
-        progress.progress(position / len(tickers), text=f"Procesando {ticker}")
+            if alpha_vantage_key and ticker in downloaded:
+                try:
+                    verification = cached_price_verification(ticker, alpha_vantage_key)
+                    verifications[ticker] = compare_verified_price(
+                        downloaded[ticker],
+                        verification,
+                    )
+                except (ExternalDataError, ValueError) as exc:
+                    errors.append(str(exc))
+        else:
+            fundamentals[ticker] = {"symbol": ticker, "_quick_mode": True}
+        mode = "análisis completo" if ticker in deep_tickers else "actualización rápida"
+        progress.progress(
+            position / len(tickers),
+            text=f"{ticker}: {mode}",
+        )
     reference_symbols: set[str] = set()
     for ticker in downloaded:
         reference_symbols.add(benchmark_for_ticker(ticker))
@@ -471,6 +563,7 @@ def load_market_data(
     st.session_state["reference_data"] = references
     st.session_state["price_verifications"] = verifications
     st.session_state["fx_snapshot"] = fx_snapshot
+    st.session_state["quick_mode_tickers"] = sorted(set(tickers).difference(deep_tickers))
     st.session_state["download_errors"] = errors
     st.session_state.pop("backtest_result", None)
 
@@ -1786,6 +1879,176 @@ def render_admin_panel(
             st.dataframe(operations, width="stretch", hide_index=True)
 
 
+def render_favorite_list(
+    favorites: pd.DataFrame,
+    *,
+    title: str,
+    journal,
+    actor_username: str,
+    shared: bool = False,
+    can_delete_all: bool = False,
+) -> None:
+    st.markdown(f"#### {title}")
+    st.caption(f"{len(favorites)} de {MAX_FAVORITES} empresas guardadas")
+    if favorites.empty:
+        st.info("Todavía no hay empresas en esta lista.")
+        return
+
+    visible = favorites.loc[:, ["name", "ticker", "exchange", "recorded_by"]].rename(
+        columns={
+            "name": "Empresa",
+            "ticker": "Ticker",
+            "exchange": "Mercado",
+            "recorded_by": "Añadida por",
+        }
+    )
+    if not shared:
+        visible = visible.drop(columns=["Añadida por"])
+    st.dataframe(visible, width="stretch", hide_index=True)
+
+    removable = favorites
+    if shared and not can_delete_all:
+        removable = favorites.loc[
+            favorites["recorded_by"].fillna("").astype(str).str.lower()
+            == actor_username.lower()
+        ]
+    if removable.empty:
+        st.caption("Sólo puedes quitar del grupo las empresas que tú añadiste.")
+        return
+    options = removable["ticker"].astype(str).tolist()
+    labels = {
+        str(row.ticker): f"{row.name} ({row.ticker})"
+        for row in removable.itertuples(index=False)
+    }
+    remove_col, button_col = st.columns([3, 1])
+    selected = remove_col.selectbox(
+        "Quitar de la lista",
+        options,
+        format_func=lambda ticker: labels.get(ticker, ticker),
+        key=f"remove_favorite_{'group' if shared else 'private'}",
+        label_visibility="collapsed",
+    )
+    if button_col.button(
+        "Quitar",
+        key=f"remove_favorite_button_{'group' if shared else 'private'}",
+        width="stretch",
+    ):
+        try:
+            journal.delete_favorite(selected)
+        except (JournalStorageError, ValueError) as exc:
+            st.error(str(exc))
+        else:
+            st.success(f"{selected} ya no está en esta lista.")
+            st.rerun()
+
+
+def render_favorites_manager(
+    private_journal,
+    group_journal,
+    private_favorites: pd.DataFrame,
+    group_favorites: pd.DataFrame,
+    *,
+    actor_username: str,
+    is_admin: bool,
+) -> None:
+    st.subheader("Favoritos y buscador de empresas")
+    st.write(
+        "Busca por el nombre normal de la empresa, guárdala en tu lista o en la del "
+        "grupo y después selecciónala en la barra izquierda para analizarla."
+    )
+    with st.form("company_search_form"):
+        search_col, button_col = st.columns([4, 1])
+        query = search_col.text_input(
+            "Nombre o símbolo",
+            placeholder="Ejemplo: Taiwan Semiconductor, Inditex o Microsoft",
+            help="El buscador muestra acciones y ETF de los mercados disponibles en Yahoo.",
+        )
+        submitted = button_col.form_submit_button(
+            "Buscar",
+            type="primary",
+            width="stretch",
+        )
+    if submitted:
+        try:
+            st.session_state["favorite_search_results"] = cached_company_search(query)
+        except (DataDownloadError, ValueError) as exc:
+            st.session_state["favorite_search_results"] = []
+            st.error(str(exc))
+
+    results: list[TickerSearchResult] = st.session_state.get(
+        "favorite_search_results",
+        [],
+    )
+    if submitted and not results:
+        st.warning(
+            "No se encontraron acciones o ETF. Prueba con el nombre en inglés o usa "
+            "el símbolo manual en la barra izquierda."
+        )
+    if results:
+        result_index = st.selectbox(
+            "Resultado correcto",
+            options=range(len(results)),
+            format_func=lambda index: results[index].label,
+            key="favorite_search_result",
+        )
+        destination = st.radio(
+            "Dónde guardarla",
+            ["Mi lista privada", "Lista del grupo"],
+            horizontal=True,
+            help="Guardar una empresa no es una recomendación de compra.",
+        )
+        selected = results[result_index]
+        if st.button(
+            f"Guardar {selected.ticker}",
+            type="primary",
+            key="save_favorite",
+        ):
+            target = (
+                private_journal
+                if destination == "Mi lista privada"
+                else group_journal
+            )
+            try:
+                target.add_favorite(
+                    selected.ticker,
+                    selected.name,
+                    selected.exchange,
+                    recorded_by=actor_username,
+                )
+            except (JournalStorageError, ValueError) as exc:
+                st.error(str(exc))
+            else:
+                st.success(
+                    f"{selected.name} se ha guardado en "
+                    f"{destination.lower()}."
+                )
+                st.session_state.pop("favorite_search_results", None)
+                st.rerun()
+
+    st.info(
+        "Para no ralentizar la aplicación, puedes guardar 100 favoritas y elegir hasta "
+        "25 para análisis completo en cada actualización. Todas las posiciones abiertas "
+        "se incorporan automáticamente con una actualización de precio y tendencia."
+    )
+    private_col, group_col = st.columns(2)
+    with private_col:
+        render_favorite_list(
+            private_favorites,
+            title="Mi lista privada",
+            journal=private_journal,
+            actor_username=actor_username,
+        )
+    with group_col:
+        render_favorite_list(
+            group_favorites,
+            title="Lista del grupo",
+            journal=group_journal,
+            actor_username=actor_username,
+            shared=True,
+            can_delete_all=is_admin,
+        )
+
+
 def render_methodology() -> None:
     st.subheader("Guía sencilla")
     st.markdown(
@@ -1867,6 +2130,18 @@ def main() -> None:
     st.caption(
         f"{role_caption} · Buscador de oportunidades · No ejecuta órdenes"
     )
+    favorite_storage_error = ""
+    try:
+        private_favorites = journal.list_favorites()
+        group_favorites = group_journal.list_favorites()
+    except JournalStorageError as exc:
+        private_favorites = pd.DataFrame()
+        group_favorites = pd.DataFrame()
+        favorite_storage_error = str(exc)
+    favorite_tickers, favorite_labels = build_favorite_catalog(
+        private_favorites,
+        group_favorites,
+    )
     (
         tickers,
         start,
@@ -1876,7 +2151,12 @@ def main() -> None:
         strategy,
         backtest,
         load_clicked,
-    ) = build_sidebar()
+    ) = build_sidebar(favorite_tickers, favorite_labels)
+    if favorite_storage_error:
+        st.sidebar.warning(
+            "Los favoritos todavía no están disponibles. Hay que aplicar la "
+            "actualización de la base de datos."
+        )
     try:
         strategy.validate()
         backtest.validate()
@@ -1911,6 +2191,7 @@ def main() -> None:
             end,
             auto_adjust,
             alpha_vantage_key,
+            fundamental_tickers=set(tickers),
         )
     for error in st.session_state.get("download_errors", []):
         st.warning(error)
@@ -1930,6 +2211,7 @@ def main() -> None:
     tab_labels = [
         "Oportunidades",
         "Prueba histórica",
+        "Favoritos",
         "Mi cartera privada",
         "Cartera del grupo",
     ]
@@ -1937,13 +2219,13 @@ def main() -> None:
         tab_labels.append("Administración")
     tab_labels.append("Ayuda y riesgos")
     app_tabs = st.tabs(tab_labels)
-    tab_analysis, tab_backtest, tab_private, tab_group = app_tabs[:4]
+    tab_analysis, tab_backtest, tab_favorites, tab_private, tab_group = app_tabs[:5]
     if authenticated_user.is_admin:
-        tab_admin = app_tabs[4]
-        tab_methodology = app_tabs[5]
+        tab_admin = app_tabs[5]
+        tab_methodology = app_tabs[6]
     else:
         tab_admin = None
-        tab_methodology = app_tabs[4]
+        tab_methodology = app_tabs[5]
     (
         prepared,
         summary,
@@ -1961,8 +2243,8 @@ def main() -> None:
     with tab_analysis:
         if not raw_data:
             st.info(
-                "Empieza en la barra izquierda: escribe las empresas, deja los valores "
-                "recomendados y pulsa «Descargar / actualizar»."
+                "Empieza en «Favoritos»: busca empresas por su nombre, selecciónalas "
+                "en la barra izquierda y pulsa «Descargar / actualizar»."
             )
         elif not prepared:
             st.error("No hay suficiente histórico válido para generar señales.")
@@ -2096,6 +2378,23 @@ def main() -> None:
         else:
             selected_backtest = st.selectbox("Ticker", list(prepared), key="backtest_select")
             render_backtest(selected_backtest, prepared[selected_backtest], strategy, backtest)
+
+    with tab_favorites:
+        if favorite_storage_error:
+            st.error(favorite_storage_error)
+            st.info(
+                "Ejecuta la versión actual de supabase/schema.sql para crear la tabla "
+                "de favoritos. Las carteras existentes no se modifican."
+            )
+        else:
+            render_favorites_manager(
+                journal,
+                group_journal,
+                private_favorites,
+                group_favorites,
+                actor_username=authenticated_user.username,
+                is_admin=authenticated_user.is_admin,
+            )
 
     with tab_private:
         if persistent_journal_enabled():
