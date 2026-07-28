@@ -20,6 +20,7 @@ class SupabaseConfig:
     url: str
     secret_key: str
     table: str = "operations"
+    favorites_table: str = "favorites"
 
 
 def _secret_section(name: str) -> dict[str, object]:
@@ -42,13 +43,22 @@ def load_supabase_config() -> SupabaseConfig | None:
         or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
     ).strip()
     table = str(section.get("table") or os.getenv("SUPABASE_TABLE", "operations")).strip()
+    favorites_table = str(
+        section.get("favorites_table")
+        or os.getenv("SUPABASE_FAVORITES_TABLE", "favorites")
+    ).strip()
     if not url and not secret_key:
         return None
     if not url or not secret_key:
         raise JournalStorageError(
             "La configuración de Supabase está incompleta: se necesitan URL y clave secreta."
         )
-    return SupabaseConfig(url=url, secret_key=secret_key, table=table or "operations")
+    return SupabaseConfig(
+        url=url,
+        secret_key=secret_key,
+        table=table or "operations",
+        favorites_table=favorites_table or "favorites",
+    )
 
 
 def create_journal(owner: str) -> TradingJournal | SupabaseTradingJournal:
@@ -67,4 +77,5 @@ def create_journal(owner: str) -> TradingJournal | SupabaseTradingJournal:
         config.secret_key,
         owner,
         table=config.table,
+        favorites_table=config.favorites_table,
     )

@@ -25,6 +25,16 @@ OPERATION_COLUMNS = [
     "created_at",
 ]
 
+FAVORITE_COLUMNS = [
+    "id",
+    "ticker",
+    "name",
+    "exchange",
+    "recorded_by",
+    "created_at",
+]
+MAX_FAVORITES = 100
+
 
 def default_database_path() -> Path:
     """Usa el proyecto en desarrollo y una carpeta privada al estar instalado."""
@@ -71,6 +81,24 @@ def normalize_operation(
         "executed_at": pd.Timestamp(executed_at).isoformat(),
         "notes": notes.strip(),
         "currency": normalized_currency,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def normalize_favorite(
+    ticker: str,
+    name: str = "",
+    exchange: str = "",
+) -> dict[str, str]:
+    """Valida una empresa favorita para cualquier backend de almacenamiento."""
+
+    normalized_ticker = ticker.strip().upper()
+    if not normalized_ticker:
+        raise ValueError("La empresa favorita necesita un ticker.")
+    return {
+        "ticker": normalized_ticker,
+        "name": name.strip() or normalized_ticker,
+        "exchange": exchange.strip(),
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -200,6 +228,18 @@ class TradingJournal:
                 connection.execute(
                     "ALTER TABLE operations ADD COLUMN recorded_by TEXT NOT NULL DEFAULT ''"
                 )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS favorites (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL DEFAULT '',
+                    exchange TEXT NOT NULL DEFAULT '',
+                    recorded_by TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
 
     def add_operation(
         self,
@@ -266,6 +306,60 @@ class TradingJournal:
     def delete_operation(self, operation_id: int) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM operations WHERE id = ?", (int(operation_id),))
+
+    def add_favorite(
+        self,
+        ticker: str,
+        name: str = "",
+        exchange: str = "",
+        recorded_by: str = "",
+    ) -> int:
+        favorite = normalize_favorite(ticker, name, exchange)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT id FROM favorites WHERE ticker = ?",
+                (favorite["ticker"],),
+            ).fetchone()
+            if existing:
+                return int(existing["id"])
+            total = int(
+                connection.execute("SELECT COUNT(*) FROM favorites").fetchone()[0]
+            )
+            if total >= MAX_FAVORITES:
+                raise ValueError(f"Cada lista admite hasta {MAX_FAVORITES} favoritos.")
+            cursor = connection.execute(
+                """
+                INSERT INTO favorites
+                    (ticker, name, exchange, recorded_by, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    favorite["ticker"],
+                    favorite["name"],
+                    favorite["exchange"],
+                    recorded_by.strip().lower(),
+                    favorite["created_at"],
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def list_favorites(self) -> pd.DataFrame:
+        with self._connect() as connection:
+            return pd.read_sql_query(
+                """
+                SELECT id, ticker, name, exchange, recorded_by, created_at
+                FROM favorites
+                ORDER BY name COLLATE NOCASE, ticker
+                """,
+                connection,
+            )
+
+    def delete_favorite(self, ticker: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM favorites WHERE ticker = ?",
+                (ticker.strip().upper(),),
+            )
 
     def open_positions(self) -> pd.DataFrame:
         """Reconstruye posiciones mediante coste medio, incluidas comisiones pagadas."""

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, timedelta
 from io import StringIO
 
@@ -38,11 +39,97 @@ class DataDownloadError(RuntimeError):
     """Error recuperable al obtener o validar precios."""
 
 
+@dataclass(frozen=True)
+class TickerSearchResult:
+    """Resultado legible del buscador de instrumentos de Yahoo."""
+
+    ticker: str
+    name: str
+    exchange: str
+    instrument_type: str
+
+    @property
+    def label(self) -> str:
+        market = f" · {self.exchange}" if self.exchange else ""
+        return f"{self.name} ({self.ticker}){market}"
+
+
 def normalize_ticker(ticker: str) -> str:
     value = ticker.strip().upper()
     if not value:
         raise ValueError("El ticker no puede estar vacío.")
     return value
+
+
+def search_instruments(query: str, max_results: int = 12) -> list[TickerSearchResult]:
+    """Busca acciones y ETF por nombre o símbolo, sin exigir conocer el ticker."""
+
+    cleaned = query.strip()
+    if len(cleaned) < 2:
+        return []
+    requested = max(1, min(int(max_results), 25))
+    try:
+        try:
+            search = yf.Search(
+                cleaned,
+                max_results=requested,
+                news_count=0,
+                lists_count=0,
+                include_cb=False,
+                include_nav_links=False,
+                include_research=False,
+                include_cultural_assets=False,
+                enable_fuzzy_query=True,
+                raise_errors=True,
+            )
+        except TypeError:
+            # Compatibilidad con versiones anteriores admitidas por requirements.
+            search = yf.Search(
+                cleaned,
+                max_results=requested,
+                news_count=0,
+            )
+        quotes = search.quotes
+    except Exception as exc:
+        raise DataDownloadError(
+            "El buscador de empresas no respondió. Puedes escribir el ticker manualmente."
+        ) from exc
+
+    results: list[TickerSearchResult] = []
+    seen: set[str] = set()
+    for quote in quotes if isinstance(quotes, list) else []:
+        if not isinstance(quote, dict):
+            continue
+        quote_type = str(quote.get("quoteType") or "").upper()
+        if quote_type and quote_type not in {"EQUITY", "ETF"}:
+            continue
+        symbol = str(quote.get("symbol") or "").strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        name = str(
+            quote.get("longname")
+            or quote.get("shortname")
+            or quote.get("longName")
+            or quote.get("shortName")
+            or symbol
+        ).strip()
+        exchange = str(
+            quote.get("exchDisp")
+            or quote.get("exchange")
+            or quote.get("exchangeDisplay")
+            or ""
+        ).strip()
+        instrument_type = "ETF" if quote_type == "ETF" else "Acción"
+        results.append(
+            TickerSearchResult(
+                ticker=symbol,
+                name=name,
+                exchange=exchange,
+                instrument_type=instrument_type,
+            )
+        )
+        seen.add(symbol)
+    return results
 
 
 def _stooq_symbol(symbol: str) -> str:

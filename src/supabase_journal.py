@@ -8,7 +8,14 @@ from typing import Any
 import pandas as pd
 import requests
 
-from src.journal import OPERATION_COLUMNS, calculate_open_positions, normalize_operation
+from src.journal import (
+    FAVORITE_COLUMNS,
+    MAX_FAVORITES,
+    OPERATION_COLUMNS,
+    calculate_open_positions,
+    normalize_favorite,
+    normalize_operation,
+)
 
 
 class JournalStorageError(RuntimeError):
@@ -27,6 +34,7 @@ class SupabaseTradingJournal:
         owner: str,
         *,
         table: str = "operations",
+        favorites_table: str = "favorites",
         timeout: float = 20.0,
     ) -> None:
         normalized_url = url.strip().rstrip("/")
@@ -38,15 +46,22 @@ class SupabaseTradingJournal:
             raise JournalStorageError("Falta el usuario propietario del diario.")
         if not table.replace("_", "").isalnum():
             raise JournalStorageError("El nombre de tabla de Supabase no es válido.")
+        if not favorites_table.replace("_", "").isalnum():
+            raise JournalStorageError("El nombre de tabla de favoritos no es válido.")
         self.url = normalized_url
         self.secret_key = secret_key.strip()
         self.owner = owner.strip()
         self.table = table
+        self.favorites_table = favorites_table
         self.timeout = timeout
 
     @property
     def endpoint(self) -> str:
         return f"{self.url}/rest/v1/{self.table}"
+
+    @property
+    def favorites_endpoint(self) -> str:
+        return f"{self.url}/rest/v1/{self.favorites_table}"
 
     @property
     def headers(self) -> dict[str, str]:
@@ -60,12 +75,18 @@ class SupabaseTradingJournal:
             headers["Authorization"] = f"Bearer {self.secret_key}"
         return headers
 
-    def _request(self, method: str, **kwargs: Any) -> requests.Response:
+    def _request(
+        self,
+        method: str,
+        *,
+        endpoint: str | None = None,
+        **kwargs: Any,
+    ) -> requests.Response:
         headers = kwargs.pop("headers", self.headers)
         try:
             response = requests.request(
                 method,
-                self.endpoint,
+                endpoint or self.endpoint,
                 headers=headers,
                 timeout=self.timeout,
                 **kwargs,
@@ -164,6 +185,70 @@ class SupabaseTradingJournal:
             "DELETE",
             params={
                 "id": f"eq.{int(operation_id)}",
+                "owner": f"eq.{self.owner}",
+            },
+        )
+
+    def add_favorite(
+        self,
+        ticker: str,
+        name: str = "",
+        exchange: str = "",
+        recorded_by: str = "",
+    ) -> int:
+        favorite = normalize_favorite(ticker, name, exchange)
+        current = self.list_favorites()
+        match = current.loc[current["ticker"] == favorite["ticker"]]
+        if not match.empty:
+            return int(match.iloc[0]["id"])
+        if len(current) >= MAX_FAVORITES:
+            raise ValueError(f"Cada lista admite hasta {MAX_FAVORITES} favoritos.")
+        response = self._request(
+            "POST",
+            endpoint=self.favorites_endpoint,
+            params={"on_conflict": "owner,ticker"},
+            json={
+                "owner": self.owner,
+                **favorite,
+                "recorded_by": recorded_by.strip().lower(),
+            },
+            headers={
+                **self.headers,
+                "Prefer": "resolution=merge-duplicates,return=representation",
+            },
+        )
+        rows = response.json()
+        if not isinstance(rows, list) or not rows or "id" not in rows[0]:
+            raise JournalStorageError("Supabase guardó un favorito con respuesta inesperada.")
+        return int(rows[0]["id"])
+
+    def list_favorites(self) -> pd.DataFrame:
+        response = self._request(
+            "GET",
+            endpoint=self.favorites_endpoint,
+            params={
+                "owner": f"eq.{self.owner}",
+                "select": ",".join(FAVORITE_COLUMNS),
+                "order": "name.asc,ticker.asc",
+            },
+        )
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise JournalStorageError("Supabase devolvió una lista de favoritos inválida.")
+        if not rows:
+            return pd.DataFrame(columns=FAVORITE_COLUMNS)
+        frame = pd.DataFrame(rows)
+        for column in FAVORITE_COLUMNS:
+            if column not in frame.columns:
+                frame[column] = None
+        return frame.loc[:, FAVORITE_COLUMNS]
+
+    def delete_favorite(self, ticker: str) -> None:
+        self._request(
+            "DELETE",
+            endpoint=self.favorites_endpoint,
+            params={
+                "ticker": f"eq.{ticker.strip().upper()}",
                 "owner": f"eq.{self.owner}",
             },
         )
