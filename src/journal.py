@@ -36,7 +36,7 @@ FAVORITE_COLUMNS = [
     "recorded_by",
     "created_at",
 ]
-MAX_FAVORITES = 100
+MAX_FAVORITES = 300
 
 
 def default_database_path() -> Path:

@@ -447,10 +447,14 @@ button[data-baseweb="tab"] {
 .ssl-tag-consumer { color: #9a3412; background: #fff0e5; border-color: #fdba8c; }
 .ssl-tag-finance { color: #075985; background: #e5f5fc; border-color: #a5d8ed; }
 .ssl-tag-industry { color: #475569; background: #edf1f5; border-color: #cbd5e1; }
+.ssl-tag-defense { color: #9f1239; background: #fff1f2; border-color: #fecdd3; }
+.ssl-tag-space { color: #3730a3; background: #eef2ff; border-color: #c7d2fe; }
+.ssl-tag-quantum { color: #6d28d9; background: #f3e8ff; border-color: #d8b4fe; }
 .ssl-tag-real-estate { color: #7e22ce; background: #f3e8ff; border-color: #d8b4fe; }
 .ssl-tag-materials { color: #3f6212; background: #eef8d8; border-color: #c8e28c; }
 .ssl-tag-etf { color: #5b21b6; background: #ede9fe; border-color: #c4b5fd; }
 .ssl-tag-fund { color: #6b21a8; background: #f5e9ff; border-color: #d8b4fe; }
+.ssl-tag-leveraged { color: #991b1b; background: #fee2e2; border-color: #fca5a5; }
 .ssl-tag-small-cap { color: #155e75; background: #dff7fb; border-color: #9bdce8; }
 .ssl-tag-dividend { color: #166534; background: #e5f7e9; border-color: #a7dfb3; }
 .ssl-tag-other { color: #475569; background: #eef2f7; border-color: #d5dde7; }

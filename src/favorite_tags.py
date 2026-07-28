@@ -14,10 +14,14 @@ FAVORITE_TAGS = (
     "Consumo",
     "Finanzas",
     "Industria",
+    "Defensa",
+    "Espacio",
+    "Cuántica",
     "Inmobiliario",
     "Materias primas",
     "ETF",
     "Fondo",
+    "Apalancado",
     "Small cap",
     "Dividendos",
     "Otra",
@@ -31,10 +35,14 @@ TAG_CSS_CLASSES = {
     "Consumo": "consumer",
     "Finanzas": "finance",
     "Industria": "industry",
+    "Defensa": "defense",
+    "Espacio": "space",
+    "Cuántica": "quantum",
     "Inmobiliario": "real-estate",
     "Materias primas": "materials",
     "ETF": "etf",
     "Fondo": "fund",
+    "Apalancado": "leveraged",
     "Small cap": "small-cap",
     "Dividendos": "dividend",
     "Otra": "other",
@@ -136,6 +144,13 @@ def suggest_favorite_tags(
             )
         ):
             tags.append("Tecnología")
+
+    if any(token in searchable for token in ("aerospace", "defense", "defence", "weapon")):
+        tags.append("Defensa")
+    if any(token in searchable for token in ("space", "satellite", "rocket")):
+        tags.append("Espacio")
+    if normalized_ticker in {"IONQ", "RGTI", "QBTS", "QUBT"} or "quantum" in searchable:
+        tags.append("Cuántica")
 
     market_cap = fundamentals.get("marketCap")
     try:
