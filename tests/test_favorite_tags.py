@@ -37,3 +37,12 @@ def test_suggestions_combine_sector_and_size() -> None:
 
 def test_suggestion_uses_name_when_sector_is_missing() -> None:
     assert suggest_favorite_tags("YPF", "YPF Sociedad Anónima") == ["Energía"]
+
+
+def test_defense_space_and_quantum_are_recognized() -> None:
+    assert suggest_favorite_tags(
+        "RKLB",
+        "Rocket Lab USA",
+        fundamentals={"sector": "Industrials", "industry": "Aerospace & Defense"},
+    ) == ["Industria", "Defensa", "Espacio"]
+    assert suggest_favorite_tags("IONQ", "IonQ Quantum Computing") == ["Cuántica"]
