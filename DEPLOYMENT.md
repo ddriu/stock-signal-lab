@@ -57,17 +57,19 @@ No pegues la contraseña en GitHub y no subas el archivo local de secretos.
 ## 4. Activar el diario persistente gratuito
 
 1. Crea un proyecto gratuito en Supabase.
-2. Abre **SQL Editor**, pega `supabase/schema.sql` y ejecútalo.
+2. Abre **SQL Editor**, pega `supabase/schema.sql` y ejecútalo. Es seguro volver
+   a ejecutarlo al actualizar: añade las columnas nuevas sin borrar operaciones.
 3. Copia la **Project URL** y una clave secreta `sb_secret_*`.
 4. Añádelas al bloque `[supabase]` de los Secrets de Streamlit.
 5. Reinicia la aplicación.
 
 La clave secreta evita las políticas RLS y por eso **nunca** debe publicarse en
 GitHub ni copiarse en código cliente. La tabla no concede permisos a las claves
-públicas. Cada fila queda asociada al usuario autenticado de la aplicación. Las
-cuentas normales sólo construyen un diario para su propio nombre; el rol `admin`
-dispone además de la vista agregada y del formulario para registrar operaciones
-en nombre de los usuarios.
+públicas. Cada cartera privada queda asociada al usuario autenticado. La cartera
+compartida utiliza el propietario interno `grupo_compartido` y guarda además quién
+registró cada movimiento. Los miembros sólo pueden eliminar desde la interfaz sus
+propios movimientos compartidos; el rol `admin` puede corregir cualquiera, dispone
+de la vista agregada y puede registrar operaciones en nombre de los usuarios.
 
 Sin `[supabase]`, la instalación local continúa usando SQLite. En Community Cloud,
 `persistent_journal = false` mantiene el diario desactivado para evitar pérdidas.

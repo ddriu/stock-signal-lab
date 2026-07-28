@@ -77,10 +77,13 @@ el coste medio incluyendo las comisiones, admite ventas parciales y calcula bene
 y beneficio neto si se vendiera al último cierre. Las posiciones guardadas se añaden
 automáticamente a la próxima descarga.
 
-Cada cuenta tiene una cartera separada. El panel del usuario resume capital pendiente,
-valor neto, beneficio latente y realizado, rentabilidad, comisiones y cobertura de precios.
-El rol administrador ve un resumen de las cuatro carteras, su concentración y actividad,
-y puede registrar operaciones para un usuario concreto.
+Cada cuenta mantiene una **cartera privada** separada. Además existe una **cartera del
+grupo**, visible únicamente después de iniciar sesión, en la que los cuatro miembros
+pueden registrar las decisiones comunes. Cada movimiento compartido identifica quién
+lo añadió; un usuario puede eliminar los suyos y el administrador puede corregir cualquiera.
+Ambas carteras muestran capital pendiente, valor neto, beneficio latente y realizado,
+rentabilidad, comisiones y cobertura de precios. El rol administrador también ve un
+resumen de las cuatro carteras privadas y puede registrar operaciones para un usuario.
 
 El comparador de cambios resta por defecto 1 € por vender y otro por comprar,
 muestra cuántas unidades de la alternativa podrían adquirirse y calcula la mejora técnica.

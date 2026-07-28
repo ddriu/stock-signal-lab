@@ -40,7 +40,7 @@ from src.fundamentals import FundamentalResult, evaluate_fundamentals
 from src.indicators import add_indicators
 from src.journal import calculate_open_positions
 from src.supabase_journal import JournalStorageError
-from src.storage import create_journal
+from src.storage import GROUP_PORTFOLIO_OWNER, create_journal
 from src.opportunity import (
     OpportunityResult,
     RelativeStrengthResult,
@@ -1000,6 +1000,8 @@ def render_operation_form(
     fixed_fee: float,
     owner_label: str | None = None,
     flash_key: str = "_journal_flash",
+    recorded_by: str = "",
+    notes_label: str = "Notas",
 ) -> None:
     """Formulario común para que un usuario o el administrador registre operaciones."""
 
@@ -1036,7 +1038,7 @@ def render_operation_form(
             help="Por defecto se utiliza 1 unidad monetaria por operación.",
         )
         executed_at = st.date_input("Fecha", value=date.today())
-        notes = st.text_area("Notas")
+        notes = st.text_area(notes_label)
         submitted = st.form_submit_button("Guardar", type="primary")
     if not submitted:
         return
@@ -1053,6 +1055,7 @@ def render_operation_form(
             executed_at,
             notes,
             currency=currency,
+            recorded_by=recorded_by,
         )
     except (ValueError, JournalStorageError) as exc:
         st.error(str(exc))
@@ -1065,6 +1068,26 @@ def render_operation_form(
     st.rerun()
 
 
+def operation_history_for_display(operations: pd.DataFrame) -> pd.DataFrame:
+    """Presenta el diario con etiquetas sencillas sin alterar los datos exportados."""
+
+    return operations.rename(
+        columns={
+            "id": "ID",
+            "ticker": "Empresa",
+            "side": "Tipo",
+            "quantity": "Cantidad",
+            "price": "Precio",
+            "fees": "Comisión",
+            "executed_at": "Fecha",
+            "notes": "Motivo / notas",
+            "currency": "Moneda",
+            "recorded_by": "Registrado por",
+            "created_at": "Guardado el",
+        }
+    )
+
+
 def render_journal(
     prepared: dict[str, pd.DataFrame],
     fundamental_results: dict[str, FundamentalResult],
@@ -1072,10 +1095,19 @@ def render_journal(
     strategy: StrategyConfig,
     fx_snapshot: FxSnapshot,
     journal: object,
+    *,
+    view_key: str,
+    title: str,
+    description: str,
+    actor_username: str,
+    shared: bool = False,
+    can_delete_all: bool = False,
 ) -> None:
-    st.subheader("Mi cartera")
+    st.subheader(title)
+    st.caption(description)
     st.caption(f"Almacenamiento: {getattr(journal, 'backend_name', 'diario')}")
-    flash_message = st.session_state.pop("_journal_flash", None)
+    flash_key = f"_{view_key}_journal_flash"
+    flash_message = st.session_state.pop(flash_key, None)
     if flash_message:
         st.success(str(flash_message))
     fixed_fee = st.number_input(
@@ -1088,6 +1120,7 @@ def render_journal(
             "Se interpreta en euros. Cuando hay tipos del BCE, la app lo convierte "
             "a la moneda de la acción."
         ),
+        key=f"{view_key}_fixed_fee",
     )
     positions_tab, register_tab, switch_tab, history_tab = st.tabs(
         ["Posiciones analizadas", "Registrar operación", "Comparar un cambio", "Historial"]
@@ -1096,8 +1129,12 @@ def render_journal(
     with register_tab:
         render_operation_form(
             journal,
-            form_key="operation_form",
+            form_key=f"{view_key}_operation_form",
             fixed_fee=float(fixed_fee),
+            owner_label="la cartera del grupo" if shared else None,
+            flash_key=flash_key,
+            recorded_by=actor_username,
+            notes_label="Motivo o acuerdo del grupo" if shared else "Notas",
         )
 
     with history_tab:
@@ -1106,17 +1143,49 @@ def render_journal(
         if operations.empty:
             st.info("El diario todavía está vacío.")
         else:
-            st.dataframe(operations, width="stretch", hide_index=True)
+            if shared:
+                contributors = sorted(
+                    value
+                    for value in operations["recorded_by"].fillna("").astype(str).unique()
+                    if value
+                )
+                if contributors:
+                    st.caption(
+                        "Movimientos registrados por: " + ", ".join(contributors) + "."
+                    )
+            st.dataframe(
+                operation_history_for_display(operations),
+                width="stretch",
+                hide_index=True,
+            )
             st.download_button(
                 "Exportar diario a CSV",
                 operations.to_csv(index=False).encode("utf-8"),
-                file_name="diario_operaciones.csv",
+                file_name=f"diario_{view_key}.csv",
                 mime="text/csv",
+                key=f"{view_key}_download_history",
             )
-            operation_id = st.selectbox("ID para eliminar", operations["id"].tolist())
-            if st.button("Eliminar operación seleccionada"):
-                journal.delete_operation(int(operation_id))
-                st.rerun()
+            deletable = operations
+            if shared and not can_delete_all:
+                recorded_by = operations["recorded_by"].fillna("").astype(str).str.lower()
+                deletable = operations.loc[recorded_by == actor_username.lower()]
+            if deletable.empty:
+                if shared:
+                    st.caption(
+                        "Puedes eliminar únicamente los movimientos que registraste tú."
+                    )
+            else:
+                operation_id = st.selectbox(
+                    "ID para eliminar",
+                    deletable["id"].tolist(),
+                    key=f"{view_key}_delete_operation_id",
+                )
+                if st.button(
+                    "Eliminar operación seleccionada",
+                    key=f"{view_key}_delete_operation",
+                ):
+                    journal.delete_operation(int(operation_id))
+                    st.rerun()
 
     positions = journal.open_positions()
     latest_prices = {
@@ -1281,7 +1350,9 @@ def render_journal(
                 )
             if details:
                 selected_position = st.selectbox(
-                    "Ver diagnóstico de una posición", list(details), key="holding_detail"
+                    "Ver diagnóstico de una posición",
+                    list(details),
+                    key=f"{view_key}_holding_detail",
                 )
                 detail = details[selected_position]
                 position = detail["position"]
@@ -1395,7 +1466,9 @@ def render_journal(
             st.info("Registra y actualiza al menos una posición para comparar cambios.")
         else:
             current_key = st.selectbox(
-                "Acción que venderías", list(details), key="switch_current"
+                "Acción que venderías",
+                list(details),
+                key=f"{view_key}_switch_current",
             )
             current = details[current_key]
             current_ticker = str(current["position"].ticker)
@@ -1404,7 +1477,9 @@ def render_journal(
                 st.info("Añade otras empresas al radar para compararlas con tu posición.")
             else:
                 candidate_ticker = st.selectbox(
-                    "Acción que comprarías", alternatives, key="switch_candidate"
+                    "Acción que comprarías",
+                    alternatives,
+                    key=f"{view_key}_switch_candidate",
                 )
                 candidate_frame = prepared[candidate_ticker]
                 candidate_price = float(candidate_frame["close"].iloc[-1])
@@ -1519,6 +1594,7 @@ def render_admin_panel(
     accounts: dict[str, AuthConfig],
     prepared: dict[str, pd.DataFrame],
     fx_snapshot: FxSnapshot,
+    admin_username: str,
 ) -> None:
     """Vista agregada y mantenimiento de las carteras de los usuarios."""
 
@@ -1653,6 +1729,7 @@ def render_admin_panel(
             fixed_fee=float(fixed_fee),
             owner_label=accounts[selected_owner].display_name,
             flash_key="_admin_flash",
+            recorded_by=admin_username,
         )
 
     with detail_tab:
@@ -1777,6 +1854,7 @@ def main() -> None:
     accounts = load_auth_accounts()
     try:
         journal = create_journal(authenticated_user.username)
+        group_journal = create_journal(GROUP_PORTFOLIO_OWNER)
     except JournalStorageError as exc:
         st.error(str(exc))
         st.stop()
@@ -1784,7 +1862,7 @@ def main() -> None:
     role_caption = (
         "Panel administrador"
         if authenticated_user.is_admin
-        else f"Cartera privada de {authenticated_user.display_name}"
+        else f"Espacio de {authenticated_user.display_name}"
     )
     st.caption(
         f"{role_caption} · Buscador de oportunidades · No ejecuta órdenes"
@@ -1808,7 +1886,7 @@ def main() -> None:
 
     if load_clicked:
         held_tickers: list[str] = []
-        owners_to_load = [authenticated_user.username]
+        owners_to_load = [authenticated_user.username, GROUP_PORTFOLIO_OWNER]
         if authenticated_user.is_admin:
             owners_to_load.extend(managed_usernames(accounts))
         for owner in dict.fromkeys(owners_to_load):
@@ -1849,18 +1927,23 @@ def main() -> None:
         "fx_snapshot",
         FxSnapshot(as_of=None, rates_per_eur={"EUR": 1.0}),
     )
-    tab_labels = ["Oportunidades", "Prueba histórica", "Mi cartera"]
+    tab_labels = [
+        "Oportunidades",
+        "Prueba histórica",
+        "Mi cartera privada",
+        "Cartera del grupo",
+    ]
     if authenticated_user.is_admin:
         tab_labels.append("Administración")
     tab_labels.append("Ayuda y riesgos")
     app_tabs = st.tabs(tab_labels)
-    tab_analysis, tab_backtest, tab_journal = app_tabs[:3]
+    tab_analysis, tab_backtest, tab_private, tab_group = app_tabs[:4]
     if authenticated_user.is_admin:
-        tab_admin = app_tabs[3]
-        tab_methodology = app_tabs[4]
+        tab_admin = app_tabs[4]
+        tab_methodology = app_tabs[5]
     else:
         tab_admin = None
-        tab_methodology = app_tabs[3]
+        tab_methodology = app_tabs[4]
     (
         prepared,
         summary,
@@ -2014,7 +2097,7 @@ def main() -> None:
             selected_backtest = st.selectbox("Ticker", list(prepared), key="backtest_select")
             render_backtest(selected_backtest, prepared[selected_backtest], strategy, backtest)
 
-    with tab_journal:
+    with tab_private:
         if persistent_journal_enabled():
             try:
                 render_journal(
@@ -2024,6 +2107,13 @@ def main() -> None:
                     strategy,
                     fx_snapshot,
                     journal,
+                    view_key="private",
+                    title="Mi cartera privada",
+                    description=(
+                        "Sólo tú puedes consultar y modificar estos movimientos. "
+                        "No se mezclan con las decisiones del grupo."
+                    ),
+                    actor_username=authenticated_user.username,
                 )
             except JournalStorageError as exc:
                 st.error(str(exc))
@@ -2039,11 +2129,47 @@ def main() -> None:
                 "conectar una base de datos externa."
             )
 
+    with tab_group:
+        if persistent_journal_enabled():
+            try:
+                render_journal(
+                    prepared,
+                    fundamental_results,
+                    opportunity_results,
+                    strategy,
+                    fx_snapshot,
+                    group_journal,
+                    view_key="group",
+                    title="Cartera del grupo",
+                    description=(
+                        "Compartida entre Luci, Fer, Xavi y ddriu. Todos pueden verla y "
+                        "registrar decisiones; no es pública en Internet ni visible sin contraseña."
+                    ),
+                    actor_username=authenticated_user.username,
+                    shared=True,
+                    can_delete_all=authenticated_user.is_admin,
+                )
+            except JournalStorageError as exc:
+                st.error(str(exc))
+                st.info(
+                    "Actualiza la tabla ejecutando supabase/schema.sql para activar "
+                    "la identificación de quién registró cada movimiento."
+                )
+        else:
+            st.warning(
+                "La cartera compartida necesita almacenamiento persistente."
+            )
+
     if tab_admin is not None:
         with tab_admin:
             if persistent_journal_enabled():
                 try:
-                    render_admin_panel(accounts, prepared, fx_snapshot)
+                    render_admin_panel(
+                        accounts,
+                        prepared,
+                        fx_snapshot,
+                        authenticated_user.username,
+                    )
                 except JournalStorageError as exc:
                     st.error(f"No se pudo cargar el panel administrador: {exc}")
             else:
