@@ -8,7 +8,7 @@ from plotly.subplots import make_subplots
 
 
 COLORS = {
-    "price": "#E8EDF5",
+    "price": "#0F172A",
     "short": "#F5B700",
     "medium": "#3A86FF",
     "long": "#FF4D6D",
@@ -69,11 +69,14 @@ def price_chart(frame: pd.DataFrame, ticker: str) -> go.Figure:
     )
     figure.update_layout(
         title=f"{ticker}: precio, medias y volumen",
-        height=650,
+        height=560,
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
-        template="plotly_dark",
-        legend={"orientation": "h", "y": 1.02},
+        template="plotly_white",
+        legend={"orientation": "h", "y": 1.04},
+        margin={"l": 35, "r": 20, "t": 70, "b": 35},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#FFFFFF",
     )
     return figure
 
@@ -96,7 +99,15 @@ def momentum_chart(frame: pd.DataFrame, overbought: float = 75.0) -> go.Figure:
         go.Scatter(x=frame.index, y=frame["macd_signal"], name="Señal MACD"), row=2, col=1
     )
     figure.update_yaxes(range=[0, 100], row=1, col=1)
-    figure.update_layout(height=520, hovermode="x unified", template="plotly_dark")
+    figure.update_layout(
+        height=440,
+        hovermode="x unified",
+        template="plotly_white",
+        legend={"orientation": "h", "y": 1.05},
+        margin={"l": 35, "r": 20, "t": 50, "b": 35},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#FFFFFF",
+    )
     return figure
 
 
@@ -121,7 +132,15 @@ def backtest_chart(curve: pd.DataFrame) -> go.Figure:
         row=2,
         col=1,
     )
-    figure.update_layout(height=590, hovermode="x unified", template="plotly_dark")
+    figure.update_layout(
+        height=500,
+        hovermode="x unified",
+        template="plotly_white",
+        legend={"orientation": "h", "y": 1.05},
+        margin={"l": 45, "r": 20, "t": 50, "b": 35},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#FFFFFF",
+    )
     figure.update_yaxes(title_text="Capital", row=1, col=1)
     figure.update_yaxes(title_text="Drawdown %", row=2, col=1)
     return figure

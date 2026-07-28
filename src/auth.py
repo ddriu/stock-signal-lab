@@ -222,8 +222,16 @@ def require_login() -> AuthConfig:
             st.rerun()
         return account
 
-    st.title("Stock Signal Lab")
-    st.caption("Acceso privado · cada usuario tiene su propia cartera")
+    st.markdown(
+        """
+        <div class="ssl-login-brand">
+            <div class="ssl-logo" aria-hidden="true">↗</div>
+            <h1>Stock Signal Lab</h1>
+            <p>Decisiones de inversión explicadas con datos, riesgo y contexto.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     with st.form("login_form"):
         username = st.text_input("Usuario", autocomplete="username")
         password = st.text_input(
@@ -242,8 +250,13 @@ def require_login() -> AuthConfig:
             st.session_state["_authenticated_user"] = candidate.username
             st.rerun()
         st.error("Usuario o contraseña incorrectos.")
-    st.caption(
-        "La contraseña se comprueba mediante un hash seguro y no aparece en el código."
+    st.markdown(
+        """
+        <p style="max-width:470px;margin:0.8rem auto;text-align:center;color:#64748b;font-size:.82rem">
+        Acceso privado. La contraseña se verifica de forma segura y no aparece en el código.
+        </p>
+        """,
+        unsafe_allow_html=True,
     )
     st.stop()
     return AuthConfig("", "")  # Ayuda al analizador; st.stop() interrumpe.
