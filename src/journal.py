@@ -21,6 +21,7 @@ OPERATION_COLUMNS = [
     "executed_at",
     "notes",
     "currency",
+    "recorded_by",
     "created_at",
 ]
 
@@ -182,6 +183,7 @@ class TradingJournal:
                     executed_at TEXT NOT NULL,
                     notes TEXT NOT NULL DEFAULT '',
                     currency TEXT NOT NULL DEFAULT 'EUR',
+                    recorded_by TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
                 )
                 """
@@ -194,6 +196,10 @@ class TradingJournal:
                 connection.execute(
                     "ALTER TABLE operations ADD COLUMN currency TEXT NOT NULL DEFAULT 'EUR'"
                 )
+            if "recorded_by" not in columns:
+                connection.execute(
+                    "ALTER TABLE operations ADD COLUMN recorded_by TEXT NOT NULL DEFAULT ''"
+                )
 
     def add_operation(
         self,
@@ -205,6 +211,7 @@ class TradingJournal:
         executed_at: date | datetime | str,
         notes: str = "",
         currency: str = "EUR",
+        recorded_by: str = "",
     ) -> int:
         operation = normalize_operation(
             ticker,
@@ -229,8 +236,11 @@ class TradingJournal:
             cursor = connection.execute(
                 """
                 INSERT INTO operations
-                    (ticker, side, quantity, price, fees, executed_at, notes, currency, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (
+                        ticker, side, quantity, price, fees, executed_at, notes,
+                        currency, recorded_by, created_at
+                    )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     operation["ticker"],
@@ -241,6 +251,7 @@ class TradingJournal:
                     operation["executed_at"],
                     operation["notes"],
                     operation["currency"],
+                    recorded_by.strip().lower(),
                     operation["created_at"],
                 ),
             )

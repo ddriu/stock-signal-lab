@@ -100,6 +100,7 @@ class SupabaseTradingJournal:
         executed_at: date | datetime | str,
         notes: str = "",
         currency: str = "EUR",
+        recorded_by: str = "",
     ) -> int:
         operation = normalize_operation(
             ticker,
@@ -120,7 +121,11 @@ class SupabaseTradingJournal:
             ]
             if available.empty or float(available.iloc[0]) + 1e-9 < quantity:
                 raise ValueError("La venta supera la cantidad registrada en cartera.")
-        payload = {"owner": self.owner, **operation}
+        payload = {
+            "owner": self.owner,
+            **operation,
+            "recorded_by": recorded_by.strip().lower(),
+        }
         response = self._request(
             "POST",
             json=payload,

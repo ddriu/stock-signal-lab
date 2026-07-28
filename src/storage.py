@@ -12,6 +12,9 @@ from src.journal import TradingJournal, default_database_path
 from src.supabase_journal import JournalStorageError, SupabaseTradingJournal
 
 
+GROUP_PORTFOLIO_OWNER = "grupo_compartido"
+
+
 @dataclass(frozen=True)
 class SupabaseConfig:
     url: str
