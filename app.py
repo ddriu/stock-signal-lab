@@ -6,6 +6,7 @@ Ejecutar con: ``streamlit run app.py``
 from __future__ import annotations
 
 from datetime import date, timedelta
+import html
 
 import pandas as pd
 import streamlit as st
@@ -61,10 +62,22 @@ from src.recommendations import (
 )
 from src.risk import calculate_position_plan
 from src.signal_engine import add_signal_columns, evaluate_latest_signal
+from src.ui import (
+    APP_CSS,
+    PROFILE_NAMES,
+    signal_tone,
+    strategy_profile_defaults,
+)
 from src.visualization import backtest_chart, momentum_chart, price_chart
 
 
 st.set_page_config(page_title="Stock Signal Lab", page_icon="📈", layout="wide")
+
+
+def apply_visual_theme() -> None:
+    """Aplica una capa visual responsive sin alterar los componentes financieros."""
+
+    st.markdown(f"<style>{APP_CSS}</style>", unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=3_600, show_spinner=False)
@@ -180,6 +193,19 @@ def build_favorite_catalog(
     return tickers, labels
 
 
+def _apply_selected_profile() -> None:
+    profile_name = str(st.session_state.get("strategy_profile", "Equilibrado"))
+    if profile_name == "Personalizado":
+        return
+    values = strategy_profile_defaults(profile_name)
+    st.session_state["cfg_rsi_range"] = (
+        int(values.pop("rsi_buy_min")),
+        int(values.pop("rsi_buy_max")),
+    )
+    for setting, value in values.items():
+        st.session_state[f"cfg_{setting}"] = value
+
+
 def build_sidebar(
     favorite_tickers: list[str] | None = None,
     favorite_labels: dict[str, str] | None = None,
@@ -195,232 +221,289 @@ def build_sidebar(
 ]:
     favorite_tickers = favorite_tickers or []
     favorite_labels = favorite_labels or {}
-    st.sidebar.header("1. Empresas y periodo")
+    st.sidebar.markdown("## Radar de empresas")
     selected_favorites = st.sidebar.multiselect(
-        "Elegir de mis favoritos",
+        "Empresas que quieres analizar",
         options=favorite_tickers,
         format_func=lambda ticker: favorite_labels.get(ticker, ticker),
         max_selections=25,
         help=(
-            "Puedes guardar hasta 100 y analizar hasta 25 en profundidad cada vez. "
-            "Las posiciones abiertas se actualizan además en modo rápido."
+            "Puedes guardar hasta 100 favoritas y analizar hasta 25 en profundidad "
+            "cada vez. Las posiciones abiertas se actualizan automáticamente."
         ),
+        key="selected_favorite_tickers",
     )
     with st.sidebar.expander("Añadir símbolos manualmente"):
         manual_tickers = parse_tickers(
             st.text_area(
                 "Símbolos bursátiles",
                 "" if favorite_tickers else "AAPL, MSFT, SAN.MC",
-                height=80,
-                help=(
-                    "Alternativa al buscador. Escribe símbolos separados por comas; "
-                    "SAN.MC indica la bolsa de Madrid."
-                ),
+                height=78,
+                help="Escribe símbolos separados por comas; SAN.MC es Banco Santander en Madrid.",
+                key="manual_tickers",
             )
         )
     tickers = list(dict.fromkeys([*selected_favorites, *manual_tickers]))
+
     years = st.sidebar.select_slider(
-        "Años de datos para analizar",
+        "Historial utilizado",
         options=[1, 2, 3, 5, 10],
         value=5,
-        format_func=lambda x: f"{x} años",
-        help="Cinco años es un buen punto de partida. Un año ofrece muy poco historial para probar reglas.",
+        format_func=lambda value: f"{value} años",
+        help="Cinco años es el punto de partida recomendado.",
+        key="analysis_years",
     )
-    end = st.sidebar.date_input(
-        "Analizar hasta",
-        value=date.today(),
-        max_value=date.today(),
-        help="Normalmente se deja en la fecha actual.",
+    profile_name = st.sidebar.selectbox(
+        "Estilo de análisis",
+        PROFILE_NAMES,
+        index=0,
+        key="strategy_profile",
+        on_change=_apply_selected_profile,
+        help=(
+            "Equilibrado mantiene los parámetros recomendados. Crecimiento tolera "
+            "más impulso; Prudente exige señales más selectivas."
+        ),
     )
-    start = end - timedelta(days=365 * years)
-    auto_adjust = st.sidebar.checkbox("Precios ajustados", value=True, help="Ajusta splits y dividendos según yfinance.")
-    with st.sidebar.expander("Fuentes de datos"):
-        st.caption(
-            "Yahoo aporta precios y contexto. Para tickers de EE. UU., la app intenta "
-            "validar las cuentas con SEC EDGAR. El BCE aporta divisas."
-        )
-        alpha_vantage_key = st.text_input(
-            "Clave gratuita de Alpha Vantage (opcional)",
-            type="password",
-            help=(
-                "Si la introduces, se compara el último cierre con un segundo proveedor. "
-                "La cuenta gratuita tiene un límite diario reducido."
-            ),
-        )
+    defaults = strategy_profile_defaults(profile_name)
+    st.sidebar.caption(
+        {
+            "Equilibrado": "Señales equilibradas para empezar.",
+            "Crecimiento": "Más tolerancia a empresas aceleradas y horizonte más largo.",
+            "Prudente": "Menor riesgo y confirmaciones más exigentes.",
+            "Personalizado": "Utiliza tus propios ajustes.",
+        }[profile_name]
+    )
 
-    st.sidebar.header("2. Cómo medir la tendencia")
-    col_a, col_b, col_c = st.sidebar.columns(3)
-    sma_short = col_a.number_input(
-        "Corta", min_value=2, max_value=100, value=20, help="Ritmo reciente del precio."
-    )
-    sma_medium = col_b.number_input(
-        "Media", min_value=5, max_value=250, value=50, help="Tendencia de varios meses."
-    )
-    sma_long = col_c.number_input(
-        "Larga", min_value=20, max_value=500, value=200, help="Tendencia principal."
-    )
-    st.sidebar.caption("20 / 50 / 200 días es la configuración recomendada para empezar.")
-    rsi_period = st.sidebar.number_input(
-        "Días para medir el impulso",
-        min_value=2,
-        max_value=50,
-        value=14,
-        help="Cuantos menos días, más rápida pero más nerviosa será la señal.",
-    )
-    rsi_range = st.sidebar.slider(
-        "Zona de impulso saludable",
-        20,
-        80,
-        (45, 68),
-        help="Premia empresas que avanzan con fuerza sin estar extremadamente aceleradas.",
-    )
-    rsi_overbought = st.sidebar.slider(
-        "Nivel de precio demasiado acelerado",
-        60,
-        95,
-        78,
-        help="Por encima de este nivel la aplicación sugiere esperar una entrada mejor.",
-    )
-    max_distance = st.sidebar.slider(
-        "Distancia máxima frente a su ritmo reciente",
-        2.0,
+    quick_a, quick_b = st.sidebar.columns(2)
+    stop_loss = quick_a.slider(
+        "Stop",
+        1.0,
         30.0,
-        12.0,
+        float(defaults["stop_loss"]),
         0.5,
         format="%.1f%%",
-        help="Evita perseguir precios excesivamente alejados de la media corta.",
+        help="Pérdida máxima orientativa desde la entrada.",
+        key="cfg_stop_loss",
+    )
+    max_risk = quick_b.slider(
+        "Riesgo",
+        0.1,
+        10.0,
+        float(defaults["max_risk"]),
+        0.1,
+        format="%.1f%%",
+        help="Capital total que aceptarías perder si se alcanza el stop.",
+        key="cfg_max_risk",
+    )
+    forward_horizon = st.sidebar.selectbox(
+        "Horizonte de la estimación",
+        options=[10, 20, 40, 60],
+        index=[10, 20, 40, 60].index(int(defaults["forward_horizon"])),
+        format_func=lambda value: f"{value} sesiones",
+        key="cfg_forward_horizon",
+    )
+    initial_capital = st.sidebar.number_input(
+        "Capital para simulaciones",
+        min_value=100.0,
+        value=10_000.0,
+        step=1_000.0,
+        key="cfg_initial_capital",
     )
 
-    with st.sidebar.expander("Opciones avanzadas de búsqueda"):
-        st.caption("Puedes mantener estos valores hasta tener suficientes backtests.")
+    with st.sidebar.expander("Periodo y fuentes"):
+        end = st.date_input(
+            "Analizar hasta",
+            value=date.today(),
+            max_value=date.today(),
+            key="analysis_end",
+        )
+        auto_adjust = st.checkbox(
+            "Precios ajustados",
+            value=True,
+            help="Ajusta splits y dividendos según Yahoo.",
+            key="auto_adjust_prices",
+        )
+        st.caption(
+            "Yahoo aporta precios y contexto; SEC valida cuentas de EE. UU. y el BCE divisas."
+        )
+        alpha_vantage_key = st.text_input(
+            "Alpha Vantage opcional",
+            type="password",
+            help="Contrasta el último cierre con un segundo proveedor gratuito.",
+            key="alpha_vantage_key",
+        )
+
+    with st.sidebar.expander("Configuración técnica avanzada"):
+        col_a, col_b, col_c = st.columns(3)
+        sma_short = col_a.number_input(
+            "Corta",
+            min_value=2,
+            max_value=100,
+            value=int(defaults["sma_short"]),
+            key="cfg_sma_short",
+        )
+        sma_medium = col_b.number_input(
+            "Media",
+            min_value=5,
+            max_value=250,
+            value=int(defaults["sma_medium"]),
+            key="cfg_sma_medium",
+        )
+        sma_long = col_c.number_input(
+            "Larga",
+            min_value=20,
+            max_value=500,
+            value=int(defaults["sma_long"]),
+            key="cfg_sma_long",
+        )
+        rsi_period = st.number_input(
+            "Días para medir impulso",
+            min_value=2,
+            max_value=50,
+            value=int(defaults["rsi_period"]),
+            key="cfg_rsi_period",
+        )
+        rsi_range = st.slider(
+            "Zona de impulso saludable",
+            20,
+            80,
+            (int(defaults["rsi_buy_min"]), int(defaults["rsi_buy_max"])),
+            key="cfg_rsi_range",
+        )
+        rsi_overbought = st.slider(
+            "Precio demasiado acelerado",
+            60,
+            95,
+            int(defaults["rsi_overbought"]),
+            key="cfg_rsi_overbought",
+        )
+        max_distance = st.slider(
+            "Distancia máxima de la media corta",
+            2.0,
+            30.0,
+            float(defaults["max_distance"]),
+            0.5,
+            format="%.1f%%",
+            key="cfg_max_distance",
+        )
         watch_score = st.slider(
-            "Empezar a vigilar desde", 45, 70, 55,
-            help="Desde 55 puntos la empresa entra en la lista de vigilancia técnica."
+            "Vigilar desde",
+            45,
+            70,
+            int(defaults["watch_score"]),
+            key="cfg_watch_score",
         )
         buy_score = st.slider(
-            "Entrada interesante desde", 55, 80, 65,
-            help="A partir de 65 puntos, con tendencia confirmada, aparece como entrada interesante."
+            "Entrada interesante desde",
+            55,
+            80,
+            int(defaults["buy_score"]),
+            key="cfg_buy_score",
         )
         strong_score = st.slider(
-            "Entrada fuerte desde", 65, 95, 75,
-            help="Reserva esta etiqueta para las configuraciones técnicas más completas."
+            "Entrada fuerte desde",
+            65,
+            95,
+            int(defaults["strong_score"]),
+            key="cfg_strong_score",
         )
         reduce_score = st.slider(
-            "Nivel de debilidad", 20, 60, 40,
-            help="Por debajo de este nivel se revisan posiciones cuya tendencia ya se debilita."
+            "Debilidad desde",
+            20,
+            60,
+            int(defaults["reduce_score"]),
+            key="cfg_reduce_score",
         )
         sell_score = st.slider(
-            "Nivel de deterioro severo", 0, 40, 25,
-            help="Un score bajo no basta por sí solo: también debe existir pérdida de tendencia."
+            "Deterioro severo",
+            0,
+            40,
+            int(defaults["sell_score"]),
+            key="cfg_sell_score",
         )
         confirmation_days = st.slider(
-            "Días para confirmar una señal negativa",
+            "Confirmar señal negativa",
             1,
             5,
-            2,
+            int(defaults["confirmation_days"]),
             format="%d sesiones",
-            help="Evita reaccionar a una sola sesión mala.",
+            key="cfg_confirmation_days",
         )
         breakout_period = st.slider(
-            "Días que debe superar para marcar nuevo máximo",
+            "Periodo para nuevo máximo",
             10,
             60,
-            20,
+            int(defaults["breakout_period"]),
             format="%d sesiones",
-            help="Detecta empresas que están rompiendo su rango reciente.",
+            key="cfg_breakout_period",
         )
         near_high = st.slider(
-            "Distancia admitida desde su máximo anual",
+            "Distancia admitida del máximo anual",
             5.0,
             30.0,
-            12.0,
+            float(defaults["near_high"]),
             1.0,
             format="%.0f%%",
-            help="Las empresas líderes suelen cotizar relativamente cerca de sus máximos.",
-        )
-        volume_surge = st.slider(
-            "Actividad de compra destacada",
-            1.1,
-            3.0,
-            1.2,
-            0.1,
-            format="%.1fx",
-            help="1,2x significa un 20% más de volumen que su media reciente.",
+            key="cfg_near_high",
         )
         volume_normal = st.slider(
             "Actividad mínima normal",
             0.5,
             1.0,
-            0.8,
+            float(defaults["volume_normal"]),
             0.1,
             format="%.1fx",
-            help="Desde 0,8x ya suma puntos; superar 1,2x añade una bonificación.",
+            key="cfg_volume_normal",
+        )
+        volume_surge = st.slider(
+            "Actividad destacada",
+            1.1,
+            3.0,
+            float(defaults["volume_surge"]),
+            0.1,
+            format="%.1fx",
+            key="cfg_volume_surge",
         )
 
-    st.sidebar.header("3. Dinero y riesgo")
-    stop_loss = st.sidebar.slider(
-        "Pérdida máxima desde la entrada",
-        1.0,
-        30.0,
-        8.0,
-        0.5,
-        format="%.1f%%",
-        help="Nivel aproximado en el que se cerraría una posición que sale mal.",
-    )
-    trailing_stop = st.sidebar.slider(
-        "Protección de beneficios (0 = desactivada)",
-        0.0,
-        30.0,
-        10.0,
-        0.5,
-        format="%.1f%%",
-        help="El nivel de salida va subiendo cuando la acción alcanza nuevos máximos.",
-    )
-    max_risk = st.sidebar.slider(
-        "Capital que aceptas perder en una operación",
-        0.1,
-        10.0,
-        1.0,
-        0.1,
-        format="%.1f%%",
-        help="No es el porcentaje invertido; es la pérdida aproximada si se alcanza el stop.",
-    )
-    forward_horizon = st.sidebar.selectbox(
-        "Horizonte para estimar resultados",
-        options=[10, 20, 40, 60],
-        index=1,
-        format_func=lambda value: f"{value} sesiones",
-        help="20 sesiones equivalen aproximadamente a un mes bursátil.",
-    )
-    exit_on_reduce = st.sidebar.checkbox(
-        "Cerrar la posición si aparece «Reducir»",
-        value=True,
-        help="En la prueba histórica, Reducir se interpreta como una salida completa.",
-    )
-    initial_capital = st.sidebar.number_input(
-        "Capital disponible para la simulación",
-        min_value=100.0,
-        value=10_000.0,
-        step=1_000.0,
-        help="Se usa para el backtest y para calcular un tamaño orientativo de posición.",
-    )
-    commission = st.sidebar.number_input(
-        "Coste de compra o venta (%)",
-        min_value=0.0,
-        value=0.10,
-        step=0.05,
-        format="%.2f",
-        help="Comisión aproximada de tu intermediario.",
-    )
-    slippage = st.sidebar.number_input(
-        "Margen por ejecución imperfecta (%)",
-        min_value=0.0,
-        value=0.05,
-        step=0.05,
-        format="%.2f",
-        help="Simula que normalmente no se compra o vende exactamente al precio observado.",
-    )
+    with st.sidebar.expander("Riesgo y costes avanzados"):
+        trailing_stop = st.slider(
+            "Protección dinámica de beneficios",
+            0.0,
+            30.0,
+            float(defaults["trailing_stop"]),
+            0.5,
+            format="%.1f%%",
+            key="cfg_trailing_stop",
+        )
+        exit_on_reduce = st.checkbox(
+            "Cerrar en backtest si aparece Reducir",
+            value=bool(defaults["exit_on_reduce"]),
+            key="cfg_exit_on_reduce",
+        )
+        commission = st.number_input(
+            "Coste de compra o venta (%)",
+            min_value=0.0,
+            value=0.10,
+            step=0.05,
+            format="%.2f",
+            key="cfg_commission",
+        )
+        slippage = st.number_input(
+            "Ejecución imperfecta (%)",
+            min_value=0.0,
+            value=0.05,
+            step=0.05,
+            format="%.2f",
+            key="cfg_slippage",
+        )
 
+    load_clicked = st.sidebar.button(
+        "Actualizar análisis",
+        type="primary",
+        width="stretch",
+        icon=":material/refresh:",
+    )
+    start = end - timedelta(days=365 * int(years))
     strategy = StrategyConfig(
         sma_short=int(sma_short),
         sma_medium=int(sma_medium),
@@ -444,17 +527,12 @@ def build_sidebar(
         stop_loss_pct=float(stop_loss),
         trailing_stop_pct=float(trailing_stop),
         max_risk_per_trade_pct=float(max_risk),
-        exit_on_reduce=exit_on_reduce,
+        exit_on_reduce=bool(exit_on_reduce),
     )
     backtest = BacktestConfig(
         initial_capital=float(initial_capital),
         commission_pct=float(commission),
         slippage_pct=float(slippage),
-    )
-    load_clicked = st.sidebar.button(
-        "Descargar / actualizar",
-        type="primary",
-        width="stretch",
     )
     return (
         tickers,
@@ -1027,8 +1105,16 @@ def render_analysis(
 
     with st.expander("Ver explicación técnica completa"):
         st.write(signal.explanation)
-    st.plotly_chart(price_chart(frame, ticker), width="stretch")
-    st.plotly_chart(momentum_chart(frame, strategy.rsi_overbought), width="stretch")
+    st.plotly_chart(
+        price_chart(frame, ticker),
+        width="stretch",
+        config=PLOTLY_CONFIG,
+    )
+    st.plotly_chart(
+        momentum_chart(frame, strategy.rsi_overbought),
+        width="stretch",
+        config=PLOTLY_CONFIG,
+    )
 
 
 def render_backtest(ticker: str, frame: pd.DataFrame, strategy: StrategyConfig, settings: BacktestConfig) -> None:
@@ -1064,7 +1150,11 @@ def render_backtest(ticker: str, frame: pd.DataFrame, strategy: StrategyConfig, 
         help="Porcentaje de operaciones cerradas con beneficio; no indica cuánto se ganó o perdió.",
     )
     cols[4].metric("Operaciones cerradas", int(metrics["completed_trades"]))
-    st.plotly_chart(backtest_chart(result.equity_curve), width="stretch")
+    st.plotly_chart(
+        backtest_chart(result.equity_curve),
+        width="stretch",
+        config=PLOTLY_CONFIG,
+    )
     with st.expander("Métricas adicionales"):
         st.json(
             {
@@ -2049,6 +2139,388 @@ def render_favorites_manager(
         )
 
 
+PLOTLY_CONFIG = {
+    "displayModeBar": False,
+    "responsive": True,
+    "scrollZoom": False,
+}
+
+
+def _numeric_score(value: object) -> float | None:
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _score_text(value: object) -> str:
+    score = _numeric_score(value)
+    return f"{score:.0f}" if score is not None else "N/D"
+
+
+def render_app_header(user: AuthConfig) -> None:
+    role = "Administrador" if user.is_admin else f"Hola, {user.display_name}"
+    st.markdown(
+        f"""
+        <div class="ssl-app-header">
+            <div class="ssl-logo" aria-hidden="true">↗</div>
+            <div>
+                <h1 class="ssl-app-title">Stock Signal Lab</h1>
+                <p class="ssl-app-subtitle">
+                    {html.escape(role)} · señales explicadas, cartera y riesgo
+                </p>
+            </div>
+            <span class="ssl-status-pill">Sólo análisis</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_opportunity_cards(
+    summary: list[dict[str, object]],
+    *,
+    limit: int = 6,
+) -> None:
+    if not summary:
+        return
+    ordered = sorted(
+        summary,
+        key=lambda row: (
+            _numeric_score(row.get("Oportunidad")) or -1,
+            _numeric_score(row.get("Momento entrada")) or -1,
+        ),
+        reverse=True,
+    )[:limit]
+    cards: list[str] = []
+    for row in ordered:
+        ticker = html.escape(str(row.get("Ticker") or "N/D"))
+        label = str(row.get("Lectura conjunta") or row.get("Estado") or "Sin lectura")
+        position_label = str(row.get("Si ya la tienes") or "Sin posición")
+        tone = signal_tone(label)
+        close = _numeric_score(row.get("Cierre"))
+        close_text = f"{close:,.2f}" if close is not None else "N/D"
+        date_value = html.escape(str(row.get("Fecha") or "Sin fecha"))
+        cards.append(
+            f"""
+            <article class="ssl-card">
+                <div class="ssl-card-top">
+                    <span class="ssl-ticker">{ticker}</span>
+                    <span class="ssl-badge ssl-{tone}">{html.escape(label)}</span>
+                </div>
+                <div class="ssl-score-row">
+                    <div class="ssl-score">
+                        <span>Oportunidad</span>
+                        <strong>{_score_text(row.get("Oportunidad"))}/100</strong>
+                    </div>
+                    <div class="ssl-score">
+                        <span>Empresa</span>
+                        <strong>{_score_text(row.get("Calidad empresa"))}</strong>
+                    </div>
+                    <div class="ssl-score">
+                        <span>Entrada</span>
+                        <strong>{_score_text(row.get("Momento entrada"))}</strong>
+                    </div>
+                </div>
+                <div class="ssl-card-footer">
+                    <span>Cierre {close_text}</span>
+                    <span>Si la tienes: {html.escape(position_label)}</span>
+                </div>
+                <div class="ssl-card-footer">
+                    <span>Datos {_score_text(row.get("Confianza datos"))}%</span>
+                    <span>{date_value}</span>
+                </div>
+            </article>
+            """
+        )
+    cards_html = ('<div class="ssl-card-grid">' + "".join(cards) + "</div>").replace(
+        "\n", ""
+    )
+    st.markdown(cards_html, unsafe_allow_html=True)
+
+
+def _portfolio_snapshot(
+    journal: object,
+    prepared: dict[str, pd.DataFrame],
+    fx_snapshot: FxSnapshot,
+) -> tuple[pd.DataFrame, object]:
+    operations = journal.list_operations()
+    positions = calculate_open_positions(operations)
+    latest_prices = {
+        ticker: float(frame["close"].iloc[-1])
+        for ticker, frame in prepared.items()
+        if not frame.empty
+    }
+    return build_position_dashboard(
+        operations,
+        positions,
+        latest_prices,
+        fx_snapshot.rates_per_eur,
+        sell_fee_eur=1.0,
+    )
+
+
+def _set_navigation(
+    section: str,
+    subsection_key: str | None = None,
+    subsection: str | None = None,
+) -> None:
+    st.session_state["main_navigation"] = section
+    if subsection_key and subsection:
+        st.session_state[subsection_key] = subsection
+
+
+def render_home(
+    user: AuthConfig,
+    journal: object,
+    group_journal: object,
+    prepared: dict[str, pd.DataFrame],
+    summary: list[dict[str, object]],
+    fx_snapshot: FxSnapshot,
+    private_favorites: pd.DataFrame,
+    group_favorites: pd.DataFrame,
+) -> None:
+    update_dates = [
+        pd.Timestamp(frame.index[-1])
+        for frame in prepared.values()
+        if not frame.empty
+    ]
+    update_text = (
+        max(update_dates).date().isoformat()
+        if update_dates
+        else "pendiente de actualización"
+    )
+    st.markdown(
+        f"""
+        <section class="ssl-hero">
+            <h2>Tu resumen de inversión</h2>
+            <p>
+                Hola, {html.escape(user.display_name)}. Aquí tienes lo importante sin
+                perderte entre indicadores. Últimos precios: {html.escape(update_text)}.
+            </p>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    try:
+        _, private_kpis = _portfolio_snapshot(journal, prepared, fx_snapshot)
+        _, group_kpis = _portfolio_snapshot(group_journal, prepared, fx_snapshot)
+    except JournalStorageError as exc:
+        st.warning(f"No se pudo construir el resumen de carteras: {exc}")
+        private_kpis = None
+        group_kpis = None
+
+    if private_kpis is not None:
+        value_text = (
+            f"{private_kpis.current_net_value_eur:,.0f} €"
+            if private_kpis.priced_positions_count
+            else "Sin actualizar"
+        )
+        result_text = (
+            f"{private_kpis.unrealized_pnl_eur:+,.0f} €"
+            if private_kpis.priced_positions_count
+            else "—"
+        )
+        result_detail = (
+            f"{private_kpis.unrealized_return_pct:+.2f}% sobre posiciones valoradas"
+            if private_kpis.priced_positions_count
+            else "Actualiza para conocer el resultado"
+        )
+        st.markdown(
+            f"""
+            <div class="ssl-kpi-grid">
+                <div class="ssl-kpi-card">
+                    <small>Valor de mi cartera</small>
+                    <strong>{value_text}</strong>
+                    <em>{private_kpis.priced_positions_count}/{private_kpis.open_positions_count}
+                    posiciones con precio</em>
+                </div>
+                <div class="ssl-kpi-card">
+                    <small>Resultado latente</small>
+                    <strong>{result_text}</strong>
+                    <em>{result_detail}</em>
+                </div>
+                <div class="ssl-kpi-card">
+                    <small>Posiciones abiertas</small>
+                    <strong>{private_kpis.open_positions_count}</strong>
+                    <em>{private_kpis.operations_count} operaciones registradas</em>
+                </div>
+                <div class="ssl-kpi-card">
+                    <small>Seguimiento</small>
+                    <strong>{len(private_favorites)} + {len(group_favorites)}</strong>
+                    <em>favoritas privadas y del grupo</em>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if group_kpis is not None and group_kpis.open_positions_count:
+            st.caption(
+                f"Cartera del grupo: {group_kpis.open_positions_count} posiciones · "
+                f"resultado latente valorado {group_kpis.unrealized_pnl_eur:+,.2f} EUR."
+            )
+
+    action_a, action_b, action_c = st.columns(3)
+    action_a.button(
+        "Analizar empresas",
+        width="stretch",
+        type="primary",
+        on_click=_set_navigation,
+        args=("Analizar",),
+    )
+    action_b.button(
+        "Buscar y guardar",
+        width="stretch",
+        on_click=_set_navigation,
+        args=("Favoritos",),
+    )
+    action_c.button(
+        "Abrir mi cartera",
+        width="stretch",
+        on_click=_set_navigation,
+        args=("Carteras", "portfolio_navigation", "Privada"),
+    )
+
+    risk_alerts = [
+        row
+        for row in summary
+        if row.get("Si ya la tienes") in {"Reducir", "Vender"}
+    ]
+    entry_alerts = [
+        row
+        for row in summary
+        if row.get("Lectura conjunta") in {"Oportunidad destacada", "Candidata"}
+    ]
+    st.markdown("### Atención hoy")
+    if not summary:
+        st.info(
+            "Selecciona empresas en la barra lateral y pulsa «Actualizar análisis». "
+            "Las posiciones abiertas se añadirán automáticamente."
+        )
+    elif not risk_alerts and not entry_alerts:
+        st.success(
+            "No aparecen alertas prioritarias. Revisa las empresas en vigilancia "
+            "antes de tomar decisiones."
+        )
+    else:
+        for row in risk_alerts[:3]:
+            st.warning(
+                f"**{row['Ticker']} · {row['Si ya la tienes']}:** "
+                f"momento de entrada {row.get('Momento entrada', 'N/D')}/100."
+            )
+        for row in entry_alerts[:3]:
+            st.success(
+                f"**{row['Ticker']} · {row['Lectura conjunta']}:** "
+                f"oportunidad {row.get('Oportunidad', 'N/D')}/100. Requiere revisión."
+            )
+
+    if summary:
+        st.markdown("### Empresas que más destacan")
+        render_opportunity_cards(summary, limit=3)
+
+
+def render_opportunities_page(
+    raw_data: dict[str, pd.DataFrame],
+    prepared: dict[str, pd.DataFrame],
+    summary: list[dict[str, object]],
+    strategy: StrategyConfig,
+    backtest: BacktestConfig,
+    fundamental_results: dict[str, FundamentalResult],
+    valuation_results: dict[str, ValuationResult],
+    relative_results: dict[str, RelativeStrengthResult],
+    risk_results: dict[str, RiskResult],
+    opportunity_results: dict[str, OpportunityResult],
+    raw_fundamentals: dict[str, dict[str, object]],
+    price_verifications: dict[str, PriceVerification],
+) -> None:
+    st.subheader("Oportunidades")
+    st.caption(
+        "Primero ves una lectura sencilla; el detalle técnico y la tabla completa "
+        "siguen disponibles debajo."
+    )
+    if not raw_data:
+        st.info(
+            "Busca empresas en «Favoritos», selecciónalas en la barra lateral y "
+            "pulsa «Actualizar análisis»."
+        )
+        return
+    if not prepared:
+        st.error("No hay suficiente histórico válido para generar señales.")
+        return
+
+    render_opportunity_cards(summary)
+    alerts = [
+        row
+        for row in summary
+        if row.get("Lectura conjunta") in {"Oportunidad destacada", "Candidata"}
+        or row.get("Si ya la tienes") in {"Reducir", "Vender"}
+    ]
+    st.caption(f"{len(alerts)} alertas prioritarias con las reglas configuradas.")
+
+    with st.expander("Ver ranking completo en tabla"):
+        radar = pd.DataFrame(summary)
+        if "Momento entrada" in radar.columns:
+            radar = radar.sort_values(
+                ["Oportunidad", "Confianza datos", "Momento entrada"],
+                ascending=[False, False, False],
+                na_position="last",
+            ).reset_index(drop=True)
+            radar.insert(0, "Ranking", range(1, len(radar) + 1))
+        st.dataframe(
+            radar,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Oportunidad": st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d"
+                ),
+                "Confianza datos": st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d%%"
+                ),
+                "Calidad empresa": st.column_config.ProgressColumn(
+                    "Empresa /100", min_value=0, max_value=100, format="%d"
+                ),
+                "Momento entrada": st.column_config.ProgressColumn(
+                    "Entrada /100", min_value=0, max_value=100, format="%d"
+                ),
+                "Valoración": st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d"
+                ),
+                "Fuerza relativa": st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d"
+                ),
+                "Riesgo controlado": st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d"
+                ),
+                "Fuerza 3 meses": st.column_config.NumberColumn(format="%+.1f%%"),
+                "Desde su máximo": st.column_config.NumberColumn(format="%+.1f%%"),
+                "Actividad": st.column_config.NumberColumn(format="%.2fx"),
+            },
+        )
+
+    selected = st.selectbox(
+        "Empresa que quieres entender mejor",
+        list(prepared),
+        key="analysis_ticker",
+    )
+    render_analysis(
+        selected,
+        prepared[selected],
+        strategy,
+        backtest,
+        fundamental_results[selected],
+        valuation_results[selected],
+        relative_results[selected],
+        risk_results[selected],
+        opportunity_results[selected],
+        raw_fundamentals.get(selected, {}),
+        price_verifications.get(selected),
+    )
+
+
 def render_methodology() -> None:
     st.subheader("Guía sencilla")
     st.markdown(
@@ -2113,6 +2585,7 @@ def render_methodology() -> None:
 
 
 def main() -> None:
+    apply_visual_theme()
     authenticated_user = require_login()
     accounts = load_auth_accounts()
     try:
@@ -2121,15 +2594,7 @@ def main() -> None:
     except JournalStorageError as exc:
         st.error(str(exc))
         st.stop()
-    st.title("Stock Signal Lab")
-    role_caption = (
-        "Panel administrador"
-        if authenticated_user.is_admin
-        else f"Espacio de {authenticated_user.display_name}"
-    )
-    st.caption(
-        f"{role_caption} · Buscador de oportunidades · No ejecuta órdenes"
-    )
+    render_app_header(authenticated_user)
     favorite_storage_error = ""
     try:
         private_favorites = journal.list_favorites()
@@ -2208,24 +2673,6 @@ def main() -> None:
         "fx_snapshot",
         FxSnapshot(as_of=None, rates_per_eur={"EUR": 1.0}),
     )
-    tab_labels = [
-        "Oportunidades",
-        "Prueba histórica",
-        "Favoritos",
-        "Mi cartera privada",
-        "Cartera del grupo",
-    ]
-    if authenticated_user.is_admin:
-        tab_labels.append("Administración")
-    tab_labels.append("Ayuda y riesgos")
-    app_tabs = st.tabs(tab_labels)
-    tab_analysis, tab_backtest, tab_favorites, tab_private, tab_group = app_tabs[:5]
-    if authenticated_user.is_admin:
-        tab_admin = app_tabs[5]
-        tab_methodology = app_tabs[6]
-    else:
-        tab_admin = None
-        tab_methodology = app_tabs[5]
     (
         prepared,
         summary,
@@ -2240,156 +2687,88 @@ def main() -> None:
         else ({}, [], {}, {}, {}, {}, {})
     )
 
-    with tab_analysis:
-        if not raw_data:
-            st.info(
-                "Empieza en «Favoritos»: busca empresas por su nombre, selecciónalas "
-                "en la barra izquierda y pulsa «Descargar / actualizar»."
-            )
-        elif not prepared:
-            st.error("No hay suficiente histórico válido para generar señales.")
-        else:
-            st.subheader("Ranking de oportunidades")
-            radar = pd.DataFrame(summary)
-            if "Momento entrada" in radar.columns:
-                radar = radar.sort_values(
-                    ["Oportunidad", "Confianza datos", "Momento entrada"],
-                    ascending=[False, False, False],
-                    na_position="last",
-                ).reset_index(drop=True)
-                radar.insert(0, "Ranking", range(1, len(radar) + 1))
-            st.dataframe(
-                radar,
-                width="stretch",
-                hide_index=True,
-                column_config={
-                    "Oportunidad": st.column_config.ProgressColumn(
-                        min_value=0,
-                        max_value=100,
-                        format="%d",
-                        help="Combinación de las cinco familias de análisis.",
-                    ),
-                    "Confianza datos": st.column_config.ProgressColumn(
-                        min_value=0,
-                        max_value=100,
-                        format="%d%%",
-                        help="Cobertura de datos, no probabilidad de beneficio.",
-                    ),
-                    "Calidad empresa": st.column_config.ProgressColumn(
-                        "Empresa /100",
-                        min_value=0,
-                        max_value=100,
-                        format="%d",
-                        help="Rentabilidad, crecimiento, deuda y caja. Vacío significa datos insuficientes.",
-                    ),
-                    "Momento entrada": st.column_config.ProgressColumn(
-                        "Entrada /100",
-                        min_value=0,
-                        max_value=100,
-                        format="%d",
-                        help="Tendencia, impulso, MACD, volumen, máximos y calidad del precio de entrada.",
-                    ),
-                    "Valoración": st.column_config.ProgressColumn(
-                        min_value=0,
-                        max_value=100,
-                        format="%d",
-                        help="Precio frente a beneficios, crecimiento, caja y patrimonio.",
-                    ),
-                    "Fuerza relativa": st.column_config.ProgressColumn(
-                        min_value=0,
-                        max_value=100,
-                        format="%d",
-                        help="Comportamiento frente al índice y al sector.",
-                    ),
-                    "Riesgo controlado": st.column_config.ProgressColumn(
-                        min_value=0,
-                        max_value=100,
-                        format="%d",
-                        help="Una nota alta indica menor volatilidad, caída y problemas de liquidez.",
-                    ),
-                    "Fuerza 3 meses": st.column_config.NumberColumn(
-                        "Subida/bajada 3 meses",
-                        format="%+.1f%%",
-                        help="Cambio del precio durante aproximadamente tres meses.",
-                    ),
-                    "Desde su máximo": st.column_config.NumberColumn(
-                        format="%+.1f%%",
-                        help="0% significa que está en máximos; -10% indica que está un 10% por debajo.",
-                    ),
-                    "Actividad": st.column_config.NumberColumn(
-                        format="%.2fx",
-                        help="1,20x equivale a un 20% más de negociación que su media.",
-                    ),
-                },
-            )
-            alerts = [
-                row
-                for row in summary
-                if row.get("Lectura conjunta") in {"Oportunidad destacada", "Candidata"}
-                or row.get("Si ya la tienes") in {"Reducir", "Vender"}
-            ]
-            opportunities = [
-                row
-                for row in summary
-                if row.get("Lectura conjunta") in {"Oportunidad destacada", "Candidata"}
-            ]
-            if opportunities:
-                leader = max(
-                    opportunities, key=lambda item: int(item.get("Oportunidad", 0))
-                )
-                company_score = leader.get("Calidad empresa")
-                company_text = (
-                    f"empresa {int(company_score)}/100, "
-                    if pd.notna(company_score)
-                    else "empresa N/D, "
-                )
-                st.success(
-                    f"Oportunidad destacada: {leader['Ticker']} — {company_text}"
-                    f"oportunidad {leader['Oportunidad']}/100, entrada "
-                    f"{leader['Momento entrada']}/100 y confianza de datos "
-                    f"{leader['Confianza datos']}%. Requiere validación adicional."
-                )
-            else:
-                st.info(
-                    "No hay una entrada interesante completa hoy. El ranking permite vigilar "
-                    "qué empresas están más cerca de cumplir las condiciones."
-                )
-            st.caption(f"{len(alerts)} alertas activas basadas en las reglas configuradas.")
-            selected = st.selectbox(
-                "Empresa que quieres entender mejor", list(prepared), key="analysis_ticker"
-            )
-            render_analysis(
-                selected,
-                prepared[selected],
+    main_options = ["Inicio", "Analizar", "Favoritos", "Carteras", "Más"]
+    if st.session_state.get("main_navigation") not in main_options:
+        st.session_state["main_navigation"] = "Inicio"
+    selected_section = st.segmented_control(
+        "Navegación principal",
+        main_options,
+        key="main_navigation",
+        required=True,
+        label_visibility="collapsed",
+        format_func=lambda value: {
+            "Inicio": "⌂ Inicio",
+            "Analizar": "⌁ Analizar",
+            "Favoritos": "☆ Favoritos",
+            "Carteras": "▣ Carteras",
+            "Más": "••• Más",
+        }[value],
+    )
+
+    if selected_section == "Inicio":
+        render_home(
+            authenticated_user,
+            journal,
+            group_journal,
+            prepared,
+            summary,
+            fx_snapshot,
+            private_favorites,
+            group_favorites,
+        )
+
+    elif selected_section == "Analizar":
+        analysis_options = ["Oportunidades", "Prueba histórica"]
+        if st.session_state.get("analysis_navigation") not in analysis_options:
+            st.session_state["analysis_navigation"] = "Oportunidades"
+        analysis_section = st.segmented_control(
+            "Tipo de análisis",
+            analysis_options,
+            key="analysis_navigation",
+            required=True,
+            label_visibility="collapsed",
+        )
+        if analysis_section == "Oportunidades":
+            render_opportunities_page(
+                raw_data,
+                prepared,
+                summary,
                 strategy,
                 backtest,
-                fundamental_results[selected],
-                valuation_results[selected],
-                relative_results[selected],
-                risk_results[selected],
-                opportunity_results[selected],
-                raw_fundamentals.get(selected, {}),
-                price_verifications.get(selected),
+                fundamental_results,
+                valuation_results,
+                relative_results,
+                risk_results,
+                opportunity_results,
+                raw_fundamentals,
+                price_verifications,
+            )
+        elif not prepared:
+            st.info("Actualiza empresas antes de ejecutar una prueba histórica.")
+        else:
+            selected_backtest = st.selectbox(
+                "Empresa para la prueba histórica",
+                list(prepared),
+                key="backtest_select",
+            )
+            render_backtest(
+                selected_backtest,
+                prepared[selected_backtest],
+                strategy,
+                backtest,
             )
 
-    with tab_backtest:
-        if not prepared:
-            st.info("Descarga datos antes de ejecutar una simulación.")
-        else:
-            selected_backtest = st.selectbox("Ticker", list(prepared), key="backtest_select")
-            render_backtest(selected_backtest, prepared[selected_backtest], strategy, backtest)
-
-    with tab_favorites:
+    elif selected_section == "Favoritos":
         if not persistent_journal_enabled():
             st.warning(
-                "Los favoritos necesitan almacenamiento persistente. En una instalación "
-                "local se guardan en SQLite; en la web hay que conectar Supabase."
+                "Los favoritos necesitan almacenamiento persistente. En local se "
+                "guardan en SQLite; en la web hay que conectar Supabase."
             )
         elif favorite_storage_error:
             st.error(favorite_storage_error)
             st.info(
-                "Ejecuta la versión actual de supabase/schema.sql para crear la tabla "
-                "de favoritos. Las carteras existentes no se modifican."
+                "Ejecuta la versión actual de supabase/schema.sql para crear la "
+                "tabla de favoritos."
             )
         else:
             render_favorites_manager(
@@ -2401,40 +2780,24 @@ def main() -> None:
                 is_admin=authenticated_user.is_admin,
             )
 
-    with tab_private:
-        if persistent_journal_enabled():
-            try:
-                render_journal(
-                    prepared,
-                    fundamental_results,
-                    opportunity_results,
-                    strategy,
-                    fx_snapshot,
-                    journal,
-                    view_key="private",
-                    title="Mi cartera privada",
-                    description=(
-                        "Sólo tú puedes consultar y modificar estos movimientos. "
-                        "No se mezclan con las decisiones del grupo."
-                    ),
-                    actor_username=authenticated_user.username,
-                )
-            except JournalStorageError as exc:
-                st.error(str(exc))
-                st.info(
-                    "Comprueba que ejecutaste supabase/schema.sql y que la URL y "
-                    "la clave secreta están guardadas en los Secrets de Streamlit."
-                )
+    elif selected_section == "Carteras":
+        portfolio_options = ["Privada", "Grupo"]
+        if st.session_state.get("portfolio_navigation") not in portfolio_options:
+            st.session_state["portfolio_navigation"] = "Privada"
+        portfolio_section = st.segmented_control(
+            "Cartera",
+            portfolio_options,
+            key="portfolio_navigation",
+            required=True,
+            label_visibility="collapsed",
+            format_func=lambda value: (
+                "Mi cartera privada" if value == "Privada" else "Cartera del grupo"
+            ),
+        )
+        if not persistent_journal_enabled():
+            st.warning("Las carteras necesitan almacenamiento persistente.")
         else:
-            st.warning(
-                "El diario está desactivado en este alojamiento porque su disco no "
-                "garantiza conservar SQLite tras un reinicio. El análisis y los "
-                "backtests siguen disponibles. Para carteras persistentes se necesita "
-                "conectar una base de datos externa."
-            )
-
-    with tab_group:
-        if persistent_journal_enabled():
+            target_journal = journal if portfolio_section == "Privada" else group_journal
             try:
                 render_journal(
                     prepared,
@@ -2442,30 +2805,45 @@ def main() -> None:
                     opportunity_results,
                     strategy,
                     fx_snapshot,
-                    group_journal,
-                    view_key="group",
-                    title="Cartera del grupo",
+                    target_journal,
+                    view_key="private" if portfolio_section == "Privada" else "group",
+                    title=(
+                        "Mi cartera privada"
+                        if portfolio_section == "Privada"
+                        else "Cartera del grupo"
+                    ),
                     description=(
-                        "Compartida entre Luci, Fer, Xavi y ddriu. Todos pueden verla y "
-                        "registrar decisiones; no es pública en Internet ni visible sin contraseña."
+                        "Sólo tú puedes consultar y modificar estos movimientos."
+                        if portfolio_section == "Privada"
+                        else (
+                            "Compartida entre Luci, Fer, Xavi y ddriu. Todos pueden "
+                            "verla y registrar decisiones."
+                        )
                     ),
                     actor_username=authenticated_user.username,
-                    shared=True,
+                    shared=portfolio_section == "Grupo",
                     can_delete_all=authenticated_user.is_admin,
                 )
             except JournalStorageError as exc:
                 st.error(str(exc))
-                st.info(
-                    "Actualiza la tabla ejecutando supabase/schema.sql para activar "
-                    "la identificación de quién registró cada movimiento."
-                )
-        else:
-            st.warning(
-                "La cartera compartida necesita almacenamiento persistente."
-            )
+                st.info("Comprueba la conexión con Supabase y vuelve a intentarlo.")
 
-    if tab_admin is not None:
-        with tab_admin:
+    elif selected_section == "Más":
+        more_options = (
+            ["Administración", "Guía y riesgos"]
+            if authenticated_user.is_admin
+            else ["Guía y riesgos"]
+        )
+        if st.session_state.get("more_navigation") not in more_options:
+            st.session_state["more_navigation"] = "Guía y riesgos"
+        more_section = st.segmented_control(
+            "Más secciones",
+            more_options,
+            key="more_navigation",
+            required=True,
+            label_visibility="collapsed",
+        )
+        if more_section == "Administración":
             if persistent_journal_enabled():
                 try:
                     render_admin_panel(
@@ -2477,12 +2855,9 @@ def main() -> None:
                 except JournalStorageError as exc:
                     st.error(f"No se pudo cargar el panel administrador: {exc}")
             else:
-                st.warning(
-                    "El panel multiusuario necesita almacenamiento persistente."
-                )
-
-    with tab_methodology:
-        render_methodology()
+                st.warning("El panel multiusuario necesita almacenamiento persistente.")
+        else:
+            render_methodology()
 
     st.divider()
     st.caption(

@@ -33,6 +33,7 @@ La instalación local solicita las credenciales guardadas en
 │   ├── opportunity.py        # Valoración, fortaleza relativa, riesgo y score conjunto
 │   ├── backtesting.py        # Simulador long-only sin anticipación
 │   ├── visualization.py      # Gráficos Plotly
+│   ├── ui.py                 # Diseño responsive y perfiles de configuración
 │   ├── risk.py               # Tamaño orientativo de posición y riesgo monetario
 │   ├── portfolio.py          # Valoración y comparación de cambios
 │   ├── recommendations.py    # Entradas, retornos históricos y ventas parciales
@@ -69,6 +70,23 @@ La interfaz incluye una lectura en lenguaje sencillo de cada señal y traduce el
 elegido a importe de posición, unidades, salida si falla y pérdida monetaria aproximada.
 La referencia 2:1 es sólo una relación matemática entre beneficio potencial y riesgo,
 no un precio objetivo ni una predicción.
+
+## Interfaz y dispositivos
+
+La portada reúne primero el valor de la cartera, el resultado latente, las posiciones,
+el seguimiento y las alertas del día. La navegación separa inicio, análisis,
+favoritos, carteras y guía para cargar únicamente la sección que se está consultando.
+Las oportunidades se presentan en tarjetas fáciles de leer y conservan el ranking
+completo y los gráficos técnicos como detalle desplegable.
+
+El diseño se adapta a escritorio, tablet y móvil: las columnas se apilan, la navegación
+permanece accesible y las tablas y pestañas pueden desplazarse horizontalmente. En
+pantallas estrechas la barra lateral se abre con el control superior de Streamlit.
+
+Los perfiles **Equilibrado**, **Crecimiento** y **Prudente** ajustan juntos los umbrales
+técnicos y de riesgo. **Personalizado** conserva los valores elegidos manualmente.
+Cambiar de perfil facilita la configuración, pero no modifica la calidad de los datos
+ni convierte una señal retrospectiva en una predicción.
 
 ## Cartera y cambios
 
