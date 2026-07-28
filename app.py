@@ -245,7 +245,7 @@ def build_sidebar(
         format_func=lambda ticker: favorite_labels.get(ticker, ticker),
         max_selections=25,
         help=(
-            "Puedes guardar hasta 100 favoritas y analizar hasta 25 en profundidad "
+            "Puedes guardar hasta 300 favoritas y analizar hasta 25 en profundidad "
             "cada vez. Las posiciones abiertas se actualizan automáticamente."
         ),
         key="selected_favorite_tickers",
