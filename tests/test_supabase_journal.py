@@ -114,6 +114,7 @@ def test_supabase_favorites_use_separate_table_and_owner(monkeypatch) -> None:
                     "ticker": "TSM",
                     "name": "Taiwan Semiconductor",
                     "exchange": "NYSE",
+                    "tags": "Tecnología",
                     "recorded_by": "xavi",
                     "created_at": "2026-07-28T12:00:00",
                 }
@@ -137,6 +138,7 @@ def test_supabase_favorites_use_separate_table_and_owner(monkeypatch) -> None:
         "tsm",
         "Taiwan Semiconductor",
         "NYSE",
+        tags=["Tecnología"],
         recorded_by="Xavi",
     )
     favorites = journal.list_favorites()
@@ -144,7 +146,30 @@ def test_supabase_favorites_use_separate_table_and_owner(monkeypatch) -> None:
 
     assert favorite_id == 9
     assert favorites.iloc[0]["recorded_by"] == "xavi"
+    assert favorites.iloc[0]["tags"] == "Tecnología"
     assert all(call["url"].endswith("/rest/v1/favorites") for call in calls)
     assert calls[0]["params"]["owner"] == "eq.grupo_compartido"
     assert calls[1]["json"]["owner"] == "grupo_compartido"
+    assert calls[1]["json"]["tags"] == "Tecnología"
     assert calls[3]["params"]["owner"] == "eq.grupo_compartido"
+
+
+def test_supabase_favorite_tags_are_updated_by_owner(monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        return FakeResponse(None, status_code=204)
+
+    monkeypatch.setattr("src.supabase_journal.requests.request", fake_request)
+    journal = SupabaseTradingJournal(
+        "https://example.supabase.co",
+        "sb_secret_test",
+        "ddriu",
+    )
+
+    journal.update_favorite_tags("ypf", ["Energía", "Dividendos"])
+
+    assert calls[0]["method"] == "PATCH"
+    assert calls[0]["params"] == {"ticker": "eq.YPF", "owner": "eq.ddriu"}
+    assert calls[0]["json"] == {"tags": "Energía, Dividendos"}

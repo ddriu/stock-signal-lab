@@ -62,6 +62,25 @@ def test_favorites_are_saved_without_duplicates(tmp_path) -> None:
     assert journal.list_favorites().empty
 
 
+def test_favorite_tags_can_be_saved_and_updated(tmp_path) -> None:
+    journal = TradingJournal(tmp_path / "journal.db")
+    journal.add_favorite(
+        "tsm",
+        "Taiwan Semiconductor",
+        "NYSE",
+        tags=["Tecnología"],
+        recorded_by="ddriu",
+    )
+
+    assert journal.list_favorites().iloc[0]["tags"] == "Tecnología"
+
+    journal.update_favorite_tags("TSM", ["Tecnología", "Dividendos"])
+    assert journal.list_favorites().iloc[0]["tags"] == "Tecnología, Dividendos"
+
+    with pytest.raises(ValueError, match="no existe"):
+        journal.update_favorite_tags("NOPE", ["Otra"])
+
+
 def test_frozen_windows_app_uses_private_local_app_data(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("src.journal.sys.platform", "win32")
     monkeypatch.setattr("src.journal.sys.frozen", True, raising=False)
