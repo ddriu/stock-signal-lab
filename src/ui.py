@@ -284,7 +284,8 @@ button[data-baseweb="tab"] {
 }
 
 .ssl-card-grid,
-.ssl-kpi-grid {
+.ssl-kpi-grid,
+.ssl-favorite-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(245px, 1fr));
     gap: 0.85rem;
@@ -386,6 +387,74 @@ button[data-baseweb="tab"] {
     color: var(--ssl-muted);
 }
 
+.ssl-favorite-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    min-width: 0;
+    padding: 0.85rem;
+    border: 1px solid var(--ssl-border);
+    border-radius: 15px;
+    background: var(--ssl-surface);
+    box-shadow: 0 5px 18px rgba(15, 23, 42, 0.045);
+}
+
+.ssl-favorite-card-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.6rem;
+}
+
+.ssl-favorite-card-top strong {
+    color: var(--ssl-ink);
+    font-size: 1.02rem;
+}
+
+.ssl-favorite-card-top span,
+.ssl-favorite-card small {
+    color: var(--ssl-muted);
+    font-size: 0.72rem;
+}
+
+.ssl-favorite-card p {
+    margin: 0;
+    color: #334155;
+    font-size: 0.86rem;
+}
+
+.ssl-favorite-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+}
+
+.ssl-favorite-tag {
+    display: inline-flex;
+    align-items: center;
+    min-height: 1.65rem;
+    padding: 0.23rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.7rem;
+    font-weight: 750;
+    border: 1px solid transparent;
+}
+
+.ssl-tag-energy { color: #92400e; background: #fff4d6; border-color: #f6d58b; }
+.ssl-tag-biotech { color: #9d174d; background: #fce7f3; border-color: #f9a8d4; }
+.ssl-tag-technology { color: #1d4ed8; background: #e8f0ff; border-color: #b9d0ff; }
+.ssl-tag-health { color: #0f766e; background: #e5f7f5; border-color: #9edfd7; }
+.ssl-tag-consumer { color: #9a3412; background: #fff0e5; border-color: #fdba8c; }
+.ssl-tag-finance { color: #075985; background: #e5f5fc; border-color: #a5d8ed; }
+.ssl-tag-industry { color: #475569; background: #edf1f5; border-color: #cbd5e1; }
+.ssl-tag-real-estate { color: #7e22ce; background: #f3e8ff; border-color: #d8b4fe; }
+.ssl-tag-materials { color: #3f6212; background: #eef8d8; border-color: #c8e28c; }
+.ssl-tag-etf { color: #5b21b6; background: #ede9fe; border-color: #c4b5fd; }
+.ssl-tag-fund { color: #6b21a8; background: #f5e9ff; border-color: #d8b4fe; }
+.ssl-tag-small-cap { color: #155e75; background: #dff7fb; border-color: #9bdce8; }
+.ssl-tag-dividend { color: #166534; background: #e5f7e9; border-color: #a7dfb3; }
+.ssl-tag-other { color: #475569; background: #eef2f7; border-color: #d5dde7; }
+
 .ssl-login-brand {
     max-width: 470px;
     margin: clamp(1rem, 7vh, 4rem) auto 1rem;
@@ -451,7 +520,8 @@ div[data-testid="stForm"]:has(input[autocomplete="username"]) {
         border-radius: 13px;
     }
     .ssl-card-grid,
-    .ssl-kpi-grid {
+    .ssl-kpi-grid,
+    .ssl-favorite-grid {
         grid-template-columns: 1fr;
     }
     .ssl-score-row {

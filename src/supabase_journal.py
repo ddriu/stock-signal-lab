@@ -194,12 +194,15 @@ class SupabaseTradingJournal:
         ticker: str,
         name: str = "",
         exchange: str = "",
+        tags: object = "",
         recorded_by: str = "",
     ) -> int:
-        favorite = normalize_favorite(ticker, name, exchange)
+        favorite = normalize_favorite(ticker, name, exchange, tags)
         current = self.list_favorites()
         match = current.loc[current["ticker"] == favorite["ticker"]]
         if not match.empty:
+            if favorite["tags"]:
+                self.update_favorite_tags(favorite["ticker"], favorite["tags"])
             return int(match.iloc[0]["id"])
         if len(current) >= MAX_FAVORITES:
             raise ValueError(f"Cada lista admite hasta {MAX_FAVORITES} favoritos.")
@@ -242,6 +245,18 @@ class SupabaseTradingJournal:
             if column not in frame.columns:
                 frame[column] = None
         return frame.loc[:, FAVORITE_COLUMNS]
+
+    def update_favorite_tags(self, ticker: str, tags: object) -> None:
+        favorite = normalize_favorite(ticker, tags=tags)
+        self._request(
+            "PATCH",
+            endpoint=self.favorites_endpoint,
+            params={
+                "ticker": f"eq.{favorite['ticker']}",
+                "owner": f"eq.{self.owner}",
+            },
+            json={"tags": favorite["tags"]},
+        )
 
     def delete_favorite(self, ticker: str) -> None:
         self._request(

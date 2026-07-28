@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.favorite_tags import serialize_favorite_tags
+
 
 OPERATION_COLUMNS = [
     "id",
@@ -30,6 +32,7 @@ FAVORITE_COLUMNS = [
     "ticker",
     "name",
     "exchange",
+    "tags",
     "recorded_by",
     "created_at",
 ]
@@ -89,6 +92,7 @@ def normalize_favorite(
     ticker: str,
     name: str = "",
     exchange: str = "",
+    tags: object = "",
 ) -> dict[str, str]:
     """Valida una empresa favorita para cualquier backend de almacenamiento."""
 
@@ -99,6 +103,7 @@ def normalize_favorite(
         "ticker": normalized_ticker,
         "name": name.strip() or normalized_ticker,
         "exchange": exchange.strip(),
+        "tags": serialize_favorite_tags(tags),
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -235,11 +240,20 @@ class TradingJournal:
                     ticker TEXT NOT NULL UNIQUE,
                     name TEXT NOT NULL DEFAULT '',
                     exchange TEXT NOT NULL DEFAULT '',
+                    tags TEXT NOT NULL DEFAULT '',
                     recorded_by TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
                 )
                 """
             )
+            favorite_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(favorites)").fetchall()
+            }
+            if "tags" not in favorite_columns:
+                connection.execute(
+                    "ALTER TABLE favorites ADD COLUMN tags TEXT NOT NULL DEFAULT ''"
+                )
 
     def add_operation(
         self,
@@ -312,15 +326,21 @@ class TradingJournal:
         ticker: str,
         name: str = "",
         exchange: str = "",
+        tags: object = "",
         recorded_by: str = "",
     ) -> int:
-        favorite = normalize_favorite(ticker, name, exchange)
+        favorite = normalize_favorite(ticker, name, exchange, tags)
         with self._connect() as connection:
             existing = connection.execute(
                 "SELECT id FROM favorites WHERE ticker = ?",
                 (favorite["ticker"],),
             ).fetchone()
             if existing:
+                if favorite["tags"]:
+                    connection.execute(
+                        "UPDATE favorites SET tags = ? WHERE ticker = ?",
+                        (favorite["tags"], favorite["ticker"]),
+                    )
                 return int(existing["id"])
             total = int(
                 connection.execute("SELECT COUNT(*) FROM favorites").fetchone()[0]
@@ -330,13 +350,14 @@ class TradingJournal:
             cursor = connection.execute(
                 """
                 INSERT INTO favorites
-                    (ticker, name, exchange, recorded_by, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                    (ticker, name, exchange, tags, recorded_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     favorite["ticker"],
                     favorite["name"],
                     favorite["exchange"],
+                    favorite["tags"],
                     recorded_by.strip().lower(),
                     favorite["created_at"],
                 ),
@@ -347,12 +368,23 @@ class TradingJournal:
         with self._connect() as connection:
             return pd.read_sql_query(
                 """
-                SELECT id, ticker, name, exchange, recorded_by, created_at
+                SELECT id, ticker, name, exchange, tags, recorded_by, created_at
                 FROM favorites
                 ORDER BY name COLLATE NOCASE, ticker
                 """,
                 connection,
             )
+
+    def update_favorite_tags(self, ticker: str, tags: object) -> None:
+        normalized_ticker = ticker.strip().upper()
+        normalized_tags = serialize_favorite_tags(tags)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE favorites SET tags = ? WHERE ticker = ?",
+                (normalized_tags, normalized_ticker),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("La empresa favorita no existe.")
 
     def delete_favorite(self, ticker: str) -> None:
         with self._connect() as connection:
