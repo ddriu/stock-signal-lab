@@ -12,8 +12,13 @@ create table if not exists public.operations (
     executed_at timestamptz not null,
     notes text not null default '',
     currency text not null default 'EUR' check (char_length(currency) = 3),
+    recorded_by text not null default '',
     created_at timestamptz not null default now()
 );
+
+-- Migración segura para instalaciones creadas con una versión anterior.
+alter table public.operations
+    add column if not exists recorded_by text not null default '';
 
 create index if not exists operations_owner_executed_idx
     on public.operations (owner, executed_at desc, id desc);
