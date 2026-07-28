@@ -100,3 +100,51 @@ def test_legacy_service_role_key_uses_bearer_header() -> None:
         "stocklab",
     )
     assert journal.headers["Authorization"] == "Bearer legacy-jwt"
+
+
+def test_supabase_favorites_use_separate_table_and_owner(monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+    responses = [
+        FakeResponse([]),
+        FakeResponse([{"id": 9}]),
+        FakeResponse(
+            [
+                {
+                    "id": 9,
+                    "ticker": "TSM",
+                    "name": "Taiwan Semiconductor",
+                    "exchange": "NYSE",
+                    "recorded_by": "xavi",
+                    "created_at": "2026-07-28T12:00:00",
+                }
+            ]
+        ),
+        FakeResponse(None, status_code=204),
+    ]
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        return responses.pop(0)
+
+    monkeypatch.setattr("src.supabase_journal.requests.request", fake_request)
+    journal = SupabaseTradingJournal(
+        "https://example.supabase.co",
+        "sb_secret_test",
+        "grupo_compartido",
+    )
+
+    favorite_id = journal.add_favorite(
+        "tsm",
+        "Taiwan Semiconductor",
+        "NYSE",
+        recorded_by="Xavi",
+    )
+    favorites = journal.list_favorites()
+    journal.delete_favorite("TSM")
+
+    assert favorite_id == 9
+    assert favorites.iloc[0]["recorded_by"] == "xavi"
+    assert all(call["url"].endswith("/rest/v1/favorites") for call in calls)
+    assert calls[0]["params"]["owner"] == "eq.grupo_compartido"
+    assert calls[1]["json"]["owner"] == "grupo_compartido"
+    assert calls[3]["params"]["owner"] == "eq.grupo_compartido"

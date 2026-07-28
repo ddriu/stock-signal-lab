@@ -40,3 +40,36 @@ def test_stooq_symbol_translates_common_markets() -> None:
     assert data_loader._stooq_symbol("AAPL") == "AAPL.US"
     assert data_loader._stooq_symbol("SAN.MC") == "SAN.ES"
     assert data_loader._stooq_symbol("^GSPC") == "^SPX"
+
+
+def test_search_instruments_returns_only_stocks_and_etfs(monkeypatch) -> None:
+    class FakeSearch:
+        def __init__(self, *args, **kwargs) -> None:
+            self.quotes = [
+                {
+                    "symbol": "TSM",
+                    "longname": "Taiwan Semiconductor Manufacturing",
+                    "quoteType": "EQUITY",
+                    "exchDisp": "NYSE",
+                },
+                {
+                    "symbol": "QQQ",
+                    "shortname": "Invesco QQQ Trust",
+                    "quoteType": "ETF",
+                    "exchange": "NasdaqGM",
+                },
+                {
+                    "symbol": "BTC-USD",
+                    "shortname": "Bitcoin USD",
+                    "quoteType": "CRYPTOCURRENCY",
+                },
+            ]
+
+    monkeypatch.setattr(data_loader.yf, "Search", FakeSearch)
+
+    results = data_loader.search_instruments("taiwan")
+
+    assert [result.ticker for result in results] == ["TSM", "QQQ"]
+    assert results[0].label == (
+        "Taiwan Semiconductor Manufacturing (TSM) · NYSE"
+    )

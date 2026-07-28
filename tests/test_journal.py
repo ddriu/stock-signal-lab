@@ -40,6 +40,28 @@ def test_journal_records_who_added_an_operation(tmp_path) -> None:
     assert journal.list_operations().iloc[0]["recorded_by"] == "luci"
 
 
+def test_favorites_are_saved_without_duplicates(tmp_path) -> None:
+    journal = TradingJournal(tmp_path / "journal.db")
+
+    first_id = journal.add_favorite(
+        "aapl",
+        "Apple Inc.",
+        "Nasdaq",
+        recorded_by="Luci",
+    )
+    repeated_id = journal.add_favorite("AAPL", "Apple", "Nasdaq")
+
+    favorites = journal.list_favorites()
+    assert first_id == repeated_id
+    assert len(favorites) == 1
+    assert favorites.iloc[0]["ticker"] == "AAPL"
+    assert favorites.iloc[0]["name"] == "Apple Inc."
+    assert favorites.iloc[0]["recorded_by"] == "luci"
+
+    journal.delete_favorite("aapl")
+    assert journal.list_favorites().empty
+
+
 def test_frozen_windows_app_uses_private_local_app_data(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("src.journal.sys.platform", "win32")
     monkeypatch.setattr("src.journal.sys.frozen", True, raising=False)
