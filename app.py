@@ -40,6 +40,12 @@ from src.data_sources import (
     sector_benchmark,
 )
 from src.fundamentals import FundamentalResult, evaluate_fundamentals
+from src.favorite_tags import (
+    FAVORITE_TAGS,
+    favorite_tag_css_class,
+    favorite_tags_from_value,
+    suggest_favorite_tags,
+)
 from src.indicators import add_indicators
 from src.journal import MAX_FAVORITES, calculate_open_positions
 from src.supabase_journal import JournalStorageError
@@ -169,6 +175,7 @@ def build_favorite_catalog(
 
     sources: dict[str, set[str]] = {}
     names: dict[str, str] = {}
+    tags_by_ticker: dict[str, list[str]] = {}
     for frame, source in (
         (private_favorites, "privada"),
         (group_favorites, "grupo"),
@@ -182,11 +189,21 @@ def build_favorite_catalog(
             sources.setdefault(ticker, set()).add(source)
             name = str(getattr(favorite, "name", "") or ticker).strip()
             names.setdefault(ticker, name)
+            tags = favorite_tags_from_value(getattr(favorite, "tags", ""))
+            merged_tags = tags_by_ticker.setdefault(ticker, [])
+            for tag in tags:
+                if tag not in merged_tags:
+                    merged_tags.append(tag)
     tickers = sorted(names, key=lambda item: (names[item].casefold(), item))
     labels = {
         ticker: (
             f"{names[ticker]} ({ticker}) · "
             + " y ".join(sorted(sources[ticker]))
+            + (
+                f" · {', '.join(tags_by_ticker.get(ticker, []))}"
+                if tags_by_ticker.get(ticker)
+                else ""
+            )
         )
         for ticker in tickers
     }
@@ -1969,67 +1986,160 @@ def render_admin_panel(
             st.dataframe(operations, width="stretch", hide_index=True)
 
 
+def _favorite_cards_html(favorites: pd.DataFrame, *, shared: bool) -> str:
+    cards: list[str] = []
+    for favorite in favorites.itertuples(index=False):
+        ticker = html.escape(str(favorite.ticker))
+        name = html.escape(str(getattr(favorite, "name", "") or favorite.ticker))
+        exchange = html.escape(str(getattr(favorite, "exchange", "") or "Mercado N/D"))
+        tags = favorite_tags_from_value(getattr(favorite, "tags", ""))
+        if not tags:
+            tags = ["Otra"]
+        badges = "".join(
+            (
+                f'<span class="ssl-favorite-tag ssl-tag-{favorite_tag_css_class(tag)}">'
+                f"{html.escape(tag)}</span>"
+            )
+            for tag in tags
+        )
+        actor = ""
+        if shared:
+            recorded_by = html.escape(
+                str(getattr(favorite, "recorded_by", "") or "grupo")
+            )
+            actor = f"<small>Añadida por {recorded_by}</small>"
+        cards.append(
+            (
+                '<article class="ssl-favorite-card">'
+                '<div class="ssl-favorite-card-top">'
+                f"<strong>{ticker}</strong><span>{exchange}</span>"
+                "</div>"
+                f"<p>{name}</p>"
+                f'<div class="ssl-favorite-tags">{badges}</div>'
+                f"{actor}"
+                "</article>"
+            )
+        )
+    return '<div class="ssl-favorite-grid">' + "".join(cards) + "</div>"
+
+
+def _favorites_matching_tags(
+    favorites: pd.DataFrame,
+    selected_tags: list[str],
+) -> pd.DataFrame:
+    if favorites.empty or not selected_tags:
+        return favorites
+    mask = favorites.get("tags", pd.Series("", index=favorites.index)).map(
+        lambda value: bool(
+            set(favorite_tags_from_value(value)).intersection(selected_tags)
+        )
+    )
+    return favorites.loc[mask].copy()
+
+
 def render_favorite_list(
     favorites: pd.DataFrame,
     *,
     title: str,
     journal,
     actor_username: str,
+    tag_filter: list[str] | None = None,
     shared: bool = False,
     can_delete_all: bool = False,
 ) -> None:
+    favorites = favorites.copy()
+    if "tags" not in favorites.columns:
+        favorites["tags"] = ""
     st.markdown(f"#### {title}")
     st.caption(f"{len(favorites)} de {MAX_FAVORITES} empresas guardadas")
     if favorites.empty:
         st.info("Todavía no hay empresas en esta lista.")
         return
 
-    visible = favorites.loc[:, ["name", "ticker", "exchange", "recorded_by"]].rename(
+    filtered = _favorites_matching_tags(favorites, tag_filter or [])
+    if filtered.empty:
+        st.info("Ninguna empresa de esta lista coincide con las etiquetas elegidas.")
+    else:
+        st.markdown(
+            _favorite_cards_html(filtered, shared=shared),
+            unsafe_allow_html=True,
+        )
+
+    visible = filtered.loc[
+        :, ["name", "ticker", "exchange", "tags", "recorded_by"]
+    ].rename(
         columns={
             "name": "Empresa",
             "ticker": "Ticker",
             "exchange": "Mercado",
+            "tags": "Etiquetas",
             "recorded_by": "Añadida por",
         }
     )
     if not shared:
         visible = visible.drop(columns=["Añadida por"])
-    st.dataframe(visible, width="stretch", hide_index=True)
+    if not visible.empty:
+        with st.expander("Ver lista en tabla"):
+            st.dataframe(visible, width="stretch", hide_index=True)
 
-    removable = favorites
+    editable = favorites
     if shared and not can_delete_all:
-        removable = favorites.loc[
+        editable = favorites.loc[
             favorites["recorded_by"].fillna("").astype(str).str.lower()
             == actor_username.lower()
         ]
-    if removable.empty:
+    if editable.empty:
         st.caption("Sólo puedes quitar del grupo las empresas que tú añadiste.")
         return
-    options = removable["ticker"].astype(str).tolist()
+
+    options = editable["ticker"].astype(str).tolist()
     labels = {
         str(row.ticker): f"{row.name} ({row.ticker})"
-        for row in removable.itertuples(index=False)
+        for row in editable.itertuples(index=False)
     }
-    remove_col, button_col = st.columns([3, 1])
-    selected = remove_col.selectbox(
-        "Quitar de la lista",
-        options,
-        format_func=lambda ticker: labels.get(ticker, ticker),
-        key=f"remove_favorite_{'group' if shared else 'private'}",
-        label_visibility="collapsed",
-    )
-    if button_col.button(
-        "Quitar",
-        key=f"remove_favorite_button_{'group' if shared else 'private'}",
-        width="stretch",
-    ):
-        try:
-            journal.delete_favorite(selected)
-        except (JournalStorageError, ValueError) as exc:
-            st.error(str(exc))
-        else:
-            st.success(f"{selected} ya no está en esta lista.")
-            st.rerun()
+    scope_key = "group" if shared else "private"
+    with st.expander("Editar etiquetas o quitar empresas"):
+        selected = st.selectbox(
+            "Empresa",
+            options,
+            format_func=lambda ticker: labels.get(ticker, ticker),
+            key=f"edit_favorite_{scope_key}",
+        )
+        selected_row = editable.loc[editable["ticker"].astype(str) == selected].iloc[0]
+        edited_tags = st.multiselect(
+            "Etiquetas",
+            FAVORITE_TAGS,
+            default=favorite_tags_from_value(selected_row.get("tags", "")),
+            max_selections=5,
+            key=f"edit_favorite_tags_{scope_key}_{selected}",
+            help="Una empresa puede pertenecer a varias categorías.",
+        )
+        edit_col, remove_col = st.columns(2)
+        if edit_col.button(
+            "Guardar etiquetas",
+            key=f"update_favorite_tags_{scope_key}",
+            type="primary",
+            width="stretch",
+        ):
+            try:
+                journal.update_favorite_tags(selected, edited_tags)
+            except (JournalStorageError, ValueError) as exc:
+                st.error(str(exc))
+            else:
+                st.success(f"Etiquetas de {selected} actualizadas.")
+                st.rerun()
+        if remove_col.button(
+            "Quitar de la lista",
+            key=f"remove_favorite_button_{scope_key}",
+            width="stretch",
+        ):
+            try:
+                journal.delete_favorite(selected)
+            except (JournalStorageError, ValueError) as exc:
+                st.error(str(exc))
+            else:
+                st.success(f"{selected} ya no está en esta lista.")
+                st.rerun()
 
 
 def render_favorites_manager(
@@ -2072,7 +2182,7 @@ def render_favorites_manager(
     if submitted and not results:
         st.warning(
             "No se encontraron acciones o ETF. Prueba con el nombre en inglés o usa "
-            "el símbolo manual en la barra izquierda."
+            "«Añadir un ticker manualmente» debajo."
         )
     if results:
         result_index = st.selectbox(
@@ -2088,6 +2198,24 @@ def render_favorites_manager(
             help="Guardar una empresa no es una recomendación de compra.",
         )
         selected = results[result_index]
+        try:
+            selected_fundamentals = cached_fundamentals(selected.ticker)
+        except (DataDownloadError, ValueError):
+            selected_fundamentals = {}
+        suggested_tags = suggest_favorite_tags(
+            selected.ticker,
+            selected.name,
+            selected.instrument_type,
+            selected_fundamentals,
+        )
+        selected_tags = st.multiselect(
+            "Etiquetas",
+            FAVORITE_TAGS,
+            default=suggested_tags,
+            max_selections=5,
+            key=f"new_favorite_tags_{selected.ticker}",
+            help="Puedes aceptar la clasificación automática o corregirla.",
+        )
         if st.button(
             f"Guardar {selected.ticker}",
             type="primary",
@@ -2103,6 +2231,7 @@ def render_favorites_manager(
                     selected.ticker,
                     selected.name,
                     selected.exchange,
+                    tags=selected_tags,
                     recorded_by=actor_username,
                 )
             except (JournalStorageError, ValueError) as exc:
@@ -2115,10 +2244,74 @@ def render_favorites_manager(
                 st.session_state.pop("favorite_search_results", None)
                 st.rerun()
 
+    with st.expander("Añadir un ticker manualmente"):
+        with st.form("manual_favorite_form", clear_on_submit=True):
+            manual_ticker = st.text_input(
+                "Ticker",
+                placeholder="Ejemplo: ASML, SAN.MC o IBE.MC",
+            )
+            manual_name = st.text_input(
+                "Nombre opcional",
+                placeholder="Si lo dejas vacío se mostrará el ticker",
+            )
+            manual_tags = st.multiselect(
+                "Etiquetas",
+                FAVORITE_TAGS,
+                max_selections=5,
+                key="manual_favorite_tags",
+            )
+            manual_destination = st.radio(
+                "Lista",
+                ["Mi lista privada", "Lista del grupo"],
+                horizontal=True,
+                key="manual_favorite_destination",
+            )
+            manual_submitted = st.form_submit_button(
+                "Guardar ticker",
+                type="primary",
+                width="stretch",
+            )
+        if manual_submitted:
+            normalized_ticker = manual_ticker.strip().upper()
+            target = (
+                private_journal
+                if manual_destination == "Mi lista privada"
+                else group_journal
+            )
+            resolved_tags = manual_tags
+            if normalized_ticker and not resolved_tags:
+                try:
+                    manual_fundamentals = cached_fundamentals(normalized_ticker)
+                except (DataDownloadError, ValueError):
+                    manual_fundamentals = {}
+                resolved_tags = suggest_favorite_tags(
+                    normalized_ticker,
+                    manual_name,
+                    fundamentals=manual_fundamentals,
+                )
+            try:
+                target.add_favorite(
+                    normalized_ticker,
+                    manual_name,
+                    tags=resolved_tags,
+                    recorded_by=actor_username,
+                )
+            except (JournalStorageError, ValueError) as exc:
+                st.error(str(exc))
+            else:
+                st.success(f"{normalized_ticker} se ha guardado.")
+                st.rerun()
+
     st.info(
         "Para no ralentizar la aplicación, puedes guardar 100 favoritas y elegir hasta "
         "25 para análisis completo en cada actualización. Todas las posiciones abiertas "
         "se incorporan automáticamente con una actualización de precio y tendencia."
+    )
+    tag_filter = st.multiselect(
+        "Filtrar ambas listas por etiquetas",
+        FAVORITE_TAGS,
+        key="favorite_tag_filter",
+        help="Si eliges varias, se muestran las empresas que tengan al menos una.",
     )
     private_col, group_col = st.columns(2)
     with private_col:
@@ -2127,6 +2320,7 @@ def render_favorites_manager(
             title="Mi lista privada",
             journal=private_journal,
             actor_username=actor_username,
+            tag_filter=tag_filter,
         )
     with group_col:
         render_favorite_list(
@@ -2134,6 +2328,7 @@ def render_favorites_manager(
             title="Lista del grupo",
             journal=group_journal,
             actor_username=actor_username,
+            tag_filter=tag_filter,
             shared=True,
             can_delete_all=is_admin,
         )
