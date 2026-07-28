@@ -98,6 +98,11 @@ automáticamente a la próxima descarga.
 La pestaña **Favoritos** permite buscar una empresa por su nombre normal, sin conocer el
 ticker, y guardarla en una lista privada o compartida. Cada lista admite 100 empresas.
 Se pueden escoger hasta 25 a la vez para descargar fundamentales y hacer el análisis completo.
+Si el buscador externo no responde, también permite guardar el ticker manualmente.
+Cada favorita admite hasta cinco etiquetas visuales —por ejemplo Energía,
+Biotecnología, Tecnología, ETF, Fondo o Small cap— que pueden corregirse y utilizarse
+como filtro. La aplicación propone etiquetas a partir del tipo de instrumento, sector,
+industria y capitalización disponibles, pero la clasificación sigue siendo editable.
 Las posiciones abiertas —también cuando superan 50— se actualizan automáticamente con
 aproximadamente 14 meses de precio y tendencia, evitando solicitar cuentas empresariales
 innecesarias para toda la cartera. El historial de operaciones no tiene ese límite.
