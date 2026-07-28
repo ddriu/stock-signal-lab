@@ -2380,7 +2380,12 @@ def main() -> None:
             render_backtest(selected_backtest, prepared[selected_backtest], strategy, backtest)
 
     with tab_favorites:
-        if favorite_storage_error:
+        if not persistent_journal_enabled():
+            st.warning(
+                "Los favoritos necesitan almacenamiento persistente. En una instalación "
+                "local se guardan en SQLite; en la web hay que conectar Supabase."
+            )
+        elif favorite_storage_error:
             st.error(favorite_storage_error)
             st.info(
                 "Ejecuta la versión actual de supabase/schema.sql para crear la tabla "
