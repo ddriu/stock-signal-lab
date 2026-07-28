@@ -1,4 +1,4 @@
-from src.storage import create_journal, load_supabase_config
+from src.storage import GROUP_PORTFOLIO_OWNER, create_journal, load_supabase_config
 
 
 def test_supabase_config_can_come_from_environment(monkeypatch) -> None:
@@ -25,3 +25,25 @@ def test_local_journals_are_isolated_by_owner(tmp_path, monkeypatch) -> None:
     assert len(first.list_operations()) == 1
     assert second.list_operations().empty
     assert first.database_path != second.database_path
+
+
+def test_group_portfolio_is_shared_without_mixing_private_data(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("src.storage.load_supabase_config", lambda: None)
+    monkeypatch.setenv("STOCK_SIGNAL_LAB_DATA_DIR", str(tmp_path))
+
+    group_for_luci = create_journal(GROUP_PORTFOLIO_OWNER)
+    group_for_fer = create_journal(GROUP_PORTFOLIO_OWNER)
+    private_luci = create_journal("luci")
+    group_for_luci.add_operation(
+        "ABC",
+        "Compra",
+        1,
+        10,
+        0,
+        "2025-01-01",
+        recorded_by="luci",
+    )
+
+    assert len(group_for_fer.list_operations()) == 1
+    assert group_for_fer.list_operations().iloc[0]["recorded_by"] == "luci"
+    assert private_luci.list_operations().empty

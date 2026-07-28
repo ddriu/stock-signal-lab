@@ -64,6 +64,7 @@ def test_supabase_journal_filters_every_request_by_owner(monkeypatch) -> None:
         1,
         "2025-01-01",
         currency="usd",
+        recorded_by="Luci",
     )
     operations = journal.list_operations()
     journal.delete_operation(operation_id)
@@ -72,6 +73,7 @@ def test_supabase_journal_filters_every_request_by_owner(monkeypatch) -> None:
     assert operations.iloc[0]["ticker"] == "AAPL"
     assert calls[0]["params"]["owner"] == "eq.stocklab"
     assert calls[1]["json"]["owner"] == "stocklab"
+    assert calls[1]["json"]["recorded_by"] == "luci"
     assert calls[2]["params"]["owner"] == "eq.stocklab"
     assert calls[3]["params"] == {"id": "eq.7", "owner": "eq.stocklab"}
     assert "Authorization" not in calls[0]["headers"]

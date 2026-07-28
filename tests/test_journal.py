@@ -24,6 +24,22 @@ def test_journal_rejects_sale_larger_than_position(tmp_path) -> None:
         journal.add_operation("ABC", "Venta", 3, 110, 1, "2025-02-01", currency="EUR")
 
 
+def test_journal_records_who_added_an_operation(tmp_path) -> None:
+    journal = TradingJournal(tmp_path / "journal.db")
+    journal.add_operation(
+        "ABC",
+        "Compra",
+        2,
+        50,
+        1,
+        "2025-01-01",
+        currency="EUR",
+        recorded_by="Luci",
+    )
+
+    assert journal.list_operations().iloc[0]["recorded_by"] == "luci"
+
+
 def test_frozen_windows_app_uses_private_local_app_data(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("src.journal.sys.platform", "win32")
     monkeypatch.setattr("src.journal.sys.frozen", True, raising=False)
