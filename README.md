@@ -77,6 +77,13 @@ el coste medio incluyendo las comisiones, admite ventas parciales y calcula bene
 y beneficio neto si se vendiera al último cierre. Las posiciones guardadas se añaden
 automáticamente a la próxima descarga.
 
+La pestaña **Favoritos** permite buscar una empresa por su nombre normal, sin conocer el
+ticker, y guardarla en una lista privada o compartida. Cada lista admite 100 empresas.
+Se pueden escoger hasta 25 a la vez para descargar fundamentales y hacer el análisis completo.
+Las posiciones abiertas —también cuando superan 50— se actualizan automáticamente con
+aproximadamente 14 meses de precio y tendencia, evitando solicitar cuentas empresariales
+innecesarias para toda la cartera. El historial de operaciones no tiene ese límite.
+
 Cada cuenta mantiene una **cartera privada** separada. Además existe una **cartera del
 grupo**, visible únicamente después de iniciar sesión, en la que los cuatro miembros
 pueden registrar las decisiones comunes. Cada movimiento compartido identifica quién
@@ -95,7 +102,8 @@ No incluye fiscalidad, spread ni el margen de cambio aplicado por el broker.
 ## Fuentes de datos
 
 - **Yahoo mediante yfinance:** precios diarios, moneda de cotización, sector y
-  múltiplos de valoración. Es la fuente práctica principal del prototipo.
+  múltiplos de valoración. También permite buscar empresas por nombre. Es la fuente
+  práctica principal del prototipo.
 - **SEC EDGAR:** para tickers estadounidenses sin sufijo, la aplicación intenta
   calcular rentabilidad, márgenes, crecimiento, deuda, liquidez y caja desde
   estados financieros oficiales. Si SEC no está disponible, conserva Yahoo como respaldo.

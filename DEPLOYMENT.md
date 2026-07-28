@@ -43,6 +43,7 @@ persistent_journal = false
 url = "https://TU_PROYECTO.supabase.co"
 secret_key = "sb_secret_TU_CLAVE_DE_SERVIDOR"
 table = "operations"
+favorites_table = "favorites"
 ```
 
 El hash de una contraseña nueva se genera localmente con:
@@ -70,6 +71,8 @@ compartida utiliza el propietario interno `grupo_compartido` y guarda además qu
 registró cada movimiento. Los miembros sólo pueden eliminar desde la interfaz sus
 propios movimientos compartidos; el rol `admin` puede corregir cualquiera, dispone
 de la vista agregada y puede registrar operaciones en nombre de los usuarios.
+El mismo esquema crea listas de favoritos privadas y del grupo sin borrar ni modificar
+las operaciones existentes.
 
 Sin `[supabase]`, la instalación local continúa usando SQLite. En Community Cloud,
 `persistent_journal = false` mantiene el diario desactivado para evitar pérdidas.
