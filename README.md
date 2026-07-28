@@ -96,7 +96,7 @@ y beneficio neto si se vendiera al último cierre. Las posiciones guardadas se a
 automáticamente a la próxima descarga.
 
 La pestaña **Favoritos** permite buscar una empresa por su nombre normal, sin conocer el
-ticker, y guardarla en una lista privada o compartida. Cada lista admite 100 empresas.
+ticker, y guardarla en una lista privada o compartida. Cada lista admite 300 empresas.
 Se pueden escoger hasta 25 a la vez para descargar fundamentales y hacer el análisis completo.
 Si el buscador externo no responde, también permite guardar el ticker manualmente.
 Cada favorita admite hasta cinco etiquetas visuales —por ejemplo Energía,
