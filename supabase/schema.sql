@@ -37,10 +37,14 @@ create table if not exists public.favorites (
     ticker text not null,
     name text not null default '',
     exchange text not null default '',
+    tags text not null default '',
     recorded_by text not null default '',
     created_at timestamptz not null default now(),
     constraint favorites_owner_ticker_unique unique (owner, ticker)
 );
+
+alter table public.favorites
+    add column if not exists tags text not null default '';
 
 create index if not exists favorites_owner_name_idx
     on public.favorites (owner, name, ticker);
