@@ -68,6 +68,7 @@ from src.recommendations import (
     historical_forward_return_study,
 )
 from src.risk import calculate_position_plan
+from src.sector_comparison import HORIZON_SESSIONS, compare_sector
 from src.signal_engine import add_signal_columns, evaluate_latest_signal
 from src.ui import (
     APP_CSS,
@@ -75,7 +76,14 @@ from src.ui import (
     signal_tone,
     strategy_profile_defaults,
 )
-from src.visualization import backtest_chart, momentum_chart, price_chart
+from src.visualization import (
+    backtest_chart,
+    correlation_heatmap,
+    momentum_chart,
+    normalized_comparison_chart,
+    price_chart,
+    risk_return_chart,
+)
 
 
 st.set_page_config(page_title="Stock Signal Lab", page_icon="📈", layout="wide")
@@ -774,6 +782,7 @@ def render_analysis(
     opportunity: OpportunityResult,
     raw_fundamentals: dict[str, object],
     verification: PriceVerification | None = None,
+    journal: object | None = None,
 ) -> None:
     with st.expander("Si ya tienes esta acción"):
         entry_price = st.number_input(
@@ -791,6 +800,16 @@ def render_analysis(
         entry_price=float(entry_price) if entry_price > 0 else None,
     )
     latest = frame.dropna(subset=["sma_long", "rsi"]).iloc[-1]
+    study = historical_forward_return_study(
+        frame,
+        current_score=signal.score,
+        horizon_days=strategy.forward_horizon_days,
+    )
+    expected_price = (
+        float(latest["close"]) * (1 + float(study.median_return_pct) / 100)
+        if study.reliable and study.median_return_pct is not None
+        else None
+    )
     previous = frame["close"].iloc[-2]
     daily_change = (latest["close"] / previous - 1) * 100
     col1, col2, col3, col4 = st.columns(4)
@@ -849,6 +868,116 @@ def render_analysis(
         st.info(f"**{signal.label}:** {plain_message}")
     else:
         st.warning(f"**{signal.label}:** {plain_message}")
+
+    if journal is not None:
+        with st.expander("Guardar este análisis y consultar su evolución"):
+            st.caption(
+                "Se guarda una fotografía privada de las notas y del precio. "
+                "Las gráficas se reconstruyen con información actual cuando vuelvas a abrirla."
+            )
+            personal_note = st.text_area(
+                "Nota personal opcional",
+                placeholder="Ejemplo: esperar resultados o revisar deuda antes de entrar",
+                max_chars=1_000,
+                key=f"analysis_note_{ticker}",
+            )
+            if st.button(
+                "Guardar análisis",
+                key=f"save_analysis_{ticker}",
+                type="primary",
+            ):
+                try:
+                    journal.add_analysis_snapshot(
+                        ticker=ticker,
+                        analyzed_at=signal.as_of,
+                        price=float(latest["close"]),
+                        opportunity_score=opportunity.score,
+                        company_score=fundamentals.score,
+                        entry_score=signal.score,
+                        valuation_score=valuation.score,
+                        relative_score=relative.score,
+                        risk_score=risk.score,
+                        opportunity_label=opportunity.label,
+                        entry_label=signal.label,
+                        position_label=signal.position_label,
+                        expected_return_pct=(
+                            study.median_return_pct if study.reliable else None
+                        ),
+                        positive_rate_pct=(
+                            study.positive_rate_pct if study.reliable else None
+                        ),
+                        expected_price=expected_price,
+                        horizon_days=(
+                            study.horizon_days if study.reliable else None
+                        ),
+                        sector=fundamentals.sector or "",
+                        explanation=opportunity.explanation,
+                        note=personal_note,
+                    )
+                except (JournalStorageError, ValueError) as exc:
+                    st.error(str(exc))
+                else:
+                    st.success(
+                        f"Análisis de {ticker} guardado. Ya puedes comparar su evolución."
+                    )
+
+            try:
+                recent_snapshots = journal.list_analysis_snapshots(ticker)
+            except JournalStorageError as exc:
+                st.warning(str(exc))
+            else:
+                if recent_snapshots.empty:
+                    st.caption("Todavía no has guardado análisis anteriores de esta empresa.")
+                else:
+                    recent = recent_snapshots.head(8).copy()
+                    recent["Cambio entrada"] = pd.to_numeric(
+                        recent["entry_score"], errors="coerce"
+                    ) - pd.to_numeric(
+                        recent["entry_score"], errors="coerce"
+                    ).shift(-1)
+                    visible_recent = recent.loc[
+                        :,
+                        [
+                            "analyzed_at",
+                            "price",
+                            "opportunity_score",
+                            "entry_score",
+                            "Cambio entrada",
+                            "entry_label",
+                            "expected_return_pct",
+                            "note",
+                        ],
+                    ].rename(
+                        columns={
+                            "analyzed_at": "Fecha",
+                            "price": "Precio",
+                            "opportunity_score": "Oportunidad",
+                            "entry_score": "Entrada",
+                            "entry_label": "Lectura",
+                            "expected_return_pct": "Retorno histórico",
+                            "note": "Nota",
+                        }
+                    )
+                    st.dataframe(
+                        visible_recent,
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "Precio": st.column_config.NumberColumn(format="%.2f"),
+                            "Oportunidad": st.column_config.ProgressColumn(
+                                min_value=0, max_value=100, format="%d"
+                            ),
+                            "Entrada": st.column_config.ProgressColumn(
+                                min_value=0, max_value=100, format="%d"
+                            ),
+                            "Cambio entrada": st.column_config.NumberColumn(
+                                format="%+d"
+                            ),
+                            "Retorno histórico": st.column_config.NumberColumn(
+                                format="%+.1f%%"
+                            ),
+                        },
+                    )
 
     company_tab, entry_tab, risk_data_tab = st.tabs(
         ["Empresa y valoración", "Momento y liderazgo", "Riesgo y fuentes"]
@@ -1112,11 +1241,6 @@ def render_analysis(
             "No es un precio objetivo ni una predicción."
         )
 
-    study = historical_forward_return_study(
-        frame,
-        current_score=signal.score,
-        horizon_days=strategy.forward_horizon_days,
-    )
     entry_guide = build_entry_guide(
         fundamental_score=fundamentals.score,
         technical_score=signal.score,
@@ -1135,9 +1259,6 @@ def render_analysis(
     )
     st.write(entry_guide.rationale)
     if study.reliable:
-        expected_price = float(latest["close"]) * (
-            1 + float(study.median_return_pct) / 100
-        )
         history_cols = st.columns(5)
         history_cols[0].metric("Casos históricos comparables", study.samples)
         history_cols[1].metric(
@@ -1152,7 +1273,10 @@ def render_analysis(
             f"{float(study.lower_quartile_pct):+.1f}% a "
             f"{float(study.upper_quartile_pct):+.1f}%",
         )
-        history_cols[4].metric("Precio estadístico orientativo", f"{expected_price:,.2f}")
+        history_cols[4].metric(
+            "Precio estadístico orientativo",
+            f"{float(expected_price):,.2f}",
+        )
         st.caption(
             "La estimación es la mediana de señales históricas comparables y no una predicción. "
             "No incorpora resultados fundamentales futuros, noticias, impuestos ni gaps."
@@ -2099,14 +2223,66 @@ def render_favorite_list(
         st.info("Todavía no hay empresas en esta lista.")
         return
 
+    scope_key = "group" if shared else "private"
+    search_value = st.text_input(
+        "Buscar dentro de esta lista",
+        placeholder="Nombre o ticker",
+        key=f"favorite_list_search_{scope_key}",
+    ).strip().casefold()
     filtered = _favorites_matching_tags(favorites, tag_filter or [])
+    if search_value:
+        name_values = filtered["name"].fillna("").astype(str).str.casefold()
+        ticker_values = filtered["ticker"].fillna("").astype(str).str.casefold()
+        filtered = filtered.loc[
+            name_values.str.contains(search_value, regex=False)
+            | ticker_values.str.contains(search_value, regex=False)
+        ]
     if filtered.empty:
-        st.info("Ninguna empresa de esta lista coincide con las etiquetas elegidas.")
+        st.info("Ninguna empresa coincide con la búsqueda o las etiquetas elegidas.")
     else:
-        st.markdown(
-            _favorite_cards_html(filtered, shared=shared),
-            unsafe_allow_html=True,
-        )
+        page_size = 12
+        page_count = (len(filtered) + page_size - 1) // page_size
+        page = 1
+        if page_count > 1:
+            page = st.selectbox(
+                "Página",
+                options=list(range(1, page_count + 1)),
+                format_func=lambda value: f"Página {value} de {page_count}",
+                key=f"favorite_page_{scope_key}",
+            )
+        page_frame = filtered.iloc[(page - 1) * page_size : page * page_size]
+        card_columns = st.columns(3)
+        for position, favorite in enumerate(page_frame.itertuples(index=False)):
+            ticker = str(favorite.ticker).strip().upper()
+            with card_columns[position % 3]:
+                with st.container(border=True):
+                    st.markdown(
+                        _favorite_cards_html(
+                            pd.DataFrame(
+                                [
+                                    {
+                                        "ticker": ticker,
+                                        "name": getattr(favorite, "name", ticker),
+                                        "exchange": getattr(favorite, "exchange", ""),
+                                        "tags": getattr(favorite, "tags", ""),
+                                        "recorded_by": getattr(
+                                            favorite, "recorded_by", ""
+                                        ),
+                                    }
+                                ]
+                            ),
+                            shared=shared,
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                    st.button(
+                        f"Analizar {ticker}",
+                        key=f"open_favorite_{scope_key}_{ticker}_{position}",
+                        width="stretch",
+                        type="primary",
+                        on_click=_open_ticker_analysis,
+                        args=(ticker,),
+                    )
 
     visible = filtered.loc[
         :, ["name", "ticker", "exchange", "tags", "recorded_by"]
@@ -2140,7 +2316,6 @@ def render_favorite_list(
         str(row.ticker): f"{row.name} ({row.ticker})"
         for row in editable.itertuples(index=False)
     }
-    scope_key = "group" if shared else "private"
     with st.expander("Editar etiquetas o quitar empresas"):
         selected = st.selectbox(
             "Empresa",
@@ -2346,9 +2521,9 @@ def render_favorites_manager(
                 st.rerun()
 
     st.info(
-        "Para no ralentizar la aplicación, puedes guardar 100 favoritas y elegir hasta "
-        "25 para análisis completo en cada actualización. Todas las posiciones abiertas "
-        "se incorporan automáticamente con una actualización de precio y tendencia."
+        "Puedes guardar hasta 300 favoritas. Pulsa «Analizar» en cualquier tarjeta para "
+        "abrir su ficha directamente; se hará análisis completo de hasta 25 empresas por "
+        "actualización."
     )
     tag_filter = st.multiselect(
         "Filtrar ambas listas por etiquetas",
@@ -2356,8 +2531,8 @@ def render_favorites_manager(
         key="favorite_tag_filter",
         help="Si eliges varias, se muestran las empresas que tengan al menos una.",
     )
-    private_col, group_col = st.columns(2)
-    with private_col:
+    private_tab, group_tab = st.tabs(["Mi lista privada", "Lista del grupo"])
+    with private_tab:
         render_favorite_list(
             private_favorites,
             title="Mi lista privada",
@@ -2365,7 +2540,7 @@ def render_favorites_manager(
             actor_username=actor_username,
             tag_filter=tag_filter,
         )
-    with group_col:
+    with group_tab:
         render_favorite_list(
             group_favorites,
             title="Lista del grupo",
@@ -2508,6 +2683,17 @@ def _set_navigation(
     st.session_state["main_navigation"] = section
     if subsection_key and subsection:
         st.session_state[subsection_key] = subsection
+
+
+def _open_ticker_analysis(ticker: str) -> None:
+    """Abre una favorita y solicita sus datos sin obligar a volver a escribirla."""
+
+    normalized = ticker.strip().upper()
+    st.session_state["selected_favorite_tickers"] = [normalized]
+    st.session_state["main_navigation"] = "Analizar"
+    st.session_state["analysis_navigation"] = "Oportunidades"
+    st.session_state["analysis_ticker"] = normalized
+    st.session_state["_pending_analysis_ticker"] = normalized
 
 
 def render_home(
@@ -2673,6 +2859,7 @@ def render_opportunities_page(
     opportunity_results: dict[str, OpportunityResult],
     raw_fundamentals: dict[str, dict[str, object]],
     price_verifications: dict[str, PriceVerification],
+    journal: object,
 ) -> None:
     st.subheader("Oportunidades")
     st.caption(
@@ -2739,6 +2926,8 @@ def render_opportunities_page(
             },
         )
 
+    if st.session_state.get("analysis_ticker") not in prepared:
+        st.session_state.pop("analysis_ticker", None)
     selected = st.selectbox(
         "Empresa que quieres entender mejor",
         list(prepared),
@@ -2756,7 +2945,383 @@ def render_opportunities_page(
         opportunity_results[selected],
         raw_fundamentals.get(selected, {}),
         price_verifications.get(selected),
+        journal,
     )
+
+
+def _comparison_groups(
+    prepared: dict[str, pd.DataFrame],
+    private_favorites: pd.DataFrame,
+    group_favorites: pd.DataFrame,
+    fundamental_results: dict[str, FundamentalResult],
+) -> dict[str, list[str]]:
+    groups: dict[str, set[str]] = {"Todas las cargadas": set(prepared)}
+    for ticker, result in fundamental_results.items():
+        if ticker in prepared and result.sector:
+            groups.setdefault(f"Sector · {result.sector}", set()).add(ticker)
+    for favorites in (private_favorites, group_favorites):
+        if favorites.empty:
+            continue
+        for favorite in favorites.itertuples(index=False):
+            ticker = str(favorite.ticker).strip().upper()
+            if ticker not in prepared:
+                continue
+            for tag in favorite_tags_from_value(getattr(favorite, "tags", "")):
+                groups.setdefault(f"Etiqueta · {tag}", set()).add(ticker)
+    return {
+        name: sorted(tickers)
+        for name, tickers in groups.items()
+        if len(tickers) >= 2
+    }
+
+
+def render_sector_comparison(
+    prepared: dict[str, pd.DataFrame],
+    fundamental_results: dict[str, FundamentalResult],
+    valuation_results: dict[str, ValuationResult],
+    risk_results: dict[str, RiskResult],
+    private_favorites: pd.DataFrame,
+    group_favorites: pd.DataFrame,
+) -> None:
+    st.subheader("Comparador sectorial")
+    st.write(
+        "Compara empresas semejantes sin confundir sus precios nominales. Todas parten "
+        "de 100 y la nota de liderazgo sólo indica quién ha destacado dentro del grupo elegido."
+    )
+    if len(prepared) < 2:
+        st.info(
+            "Selecciona al menos dos favoritas en la barra lateral y pulsa "
+            "«Actualizar análisis» para utilizar el comparador."
+        )
+        return
+
+    groups = _comparison_groups(
+        prepared,
+        private_favorites,
+        group_favorites,
+        fundamental_results,
+    )
+    group_name = st.selectbox(
+        "Sector o grupo",
+        options=list(groups),
+        key="comparison_group",
+        help=(
+            "Los sectores proceden de los datos empresariales y las etiquetas son las "
+            "categorías que habéis guardado en favoritos."
+        ),
+    )
+    available = groups[group_name]
+    selection_key = f"comparison_tickers_{group_name}"
+    previous_selection = st.session_state.get(selection_key, [])
+    valid_previous = [ticker for ticker in previous_selection if ticker in available]
+    default_selection = valid_previous or available[: min(5, len(available))]
+    selected_tickers = st.multiselect(
+        "Empresas que quieres comparar",
+        options=available,
+        default=default_selection,
+        max_selections=10,
+        key=selection_key,
+    )
+    horizon = st.segmented_control(
+        "Horizonte",
+        options=list(HORIZON_SESSIONS),
+        default="6 meses",
+        key="comparison_horizon",
+    )
+    if len(selected_tickers) < 2:
+        st.info("Elige entre 2 y 10 empresas.")
+        return
+
+    try:
+        comparison = compare_sector(
+            prepared,
+            selected_tickers,
+            horizon_label=str(horizon or "6 meses"),
+        )
+    except ValueError as exc:
+        st.warning(str(exc))
+        return
+
+    st.plotly_chart(
+        normalized_comparison_chart(
+            comparison.normalized_prices,
+            title=f"Evolución comparable · {comparison.horizon_label}",
+        ),
+        width="stretch",
+        config=PLOTLY_CONFIG,
+    )
+    st.caption(
+        "100 es el punto de partida común. Un valor de 118 significa una subida del "
+        "18% desde ese comienzo; no significa que la acción cueste 118."
+    )
+
+    metrics = comparison.metrics.copy()
+    metrics["company_score"] = [
+        fundamental_results.get(ticker).score
+        if fundamental_results.get(ticker)
+        else None
+        for ticker in metrics.index
+    ]
+    metrics["valuation_score"] = [
+        valuation_results.get(ticker).score
+        if valuation_results.get(ticker)
+        else None
+        for ticker in metrics.index
+    ]
+    metrics["risk_score"] = [
+        risk_results.get(ticker).score if risk_results.get(ticker) else None
+        for ticker in metrics.index
+    ]
+    leader = str(metrics.index[0])
+    leader_score = metrics.iloc[0]["leadership_score"]
+    st.success(
+        f"**Líder bursátil del grupo: {leader} ({leader_score:.0f}/100).** "
+        "Ha combinado mejor comportamiento relativo y control de caídas entre las "
+        "seleccionadas; no implica que esté barata ni que vaya a seguir liderando."
+    )
+
+    visible_metrics = metrics.reset_index().rename(
+        columns={
+            "ticker": "Ticker",
+            "leadership_score": "Liderazgo",
+            "horizon_return_pct": f"Rentabilidad {comparison.horizon_label}",
+            "return_1m_pct": "1 mes",
+            "return_3m_pct": "3 meses",
+            "return_6m_pct": "6 meses",
+            "return_1y_pct": "1 año",
+            "annualized_volatility_pct": "Volatilidad",
+            "max_drawdown_pct": "Peor caída",
+            "distance_high_pct": "Desde máximo anual",
+            "company_score": "Empresa",
+            "valuation_score": "Valoración",
+            "risk_score": "Riesgo controlado",
+        }
+    )
+    st.dataframe(
+        visible_metrics.loc[
+            :,
+            [
+                "Ticker",
+                "Liderazgo",
+                f"Rentabilidad {comparison.horizon_label}",
+                "1 mes",
+                "3 meses",
+                "6 meses",
+                "1 año",
+                "Volatilidad",
+                "Peor caída",
+                "Desde máximo anual",
+                "Empresa",
+                "Valoración",
+                "Riesgo controlado",
+            ],
+        ],
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Liderazgo": st.column_config.ProgressColumn(
+                min_value=0, max_value=100, format="%d"
+            ),
+            "Empresa": st.column_config.ProgressColumn(
+                min_value=0, max_value=100, format="%d"
+            ),
+            "Valoración": st.column_config.ProgressColumn(
+                min_value=0, max_value=100, format="%d"
+            ),
+            "Riesgo controlado": st.column_config.ProgressColumn(
+                min_value=0, max_value=100, format="%d"
+            ),
+            **{
+                column: st.column_config.NumberColumn(format="%+.1f%%")
+                for column in [
+                    f"Rentabilidad {comparison.horizon_label}",
+                    "1 mes",
+                    "3 meses",
+                    "6 meses",
+                    "1 año",
+                    "Peor caída",
+                    "Desde máximo anual",
+                ]
+            },
+            "Volatilidad": st.column_config.NumberColumn(format="%.1f%%"),
+        },
+    )
+
+    chart_col, explanation_col = st.columns([3, 2])
+    with chart_col:
+        st.plotly_chart(
+            risk_return_chart(
+                comparison.metrics,
+                horizon_label=comparison.horizon_label,
+            ),
+            width="stretch",
+            config=PLOTLY_CONFIG,
+        )
+    with explanation_col:
+        st.markdown("#### Cómo interpretarlo")
+        st.markdown(
+            """
+            - **Arriba e izquierda:** mejor rentabilidad con movimientos más contenidos.
+            - **Arriba e derecha:** más rentabilidad, pero también más variación y riesgo.
+            - **Abajo:** ha perdido terreno durante el periodo elegido.
+            - **Liderazgo:** combina 3, 6 y 12 meses con la caída máxima anual.
+
+            Calidad, valoración y riesgo permanecen separados para que una subida reciente
+            no convierta automáticamente una empresa cara o débil en una buena candidata.
+            """
+        )
+
+    with st.expander("Ver si estas empresas se mueven casi igual"):
+        st.plotly_chart(
+            correlation_heatmap(comparison.correlations),
+            width="stretch",
+            config=PLOTLY_CONFIG,
+        )
+        st.caption(
+            "Cerca de 1 significa movimientos diarios muy parecidos; cerca de 0, poca "
+            "relación. La correlación histórica puede cambiar y no garantiza diversificación."
+        )
+
+
+def render_saved_analysis_history(journal: object) -> None:
+    st.subheader("Historial de análisis guardados")
+    st.write(
+        "Comprueba cómo han cambiado el precio y las notas desde cada revisión. "
+        "Es un seguimiento de decisiones, no un registro de operaciones."
+    )
+    try:
+        snapshots = journal.list_analysis_snapshots()
+    except JournalStorageError as exc:
+        st.error(str(exc))
+        st.info(
+            "Si es la primera vez que utilizas esta función, aplica la versión actual "
+            "de supabase/schema.sql."
+        )
+        return
+    if snapshots.empty:
+        st.info(
+            "Todavía no has guardado ningún análisis. Abre una empresa y utiliza "
+            "«Guardar este análisis y consultar su evolución»."
+        )
+        return
+
+    tickers = sorted(snapshots["ticker"].dropna().astype(str).unique())
+    selected_ticker = st.selectbox(
+        "Empresa",
+        tickers,
+        key="saved_history_ticker",
+    )
+    selected = snapshots.loc[snapshots["ticker"] == selected_ticker].copy()
+    selected["analyzed_at"] = pd.to_datetime(
+        selected["analyzed_at"], errors="coerce"
+    )
+    selected = selected.sort_values("analyzed_at")
+    action_col, count_col = st.columns([2, 3])
+    action_col.button(
+        f"Abrir análisis actualizado de {selected_ticker}",
+        type="primary",
+        width="stretch",
+        on_click=_open_ticker_analysis,
+        args=(selected_ticker,),
+    )
+    count_col.info(f"{len(selected)} revisiones guardadas de {selected_ticker}.")
+
+    evolution = selected.set_index("analyzed_at")[
+        ["opportunity_score", "entry_score", "company_score"]
+    ].rename(
+        columns={
+            "opportunity_score": "Oportunidad",
+            "entry_score": "Entrada",
+            "company_score": "Empresa",
+        }
+    )
+    st.line_chart(evolution, height=330)
+
+    visible = selected.sort_values("analyzed_at", ascending=False).rename(
+        columns={
+            "id": "ID",
+            "analyzed_at": "Fecha",
+            "price": "Precio",
+            "opportunity_score": "Oportunidad",
+            "company_score": "Empresa",
+            "entry_score": "Entrada",
+            "valuation_score": "Valoración",
+            "risk_score": "Riesgo",
+            "opportunity_label": "Lectura conjunta",
+            "entry_label": "Lectura entrada",
+            "expected_return_pct": "Retorno histórico",
+            "positive_rate_pct": "Casos positivos",
+            "expected_price": "Precio estadístico",
+            "horizon_days": "Sesiones",
+            "note": "Nota personal",
+        }
+    )
+    st.dataframe(
+        visible.loc[
+            :,
+            [
+                "ID",
+                "Fecha",
+                "Precio",
+                "Oportunidad",
+                "Empresa",
+                "Entrada",
+                "Valoración",
+                "Riesgo",
+                "Lectura conjunta",
+                "Lectura entrada",
+                "Retorno histórico",
+                "Casos positivos",
+                "Precio estadístico",
+                "Sesiones",
+                "Nota personal",
+            ],
+        ],
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Precio": st.column_config.NumberColumn(format="%.2f"),
+            "Precio estadístico": st.column_config.NumberColumn(format="%.2f"),
+            "Retorno histórico": st.column_config.NumberColumn(format="%+.1f%%"),
+            "Casos positivos": st.column_config.NumberColumn(format="%.1f%%"),
+            **{
+                column: st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d"
+                )
+                for column in [
+                    "Oportunidad",
+                    "Empresa",
+                    "Entrada",
+                    "Valoración",
+                    "Riesgo",
+                ]
+            },
+        },
+    )
+
+    with st.expander("Eliminar una fotografía guardada"):
+        ids = selected.sort_values("analyzed_at", ascending=False)["id"].astype(int)
+        labels = {
+            int(row.id): (
+                f"{pd.Timestamp(row.analyzed_at).date()} · "
+                f"entrada {int(row.entry_score)}/100"
+            )
+            for row in selected.itertuples(index=False)
+        }
+        snapshot_id = st.selectbox(
+            "Revisión",
+            options=ids.tolist(),
+            format_func=lambda value: labels.get(value, str(value)),
+            key="delete_snapshot_id",
+        )
+        if st.button("Eliminar revisión", key="delete_snapshot_button"):
+            try:
+                journal.delete_analysis_snapshot(int(snapshot_id))
+            except JournalStorageError as exc:
+                st.error(str(exc))
+            else:
+                st.success("La revisión se ha eliminado.")
+                st.rerun()
 
 
 def render_methodology() -> None:
@@ -2788,6 +3353,8 @@ def render_methodology() -> None:
           del precio medio de compra.
         - **Beneficio esperado:** mediana histórica de señales parecidas, no una
           rentabilidad garantizada.
+        - **Liderazgo sectorial:** posición relativa dentro de las empresas elegidas,
+          basada en rentabilidad y caídas; no mide monopolio ni garantiza continuidad.
 
         La nota de empresa utiliza rentabilidad, crecimiento, deuda y caja. La valoración
         examina múltiplos y generación de caja. La nota de entrada combina tendencia,
@@ -2820,6 +3387,8 @@ def render_methodology() -> None:
         - Los tipos del BCE son referencias informativas y pueden diferir del cambio real del broker.
         - Los niveles de venta y stops son referencias: una orden puede ejecutarse
           a otro precio durante gaps o mercados volátiles.
+        - Las correlaciones y el liderazgo dependen del periodo y del grupo elegido;
+          pueden cambiar cuando cambia el régimen de mercado.
         """
     )
 
@@ -2869,7 +3438,10 @@ def main() -> None:
         st.error(f"Configuración inválida: {exc}")
         st.stop()
 
-    if load_clicked:
+    pending_analysis_ticker = str(
+        st.session_state.get("_pending_analysis_ticker", "")
+    ).strip().upper()
+    if load_clicked or pending_analysis_ticker:
         held_tickers: list[str] = []
         owners_to_load = [authenticated_user.username, GROUP_PORTFOLIO_OWNER]
         if authenticated_user.is_admin:
@@ -2889,15 +3461,27 @@ def main() -> None:
                 continue
             if not saved_positions.empty:
                 held_tickers.extend(saved_positions["ticker"].astype(str).tolist())
-        tickers_to_load = list(dict.fromkeys([*tickers, *held_tickers]))
+        tickers_to_load = list(
+            dict.fromkeys(
+                [
+                    *([pending_analysis_ticker] if pending_analysis_ticker else []),
+                    *tickers,
+                    *held_tickers,
+                ]
+            )
+        )
         load_market_data(
             tickers_to_load,
             start,
             end,
             auto_adjust,
             alpha_vantage_key,
-            fundamental_tickers=set(tickers),
+            fundamental_tickers={
+                *tickers,
+                *([pending_analysis_ticker] if pending_analysis_ticker else []),
+            },
         )
+        st.session_state.pop("_pending_analysis_ticker", None)
     for error in st.session_state.get("download_errors", []):
         st.warning(error)
 
@@ -2958,7 +3542,12 @@ def main() -> None:
         )
 
     elif selected_section == "Analizar":
-        analysis_options = ["Oportunidades", "Prueba histórica"]
+        analysis_options = [
+            "Oportunidades",
+            "Comparador sectorial",
+            "Historial guardado",
+            "Prueba histórica",
+        ]
         if st.session_state.get("analysis_navigation") not in analysis_options:
             st.session_state["analysis_navigation"] = "Oportunidades"
         analysis_section = st.segmented_control(
@@ -2982,7 +3571,19 @@ def main() -> None:
                 opportunity_results,
                 raw_fundamentals,
                 price_verifications,
+                journal,
             )
+        elif analysis_section == "Comparador sectorial":
+            render_sector_comparison(
+                prepared,
+                fundamental_results,
+                valuation_results,
+                risk_results,
+                private_favorites,
+                group_favorites,
+            )
+        elif analysis_section == "Historial guardado":
+            render_saved_analysis_history(journal)
         elif not prepared:
             st.info("Actualiza empresas antes de ejecutar una prueba histórica.")
         else:

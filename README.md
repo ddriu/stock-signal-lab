@@ -31,6 +31,7 @@ La instalación local solicita las credenciales guardadas en
 │   ├── signal_engine.py      # Momento de entrada y gestión de posición
 │   ├── fundamentals.py       # Calidad empresarial con cobertura de datos
 │   ├── opportunity.py        # Valoración, fortaleza relativa, riesgo y score conjunto
+│   ├── sector_comparison.py  # Comparación normalizada y liderazgo entre pares
 │   ├── backtesting.py        # Simulador long-only sin anticipación
 │   ├── visualization.py      # Gráficos Plotly
 │   ├── ui.py                 # Diseño responsive y perfiles de configuración
@@ -97,6 +98,8 @@ automáticamente a la próxima descarga.
 
 La pestaña **Favoritos** permite buscar una empresa por su nombre normal, sin conocer el
 ticker, y guardarla en una lista privada o compartida. Cada lista admite 300 empresas.
+Cada tarjeta tiene acceso directo a su análisis completo, con búsqueda y paginación
+para que las listas largas sigan siendo manejables desde móvil.
 Se pueden escoger hasta 25 a la vez para descargar fundamentales y hacer el análisis completo.
 Si el buscador externo no responde, también permite guardar el ticker manualmente.
 Cada favorita admite hasta cinco etiquetas visuales —por ejemplo Energía,
@@ -106,6 +109,17 @@ industria y capitalización disponibles, pero la clasificación sigue siendo edi
 Las posiciones abiertas —también cuando superan 50— se actualizan automáticamente con
 aproximadamente 14 meses de precio y tendencia, evitando solicitar cuentas empresariales
 innecesarias para toda la cartera. El historial de operaciones no tiene ese límite.
+
+La sección **Comparador sectorial** enfrenta de 2 a 10 empresas cargadas durante
+1, 3, 6 o 12 meses. Normaliza todas las cotizaciones a 100, calcula rentabilidad,
+volatilidad, drawdown, distancia al máximo y correlaciones, y asigna un liderazgo
+relativo únicamente dentro de la selección. Calidad, valoración y riesgo continúan
+separados para evitar que una subida reciente se interprete como calidad empresarial.
+
+Desde la ficha de una empresa se puede guardar una fotografía privada del análisis:
+precio, fecha, seis notas, lecturas, expectativa histórica y una nota personal. El
+historial permite ver la evolución, abrir de nuevo la empresa y borrar revisiones.
+No duplica las series de precios ni las gráficas en la base de datos.
 
 Cada cuenta mantiene una **cartera privada** separada. Además existe una **cartera del
 grupo**, visible únicamente después de iniciar sesión, en la que los cuatro miembros
