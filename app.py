@@ -48,6 +48,7 @@ from src.favorite_tags import (
 )
 from src.indicators import add_indicators
 from src.journal import MAX_FAVORITES, calculate_open_positions
+from src.msn_research import build_msn_research_links
 from src.supabase_journal import JournalStorageError
 from src.storage import GROUP_PORTFOLIO_OWNER, create_journal
 from src.opportunity import (
@@ -341,7 +342,8 @@ def build_sidebar(
             key="auto_adjust_prices",
         )
         st.caption(
-            "Yahoo aporta precios y contexto; SEC valida cuentas de EE. UU. y el BCE divisas."
+            "Yahoo aporta precios y contexto; SEC valida cuentas de EE. UU.; "
+            "el BCE convierte divisas y MSN sirve como contraste externo."
         )
         alpha_vantage_key = st.text_input(
             "Alpha Vantage opcional",
@@ -1038,6 +1040,47 @@ def render_analysis(
             )
         for warning in raw_fundamentals.get("_warnings", []):
             st.warning(str(warning))
+
+        msn_links = build_msn_research_links(ticker)
+        with st.expander("Contrastar este análisis con MSN Dinero"):
+            st.caption(
+                "MSN Dinero muestra datos de LSEG, noticias y previsiones de analistas. "
+                "La aplicación no los copia ni los introduce automáticamente en el score "
+                "porque Microsoft no ofrece una API pública estable para este uso."
+            )
+            msn_link_col, msn_home_col = st.columns(2)
+            with msn_link_col:
+                st.link_button(
+                    f"Buscar la ficha de {ticker} en MSN",
+                    msn_links.search_url,
+                    width="stretch",
+                )
+            with msn_home_col:
+                st.link_button(
+                    "Abrir MSN Dinero",
+                    msn_links.money_url,
+                    width="stretch",
+                )
+            st.markdown(
+                """
+                **Qué conviene comparar**
+
+                - Que ticker, bolsa y moneda coincidan con los de tu posición.
+                - Próximos resultados y cambios recientes en previsiones de analistas.
+                - Evolución de ingresos, márgenes, deuda y caja frente a la nota de empresa.
+                - Noticias capaces de cambiar la tesis, no sólo el precio de una sesión.
+
+                **Cómo usar el contraste**
+
+                - Si coincide con la app, aumenta la confianza cualitativa, no el score.
+                - Si difiere, no promedies los números: revisa fecha, moneda y proveedor.
+                - Si aparece un riesgo nuevo o una rebaja fuerte de expectativas, reduce
+                  el tamaño orientativo o espera hasta entender la causa.
+                """
+            )
+            st.markdown(
+                f"[Ver proveedor, retrasos y condiciones de MSN]({msn_links.disclaimer_url})"
+            )
 
     if entry_price > 0 and signal.position_label in {"Reducir", "Vender"}:
         st.warning(
@@ -2771,6 +2814,8 @@ def render_methodology() -> None:
           tickers estadounidenses se intentan contrastar las cuentas con SEC EDGAR.
         - La comparación opcional con Alpha Vantage detecta diferencias, pero no convierte
           los datos gratuitos en cotizaciones profesionales en tiempo real.
+        - MSN Dinero abre una segunda lectura basada en datos de LSEG, noticias y
+          expectativas. Se consulta manualmente y no modifica el score ni el backtest.
         - Dividendos, fiscalidad, préstamos de valores y el coste de cambio del broker no están modelados.
         - Los tipos del BCE son referencias informativas y pueden diferir del cambio real del broker.
         - Los niveles de venta y stops son referencias: una orden puede ejecutarse
