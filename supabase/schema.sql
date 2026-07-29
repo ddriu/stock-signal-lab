@@ -87,3 +87,45 @@ alter table public.analysis_snapshots enable row level security;
 revoke all on table public.analysis_snapshots from anon, authenticated;
 grant all on table public.analysis_snapshots to service_role;
 grant usage, select on sequence public.analysis_snapshots_id_seq to service_role;
+
+-- Preferencias privadas de avisos. El correo sólo es accesible para el backend
+-- mediante la clave secreta y nunca se expone a las claves públicas.
+create table if not exists public.email_alert_preferences (
+    owner text primary key,
+    email text not null default '',
+    enabled boolean not null default false,
+    alert_buy boolean not null default true,
+    alert_reduce boolean not null default true,
+    alert_sell boolean not null default true,
+    include_group boolean not null default true,
+    minimum_buy_score integer not null default 65
+        check (minimum_buy_score between 55 and 100),
+    only_changes boolean not null default true,
+    updated_at timestamptz not null default now()
+);
+
+alter table public.email_alert_preferences enable row level security;
+revoke all on table public.email_alert_preferences from anon, authenticated;
+grant all on table public.email_alert_preferences to service_role;
+
+-- Último estado técnico visto por usuario y ticker. Permite avisar sólo cuando
+-- cambia la señal y no repetir el mismo mensaje cada mañana.
+create table if not exists public.email_alert_states (
+    owner text not null,
+    ticker text not null,
+    signature text not null,
+    entry_score integer not null check (entry_score between 0 and 100),
+    entry_label text not null default '',
+    position_label text not null default '',
+    price double precision not null check (price > 0),
+    evaluated_at timestamptz not null,
+    notified_at timestamptz,
+    primary key (owner, ticker)
+);
+
+create index if not exists email_alert_states_owner_evaluated_idx
+    on public.email_alert_states (owner, evaluated_at desc);
+
+alter table public.email_alert_states enable row level security;
+revoke all on table public.email_alert_states from anon, authenticated;
+grant all on table public.email_alert_states to service_role;
