@@ -1,0 +1,44 @@
+name: Enviar alertas diarias
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 07:15 UTC, de lunes a viernes: 08:15/09:15 en España según la época.
+    - cron: "15 7 * * 1-5"
+
+concurrency:
+  group: stock-signal-lab-daily-alerts
+  cancel-in-progress: false
+
+jobs:
+  send-alerts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: python -m pip install -r requirements.txt
+
+      - name: Analizar y enviar resúmenes
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          EMAIL_SMTP_HOST: smtp.gmail.com
+          EMAIL_SMTP_PORT: "465"
+          EMAIL_SMTP_USE_SSL: "true"
+          EMAIL_SMTP_USERNAME: ${{ secrets.EMAIL_SMTP_USERNAME }}
+          EMAIL_SMTP_PASSWORD: ${{ secrets.EMAIL_SMTP_PASSWORD }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SMTP_USERNAME }}
+          EMAIL_SENDER_NAME: Stock Signal Lab
+        run: python -m scripts.run_alerts
