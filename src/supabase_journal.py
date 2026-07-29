@@ -9,10 +9,12 @@ import pandas as pd
 import requests
 
 from src.journal import (
+    ANALYSIS_SNAPSHOT_COLUMNS,
     FAVORITE_COLUMNS,
     MAX_FAVORITES,
     OPERATION_COLUMNS,
     calculate_open_positions,
+    normalize_analysis_snapshot,
     normalize_favorite,
     normalize_operation,
 )
@@ -35,6 +37,7 @@ class SupabaseTradingJournal:
         *,
         table: str = "operations",
         favorites_table: str = "favorites",
+        analysis_table: str = "analysis_snapshots",
         timeout: float = 20.0,
     ) -> None:
         normalized_url = url.strip().rstrip("/")
@@ -48,11 +51,14 @@ class SupabaseTradingJournal:
             raise JournalStorageError("El nombre de tabla de Supabase no es válido.")
         if not favorites_table.replace("_", "").isalnum():
             raise JournalStorageError("El nombre de tabla de favoritos no es válido.")
+        if not analysis_table.replace("_", "").isalnum():
+            raise JournalStorageError("El nombre de tabla de análisis no es válido.")
         self.url = normalized_url
         self.secret_key = secret_key.strip()
         self.owner = owner.strip()
         self.table = table
         self.favorites_table = favorites_table
+        self.analysis_table = analysis_table
         self.timeout = timeout
 
     @property
@@ -62,6 +68,10 @@ class SupabaseTradingJournal:
     @property
     def favorites_endpoint(self) -> str:
         return f"{self.url}/rest/v1/{self.favorites_table}"
+
+    @property
+    def analysis_endpoint(self) -> str:
+        return f"{self.url}/rest/v1/{self.analysis_table}"
 
     @property
     def headers(self) -> dict[str, str]:
@@ -264,6 +274,58 @@ class SupabaseTradingJournal:
             endpoint=self.favorites_endpoint,
             params={
                 "ticker": f"eq.{ticker.strip().upper()}",
+                "owner": f"eq.{self.owner}",
+            },
+        )
+
+    def add_analysis_snapshot(self, **values: object) -> int:
+        snapshot = normalize_analysis_snapshot(**values)  # type: ignore[arg-type]
+        response = self._request(
+            "POST",
+            endpoint=self.analysis_endpoint,
+            json={"owner": self.owner, **snapshot},
+            headers={
+                **self.headers,
+                "Prefer": "return=representation",
+            },
+        )
+        rows = response.json()
+        if not isinstance(rows, list) or not rows or "id" not in rows[0]:
+            raise JournalStorageError(
+                "Supabase guardó un análisis con una respuesta inesperada."
+            )
+        return int(rows[0]["id"])
+
+    def list_analysis_snapshots(self, ticker: str | None = None) -> pd.DataFrame:
+        params = {
+            "owner": f"eq.{self.owner}",
+            "select": ",".join(ANALYSIS_SNAPSHOT_COLUMNS),
+            "order": "analyzed_at.desc,id.desc",
+        }
+        if ticker:
+            params["ticker"] = f"eq.{ticker.strip().upper()}"
+        response = self._request(
+            "GET",
+            endpoint=self.analysis_endpoint,
+            params=params,
+        )
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise JournalStorageError("Supabase devolvió un historial de análisis inválido.")
+        if not rows:
+            return pd.DataFrame(columns=ANALYSIS_SNAPSHOT_COLUMNS)
+        frame = pd.DataFrame(rows)
+        for column in ANALYSIS_SNAPSHOT_COLUMNS:
+            if column not in frame.columns:
+                frame[column] = None
+        return frame.loc[:, ANALYSIS_SNAPSHOT_COLUMNS]
+
+    def delete_analysis_snapshot(self, snapshot_id: int) -> None:
+        self._request(
+            "DELETE",
+            endpoint=self.analysis_endpoint,
+            params={
+                "id": f"eq.{int(snapshot_id)}",
                 "owner": f"eq.{self.owner}",
             },
         )

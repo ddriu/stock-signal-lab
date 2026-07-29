@@ -144,3 +144,110 @@ def backtest_chart(curve: pd.DataFrame) -> go.Figure:
     figure.update_yaxes(title_text="Capital", row=1, col=1)
     figure.update_yaxes(title_text="Drawdown %", row=2, col=1)
     return figure
+
+
+def normalized_comparison_chart(
+    normalized_prices: pd.DataFrame,
+    *,
+    title: str,
+) -> go.Figure:
+    """Compara recorridos desde una base 100, no precios nominales."""
+
+    figure = go.Figure()
+    for ticker in normalized_prices.columns:
+        series = normalized_prices[ticker].dropna()
+        figure.add_trace(
+            go.Scatter(
+                x=series.index,
+                y=series,
+                name=str(ticker),
+                mode="lines",
+                line={"width": 2.2},
+            )
+        )
+    figure.add_hline(y=100, line_dash="dot", line_color=COLORS["muted"])
+    figure.update_layout(
+        title=title,
+        height=480,
+        hovermode="x unified",
+        template="plotly_white",
+        legend={"orientation": "h", "y": 1.08},
+        margin={"l": 45, "r": 20, "t": 75, "b": 35},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#FFFFFF",
+        yaxis_title="Evolución con inicio = 100",
+    )
+    return figure
+
+
+def risk_return_chart(metrics: pd.DataFrame, *, horizon_label: str) -> go.Figure:
+    """Sitúa cada empresa por rendimiento y volatilidad del mismo periodo."""
+
+    data = metrics.dropna(
+        subset=["horizon_return_pct", "annualized_volatility_pct"]
+    )
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=data["annualized_volatility_pct"],
+            y=data["horizon_return_pct"],
+            text=data.index.astype(str),
+            mode="markers+text",
+            textposition="top center",
+            marker={
+                "size": data["leadership_score"].fillna(50).clip(20, 100) / 3 + 10,
+                "color": data["leadership_score"],
+                "colorscale": "RdYlGn",
+                "cmin": 0,
+                "cmax": 100,
+                "showscale": True,
+                "colorbar": {"title": "Liderazgo"},
+                "line": {"color": "#ffffff", "width": 1},
+            },
+            hovertemplate=(
+                "<b>%{text}</b><br>Volatilidad anual: %{x:.1f}%"
+                "<br>Rentabilidad: %{y:+.1f}%<extra></extra>"
+            ),
+        )
+    )
+    figure.add_hline(y=0, line_dash="dot", line_color=COLORS["muted"])
+    figure.update_layout(
+        title=f"Rentabilidad y movimiento del precio · {horizon_label}",
+        height=440,
+        template="plotly_white",
+        margin={"l": 45, "r": 20, "t": 70, "b": 45},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#FFFFFF",
+        xaxis_title="Volatilidad anualizada (%)",
+        yaxis_title="Rentabilidad del periodo (%)",
+    )
+    return figure
+
+
+def correlation_heatmap(correlations: pd.DataFrame) -> go.Figure:
+    """Muestra qué acciones tienden a moverse de forma parecida."""
+
+    figure = go.Figure(
+        data=go.Heatmap(
+            z=correlations.to_numpy(dtype=float),
+            x=correlations.columns.astype(str),
+            y=correlations.index.astype(str),
+            zmin=-1,
+            zmax=1,
+            colorscale="RdBu",
+            reversescale=True,
+            text=correlations.round(2).to_numpy(),
+            texttemplate="%{text}",
+            hovertemplate="%{y} con %{x}: %{z:.2f}<extra></extra>",
+            colorbar={"title": "Correlación"},
+        )
+    )
+    figure.update_layout(
+        title="Similitud de movimientos diarios",
+        height=max(380, 48 * len(correlations)),
+        template="plotly_white",
+        margin={"l": 60, "r": 20, "t": 70, "b": 45},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#FFFFFF",
+    )
+    return figure

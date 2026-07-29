@@ -36,6 +36,29 @@ FAVORITE_COLUMNS = [
     "recorded_by",
     "created_at",
 ]
+ANALYSIS_SNAPSHOT_COLUMNS = [
+    "id",
+    "ticker",
+    "analyzed_at",
+    "price",
+    "opportunity_score",
+    "company_score",
+    "entry_score",
+    "valuation_score",
+    "relative_score",
+    "risk_score",
+    "opportunity_label",
+    "entry_label",
+    "position_label",
+    "expected_return_pct",
+    "positive_rate_pct",
+    "expected_price",
+    "horizon_days",
+    "sector",
+    "explanation",
+    "note",
+    "created_at",
+]
 MAX_FAVORITES = 300
 
 
@@ -104,6 +127,84 @@ def normalize_favorite(
         "name": name.strip() or normalized_ticker,
         "exchange": exchange.strip(),
         "tags": serialize_favorite_tags(tags),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def normalize_analysis_snapshot(
+    *,
+    ticker: str,
+    analyzed_at: date | datetime | str,
+    price: float,
+    opportunity_score: int,
+    company_score: int | None,
+    entry_score: int,
+    valuation_score: int | None,
+    relative_score: int | None,
+    risk_score: int | None,
+    opportunity_label: str,
+    entry_label: str,
+    position_label: str,
+    expected_return_pct: float | None = None,
+    positive_rate_pct: float | None = None,
+    expected_price: float | None = None,
+    horizon_days: int | None = None,
+    sector: str = "",
+    explanation: str = "",
+    note: str = "",
+) -> dict[str, object]:
+    """Valida una fotografía resumida del análisis para cualquier backend."""
+
+    normalized_ticker = ticker.strip().upper()
+    if not normalized_ticker:
+        raise ValueError("El análisis necesita un ticker.")
+    if price <= 0:
+        raise ValueError("El precio analizado debe ser positivo.")
+
+    def checked_score(value: int | None, name: str) -> int | None:
+        if value is None:
+            return None
+        normalized = int(value)
+        if not 0 <= normalized <= 100:
+            raise ValueError(f"La nota de {name} debe estar entre 0 y 100.")
+        return normalized
+
+    normalized_expected_price = (
+        float(expected_price) if expected_price is not None else None
+    )
+    if normalized_expected_price is not None and normalized_expected_price <= 0:
+        raise ValueError("El precio esperado debe ser positivo.")
+    normalized_horizon = int(horizon_days) if horizon_days is not None else None
+    if normalized_horizon is not None and normalized_horizon <= 0:
+        raise ValueError("El horizonte del análisis debe ser positivo.")
+    normalized_positive_rate = (
+        float(positive_rate_pct) if positive_rate_pct is not None else None
+    )
+    if normalized_positive_rate is not None and not 0 <= normalized_positive_rate <= 100:
+        raise ValueError("El porcentaje de casos positivos debe estar entre 0 y 100.")
+
+    return {
+        "ticker": normalized_ticker,
+        "analyzed_at": pd.Timestamp(analyzed_at).isoformat(),
+        "price": float(price),
+        "opportunity_score": checked_score(opportunity_score, "oportunidad"),
+        "company_score": checked_score(company_score, "empresa"),
+        "entry_score": checked_score(entry_score, "entrada"),
+        "valuation_score": checked_score(valuation_score, "valoración"),
+        "relative_score": checked_score(relative_score, "fortaleza relativa"),
+        "risk_score": checked_score(risk_score, "riesgo"),
+        "opportunity_label": opportunity_label.strip(),
+        "entry_label": entry_label.strip(),
+        "position_label": position_label.strip(),
+        "expected_return_pct": (
+            float(expected_return_pct) if expected_return_pct is not None else None
+        ),
+        "positive_rate_pct": normalized_positive_rate,
+        "expected_price": normalized_expected_price,
+        "horizon_days": normalized_horizon,
+        "sector": sector.strip(),
+        "explanation": explanation.strip(),
+        "note": note.strip()[:1_000],
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -254,6 +355,41 @@ class TradingJournal:
                 connection.execute(
                     "ALTER TABLE favorites ADD COLUMN tags TEXT NOT NULL DEFAULT ''"
                 )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS analysis_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    analyzed_at TEXT NOT NULL,
+                    price REAL NOT NULL CHECK (price > 0),
+                    opportunity_score INTEGER NOT NULL
+                        CHECK (opportunity_score BETWEEN 0 AND 100),
+                    company_score INTEGER,
+                    entry_score INTEGER NOT NULL
+                        CHECK (entry_score BETWEEN 0 AND 100),
+                    valuation_score INTEGER,
+                    relative_score INTEGER,
+                    risk_score INTEGER,
+                    opportunity_label TEXT NOT NULL DEFAULT '',
+                    entry_label TEXT NOT NULL DEFAULT '',
+                    position_label TEXT NOT NULL DEFAULT '',
+                    expected_return_pct REAL,
+                    positive_rate_pct REAL,
+                    expected_price REAL,
+                    horizon_days INTEGER,
+                    sector TEXT NOT NULL DEFAULT '',
+                    explanation TEXT NOT NULL DEFAULT '',
+                    note TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS analysis_snapshots_ticker_date_idx
+                ON analysis_snapshots (ticker, analyzed_at DESC, id DESC)
+                """
+            )
 
     def add_operation(
         self,
@@ -391,6 +527,41 @@ class TradingJournal:
             connection.execute(
                 "DELETE FROM favorites WHERE ticker = ?",
                 (ticker.strip().upper(),),
+            )
+
+    def add_analysis_snapshot(self, **values: object) -> int:
+        """Guarda una fotografía ligera de una señal y sus notas."""
+
+        snapshot = normalize_analysis_snapshot(**values)  # type: ignore[arg-type]
+        columns = [column for column in ANALYSIS_SNAPSHOT_COLUMNS if column != "id"]
+        placeholders = ", ".join("?" for _ in columns)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"""
+                INSERT INTO analysis_snapshots ({", ".join(columns)})
+                VALUES ({placeholders})
+                """,
+                tuple(snapshot[column] for column in columns),
+            )
+            return int(cursor.lastrowid)
+
+    def list_analysis_snapshots(self, ticker: str | None = None) -> pd.DataFrame:
+        """Devuelve el seguimiento más reciente, opcionalmente de una empresa."""
+
+        query = "SELECT * FROM analysis_snapshots"
+        parameters: tuple[object, ...] = ()
+        if ticker:
+            query += " WHERE ticker = ?"
+            parameters = (ticker.strip().upper(),)
+        query += " ORDER BY analyzed_at DESC, id DESC"
+        with self._connect() as connection:
+            return pd.read_sql_query(query, connection, params=parameters)
+
+    def delete_analysis_snapshot(self, snapshot_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM analysis_snapshots WHERE id = ?",
+                (int(snapshot_id),),
             )
 
     def open_positions(self) -> pd.DataFrame:
