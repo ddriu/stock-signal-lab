@@ -134,6 +134,10 @@ No incluye fiscalidad, spread ni el margen de cambio aplicado por el broker.
   de cartera entre EUR, USD, GBP y otras monedas soportadas.
 - **Alpha Vantage:** comprobación opcional del último cierre. La clave se introduce
   en la interfaz y no es necesaria para utilizar el resto de la aplicación.
+- **MSN Dinero:** contraste externo por empresa para revisar cotización, resultados,
+  previsiones de analistas, inversores y noticias. MSN indica que sus datos financieros
+  proceden de LSEG. No se extraen automáticamente ni se incorporan al score porque
+  Microsoft no ofrece una API pública estable para reutilizarlos en esta aplicación.
 
 La pantalla muestra la procedencia, la fecha del último periodo oficial y cualquier
 discrepancia superior al 1% entre el cierre principal y el alternativo.
@@ -181,7 +185,8 @@ capital. Esta simplificación no tiene en cuenta correlaciones entre posiciones.
   auditoría con datos intradía para estrategias sensibles a stops.
 - **Datos:** ninguna fuente gratuita ofrece garantías profesionales completas. Pueden
   existir huecos, revisiones y diferencias de ajuste. SEC aporta cuentas publicadas,
-  pero no estimaciones del futuro; Alpha Vantage es sólo un contraste opcional.
+  pero no estimaciones del futuro; Alpha Vantage es sólo un contraste opcional y
+  MSN se consulta de forma manual sin alterar las puntuaciones.
 - **Comparabilidad:** los múltiplos tienen significados diferentes por sector y los
   tipos del BCE no incluyen el coste real de conversión del broker.
 
