@@ -6,6 +6,7 @@ def test_supabase_config_can_come_from_environment(monkeypatch) -> None:
     monkeypatch.setenv("SUPABASE_SECRET_KEY", "sb_secret_test")
     monkeypatch.setenv("SUPABASE_TABLE", "operations")
     monkeypatch.setenv("SUPABASE_FAVORITES_TABLE", "favorites")
+    monkeypatch.setenv("SUPABASE_ANALYSIS_TABLE", "analysis_snapshots")
 
     config = load_supabase_config()
 
@@ -14,6 +15,7 @@ def test_supabase_config_can_come_from_environment(monkeypatch) -> None:
     assert config.secret_key == "sb_secret_test"
     assert config.table == "operations"
     assert config.favorites_table == "favorites"
+    assert config.analysis_table == "analysis_snapshots"
 
 
 def test_local_journals_are_isolated_by_owner(tmp_path, monkeypatch) -> None:

@@ -173,3 +173,73 @@ def test_supabase_favorite_tags_are_updated_by_owner(monkeypatch) -> None:
     assert calls[0]["method"] == "PATCH"
     assert calls[0]["params"] == {"ticker": "eq.YPF", "owner": "eq.ddriu"}
     assert calls[0]["json"] == {"tags": "Energía, Dividendos"}
+
+
+def test_supabase_analysis_history_uses_owner_and_separate_table(monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+    responses = [
+        FakeResponse([{"id": 12}]),
+        FakeResponse(
+            [
+                {
+                    "id": 12,
+                    "ticker": "TSM",
+                    "analyzed_at": "2026-07-29T00:00:00Z",
+                    "price": 151.5,
+                    "opportunity_score": 78,
+                    "company_score": 90,
+                    "entry_score": 64,
+                    "valuation_score": 55,
+                    "relative_score": 82,
+                    "risk_score": 61,
+                    "opportunity_label": "Candidata",
+                    "entry_label": "Vigilancia",
+                    "position_label": "Mantener",
+                    "expected_return_pct": 6.5,
+                    "positive_rate_pct": 62.0,
+                    "expected_price": 161.35,
+                    "horizon_days": 20,
+                    "sector": "Technology",
+                    "explanation": "Seguimiento",
+                    "note": "",
+                    "created_at": "2026-07-29T12:00:00Z",
+                }
+            ]
+        ),
+        FakeResponse(None, status_code=204),
+    ]
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        return responses.pop(0)
+
+    monkeypatch.setattr("src.supabase_journal.requests.request", fake_request)
+    journal = SupabaseTradingJournal(
+        "https://example.supabase.co",
+        "sb_secret_test",
+        "ddriu",
+    )
+
+    snapshot_id = journal.add_analysis_snapshot(
+        ticker="TSM",
+        analyzed_at="2026-07-29",
+        price=151.5,
+        opportunity_score=78,
+        company_score=90,
+        entry_score=64,
+        valuation_score=55,
+        relative_score=82,
+        risk_score=61,
+        opportunity_label="Candidata",
+        entry_label="Vigilancia",
+        position_label="Mantener",
+    )
+    history = journal.list_analysis_snapshots("tsm")
+    journal.delete_analysis_snapshot(snapshot_id)
+
+    assert history.iloc[0]["ticker"] == "TSM"
+    assert all(call["url"].endswith("/rest/v1/analysis_snapshots") for call in calls)
+    assert calls[0]["json"]["owner"] == "ddriu"
+    assert calls[1]["params"]["owner"] == "eq.ddriu"
+    assert calls[1]["params"]["ticker"] == "eq.TSM"
+    assert calls[2]["params"] == {"id": "eq.12", "owner": "eq.ddriu"}

@@ -81,6 +81,40 @@ def test_favorite_tags_can_be_saved_and_updated(tmp_path) -> None:
         journal.update_favorite_tags("NOPE", ["Otra"])
 
 
+def test_analysis_snapshots_are_private_lightweight_history(tmp_path) -> None:
+    journal = TradingJournal(tmp_path / "journal.db")
+    snapshot_id = journal.add_analysis_snapshot(
+        ticker="tsm",
+        analyzed_at="2026-07-29",
+        price=151.5,
+        opportunity_score=78,
+        company_score=90,
+        entry_score=64,
+        valuation_score=55,
+        relative_score=82,
+        risk_score=61,
+        opportunity_label="Candidata",
+        entry_label="Vigilancia",
+        position_label="Mantener",
+        expected_return_pct=6.5,
+        positive_rate_pct=62.0,
+        expected_price=161.35,
+        horizon_days=20,
+        sector="Technology",
+        explanation="Buena empresa con entrada todavía incompleta.",
+        note="Revisar después de resultados.",
+    )
+
+    snapshots = journal.list_analysis_snapshots("TSM")
+    assert snapshots.iloc[0]["id"] == snapshot_id
+    assert snapshots.iloc[0]["ticker"] == "TSM"
+    assert snapshots.iloc[0]["entry_score"] == 64
+    assert snapshots.iloc[0]["note"] == "Revisar después de resultados."
+
+    journal.delete_analysis_snapshot(snapshot_id)
+    assert journal.list_analysis_snapshots().empty
+
+
 def test_frozen_windows_app_uses_private_local_app_data(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("src.journal.sys.platform", "win32")
     monkeypatch.setattr("src.journal.sys.frozen", True, raising=False)
