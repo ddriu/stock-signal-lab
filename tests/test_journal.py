@@ -1,5 +1,6 @@
 import pytest
 
+from src.alerts import AlertState, normalize_alert_preferences
 from src.journal import TradingJournal, default_database_path
 
 
@@ -121,3 +122,40 @@ def test_frozen_windows_app_uses_private_local_app_data(tmp_path, monkeypatch) -
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     monkeypatch.delenv("STOCK_SIGNAL_LAB_DATA_DIR", raising=False)
     assert default_database_path() == tmp_path / "StockSignalLab" / "trading_journal.db"
+
+
+def test_email_alert_preferences_and_states_are_private(tmp_path) -> None:
+    journal = TradingJournal(tmp_path / "journal.db", owner="luci")
+    preferences = normalize_alert_preferences(
+        owner="luci",
+        email="luci@example.com",
+        enabled=True,
+        minimum_buy_score=75,
+    )
+    journal.save_alert_preferences(preferences)
+    journal.upsert_alert_states(
+        [
+            AlertState(
+                owner="luci",
+                ticker="TSM",
+                signature="entry:Entrada fuerte",
+                entry_score=80,
+                entry_label="Entrada fuerte",
+                position_label="Mantener",
+                price=155,
+                evaluated_at="2026-07-29T08:00:00+02:00",
+                notified_at="2026-07-29T08:00:00+02:00",
+            )
+        ]
+    )
+
+    stored = journal.get_alert_preferences()
+    states = journal.list_alert_states()
+    assert stored.email == "luci@example.com"
+    assert stored.minimum_buy_score == 75
+    assert states.iloc[0]["signature"] == "entry:Entrada fuerte"
+
+    with pytest.raises(ValueError, match="otro usuario"):
+        journal.save_alert_preferences(
+            normalize_alert_preferences(owner="fer", email="fer@example.com")
+        )

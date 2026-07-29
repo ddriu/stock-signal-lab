@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from src.supabase_journal import SupabaseTradingJournal
+from src.alerts import AlertState, normalize_alert_preferences
 
 
 @dataclass
@@ -243,3 +244,78 @@ def test_supabase_analysis_history_uses_owner_and_separate_table(monkeypatch) ->
     assert calls[1]["params"]["owner"] == "eq.ddriu"
     assert calls[1]["params"]["ticker"] == "eq.TSM"
     assert calls[2]["params"] == {"id": "eq.12", "owner": "eq.ddriu"}
+
+
+def test_supabase_email_alerts_are_filtered_and_upserted_by_owner(monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+    responses = [
+        FakeResponse(
+            [
+                {
+                    "owner": "ddriu",
+                    "email": "ddriu@example.com",
+                    "enabled": True,
+                    "alert_buy": True,
+                    "alert_reduce": True,
+                    "alert_sell": True,
+                    "include_group": True,
+                    "minimum_buy_score": 65,
+                    "only_changes": True,
+                    "updated_at": "2026-07-29T08:00:00Z",
+                }
+            ]
+        ),
+        FakeResponse(None, status_code=204),
+        FakeResponse([]),
+        FakeResponse(None, status_code=204),
+    ]
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        return responses.pop(0)
+
+    monkeypatch.setattr("src.supabase_journal.requests.request", fake_request)
+    journal = SupabaseTradingJournal(
+        "https://example.supabase.co",
+        "sb_secret_test",
+        "ddriu",
+    )
+
+    preferences = journal.get_alert_preferences()
+    journal.save_alert_preferences(
+        normalize_alert_preferences(
+            owner="ddriu",
+            email="ddriu@example.com",
+            enabled=True,
+        )
+    )
+    states = journal.list_alert_states()
+    journal.upsert_alert_states(
+        [
+            AlertState(
+                owner="ddriu",
+                ticker="TSM",
+                signature="neutral",
+                entry_score=50,
+                entry_label="Esperar",
+                position_label="Mantener",
+                price=150,
+                evaluated_at="2026-07-29T08:00:00Z",
+            )
+        ]
+    )
+
+    assert preferences.enabled is True
+    assert states.empty
+    assert calls[0]["params"]["owner"] == "eq.ddriu"
+    assert calls[1]["json"]["owner"] == "ddriu"
+    assert calls[2]["params"]["owner"] == "eq.ddriu"
+    assert calls[3]["json"][0]["owner"] == "ddriu"
+    assert all(
+        call["url"].endswith(
+            "/rest/v1/email_alert_preferences"
+            if index < 2
+            else "/rest/v1/email_alert_states"
+        )
+        for index, call in enumerate(calls)
+    )
