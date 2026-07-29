@@ -1,0 +1,208 @@
+"""Proceso diario que analiza listas y envía un resumen por usuario."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, timedelta
+from typing import Callable
+
+import pandas as pd
+
+from config import StrategyConfig
+from src.alerts import (
+    AlertCandidate,
+    AlertPreferences,
+    build_alert_candidate,
+    build_alert_state,
+    build_digest_content,
+    filter_changed_candidates,
+)
+from src.data_loader import DataDownloadError, download_prices
+from src.email_sender import send_email
+from src.indicators import add_indicators
+from src.signal_engine import evaluate_latest_signal
+from src.storage import GROUP_PORTFOLIO_OWNER, create_journal
+
+
+@dataclass(frozen=True)
+class AlertRunSummary:
+    users_checked: int
+    tickers_checked: int
+    emails_sent: int
+    alerts_sent: int
+    errors: tuple[str, ...]
+
+
+def _favorite_tickers(journal: object) -> set[str]:
+    favorites = journal.list_favorites()
+    if favorites.empty:
+        return set()
+    return {
+        str(ticker).strip().upper()
+        for ticker in favorites["ticker"].dropna()
+        if str(ticker).strip()
+    }
+
+
+def _position_costs(journal: object) -> dict[str, float]:
+    positions = journal.open_positions()
+    if positions.empty:
+        return {}
+    result: dict[str, float] = {}
+    for row in positions.itertuples(index=False):
+        ticker = str(row.ticker).strip().upper()
+        average_cost = float(row.average_cost)
+        if ticker and average_cost > 0:
+            result[ticker] = average_cost
+    return result
+
+
+def _download_alert_frames(
+    tickers: set[str],
+    *,
+    today: date,
+    downloader: Callable[..., pd.DataFrame],
+) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    frames: dict[str, pd.DataFrame] = {}
+    errors: list[str] = []
+    start = today - timedelta(days=550)
+    config = StrategyConfig()
+    for ticker in sorted(tickers):
+        try:
+            raw = downloader(ticker, start, today, auto_adjust=True)
+            frames[ticker] = add_indicators(raw, config)
+        except (DataDownloadError, ValueError, KeyError) as exc:
+            errors.append(f"{ticker}: {exc}")
+    return frames, errors
+
+
+def run_daily_alerts(
+    *,
+    journal_factory: Callable[[str], object] = create_journal,
+    downloader: Callable[..., pd.DataFrame] = download_prices,
+    sender: Callable[..., None] = send_email,
+    today: date | None = None,
+) -> AlertRunSummary:
+    """Ejecuta el radar de todas las preferencias activas del backend."""
+
+    resolved_today = today or date.today()
+    group_journal = journal_factory(GROUP_PORTFOLIO_OWNER)
+    if not hasattr(group_journal, "list_enabled_alert_preferences"):
+        raise RuntimeError(
+            "La ejecución automática requiere Supabase; SQLite sólo admite pruebas manuales."
+        )
+    preferences: list[AlertPreferences] = (
+        group_journal.list_enabled_alert_preferences()
+    )
+    if not preferences:
+        return AlertRunSummary(0, 0, 0, 0, ())
+
+    group_favorites = _favorite_tickers(group_journal)
+    group_positions = _position_costs(group_journal)
+    scopes: dict[str, tuple[AlertPreferences, object, set[str], dict[str, float]]] = {}
+    all_tickers: set[str] = set()
+    errors: list[str] = []
+    for preference in preferences:
+        try:
+            user_journal = journal_factory(preference.owner)
+            favorites = _favorite_tickers(user_journal)
+            positions = _position_costs(user_journal)
+            if preference.include_group:
+                favorites |= group_favorites
+                for ticker, average_cost in group_positions.items():
+                    positions.setdefault(ticker, average_cost)
+            scope = favorites | set(positions)
+            scopes[preference.owner] = (
+                preference,
+                user_journal,
+                scope,
+                positions,
+            )
+            all_tickers |= scope
+        except Exception as exc:
+            errors.append(f"{preference.owner}: no se pudo leer su seguimiento ({exc}).")
+
+    frames, download_errors = _download_alert_frames(
+        all_tickers,
+        today=resolved_today,
+        downloader=downloader,
+    )
+    errors.extend(download_errors)
+    config = StrategyConfig()
+    emails_sent = 0
+    alerts_sent = 0
+
+    for owner, (preference, journal, scope, positions) in scopes.items():
+        try:
+            previous = journal.list_alert_states()
+            previous_signatures = (
+                dict(zip(previous["ticker"], previous["signature"]))
+                if not previous.empty
+                else {}
+            )
+            evaluated: list[tuple[object, float, bool]] = []
+            candidates: list[AlertCandidate] = []
+            for ticker in sorted(scope):
+                frame = frames.get(ticker)
+                if frame is None or frame.empty:
+                    continue
+                held = ticker in positions
+                signal = evaluate_latest_signal(
+                    frame,
+                    config,
+                    ticker=ticker,
+                    entry_price=positions.get(ticker),
+                )
+                price = float(frame["close"].iloc[-1])
+                evaluated.append((signal, price, held))
+                candidate = build_alert_candidate(
+                    signal,
+                    price=price,
+                    held=held,
+                    preferences=preference,
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
+
+            selected = filter_changed_candidates(
+                candidates,
+                previous_signatures,
+                only_changes=preference.only_changes,
+            )
+            if selected:
+                subject, plain_body, html_body = build_digest_content(
+                    owner.capitalize(),
+                    selected,
+                )
+                sender(
+                    preference.email,
+                    subject,
+                    plain_body,
+                    html_body,
+                )
+                emails_sent += 1
+                alerts_sent += len(selected)
+            notified_tickers = {candidate.ticker for candidate in selected}
+            states = [
+                build_alert_state(
+                    owner=owner,
+                    signal=signal,
+                    price=price,
+                    held=held,
+                    notified=signal.ticker in notified_tickers,
+                )
+                for signal, price, held in evaluated
+            ]
+            journal.upsert_alert_states(states)
+        except Exception as exc:
+            # Un destinatario no debe impedir que los demás reciban su resumen.
+            errors.append(f"{owner}: no se pudo completar el aviso ({exc}).")
+
+    return AlertRunSummary(
+        users_checked=len(scopes),
+        tickers_checked=len(frames),
+        emails_sent=emails_sent,
+        alerts_sent=alerts_sent,
+        errors=tuple(errors),
+    )
+

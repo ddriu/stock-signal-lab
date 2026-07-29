@@ -10,6 +10,13 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.alerts import (
+    ALERT_STATE_COLUMNS,
+    AlertPreferences,
+    AlertState,
+    normalize_alert_preferences,
+    preferences_from_mapping,
+)
 from src.favorite_tags import serialize_favorite_tags
 
 
@@ -293,8 +300,14 @@ def calculate_open_positions(operations: pd.DataFrame) -> pd.DataFrame:
 class TradingJournal:
     backend_name = "SQLite local"
 
-    def __init__(self, database_path: str | Path = DEFAULT_DATABASE) -> None:
+    def __init__(
+        self,
+        database_path: str | Path = DEFAULT_DATABASE,
+        *,
+        owner: str = "",
+    ) -> None:
         self.database_path = Path(database_path)
+        self.owner = owner.strip().lower() or self.database_path.stem
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
@@ -388,6 +401,39 @@ class TradingJournal:
                 """
                 CREATE INDEX IF NOT EXISTS analysis_snapshots_ticker_date_idx
                 ON analysis_snapshots (ticker, analyzed_at DESC, id DESC)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS email_alert_preferences (
+                    owner TEXT PRIMARY KEY,
+                    email TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    alert_buy INTEGER NOT NULL DEFAULT 1,
+                    alert_reduce INTEGER NOT NULL DEFAULT 1,
+                    alert_sell INTEGER NOT NULL DEFAULT 1,
+                    include_group INTEGER NOT NULL DEFAULT 1,
+                    minimum_buy_score INTEGER NOT NULL DEFAULT 65
+                        CHECK (minimum_buy_score BETWEEN 55 AND 100),
+                    only_changes INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS email_alert_states (
+                    owner TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    signature TEXT NOT NULL,
+                    entry_score INTEGER NOT NULL,
+                    entry_label TEXT NOT NULL DEFAULT '',
+                    position_label TEXT NOT NULL DEFAULT '',
+                    price REAL NOT NULL,
+                    evaluated_at TEXT NOT NULL,
+                    notified_at TEXT,
+                    PRIMARY KEY (owner, ticker)
+                )
                 """
             )
 
@@ -562,6 +608,99 @@ class TradingJournal:
             connection.execute(
                 "DELETE FROM analysis_snapshots WHERE id = ?",
                 (int(snapshot_id),),
+            )
+
+    def get_alert_preferences(self) -> AlertPreferences:
+        """Devuelve valores seguros aunque el usuario aún no los haya guardado."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM email_alert_preferences WHERE owner = ?",
+                (self.owner,),
+            ).fetchone()
+        if row is None:
+            return normalize_alert_preferences(owner=self.owner)
+        return preferences_from_mapping(dict(row), owner=self.owner)
+
+    def save_alert_preferences(
+        self,
+        preferences: AlertPreferences,
+    ) -> None:
+        values = normalize_alert_preferences(**preferences.__dict__)
+        if values.owner != self.owner:
+            raise ValueError("No se pueden modificar las alertas de otro usuario.")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO email_alert_preferences (
+                    owner, email, enabled, alert_buy, alert_reduce, alert_sell,
+                    include_group, minimum_buy_score, only_changes, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(owner) DO UPDATE SET
+                    email = excluded.email,
+                    enabled = excluded.enabled,
+                    alert_buy = excluded.alert_buy,
+                    alert_reduce = excluded.alert_reduce,
+                    alert_sell = excluded.alert_sell,
+                    include_group = excluded.include_group,
+                    minimum_buy_score = excluded.minimum_buy_score,
+                    only_changes = excluded.only_changes,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    values.owner,
+                    values.email,
+                    int(values.enabled),
+                    int(values.alert_buy),
+                    int(values.alert_reduce),
+                    int(values.alert_sell),
+                    int(values.include_group),
+                    values.minimum_buy_score,
+                    int(values.only_changes),
+                    values.updated_at,
+                ),
+            )
+
+    def list_alert_states(self) -> pd.DataFrame:
+        with self._connect() as connection:
+            return pd.read_sql_query(
+                """
+                SELECT owner, ticker, signature, entry_score, entry_label,
+                       position_label, price, evaluated_at, notified_at
+                FROM email_alert_states
+                ORDER BY ticker
+                """,
+                connection,
+            )
+
+    def upsert_alert_states(self, states: list[AlertState]) -> None:
+        if not states:
+            return
+        with self._connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO email_alert_states (
+                    owner, ticker, signature, entry_score, entry_label,
+                    position_label, price, evaluated_at, notified_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(owner, ticker) DO UPDATE SET
+                    signature = excluded.signature,
+                    entry_score = excluded.entry_score,
+                    entry_label = excluded.entry_label,
+                    position_label = excluded.position_label,
+                    price = excluded.price,
+                    evaluated_at = excluded.evaluated_at,
+                    notified_at = COALESCE(
+                        excluded.notified_at,
+                        email_alert_states.notified_at
+                    )
+                """,
+                [
+                    tuple(getattr(state, column) for column in ALERT_STATE_COLUMNS)
+                    for state in states
+                ],
             )
 
     def open_positions(self) -> pd.DataFrame:

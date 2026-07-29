@@ -8,6 +8,14 @@ from typing import Any
 import pandas as pd
 import requests
 
+from src.alerts import (
+    ALERT_PREFERENCE_COLUMNS,
+    ALERT_STATE_COLUMNS,
+    AlertPreferences,
+    AlertState,
+    normalize_alert_preferences,
+    preferences_from_mapping,
+)
 from src.journal import (
     ANALYSIS_SNAPSHOT_COLUMNS,
     FAVORITE_COLUMNS,
@@ -72,6 +80,14 @@ class SupabaseTradingJournal:
     @property
     def analysis_endpoint(self) -> str:
         return f"{self.url}/rest/v1/{self.analysis_table}"
+
+    @property
+    def alert_preferences_endpoint(self) -> str:
+        return f"{self.url}/rest/v1/email_alert_preferences"
+
+    @property
+    def alert_states_endpoint(self) -> str:
+        return f"{self.url}/rest/v1/email_alert_states"
 
     @property
     def headers(self) -> dict[str, str]:
@@ -327,6 +343,98 @@ class SupabaseTradingJournal:
             params={
                 "id": f"eq.{int(snapshot_id)}",
                 "owner": f"eq.{self.owner}",
+            },
+        )
+
+    def get_alert_preferences(self) -> AlertPreferences:
+        response = self._request(
+            "GET",
+            endpoint=self.alert_preferences_endpoint,
+            params={
+                "owner": f"eq.{self.owner}",
+                "select": ",".join(ALERT_PREFERENCE_COLUMNS),
+                "limit": "1",
+            },
+        )
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise JournalStorageError("Supabase devolvió preferencias de alertas inválidas.")
+        return preferences_from_mapping(
+            rows[0] if rows else None,
+            owner=self.owner,
+        )
+
+    def save_alert_preferences(self, preferences: AlertPreferences) -> None:
+        values = normalize_alert_preferences(**preferences.__dict__)
+        if values.owner != self.owner.strip().lower():
+            raise ValueError("No se pueden modificar las alertas de otro usuario.")
+        self._request(
+            "POST",
+            endpoint=self.alert_preferences_endpoint,
+            params={"on_conflict": "owner"},
+            json=values.__dict__,
+            headers={
+                **self.headers,
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            },
+        )
+
+    def list_enabled_alert_preferences(self) -> list[AlertPreferences]:
+        """Uso exclusivo del proceso servidor que prepara todos los resúmenes."""
+
+        response = self._request(
+            "GET",
+            endpoint=self.alert_preferences_endpoint,
+            params={
+                "enabled": "eq.true",
+                "select": ",".join(ALERT_PREFERENCE_COLUMNS),
+                "order": "owner.asc",
+            },
+        )
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise JournalStorageError("Supabase devolvió preferencias de alertas inválidas.")
+        return [
+            preferences_from_mapping(row, owner=str(row.get("owner") or ""))
+            for row in rows
+            if isinstance(row, dict) and row.get("owner")
+        ]
+
+    def list_alert_states(self) -> pd.DataFrame:
+        response = self._request(
+            "GET",
+            endpoint=self.alert_states_endpoint,
+            params={
+                "owner": f"eq.{self.owner}",
+                "select": ",".join(ALERT_STATE_COLUMNS),
+                "order": "ticker.asc",
+            },
+        )
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise JournalStorageError("Supabase devolvió estados de alertas inválidos.")
+        if not rows:
+            return pd.DataFrame(columns=ALERT_STATE_COLUMNS)
+        frame = pd.DataFrame(rows)
+        for column in ALERT_STATE_COLUMNS:
+            if column not in frame.columns:
+                frame[column] = None
+        return frame.loc[:, ALERT_STATE_COLUMNS]
+
+    def upsert_alert_states(self, states: list[AlertState]) -> None:
+        if not states:
+            return
+        for state in states:
+            if state.owner != self.owner.strip().lower():
+                raise ValueError("No se pueden modificar estados de otro usuario.")
+        self._request(
+            "POST",
+            endpoint=self.alert_states_endpoint,
+            params={"on_conflict": "owner,ticker"},
+            json=[state.__dict__ for state in states],
+            headers={
+                **self.headers,
+                "Prefer": "resolution=merge-duplicates,return=minimal",
             },
         )
 

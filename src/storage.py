@@ -77,7 +77,7 @@ def create_journal(owner: str) -> TradingJournal | SupabaseTradingJournal:
             raise JournalStorageError("El nombre de usuario no permite crear un diario local.")
         base_path = default_database_path()
         user_path = base_path.with_name(f"{base_path.stem}_{safe_owner}{base_path.suffix}")
-        return TradingJournal(user_path)
+        return TradingJournal(user_path, owner=safe_owner)
     return SupabaseTradingJournal(
         config.url,
         config.secret_key,
