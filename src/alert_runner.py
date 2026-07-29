@@ -146,23 +146,30 @@ def run_daily_alerts(
                 frame = frames.get(ticker)
                 if frame is None or frame.empty:
                     continue
-                held = ticker in positions
-                signal = evaluate_latest_signal(
-                    frame,
-                    config,
-                    ticker=ticker,
-                    entry_price=positions.get(ticker),
-                )
-                price = float(frame["close"].iloc[-1])
-                evaluated.append((signal, price, held))
-                candidate = build_alert_candidate(
-                    signal,
-                    price=price,
-                    held=held,
-                    preferences=preference,
-                )
-                if candidate is not None:
-                    candidates.append(candidate)
+                try:
+                    held = ticker in positions
+                    signal = evaluate_latest_signal(
+                        frame,
+                        config,
+                        ticker=ticker,
+                        entry_price=positions.get(ticker),
+                    )
+                    price = float(frame["close"].iloc[-1])
+                    evaluated.append((signal, price, held))
+                    candidate = build_alert_candidate(
+                        signal,
+                        price=price,
+                        held=held,
+                        preferences=preference,
+                    )
+                    if candidate is not None:
+                        candidates.append(candidate)
+                except Exception as exc:
+                    # Un ticker con poco histórico o datos incompletos no debe
+                    # cancelar el resumen de las demás empresas del usuario.
+                    errors.append(
+                        f"{owner} / {ticker}: no se pudo calcular la señal ({exc})."
+                    )
 
             selected = filter_changed_candidates(
                 candidates,
@@ -205,4 +212,3 @@ def run_daily_alerts(
         alerts_sent=alerts_sent,
         errors=tuple(errors),
     )
-
