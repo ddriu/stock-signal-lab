@@ -45,6 +45,15 @@ secret_key = "sb_secret_TU_CLAVE_DE_SERVIDOR"
 table = "operations"
 favorites_table = "favorites"
 analysis_table = "analysis_snapshots"
+
+[email]
+smtp_host = "smtp.gmail.com"
+smtp_port = 465
+use_ssl = true
+username = "CORREO_GMAIL_DEL_PROYECTO"
+app_password = "CONTRASEÑA_DE_APLICACION_DE_GOOGLE"
+sender_email = "CORREO_GMAIL_DEL_PROYECTO"
+sender_name = "Stock Signal Lab"
 ```
 
 El hash de una contraseña nueva se genera localmente con:
@@ -74,9 +83,31 @@ propios movimientos compartidos; el rol `admin` puede corregir cualquiera, dispo
 de la vista agregada y puede registrar operaciones en nombre de los usuarios.
 El mismo esquema crea listas de favoritos privadas y del grupo y el historial privado
 de análisis, sin borrar ni modificar las operaciones existentes.
+También crea `email_alert_preferences` y `email_alert_states`: la primera conserva
+el correo y las opciones privadas; la segunda recuerda el último estado de cada
+empresa para no repetir el mismo aviso.
 
 Sin `[supabase]`, la instalación local continúa usando SQLite. En Community Cloud,
 `persistent_journal = false` mantiene el diario desactivado para evitar pérdidas.
+
+## 5. Activar las alertas gratuitas por Gmail
+
+1. Crea una cuenta Gmail exclusiva para Stock Signal Lab y activa la verificación
+   en dos pasos.
+2. Genera una contraseña de aplicación de Google. No utilices ni compartas la
+   contraseña habitual de la cuenta.
+3. Añade el bloque `[email]` anterior a los secretos de Streamlit. Esto activa el
+   botón de correo de prueba de la aplicación.
+4. En GitHub abre **Settings > Secrets and variables > Actions** y crea:
+   `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `EMAIL_SMTP_USERNAME` y
+   `EMAIL_SMTP_PASSWORD`.
+5. Abre **Actions > Enviar alertas diarias > Run workflow** para la primera prueba.
+6. Cada usuario entra en **Más > Alertas por correo**, guarda su dirección y activa
+   los tipos de aviso que quiera recibir.
+
+El workflow programado se lanza a las 07:15 UTC de lunes a viernes. GitHub puede
+retrasar algunos minutos las tareas gratuitas. Es un resumen con el último cierre
+diario disponible, no una alerta intradía.
 
 ## Seguridad
 

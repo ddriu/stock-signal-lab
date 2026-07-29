@@ -23,6 +23,9 @@ La instalación local solicita las credenciales guardadas en
 ├── config.py                 # Configuración tipada de estrategia y simulación
 ├── data/                     # Base SQLite local (creada al usar el diario)
 ├── src/
+│   ├── alerts.py             # Preferencias, cambios de estado y resumen explicable
+│   ├── alert_runner.py       # Revisión diaria de favoritos y posiciones
+│   ├── email_sender.py       # Envío SMTP intercambiable (Gmail/Resend)
 │   ├── data_loader.py        # yfinance, validación y normalización OHLCV
 │   ├── data_sources.py       # SEC EDGAR, BCE, Alpha Vantage y trazabilidad
 │   ├── auth.py               # Cuentas, roles y contraseñas con hash PBKDF2
@@ -135,6 +138,31 @@ Sólo recomienda estudiar un cambio si la posición actual está deteriorada, la
 tiene una entrada atractiva, mejora al menos 10 puntos técnicos y 5 puntos de oportunidad.
 Para monedas distintas convierte el importe con el último tipo de referencia del BCE.
 No incluye fiscalidad, spread ni el margen de cambio aplicado por el broker.
+
+## Alertas por correo
+
+Cada usuario puede guardar su propio correo, activar o desactivar avisos de entrada,
+reducción y posible salida, elegir una nota mínima de entrada e incluir el seguimiento
+del grupo. El correo contiene un solo resumen y, por defecto, sólo se envía cuando la
+categoría cambia para evitar mensajes repetidos.
+
+La revisión automática incluye favoritas y posiciones abiertas. Las entradas se
+evalúan únicamente para empresas que no están ya en cartera; las alertas de reducir
+o vender se limitan a posiciones registradas y utilizan su coste medio para comprobar
+el stop loss. El proceso usa el perfil equilibrado predeterminado y precios diarios:
+no vigila el mercado en tiempo real ni garantiza que el precio continúe disponible.
+
+El workflow `.github/workflows/daily-alerts.yml` se ejecuta por la mañana de lunes
+a viernes y también puede iniciarse manualmente. Necesita cuatro secretos de GitHub:
+`SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `EMAIL_SMTP_USERNAME` y
+`EMAIL_SMTP_PASSWORD` (los dos últimos corresponden al Gmail del proyecto; el host,
+el puerto y el remitente ya están resueltos en el workflow).
+
+Para probar el envío desde la interfaz, el mismo Gmail se configura en el bloque
+`[email]` de los secretos de Streamlit. `EMAIL_SMTP_PASSWORD` y `app_password`
+deben ser una contraseña de aplicación de Google, nunca la contraseña normal.
+La dirección de cada destinatario se guarda en Supabase y sólo es accesible con la
+clave secreta del backend.
 
 ## Fuentes de datos
 

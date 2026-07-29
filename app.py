@@ -12,6 +12,7 @@ import pandas as pd
 import streamlit as st
 
 from config import BacktestConfig, StrategyConfig
+from src.alerts import normalize_alert_preferences
 from src.auth import (
     AuthConfig,
     load_auth_accounts,
@@ -40,6 +41,12 @@ from src.data_sources import (
     sector_benchmark,
 )
 from src.fundamentals import FundamentalResult, evaluate_fundamentals
+from src.email_sender import (
+    EmailConfigurationError,
+    EmailDeliveryError,
+    load_email_config,
+    send_test_email,
+)
 from src.favorite_tags import (
     FAVORITE_TAGS,
     favorite_tag_css_class,
@@ -3324,6 +3331,174 @@ def render_saved_analysis_history(journal: object) -> None:
                 st.rerun()
 
 
+def render_email_alert_settings(journal: object) -> None:
+    """Preferencias privadas y prueba controlada del canal de correo."""
+
+    st.subheader("Alertas por correo")
+    st.write(
+        "Recibe un único resumen cuando una favorita pase a entrada interesante o "
+        "cuando una posición registrada cambie a reducir o vender."
+    )
+    st.info(
+        "Una alerta invita a revisar los datos; no compra, vende ni envía órdenes a "
+        "ningún broker. El precio puede cambiar antes de que leas el mensaje."
+    )
+    try:
+        preferences = journal.get_alert_preferences()
+    except (JournalStorageError, AttributeError) as exc:
+        st.error(f"No se pudieron cargar las alertas: {exc}")
+        st.caption(
+            "El administrador debe ejecutar la versión actual de supabase/schema.sql."
+        )
+        return
+
+    with st.form("email_alert_preferences_form"):
+        email_address = st.text_input(
+            "Correo que recibirá los avisos",
+            value=preferences.email,
+            placeholder="tu.nombre@gmail.com",
+            help="Sólo el backend privado puede leer esta dirección.",
+        )
+        enabled = st.toggle(
+            "Activar mis alertas automáticas",
+            value=preferences.enabled,
+        )
+        type_a, type_b, type_c = st.columns(3)
+        with type_a:
+            alert_buy = st.checkbox(
+                "Entradas interesantes",
+                value=preferences.alert_buy,
+                help=(
+                    "Avisa sobre favoritas que no están en tu cartera cuando su momento "
+                    "técnico alcanza el mínimo elegido."
+                ),
+            )
+        with type_b:
+            alert_reduce = st.checkbox(
+                "Revisar / reducir",
+                value=preferences.alert_reduce,
+                help="Avisa cuando una posición pierde fuerza o la media intermedia.",
+            )
+        with type_c:
+            alert_sell = st.checkbox(
+                "Posible salida",
+                value=preferences.alert_sell,
+                help="Avisa al perder la tendencia larga o activar el stop configurado.",
+            )
+        minimum_buy_score = st.slider(
+            "Puntuación mínima para avisar de una posible entrada",
+            min_value=55,
+            max_value=85,
+            value=min(max(preferences.minimum_buy_score, 55), 85),
+            step=5,
+            help=(
+                "65 incluye entradas interesantes; 75 es más selectivo y normalmente "
+                "produce menos avisos."
+            ),
+        )
+        include_group = st.checkbox(
+            "Incluir favoritas y posiciones de la cartera del grupo",
+            value=preferences.include_group,
+        )
+        only_changes = st.checkbox(
+            "Avisar sólo cuando cambie la señal",
+            value=preferences.only_changes,
+            help="Evita recibir el mismo aviso todos los días.",
+        )
+        saved = st.form_submit_button(
+            "Guardar mis preferencias",
+            type="primary",
+            width="stretch",
+        )
+    if saved:
+        try:
+            values = normalize_alert_preferences(
+                owner=preferences.owner,
+                email=email_address,
+                enabled=enabled,
+                alert_buy=alert_buy,
+                alert_reduce=alert_reduce,
+                alert_sell=alert_sell,
+                include_group=include_group,
+                minimum_buy_score=minimum_buy_score,
+                only_changes=only_changes,
+            )
+            journal.save_alert_preferences(values)
+            st.success("Preferencias guardadas.")
+            st.rerun()
+        except (ValueError, JournalStorageError) as exc:
+            st.error(str(exc))
+
+    mail_configured = load_email_config().configured
+    if mail_configured:
+        st.success(
+            "El canal de correo está conectado. La revisión automática se ejecuta "
+            "por la mañana, de lunes a viernes."
+        )
+    else:
+        st.warning(
+            "Las preferencias pueden guardarse, pero el administrador todavía debe "
+            "conectar la cuenta Gmail del proyecto."
+        )
+    test_disabled = not bool(preferences.email) or not mail_configured
+    if st.button(
+        "Enviarme un correo de prueba",
+        disabled=test_disabled,
+        width="stretch",
+    ):
+        try:
+            send_test_email(preferences.email)
+            st.success("Correo enviado. Si no aparece, revisa también la carpeta de spam.")
+        except (EmailConfigurationError, EmailDeliveryError) as exc:
+            st.error(str(exc))
+
+    with st.expander("¿Qué empresas se revisan y cuándo se avisa?"):
+        st.markdown(
+            """
+            - Tus favoritas privadas y todas tus posiciones abiertas.
+            - Opcionalmente, las favoritas y posiciones de la cartera del grupo.
+            - **Compra:** sólo para empresas que todavía no figuran en tu cartera.
+            - **Reducir o vender:** sólo para posiciones registradas, utilizando su
+              coste medio para comprobar también el stop loss.
+            - Un mismo estado no vuelve a enviarse hasta que la señal cambie.
+
+            Los precios diarios gratuitos pueden contener retrasos, huecos o ajustes.
+            Comprueba siempre la cotización y las noticias antes de actuar.
+            """
+        )
+    try:
+        states = journal.list_alert_states()
+    except (JournalStorageError, AttributeError):
+        states = pd.DataFrame()
+    if not states.empty:
+        st.caption("Últimas empresas revisadas automáticamente")
+        visible = states.rename(
+            columns={
+                "ticker": "Ticker",
+                "entry_score": "Entrada",
+                "entry_label": "Momento",
+                "position_label": "Si ya la tienes",
+                "price": "Último cierre",
+                "evaluated_at": "Revisada",
+            }
+        )
+        st.dataframe(
+            visible.loc[
+                :,
+                [
+                    "Ticker",
+                    "Entrada",
+                    "Momento",
+                    "Si ya la tienes",
+                    "Último cierre",
+                    "Revisada",
+                ],
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+
+
 def render_methodology() -> None:
     st.subheader("Guía sencilla")
     st.markdown(
@@ -3670,11 +3845,10 @@ def main() -> None:
                 st.info("Comprueba la conexión con Supabase y vuelve a intentarlo.")
 
     elif selected_section == "Más":
-        more_options = (
-            ["Administración", "Guía y riesgos"]
-            if authenticated_user.is_admin
-            else ["Guía y riesgos"]
-        )
+        more_options = ["Alertas por correo"]
+        if authenticated_user.is_admin:
+            more_options.append("Administración")
+        more_options.append("Guía y riesgos")
         if st.session_state.get("more_navigation") not in more_options:
             st.session_state["more_navigation"] = "Guía y riesgos"
         more_section = st.segmented_control(
@@ -3684,7 +3858,12 @@ def main() -> None:
             required=True,
             label_visibility="collapsed",
         )
-        if more_section == "Administración":
+        if more_section == "Alertas por correo":
+            if persistent_journal_enabled():
+                render_email_alert_settings(journal)
+            else:
+                st.warning("Las alertas necesitan almacenamiento persistente.")
+        elif more_section == "Administración":
             if persistent_journal_enabled():
                 try:
                     render_admin_panel(
