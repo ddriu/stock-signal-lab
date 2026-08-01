@@ -243,10 +243,11 @@ def annual_portfolio_chart(annual: pd.DataFrame) -> go.Figure:
 
 
 def private_investments_chart(investments: pd.DataFrame) -> go.Figure:
-    """Compara importe invertido y valor manual actual por plataforma."""
+    """Compara capital todavía abierto y valor manual actual por plataforma."""
 
+    open_investments = investments.loc[investments["status"] != "Finalizada"]
     summary = (
-        investments.groupby("platform")[["invested_amount", "current_value"]]
+        open_investments.groupby("platform")[["invested_amount", "current_value"]]
         .sum()
         .reset_index()
     )
@@ -255,7 +256,7 @@ def private_investments_chart(investments: pd.DataFrame) -> go.Figure:
         go.Bar(
             x=summary["platform"],
             y=summary["invested_amount"],
-            name="Invertido",
+            name="Capital abierto",
             marker_color=COLORS["medium"],
         )
     )
@@ -268,7 +269,7 @@ def private_investments_chart(investments: pd.DataFrame) -> go.Figure:
         )
     )
     figure.update_layout(
-        title="Civislend y Segofactoring",
+        title="Capital todavía abierto en Civislend y Segofactoring",
         barmode="group",
         height=370,
         hovermode="x unified",
