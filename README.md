@@ -42,6 +42,7 @@ La instalación local solicita las credenciales guardadas en
 │   ├── portfolio.py          # Valoración y comparación de cambios
 │   ├── portfolio_history.py  # Evolución diaria y resumen anual de cartera
 │   ├── portfolio_export.py   # Libro Excel con tablas y gráficos editables
+│   ├── segofactoring_import.py # Importación idempotente del resumen XLSX
 │   ├── recommendations.py    # Entradas, retornos históricos y ventas parciales
 │   └── journal.py            # Diario SQLite y exportación mediante la UI
 └── tests/                    # Pruebas unitarias sin red
@@ -153,6 +154,14 @@ Revolut, Segofactoring y Civislend**. Las cinco se crean con valor cero y el est
 y Segofactoring el detalle por proyectos registrado manualmente tiene prioridad sobre el
 total provisional, porque esos activos no tienen una cotización pública automática. El
 Excel incorpora también una hoja independiente con las cuentas y plataformas.
+
+En **Mis cuentas** se puede subir el resumen `.xlsx` de Segofactoring. La vista previa
+separa capital pendiente, operaciones cobradas y ganancia neta registrada. Si el mismo
+archivo se vuelve a subir, la aplicación actualiza las filas importadas sin duplicarlas;
+las participaciones repetidas del documento se conservan como inversiones independientes
+y los proyectos añadidos manualmente no se borran. Una operación cobrada queda en el
+histórico, pero deja de contarse como capital todavía invertido. Cuando el fichero sea
+antiguo puede marcarse como pendiente de actualizar para no presentar sus cifras como actuales.
 
 El comparador de cambios resta por defecto 1 € por vender y otro por comprar,
 muestra cuántas unidades de la alternativa podrían adquirirse y calcula la mejora técnica.

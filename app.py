@@ -82,6 +82,10 @@ from src.recommendations import (
 )
 from src.risk import calculate_position_plan
 from src.sector_comparison import HORIZON_SESSIONS, compare_sector
+from src.segofactoring_import import (
+    import_segofactoring_rows,
+    parse_segofactoring_excel,
+)
 from src.signal_engine import add_signal_columns, evaluate_latest_signal
 from src.ui import (
     APP_CSS,
@@ -1694,33 +1698,187 @@ def render_private_investments(
         "Estas inversiones no cotizan en bolsa. Su valor no se descarga: debes "
         "actualizarlo según los datos de cada plataforma."
     )
+    with st.expander("Importar o actualizar el Excel de Segofactoring"):
+        st.caption(
+            "Puedes volver a subir el resumen cuando cambie. La app actualiza las "
+            "operaciones ya importadas, conserva participaciones repetidas y no borra "
+            "proyectos añadidos manualmente."
+        )
+        segofactoring_file = st.file_uploader(
+            "Resumen de operaciones (.xlsx)",
+            type=["xlsx"],
+            key=f"{view_key}_segofactoring_excel",
+        )
+        if segofactoring_file is not None:
+            try:
+                segofactoring_rows = parse_segofactoring_excel(
+                    segofactoring_file.getvalue()
+                )
+            except (ValueError, ImportError) as exc:
+                st.error(str(exc))
+            else:
+                active_rows = segofactoring_rows.loc[
+                    segofactoring_rows["status"] != "Finalizada"
+                ]
+                completed_rows = segofactoring_rows.loc[
+                    segofactoring_rows["status"] == "Finalizada"
+                ]
+                identity_columns = [
+                    "project_name", "start_date", "maturity_date", "invested_amount"
+                ]
+                duplicate_groups = int(
+                    (
+                        segofactoring_rows.groupby(identity_columns, dropna=False).size()
+                        > 1
+                    ).sum()
+                )
+                import_cols = st.columns(4)
+                import_cols[0].metric("Operaciones", len(segofactoring_rows))
+                import_cols[1].metric(
+                    "Capital pendiente",
+                    f"{active_rows['current_value'].sum():,.2f} €",
+                )
+                import_cols[2].metric("Ya cobradas", len(completed_rows))
+                import_cols[3].metric(
+                    "Ganancia neta registrada",
+                    f"{segofactoring_rows['net_profit'].sum():,.2f} €",
+                )
+                if duplicate_groups:
+                    st.info(
+                        f"Hay {duplicate_groups} referencias repetidas. Se conservarán "
+                        "como participaciones independientes, igual que en el Excel."
+                    )
+                st.dataframe(
+                    segofactoring_rows.rename(
+                        columns={
+                            "project_name": "Operación",
+                            "source_status": "Estado original",
+                            "start_date": "Inversión",
+                            "maturity_date": "Vencimiento",
+                            "invested_amount": "Invertido €",
+                            "net_profit": "Ganancia neta €",
+                        }
+                    ).loc[
+                        :,
+                        [
+                            "Operación", "Estado original", "Inversión", "Vencimiento",
+                            "Invertido €", "Ganancia neta €",
+                        ],
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "Invertido €": st.column_config.NumberColumn(format="%.2f €"),
+                        "Ganancia neta €": st.column_config.NumberColumn(format="%+.2f €"),
+                    },
+                )
+                file_is_current = st.checkbox(
+                    "Este archivo está actualizado a hoy",
+                    value=False,
+                    key=f"{view_key}_segofactoring_current",
+                    help=(
+                        "Déjalo desmarcado para un piloto antiguo. La cuenta seguirá "
+                        "indicando que necesita revisión."
+                    ),
+                )
+                if st.button(
+                    "Importar o actualizar estas operaciones",
+                    type="primary",
+                    key=f"{view_key}_import_segofactoring",
+                ):
+                    try:
+                        import_result = import_segofactoring_rows(
+                            journal,
+                            segofactoring_rows,
+                            recorded_by=actor_username,
+                        )
+                        existing_sego = (
+                            accounts.loc[accounts["account_name"] == "Segofactoring"]
+                            if not accounts.empty and "account_name" in accounts.columns
+                            else pd.DataFrame()
+                        )
+                        cash_balance = (
+                            float(existing_sego.iloc[0]["cash_balance"])
+                            if not existing_sego.empty
+                            else 0.0
+                        )
+                        journal.upsert_portfolio_account(
+                            account_name="Segofactoring",
+                            account_type="Inversión alternativa",
+                            investments_value=float(active_rows["current_value"].sum()),
+                            cash_balance=cash_balance,
+                            currency="EUR",
+                            status=(
+                                "Actualizada"
+                                if file_is_current
+                                else "Pendiente de actualizar"
+                            ),
+                            notes=(
+                                f"Excel importado: {len(segofactoring_rows)} operaciones; "
+                                f"{len(active_rows)} pendientes y {len(completed_rows)} cobradas."
+                            ),
+                        )
+                    except (ValueError, JournalStorageError) as exc:
+                        st.error(str(exc))
+                    else:
+                        st.success(
+                            f"Importación terminada: {import_result.created} nuevas y "
+                            f"{import_result.updated} actualizadas."
+                        )
+                        st.rerun()
     if investments.empty:
         st.info("Todavía no has registrado proyectos de estas plataformas.")
     else:
-        invested = float(pd.to_numeric(investments["invested_amount"], errors="coerce").sum())
-        current = float(pd.to_numeric(investments["current_value"], errors="coerce").sum())
-        active = int(investments["status"].isin(["Activa", "Retrasada"]).sum())
+        open_investments = investments.loc[investments["status"] != "Finalizada"].copy()
+        invested = float(
+            pd.to_numeric(open_investments["invested_amount"], errors="coerce").sum()
+        )
+        current = float(
+            pd.to_numeric(open_investments["current_value"], errors="coerce").sum()
+        )
+        active = int(open_investments["status"].isin(["Activa", "Retrasada"]).sum())
+        completed = int((investments["status"] == "Finalizada").sum())
+        expected_values = pd.to_numeric(
+            open_investments["expected_return_pct"], errors="coerce"
+        )
+        forecast_mask = expected_values.notna() & (expected_values != 0)
+        forecast_investments = open_investments.loc[forecast_mask]
+        forecast_invested = float(
+            pd.to_numeric(
+                forecast_investments["invested_amount"], errors="coerce"
+            ).sum()
+        )
         weighted_return = (
             float(
                 (
-                    pd.to_numeric(investments["invested_amount"], errors="coerce")
-                    * pd.to_numeric(investments["expected_return_pct"], errors="coerce")
+                    pd.to_numeric(
+                        forecast_investments["invested_amount"], errors="coerce"
+                    )
+                    * pd.to_numeric(
+                        forecast_investments["expected_return_pct"], errors="coerce"
+                    )
                 ).sum()
-                / invested
+                / forecast_invested
             )
-            if invested > 0
-            else 0.0
+            if forecast_invested > 0
+            else None
         )
         metric_cols = st.columns(4)
-        metric_cols[0].metric("Importe registrado", f"{invested:,.2f} €")
-        metric_cols[1].metric("Valor actual manual", f"{current:,.2f} €")
-        metric_cols[2].metric("Diferencia", f"{current - invested:+,.2f} €")
+        metric_cols[0].metric("Capital abierto", f"{invested:,.2f} €")
+        metric_cols[1].metric("Valor pendiente actual", f"{current:,.2f} €")
+        metric_cols[2].metric("Diferencia abierta", f"{current - invested:+,.2f} €")
         metric_cols[3].metric(
             "Rentabilidad esperada media",
-            f"{weighted_return:.2f}%",
-            help="Media ponderada por el importe inicial; no es una rentabilidad garantizada.",
+            f"{weighted_return:.2f}%" if weighted_return is not None else "N/D",
+            help=(
+                "Media ponderada sólo cuando el proyecto aporta una previsión. "
+                "El resumen de Segofactoring no incluye ese dato."
+            ),
         )
-        st.caption(f"{active} proyectos activos o retrasados.")
+        st.caption(
+            f"{active} proyectos activos o retrasados y {completed} finalizados. "
+            "Los finalizados siguen en el histórico, pero no se cuentan como capital abierto."
+        )
         st.plotly_chart(
             private_investments_chart(investments),
             width="stretch",
