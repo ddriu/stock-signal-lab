@@ -27,6 +27,7 @@ from src.data_loader import (
     TickerSearchResult,
     download_fundamental_snapshot,
     download_prices,
+    resolve_analysis_ticker,
     search_result_market_group,
     search_instruments,
 )
@@ -188,7 +189,13 @@ def apply_section_layout(section: str) -> None:
 
 def parse_tickers(raw_value: str) -> list[str]:
     values = raw_value.replace(";", ",").replace("\n", ",").split(",")
-    return list(dict.fromkeys(value.strip().upper() for value in values if value.strip()))
+    return list(
+        dict.fromkeys(
+            resolve_analysis_ticker(value)
+            for value in values
+            if value.strip()
+        )
+    )
 
 
 def format_pct(value: float) -> str:
@@ -329,19 +336,30 @@ def build_sidebar(
         key="selected_favorite_tickers",
     )
     with st.sidebar.expander("Modo avanzado: ticker exacto"):
-        manual_tickers = parse_tickers(
-            st.text_area(
-                "Símbolos bursátiles",
-                "" if favorite_tickers else "AAPL, MSFT, SAN.MC",
-                height=78,
-                help=(
-                    "Sólo es necesario si el buscador no encuentra la empresa. Ejemplos: "
-                    "SAN.MC (Madrid), 7974.T (Tokio) o KAP.IL (Londres internacional)."
-                ),
-                key="manual_tickers",
-            )
+        manual_value = st.text_area(
+            "Símbolos bursátiles",
+            "" if favorite_tickers else "AAPL, MSFT, SAN.MC",
+            height=78,
+            help=(
+                "Sólo es necesario si el buscador no encuentra la empresa. Ejemplos: "
+                "SAN.MC (Madrid), 7974.T (Tokio) o KAP.IL (Londres internacional)."
+            ),
+            key="manual_tickers",
         )
-    tickers = list(dict.fromkeys([*selected_favorites, *manual_tickers]))
+        manual_tickers = parse_tickers(manual_value)
+        alias_changes = []
+        for value in manual_value.replace(";", ",").replace("\n", ",").split(","):
+            requested = value.strip().upper()
+            if requested:
+                resolved = resolve_analysis_ticker(requested)
+                if requested != resolved:
+                    alias_changes.append(f"{requested} → {resolved}")
+        if alias_changes:
+            st.info("Usaremos la cotización de análisis: " + ", ".join(alias_changes))
+    selected_analysis_tickers = [
+        resolve_analysis_ticker(ticker) for ticker in selected_favorites
+    ]
+    tickers = list(dict.fromkeys([*selected_analysis_tickers, *manual_tickers]))
 
     years = st.sidebar.select_slider(
         "Historial utilizado",
@@ -3207,6 +3225,13 @@ def render_admin_panel(
         journal = create_journal(username)
         operations = journal.list_operations()
         positions = calculate_open_positions(operations)
+        portfolio_snapshot = pd.DataFrame()
+        portfolio_snapshot_summary = None
+        if hasattr(journal, "list_portfolio_snapshot_positions"):
+            stored_portfolio_snapshots = journal.list_portfolio_snapshot_positions()
+            portfolio_snapshot, portfolio_snapshot_summary = latest_portfolio_snapshot(
+                stored_portfolio_snapshots
+            )
         dashboard, kpis = build_position_dashboard(
             operations,
             positions,
@@ -3220,6 +3245,8 @@ def render_admin_panel(
             "positions": positions,
             "dashboard": dashboard,
             "kpis": kpis,
+            "portfolio_snapshot": portfolio_snapshot,
+            "portfolio_snapshot_summary": portfolio_snapshot_summary,
         }
         summary_rows.append(
             {
@@ -3236,12 +3263,25 @@ def render_admin_panel(
                 "Rentabilidad latente": kpis.unrealized_return_pct,
                 "Resultado realizado EUR": kpis.realized_pnl_eur,
                 "Comisiones EUR": kpis.fees_eur,
+                "Fotografía": (
+                    portfolio_snapshot_summary.snapshot_date
+                    if portfolio_snapshot_summary is not None
+                    else "Sin fotografía"
+                ),
+                "Valor fotografía EUR": (
+                    portfolio_snapshot_summary.value_eur
+                    if portfolio_snapshot_summary is not None
+                    else None
+                ),
                 "Última actividad": kpis.latest_activity or "Sin operaciones",
             }
         )
 
     active_users = sum(
-        1 for snapshot in snapshots.values() if len(snapshot["operations"]) > 0
+        1
+        for snapshot in snapshots.values()
+        if len(snapshot["operations"]) > 0
+        or snapshot["portfolio_snapshot_summary"] is not None
     )
     total_operations = sum(
         int(snapshot["kpis"].operations_count) for snapshot in snapshots.values()
@@ -3266,8 +3306,13 @@ def render_admin_panel(
         help=f"Sobre {total_invested:,.2f} EUR de capital pendiente convertible.",
     )
 
-    overview_tab, register_tab, detail_tab = st.tabs(
-        ["Resumen de usuarios", "Añadir posición", "Detalle e historial"]
+    overview_tab, register_tab, import_tab, detail_tab = st.tabs(
+        [
+            "Resumen de usuarios",
+            "Añadir posición",
+            "Importar fotografía",
+            "Detalle e historial",
+        ]
     )
     with overview_tab:
         st.dataframe(
@@ -3281,6 +3326,7 @@ def render_admin_panel(
                 "Rentabilidad latente": st.column_config.NumberColumn(format="%+.2f%%"),
                 "Resultado realizado EUR": st.column_config.NumberColumn(format="%+.2f"),
                 "Comisiones EUR": st.column_config.NumberColumn(format="%.2f"),
+                "Valor fotografía EUR": st.column_config.NumberColumn(format="%.2f"),
             },
         )
         if total_positions and not latest_prices:
@@ -3306,6 +3352,95 @@ def render_admin_panel(
             flash_key="_admin_flash",
             recorded_by=admin_username,
         )
+
+    with import_tab:
+        st.caption(
+            "Carga una valoración de cartera para un usuario sin inventar compras, "
+            "cantidades ni fechas de ejecución. La portada utilizará la fotografía "
+            "más reciente de ese usuario."
+        )
+        selected_import_owner = st.selectbox(
+            "Usuario propietario de la fotografía",
+            usernames,
+            format_func=lambda value: f"{accounts[value].display_name} ({value})",
+            key="admin_snapshot_owner",
+        )
+        snapshot_file = st.file_uploader(
+            "Excel de cartera",
+            type=["xlsx"],
+            key="admin_snapshot_file",
+        )
+        if snapshot_file is not None:
+            try:
+                workbook_snapshot = parse_portfolio_snapshot_excel(
+                    snapshot_file.getvalue()
+                )
+            except (ValueError, ImportError) as exc:
+                st.error(str(exc))
+            else:
+                preview = workbook_snapshot.positions
+                preview_value = float(preview["value_eur"].sum())
+                preview_cost = float(
+                    pd.to_numeric(
+                        preview["cost_estimate_eur"], errors="coerce"
+                    ).sum()
+                )
+                preview_pnl = float(
+                    pd.to_numeric(preview["gain_loss_eur"], errors="coerce").sum()
+                )
+                preview_cols = st.columns(4)
+                preview_cols[0].metric("Fecha", workbook_snapshot.snapshot_date)
+                preview_cols[1].metric("Posiciones", len(preview))
+                preview_cols[2].metric("Valor", f"{preview_value:,.2f} €")
+                preview_cols[3].metric(
+                    "Resultado estimado", f"{preview_pnl:+,.2f} €"
+                )
+                st.caption(f"Coste estimado total: {preview_cost:,.2f} €")
+                st.dataframe(
+                    preview.rename(
+                        columns={
+                            "asset_name": "Activo",
+                            "raw_identifier": "Símbolo original",
+                            "analysis_ticker": "Ticker de análisis",
+                            "value_eur": "Valor €",
+                            "return_pct": "Rentabilidad",
+                        }
+                    ).loc[
+                        :,
+                        [
+                            "Activo",
+                            "Símbolo original",
+                            "Ticker de análisis",
+                            "Valor €",
+                            "Rentabilidad",
+                        ],
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "Valor €": st.column_config.NumberColumn(format="%.2f €"),
+                        "Rentabilidad": st.column_config.NumberColumn(format="%+.2f%%"),
+                    },
+                )
+                if st.button(
+                    f"Guardar para {accounts[selected_import_owner].display_name}",
+                    type="primary",
+                    key="admin_save_snapshot",
+                ):
+                    try:
+                        import_result = import_portfolio_workbook_snapshot(
+                            snapshots[selected_import_owner]["journal"],
+                            workbook_snapshot,
+                            recorded_by=admin_username,
+                        )
+                    except (ValueError, JournalStorageError) as exc:
+                        st.error(str(exc))
+                    else:
+                        st.session_state["_admin_flash"] = (
+                            f"Guardadas {import_result.positions_saved} posiciones "
+                            f"para {accounts[selected_import_owner].display_name}."
+                        )
+                        st.rerun()
 
     with detail_tab:
         selected_detail = st.selectbox(
@@ -3958,9 +4093,9 @@ def _continue_search_in_favorites(
 def _open_ticker_analysis(ticker: str) -> None:
     """Abre una favorita y solicita sus datos sin obligar a volver a escribirla."""
 
-    normalized = ticker.strip().upper()
-    if not normalized:
+    if not ticker.strip():
         return
+    normalized = resolve_analysis_ticker(ticker)
     st.session_state["main_navigation"] = "Analizar"
     st.session_state["analysis_navigation"] = "Oportunidades"
     st.session_state["analysis_ticker"] = normalized
@@ -4066,7 +4201,7 @@ def render_home(
                 stored_snapshots
             )
         except (JournalStorageError, ValueError) as exc:
-            st.warning(f"No se pudo leer la fotografía piloto: {exc}")
+            st.warning(f"No se pudo leer la fotografía de cartera: {exc}")
 
     update_dates = [
         pd.Timestamp(frame.index[-1])
@@ -4183,7 +4318,7 @@ def render_home(
             )
 
     if snapshot_summary is not None:
-        st.markdown("### Mi cartera piloto")
+        st.markdown("### Mi cartera")
         st.caption(
             "Distribución basada en la fotografía guardada, no en cotizaciones en tiempo real. "
             f"{snapshot_summary.analyzable_count} partidas tienen ticker reconocible para análisis."
@@ -5035,12 +5170,27 @@ def main() -> None:
         st.error(f"Configuración inválida: {exc}")
         st.stop()
 
-    pending_analysis_ticker = str(
+    requested_pending_ticker = str(
         st.session_state.get("_pending_analysis_ticker", "")
     ).strip().upper()
-    active_analysis_ticker = str(
+    pending_analysis_ticker = (
+        resolve_analysis_ticker(requested_pending_ticker)
+        if requested_pending_ticker
+        else ""
+    )
+    requested_active_ticker = str(
         st.session_state.get("analysis_ticker", "")
     ).strip().upper()
+    active_analysis_ticker = (
+        resolve_analysis_ticker(requested_active_ticker)
+        if requested_active_ticker
+        else ""
+    )
+    if requested_pending_ticker and requested_pending_ticker != pending_analysis_ticker:
+        st.info(
+            f"{requested_pending_ticker} es el símbolo mostrado por el bróker; "
+            f"el análisis utilizará {pending_analysis_ticker}."
+        )
     if load_clicked or pending_analysis_ticker:
         held_tickers: list[str] = []
         owners_to_load = [authenticated_user.username, GROUP_PORTFOLIO_OWNER]
@@ -5060,7 +5210,11 @@ def main() -> None:
                 )
                 continue
             if not saved_positions.empty:
-                held_tickers.extend(saved_positions["ticker"].astype(str).tolist())
+                held_tickers.extend(
+                    resolve_analysis_ticker(ticker)
+                    for ticker in saved_positions["ticker"].astype(str).tolist()
+                    if ticker.strip()
+                )
         tickers_to_load = analysis_refresh_tickers(
             tickers,
             held_tickers,
