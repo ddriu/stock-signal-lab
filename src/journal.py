@@ -96,6 +96,29 @@ PORTFOLIO_ACCOUNT_COLUMNS = [
 ]
 PORTFOLIO_ACCOUNT_TYPES = ("Bróker", "Inversión alternativa")
 PORTFOLIO_ACCOUNT_STATUSES = ("Pendiente de actualizar", "Actualizada", "Inactiva")
+PORTFOLIO_SNAPSHOT_COLUMNS = [
+    "id",
+    "snapshot_date",
+    "platform",
+    "asset_name",
+    "raw_identifier",
+    "analysis_ticker",
+    "asset_type",
+    "portfolio_block",
+    "quantity",
+    "current_price",
+    "currency",
+    "value_eur",
+    "return_pct",
+    "cost_estimate_eur",
+    "gain_loss_eur",
+    "comments",
+    "source",
+    "notes",
+    "recorded_by",
+    "created_at",
+    "updated_at",
+]
 DEFAULT_DDRIU_ACCOUNTS = (
     ("MyInvestor", "Bróker"),
     ("Trade Republic", "Bróker"),
@@ -339,6 +362,82 @@ def normalize_portfolio_account(
         "notes": notes.strip()[:1_000],
         "updated_at": now,
         "created_at": now,
+    }
+
+
+def normalize_portfolio_snapshot_position(
+    *,
+    snapshot_date: date | datetime | str,
+    platform: str,
+    asset_name: str,
+    raw_identifier: str = "",
+    analysis_ticker: str = "",
+    asset_type: str = "",
+    portfolio_block: str = "",
+    quantity: float | None = None,
+    current_price: float | None = None,
+    currency: str = "EUR",
+    value_eur: float,
+    return_pct: float | None = None,
+    cost_estimate_eur: float | None = None,
+    gain_loss_eur: float | None = None,
+    comments: str = "",
+    source: str = "",
+    notes: str = "",
+) -> dict[str, object]:
+    """Valida una posición de una fotografía, no una operación de compraventa."""
+
+    normalized_platform = platform.strip()
+    normalized_asset = asset_name.strip()
+    if not normalized_platform or not normalized_asset:
+        raise ValueError("La fotografía necesita plataforma y nombre del activo.")
+    if value_eur < 0:
+        raise ValueError("El valor de la posición no puede ser negativo.")
+    for number, label in (
+        (quantity, "cantidad"),
+        (current_price, "precio actual"),
+        (cost_estimate_eur, "coste estimado"),
+    ):
+        if number is not None and pd.notna(number) and float(number) < 0:
+            raise ValueError(f"El {label} no puede ser negativo.")
+    normalized_currency = currency.strip().upper()
+    if len(normalized_currency) != 3:
+        raise ValueError("La moneda debe tener tres letras, por ejemplo EUR o USD.")
+    now = datetime.now().isoformat(timespec="seconds")
+    return {
+        "snapshot_date": pd.Timestamp(snapshot_date).date().isoformat(),
+        "platform": normalized_platform[:100],
+        "asset_name": normalized_asset[:200],
+        "raw_identifier": raw_identifier.strip()[:100],
+        "analysis_ticker": analysis_ticker.strip().upper()[:30],
+        "asset_type": asset_type.strip()[:100],
+        "portfolio_block": portfolio_block.strip()[:100],
+        "quantity": float(quantity) if quantity is not None and pd.notna(quantity) else None,
+        "current_price": (
+            float(current_price)
+            if current_price is not None and pd.notna(current_price)
+            else None
+        ),
+        "currency": normalized_currency,
+        "value_eur": float(value_eur),
+        "return_pct": (
+            float(return_pct) if return_pct is not None and pd.notna(return_pct) else None
+        ),
+        "cost_estimate_eur": (
+            float(cost_estimate_eur)
+            if cost_estimate_eur is not None and pd.notna(cost_estimate_eur)
+            else None
+        ),
+        "gain_loss_eur": (
+            float(gain_loss_eur)
+            if gain_loss_eur is not None and pd.notna(gain_loss_eur)
+            else None
+        ),
+        "comments": comments.strip()[:1_000],
+        "source": source.strip()[:500],
+        "notes": notes.strip()[:1_000],
+        "created_at": now,
+        "updated_at": now,
     }
 
 
@@ -601,6 +700,40 @@ class TradingJournal:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_date TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    asset_name TEXT NOT NULL,
+                    raw_identifier TEXT NOT NULL DEFAULT '',
+                    analysis_ticker TEXT NOT NULL DEFAULT '',
+                    asset_type TEXT NOT NULL DEFAULT '',
+                    portfolio_block TEXT NOT NULL DEFAULT '',
+                    quantity REAL,
+                    current_price REAL,
+                    currency TEXT NOT NULL DEFAULT 'EUR',
+                    value_eur REAL NOT NULL CHECK (value_eur >= 0),
+                    return_pct REAL,
+                    cost_estimate_eur REAL,
+                    gain_loss_eur REAL,
+                    comments TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    recorded_by TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (snapshot_date, platform, asset_name)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS portfolio_snapshots_date_platform_idx
+                ON portfolio_snapshots (snapshot_date DESC, platform, asset_name)
+                """
+            )
 
     def add_operation(
         self,
@@ -800,6 +933,65 @@ class TradingJournal:
                     WHEN 'Segofactoring' THEN 4
                     WHEN 'Civislend' THEN 5
                     ELSE 6 END, account_name
+                """,
+                connection,
+            )
+
+    def upsert_portfolio_snapshot_positions(
+        self,
+        positions: pd.DataFrame,
+        *,
+        recorded_by: str = "",
+    ) -> int:
+        """Guarda una fotografía completa sin convertirla en compraventas."""
+
+        payloads = [
+            normalize_portfolio_snapshot_position(
+                **{
+                    column: getattr(row, column)
+                    for column in PORTFOLIO_SNAPSHOT_COLUMNS
+                    if column
+                    not in {"id", "recorded_by", "created_at", "updated_at"}
+                }
+            )
+            for row in positions.itertuples(index=False)
+        ]
+        columns = [column for column in PORTFOLIO_SNAPSHOT_COLUMNS if column != "id"]
+        with self._connect() as connection:
+            for position in payloads:
+                values = {**position, "recorded_by": recorded_by.strip().lower()}
+                connection.execute(
+                    f"""
+                    INSERT INTO portfolio_snapshots ({', '.join(columns)})
+                    VALUES ({', '.join('?' for _ in columns)})
+                    ON CONFLICT(snapshot_date, platform, asset_name) DO UPDATE SET
+                        raw_identifier = excluded.raw_identifier,
+                        analysis_ticker = excluded.analysis_ticker,
+                        asset_type = excluded.asset_type,
+                        portfolio_block = excluded.portfolio_block,
+                        quantity = excluded.quantity,
+                        current_price = excluded.current_price,
+                        currency = excluded.currency,
+                        value_eur = excluded.value_eur,
+                        return_pct = excluded.return_pct,
+                        cost_estimate_eur = excluded.cost_estimate_eur,
+                        gain_loss_eur = excluded.gain_loss_eur,
+                        comments = excluded.comments,
+                        source = excluded.source,
+                        notes = excluded.notes,
+                        recorded_by = excluded.recorded_by,
+                        updated_at = excluded.updated_at
+                    """,
+                    tuple(values[column] for column in columns),
+                )
+        return len(payloads)
+
+    def list_portfolio_snapshot_positions(self) -> pd.DataFrame:
+        with self._connect() as connection:
+            return pd.read_sql_query(
+                """
+                SELECT * FROM portfolio_snapshots
+                ORDER BY snapshot_date DESC, platform, value_eur DESC, asset_name
                 """,
                 connection,
             )

@@ -283,6 +283,68 @@ def private_investments_chart(investments: pd.DataFrame) -> go.Figure:
     return figure
 
 
+def portfolio_snapshot_allocation_chart(positions: pd.DataFrame) -> go.Figure:
+    """Distribución por plataforma de la última fotografía disponible."""
+
+    summary = (
+        positions.groupby("platform", as_index=False)["value_eur"]
+        .sum()
+        .sort_values("value_eur", ascending=False)
+    )
+    figure = go.Figure(
+        go.Pie(
+            labels=summary["platform"],
+            values=summary["value_eur"],
+            hole=0.55,
+            textinfo="label+percent",
+            hovertemplate="%{label}<br>%{value:,.2f} €<br>%{percent}<extra></extra>",
+        )
+    )
+    figure.update_layout(
+        title="Distribución de la fotografía por plataforma",
+        height=390,
+        template="plotly_white",
+        legend={"orientation": "h", "y": -0.08},
+        margin={"l": 20, "r": 20, "t": 65, "b": 55},
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return figure
+
+
+def portfolio_snapshot_history_chart(positions: pd.DataFrame) -> go.Figure:
+    """Evolución del valor declarado por plataforma entre fotografías."""
+
+    summary = (
+        positions.groupby(["snapshot_date", "platform"], as_index=False)["value_eur"]
+        .sum()
+        .sort_values("snapshot_date")
+    )
+    figure = go.Figure()
+    for platform, group in summary.groupby("platform", sort=True):
+        figure.add_trace(
+            go.Scatter(
+                x=pd.to_datetime(group["snapshot_date"]),
+                y=group["value_eur"],
+                name=str(platform),
+                mode="lines+markers",
+                stackgroup="total",
+                hovertemplate="%{x|%d/%m/%Y}<br>%{y:,.2f} €<extra>%{fullData.name}</extra>",
+            )
+        )
+    figure.update_layout(
+        title="Evolución por fotografías guardadas",
+        height=390,
+        hovermode="x unified",
+        template="plotly_white",
+        legend={"orientation": "h", "y": 1.1},
+        margin={"l": 45, "r": 20, "t": 75, "b": 35},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#FFFFFF",
+        yaxis_title="Valor declarado (€)",
+    )
+    return figure
+
+
 def normalized_comparison_chart(
     normalized_prices: pd.DataFrame,
     *,

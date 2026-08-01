@@ -24,12 +24,14 @@ from src.journal import (
     PRIVATE_INVESTMENT_COLUMNS,
     PRIVATE_INVESTMENT_STATUSES,
     PORTFOLIO_ACCOUNT_COLUMNS,
+    PORTFOLIO_SNAPSHOT_COLUMNS,
     calculate_open_positions,
     normalize_analysis_snapshot,
     normalize_favorite,
     normalize_operation,
     normalize_private_investment,
     normalize_portfolio_account,
+    normalize_portfolio_snapshot_position,
 )
 
 
@@ -53,6 +55,7 @@ class SupabaseTradingJournal:
         analysis_table: str = "analysis_snapshots",
         private_investments_table: str = "private_investments",
         portfolio_accounts_table: str = "portfolio_accounts",
+        portfolio_snapshots_table: str = "portfolio_snapshots",
         timeout: float = 20.0,
     ) -> None:
         normalized_url = url.strip().rstrip("/")
@@ -72,6 +75,8 @@ class SupabaseTradingJournal:
             raise JournalStorageError("El nombre de tabla de inversión privada no es válido.")
         if not portfolio_accounts_table.replace("_", "").isalnum():
             raise JournalStorageError("El nombre de tabla de cuentas no es válido.")
+        if not portfolio_snapshots_table.replace("_", "").isalnum():
+            raise JournalStorageError("El nombre de tabla de fotografías no es válido.")
         self.url = normalized_url
         self.secret_key = secret_key.strip()
         self.owner = owner.strip()
@@ -80,6 +85,7 @@ class SupabaseTradingJournal:
         self.analysis_table = analysis_table
         self.private_investments_table = private_investments_table
         self.portfolio_accounts_table = portfolio_accounts_table
+        self.portfolio_snapshots_table = portfolio_snapshots_table
         self.timeout = timeout
 
     @property
@@ -101,6 +107,10 @@ class SupabaseTradingJournal:
     @property
     def portfolio_accounts_endpoint(self) -> str:
         return f"{self.url}/rest/v1/{self.portfolio_accounts_table}"
+
+    @property
+    def portfolio_snapshots_endpoint(self) -> str:
+        return f"{self.url}/rest/v1/{self.portfolio_snapshots_table}"
 
     @property
     def alert_preferences_endpoint(self) -> str:
@@ -397,6 +407,64 @@ class SupabaseTradingJournal:
             .loc[:, PORTFOLIO_ACCOUNT_COLUMNS]
             .reset_index(drop=True)
         )
+
+    def upsert_portfolio_snapshot_positions(
+        self,
+        positions: pd.DataFrame,
+        *,
+        recorded_by: str = "",
+    ) -> int:
+        payload: list[dict[str, object]] = []
+        for row in positions.itertuples(index=False):
+            normalized = normalize_portfolio_snapshot_position(
+                **{
+                    column: getattr(row, column)
+                    for column in PORTFOLIO_SNAPSHOT_COLUMNS
+                    if column
+                    not in {"id", "recorded_by", "created_at", "updated_at"}
+                }
+            )
+            payload.append(
+                {
+                    "owner": self.owner,
+                    **normalized,
+                    "recorded_by": recorded_by.strip().lower(),
+                }
+            )
+        if not payload:
+            return 0
+        self._request(
+            "POST",
+            endpoint=self.portfolio_snapshots_endpoint,
+            params={"on_conflict": "owner,snapshot_date,platform,asset_name"},
+            json=payload,
+            headers={
+                **self.headers,
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            },
+        )
+        return len(payload)
+
+    def list_portfolio_snapshot_positions(self) -> pd.DataFrame:
+        response = self._request(
+            "GET",
+            endpoint=self.portfolio_snapshots_endpoint,
+            params={
+                "owner": f"eq.{self.owner}",
+                "select": ",".join(PORTFOLIO_SNAPSHOT_COLUMNS),
+                "order": "snapshot_date.desc,platform.asc,value_eur.desc,asset_name.asc",
+            },
+        )
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise JournalStorageError("Supabase devolvió fotografías de cartera inválidas.")
+        if not rows:
+            return pd.DataFrame(columns=PORTFOLIO_SNAPSHOT_COLUMNS)
+        frame = pd.DataFrame(rows)
+        for column in PORTFOLIO_SNAPSHOT_COLUMNS:
+            if column not in frame.columns:
+                frame[column] = None
+        return frame.loc[:, PORTFOLIO_SNAPSHOT_COLUMNS]
 
     def add_favorite(
         self,
