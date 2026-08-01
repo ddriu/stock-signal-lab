@@ -12,6 +12,11 @@ from .recommendations import (
     build_profit_taking_plan,
     historical_forward_return_study,
 )
+from .return_calibration import (
+    ReturnCalibrationResult,
+    annual_rate_to_horizon_return,
+    calibrate_score_returns,
+)
 from .signal_engine import SignalResult, evaluate_latest_signal
 
 __all__ = [
@@ -20,10 +25,13 @@ __all__ = [
     "FundamentalResult",
     "ForwardReturnStudy",
     "OpportunityResult",
+    "ReturnCalibrationResult",
     "SignalResult",
     "add_indicators",
+    "annual_rate_to_horizon_return",
     "build_entry_guide",
     "build_profit_taking_plan",
+    "calibrate_score_returns",
     "combine_opportunity",
     "download_prices",
     "download_fundamental_snapshot",

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
 from io import StringIO
+from urllib.parse import quote
 
 import pandas as pd
 import requests
@@ -19,6 +20,7 @@ from src.data_sources import (
 
 REQUIRED_COLUMNS = ("open", "high", "low", "close", "volume")
 STOOQ_DAILY_URL = "https://stooq.com/q/d/l/"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 STOOQ_SUFFIXES = {
     "AS": "NL",
     "L": "UK",
@@ -26,6 +28,7 @@ STOOQ_SUFFIXES = {
     "MI": "IT",
     "PA": "FR",
     "SW": "CH",
+    "T": "JP",
     "TO": "CA",
 }
 STOOQ_INDEX_SYMBOLS = {
@@ -182,6 +185,30 @@ _CURATED_INTERNATIONAL_LISTINGS: tuple[tuple[tuple[str, ...], TickerSearchResult
         TickerSearchResult(
             ticker="NTDOY",
             name="Nintendo Co., Ltd.",
+            exchange="OTC",
+            instrument_type="Acción",
+            country="Estados Unidos",
+            currency="USD",
+            listing_type="ADR / OTC",
+        ),
+    ),
+    (
+        ("bae systems", "bae systems plc", "british aerospace", "ba.l", "ba.ln"),
+        TickerSearchResult(
+            ticker="BA.L",
+            name="BAE Systems plc",
+            exchange="London Stock Exchange",
+            instrument_type="Acción",
+            country="Reino Unido",
+            currency="GBP",
+            listing_type="Acción local",
+        ),
+    ),
+    (
+        ("bae systems", "bae systems plc", "british aerospace", "baesy"),
+        TickerSearchResult(
+            ticker="BAESY",
+            name="BAE Systems plc",
             exchange="OTC",
             instrument_type="Acción",
             country="Estados Unidos",
@@ -347,6 +374,77 @@ def _download_stooq_prices(
     return frame
 
 
+def _download_yahoo_chart_prices(
+    symbol: str,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    *,
+    auto_adjust: bool,
+) -> pd.DataFrame:
+    """Consulta el endpoint de gráficos de Yahoo sin depender de cookies.
+
+    ``yfinance.download`` es la vía principal. Esta segunda ruta resulta útil
+    cuando la negociación de cookies de Yahoo falla, algo más frecuente en
+    servidores compartidos, y conserva la cotización solicitada sin sustituirla
+    silenciosamente por un ADR en otra moneda.
+    """
+
+    start_utc = start_ts.tz_localize("UTC")
+    end_utc = (end_ts + timedelta(days=1)).tz_localize("UTC")
+    try:
+        response = requests.get(
+            YAHOO_CHART_URL.format(symbol=quote(symbol, safe="")),
+            params={
+                "period1": int(start_utc.timestamp()),
+                "period2": int(end_utc.timestamp()),
+                "interval": "1d",
+                "events": "div,splits,capitalGains",
+                "includeAdjustedClose": "true",
+            },
+            headers={"User-Agent": "Mozilla/5.0 stock-signal-lab/1.0"},
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        chart = payload.get("chart") if isinstance(payload, dict) else None
+        result = (chart or {}).get("result")
+        if not isinstance(result, list) or not result:
+            description = ((chart or {}).get("error") or {}).get("description")
+            raise ValueError(description or "respuesta sin series de precios")
+        series = result[0]
+        timestamps = series.get("timestamp") or []
+        indicators = series.get("indicators") or {}
+        quotes = indicators.get("quote") or []
+        if not timestamps or not quotes:
+            raise ValueError("respuesta sin sesiones de mercado")
+        quote_values = quotes[0]
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(timestamps, unit="s", utc=True).tz_localize(None),
+                "Open": quote_values.get("open"),
+                "High": quote_values.get("high"),
+                "Low": quote_values.get("low"),
+                "Close": quote_values.get("close"),
+                "Volume": quote_values.get("volume"),
+            }
+        ).set_index("Date")
+
+        adjusted = indicators.get("adjclose") or []
+        adjusted_values = adjusted[0].get("adjclose") if adjusted else None
+        if auto_adjust and adjusted_values is not None:
+            adjusted_close = pd.Series(adjusted_values, index=frame.index, dtype=float)
+            ratio = adjusted_close.div(frame["Close"]).replace([float("inf"), float("-inf")], pd.NA)
+            ratio = ratio.fillna(1.0)
+            for column in ("Open", "High", "Low", "Close"):
+                frame[column] = pd.to_numeric(frame[column], errors="coerce") * ratio
+        frame.attrs["provider"] = "Yahoo Finance (conexión directa)"
+        return frame
+    except (requests.RequestException, AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise DataDownloadError(
+            f"Yahoo directo no encontró precios para {symbol}: {exc}"
+        ) from exc
+
+
 def download_prices(
     ticker: str,
     start: date | str,
@@ -381,6 +479,18 @@ def download_prices(
         frame = pd.DataFrame()
         yahoo_error = str(exc)
 
+    direct_error = ""
+    if frame.empty:
+        try:
+            frame = _download_yahoo_chart_prices(
+                symbol,
+                start_ts,
+                end_ts,
+                auto_adjust=auto_adjust,
+            )
+        except DataDownloadError as exc:
+            direct_error = str(exc)
+
     if frame.empty:
         try:
             frame = _download_stooq_prices(symbol, start_ts, end_ts)
@@ -392,7 +502,7 @@ def download_prices(
             )
             raise DataDownloadError(
                 f"No se encontraron precios para {symbol} en ese intervalo."
-                f"{detail} {exc}"
+                f"{detail} {direct_error}. {exc}"
             ) from exc
 
     if isinstance(frame.columns, pd.MultiIndex):

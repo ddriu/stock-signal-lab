@@ -146,6 +146,42 @@ def backtest_chart(curve: pd.DataFrame) -> go.Figure:
     return figure
 
 
+def return_calibration_chart(summary: pd.DataFrame) -> go.Figure:
+    """Compara frecuencias históricas positivas y de superación de objetivos."""
+
+    figure = go.Figure()
+    visible = summary.loc[
+        ~summary["score_tier"].astype(str).str.startswith("Todas las")
+    ].copy()
+    for column, name, color in (
+        ("positive_rate_pct", "Terminó en positivo", COLORS["medium"]),
+        ("beat_sego_rate_pct", "Superó Segofactoring", COLORS["short"]),
+        ("beat_civislend_rate_pct", "Superó Civislend", COLORS["positive"]),
+    ):
+        figure.add_trace(
+            go.Bar(
+                x=visible["score_tier"],
+                y=visible[column],
+                name=name,
+                marker_color=color,
+                text=visible[column].map(lambda value: f"{value:.1f}%"),
+                textposition="outside",
+            )
+        )
+    figure.update_layout(
+        title="Qué ocurrió después de las señales históricas",
+        barmode="group",
+        height=430,
+        template="plotly_white",
+        yaxis={"title": "Frecuencia histórica", "range": [0, 105], "ticksuffix": "%"},
+        legend={"orientation": "h", "y": 1.14},
+        margin={"l": 45, "r": 20, "t": 95, "b": 55},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#FFFFFF",
+    )
+    return figure
+
+
 def portfolio_evolution_chart(history: pd.DataFrame) -> go.Figure:
     """Compara valor de mercado, dinero neto aportado y resultado acumulado."""
 
