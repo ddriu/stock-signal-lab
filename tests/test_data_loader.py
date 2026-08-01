@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import pandas as pd
 
@@ -10,9 +11,15 @@ from src import data_loader
 @dataclass
 class FakeResponse:
     text: str
+    payload: dict[str, Any] | None = None
 
     def raise_for_status(self) -> None:
         return None
+
+    def json(self) -> dict[str, Any]:
+        if self.payload is None:
+            raise ValueError("No es JSON")
+        return self.payload
 
 
 def test_download_prices_uses_stooq_when_yahoo_is_empty(monkeypatch) -> None:
@@ -39,7 +46,46 @@ def test_download_prices_uses_stooq_when_yahoo_is_empty(monkeypatch) -> None:
 def test_stooq_symbol_translates_common_markets() -> None:
     assert data_loader._stooq_symbol("AAPL") == "AAPL.US"
     assert data_loader._stooq_symbol("SAN.MC") == "SAN.ES"
+    assert data_loader._stooq_symbol("7974.T") == "7974.JP"
     assert data_loader._stooq_symbol("^GSPC") == "^SPX"
+
+
+def test_download_prices_uses_direct_yahoo_chart_before_stooq(monkeypatch) -> None:
+    monkeypatch.setattr(data_loader.yf, "download", lambda *args, **kwargs: pd.DataFrame())
+    payload = {
+        "chart": {
+            "result": [
+                {
+                    "timestamp": [1735776000, 1735862400],
+                    "indicators": {
+                        "quote": [
+                            {
+                                "open": [100.0, 102.0],
+                                "high": [104.0, 105.0],
+                                "low": [99.0, 101.0],
+                                "close": [103.0, 104.0],
+                                "volume": [1_200_000, 900_000],
+                            }
+                        ],
+                        "adjclose": [{"adjclose": [101.0, 104.0]}],
+                    },
+                }
+            ],
+            "error": None,
+        }
+    }
+    monkeypatch.setattr(
+        data_loader.requests,
+        "get",
+        lambda url, **kwargs: FakeResponse("", payload=payload),
+    )
+
+    frame = data_loader.download_prices("7974.T", "2025-01-01", "2025-01-04")
+
+    assert len(frame) == 2
+    assert frame.attrs["ticker"] == "7974.T"
+    assert frame.attrs["provider"] == "Yahoo Finance (conexión directa)"
+    assert frame["close"].tolist() == [101.0, 104.0]
 
 
 def test_search_instruments_returns_only_stocks_and_etfs(monkeypatch) -> None:
@@ -113,4 +159,18 @@ def test_curated_international_search_survives_yahoo_failure(monkeypatch) -> Non
 
     assert [result.ticker for result in results] == ["7974.T", "NTDOY"]
     assert results[0].country == "Japón"
+    assert results[1].listing_type == "ADR / OTC"
+
+
+def test_curated_bae_systems_search_survives_yahoo_failure(monkeypatch) -> None:
+    class FailingSearch:
+        def __init__(self, *args, **kwargs) -> None:
+            raise RuntimeError("Yahoo temporalmente no disponible")
+
+    monkeypatch.setattr(data_loader.yf, "Search", FailingSearch)
+
+    results = data_loader.search_instruments("BAE Systems plc")
+
+    assert [result.ticker for result in results] == ["BA.L", "BAESY"]
+    assert results[0].country == "Reino Unido"
     assert results[1].listing_type == "ADR / OTC"
