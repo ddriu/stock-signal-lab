@@ -66,6 +66,22 @@ ANALYSIS_SNAPSHOT_COLUMNS = [
     "note",
     "created_at",
 ]
+PRIVATE_INVESTMENT_COLUMNS = [
+    "id",
+    "platform",
+    "project_name",
+    "invested_amount",
+    "current_value",
+    "expected_return_pct",
+    "start_date",
+    "maturity_date",
+    "status",
+    "notes",
+    "recorded_by",
+    "created_at",
+]
+PRIVATE_INVESTMENT_PLATFORMS = ("Civislend", "Segofactoring")
+PRIVATE_INVESTMENT_STATUSES = ("Activa", "Finalizada", "Retrasada", "Impagada")
 MAX_FAVORITES = 300
 
 
@@ -212,6 +228,57 @@ def normalize_analysis_snapshot(
         "sector": sector.strip(),
         "explanation": explanation.strip(),
         "note": note.strip()[:1_000],
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def normalize_private_investment(
+    *,
+    platform: str,
+    project_name: str,
+    invested_amount: float,
+    current_value: float,
+    expected_return_pct: float,
+    start_date: date | datetime | str,
+    maturity_date: date | datetime | str | None = None,
+    status: str = "Activa",
+    notes: str = "",
+) -> dict[str, object]:
+    """Valida una inversión manual de Civislend o Segofactoring."""
+
+    normalized_platform = platform.strip()
+    if normalized_platform not in PRIVATE_INVESTMENT_PLATFORMS:
+        raise ValueError("La plataforma debe ser Civislend o Segofactoring.")
+    normalized_project = project_name.strip()
+    if not normalized_project:
+        raise ValueError("Indica el nombre o referencia del proyecto.")
+    if invested_amount <= 0:
+        raise ValueError("El importe invertido debe ser positivo.")
+    if current_value < 0:
+        raise ValueError("El valor actual no puede ser negativo.")
+    if not -100 <= expected_return_pct <= 1_000:
+        raise ValueError("La rentabilidad esperada debe estar entre -100% y 1.000%.")
+    if status not in PRIVATE_INVESTMENT_STATUSES:
+        raise ValueError("El estado de la inversión no es válido.")
+
+    normalized_start = pd.Timestamp(start_date)
+    normalized_maturity = (
+        pd.Timestamp(maturity_date) if maturity_date not in (None, "") else None
+    )
+    if normalized_maturity is not None and normalized_maturity < normalized_start:
+        raise ValueError("El vencimiento no puede ser anterior a la inversión.")
+    return {
+        "platform": normalized_platform,
+        "project_name": normalized_project[:200],
+        "invested_amount": float(invested_amount),
+        "current_value": float(current_value),
+        "expected_return_pct": float(expected_return_pct),
+        "start_date": normalized_start.isoformat(),
+        "maturity_date": (
+            normalized_maturity.isoformat() if normalized_maturity is not None else None
+        ),
+        "status": status,
+        "notes": notes.strip()[:1_000],
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -436,6 +503,26 @@ class TradingJournal:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS private_investments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    platform TEXT NOT NULL
+                        CHECK (platform IN ('Civislend', 'Segofactoring')),
+                    project_name TEXT NOT NULL,
+                    invested_amount REAL NOT NULL CHECK (invested_amount > 0),
+                    current_value REAL NOT NULL CHECK (current_value >= 0),
+                    expected_return_pct REAL NOT NULL DEFAULT 0,
+                    start_date TEXT NOT NULL,
+                    maturity_date TEXT,
+                    status TEXT NOT NULL DEFAULT 'Activa'
+                        CHECK (status IN ('Activa', 'Finalizada', 'Retrasada', 'Impagada')),
+                    notes TEXT NOT NULL DEFAULT '',
+                    recorded_by TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
 
     def add_operation(
         self,
@@ -502,6 +589,82 @@ class TradingJournal:
     def delete_operation(self, operation_id: int) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM operations WHERE id = ?", (int(operation_id),))
+
+    def add_private_investment(
+        self,
+        *,
+        platform: str,
+        project_name: str,
+        invested_amount: float,
+        current_value: float,
+        expected_return_pct: float,
+        start_date: date | datetime | str,
+        maturity_date: date | datetime | str | None = None,
+        status: str = "Activa",
+        notes: str = "",
+        recorded_by: str = "",
+    ) -> int:
+        investment = normalize_private_investment(
+            platform=platform,
+            project_name=project_name,
+            invested_amount=invested_amount,
+            current_value=current_value,
+            expected_return_pct=expected_return_pct,
+            start_date=start_date,
+            maturity_date=maturity_date,
+            status=status,
+            notes=notes,
+        )
+        columns = [column for column in PRIVATE_INVESTMENT_COLUMNS if column != "id"]
+        values = {**investment, "recorded_by": recorded_by.strip().lower()}
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"INSERT INTO private_investments ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                tuple(values[column] for column in columns),
+            )
+            return int(cursor.lastrowid)
+
+    def list_private_investments(self) -> pd.DataFrame:
+        with self._connect() as connection:
+            return pd.read_sql_query(
+                """
+                SELECT * FROM private_investments
+                ORDER BY start_date DESC, id DESC
+                """,
+                connection,
+            )
+
+    def update_private_investment(
+        self,
+        investment_id: int,
+        *,
+        current_value: float,
+        status: str,
+        notes: str,
+    ) -> None:
+        if current_value < 0:
+            raise ValueError("El valor actual no puede ser negativo.")
+        if status not in PRIVATE_INVESTMENT_STATUSES:
+            raise ValueError("El estado de la inversión no es válido.")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE private_investments
+                SET current_value = ?, status = ?, notes = ?
+                WHERE id = ?
+                """,
+                (float(current_value), status, notes.strip()[:1_000], int(investment_id)),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("La inversión privada no existe.")
+
+    def delete_private_investment(self, investment_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM private_investments WHERE id = ?",
+                (int(investment_id),),
+            )
 
     def add_favorite(
         self,

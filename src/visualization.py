@@ -146,6 +146,142 @@ def backtest_chart(curve: pd.DataFrame) -> go.Figure:
     return figure
 
 
+def portfolio_evolution_chart(history: pd.DataFrame) -> go.Figure:
+    """Compara valor de mercado, dinero neto aportado y resultado acumulado."""
+
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=history.index,
+            y=history["market_value_eur"],
+            name="Valor de la cartera",
+            mode="lines",
+            line={"color": COLORS["positive"], "width": 2.6},
+            fill="tozeroy",
+            fillcolor="rgba(32, 201, 151, 0.10)",
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=history.index,
+            y=history["net_contributions_eur"],
+            name="Dinero neto aportado",
+            mode="lines",
+            line={"color": COLORS["medium"], "width": 2, "dash": "dash"},
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=history.index,
+            y=history["accumulated_result_eur"],
+            name="Resultado acumulado",
+            mode="lines",
+            line={"color": COLORS["short"], "width": 1.8},
+        )
+    )
+    figure.add_hline(y=0, line_dash="dot", line_color=COLORS["muted"])
+    figure.update_layout(
+        title="Cómo ha evolucionado la cartera",
+        height=470,
+        hovermode="x unified",
+        template="plotly_white",
+        legend={"orientation": "h", "y": 1.08},
+        margin={"l": 45, "r": 20, "t": 75, "b": 35},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#FFFFFF",
+        yaxis_title="Euros estimados",
+    )
+    return figure
+
+
+def annual_portfolio_chart(annual: pd.DataFrame) -> go.Figure:
+    """Resume la actividad anual y el valor alcanzado al cierre."""
+
+    figure = make_subplots(specs=[[{"secondary_y": True}]])
+    figure.add_trace(
+        go.Bar(
+            x=annual["Año"],
+            y=annual["Compras EUR"],
+            name="Compras",
+            marker_color=COLORS["medium"],
+        ),
+        secondary_y=False,
+    )
+    figure.add_trace(
+        go.Bar(
+            x=annual["Año"],
+            y=annual["Ventas EUR"],
+            name="Ventas",
+            marker_color=COLORS["positive"],
+        ),
+        secondary_y=False,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=annual["Año"],
+            y=annual["Valor al cierre EUR"],
+            name="Valor al cierre",
+            mode="lines+markers",
+            line={"color": COLORS["price"], "width": 2.6},
+        ),
+        secondary_y=True,
+    )
+    figure.update_layout(
+        title="Compras, ventas y valor al cierre de cada año",
+        barmode="group",
+        height=430,
+        hovermode="x unified",
+        template="plotly_white",
+        legend={"orientation": "h", "y": 1.09},
+        margin={"l": 45, "r": 45, "t": 75, "b": 35},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#FFFFFF",
+    )
+    figure.update_yaxes(title_text="Movimientos (€)", secondary_y=False)
+    figure.update_yaxes(title_text="Valor (€)", secondary_y=True)
+    return figure
+
+
+def private_investments_chart(investments: pd.DataFrame) -> go.Figure:
+    """Compara importe invertido y valor manual actual por plataforma."""
+
+    summary = (
+        investments.groupby("platform")[["invested_amount", "current_value"]]
+        .sum()
+        .reset_index()
+    )
+    figure = go.Figure()
+    figure.add_trace(
+        go.Bar(
+            x=summary["platform"],
+            y=summary["invested_amount"],
+            name="Invertido",
+            marker_color=COLORS["medium"],
+        )
+    )
+    figure.add_trace(
+        go.Bar(
+            x=summary["platform"],
+            y=summary["current_value"],
+            name="Valor actual manual",
+            marker_color=COLORS["positive"],
+        )
+    )
+    figure.update_layout(
+        title="Civislend y Segofactoring",
+        barmode="group",
+        height=370,
+        hovermode="x unified",
+        template="plotly_white",
+        legend={"orientation": "h", "y": 1.1},
+        margin={"l": 45, "r": 20, "t": 75, "b": 35},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#FFFFFF",
+        yaxis_title="Euros",
+    )
+    return figure
+
+
 def normalized_comparison_chart(
     normalized_prices: pd.DataFrame,
     *,

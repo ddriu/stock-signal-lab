@@ -21,10 +21,13 @@ from src.journal import (
     FAVORITE_COLUMNS,
     MAX_FAVORITES,
     OPERATION_COLUMNS,
+    PRIVATE_INVESTMENT_COLUMNS,
+    PRIVATE_INVESTMENT_STATUSES,
     calculate_open_positions,
     normalize_analysis_snapshot,
     normalize_favorite,
     normalize_operation,
+    normalize_private_investment,
 )
 
 
@@ -46,6 +49,7 @@ class SupabaseTradingJournal:
         table: str = "operations",
         favorites_table: str = "favorites",
         analysis_table: str = "analysis_snapshots",
+        private_investments_table: str = "private_investments",
         timeout: float = 20.0,
     ) -> None:
         normalized_url = url.strip().rstrip("/")
@@ -61,12 +65,15 @@ class SupabaseTradingJournal:
             raise JournalStorageError("El nombre de tabla de favoritos no es válido.")
         if not analysis_table.replace("_", "").isalnum():
             raise JournalStorageError("El nombre de tabla de análisis no es válido.")
+        if not private_investments_table.replace("_", "").isalnum():
+            raise JournalStorageError("El nombre de tabla de inversión privada no es válido.")
         self.url = normalized_url
         self.secret_key = secret_key.strip()
         self.owner = owner.strip()
         self.table = table
         self.favorites_table = favorites_table
         self.analysis_table = analysis_table
+        self.private_investments_table = private_investments_table
         self.timeout = timeout
 
     @property
@@ -80,6 +87,10 @@ class SupabaseTradingJournal:
     @property
     def analysis_endpoint(self) -> str:
         return f"{self.url}/rest/v1/{self.analysis_table}"
+
+    @property
+    def private_investments_endpoint(self) -> str:
+        return f"{self.url}/rest/v1/{self.private_investments_table}"
 
     @property
     def alert_preferences_endpoint(self) -> str:
@@ -213,6 +224,99 @@ class SupabaseTradingJournal:
                 "id": f"eq.{int(operation_id)}",
                 "owner": f"eq.{self.owner}",
             },
+        )
+
+    def add_private_investment(
+        self,
+        *,
+        platform: str,
+        project_name: str,
+        invested_amount: float,
+        current_value: float,
+        expected_return_pct: float,
+        start_date: date | datetime | str,
+        maturity_date: date | datetime | str | None = None,
+        status: str = "Activa",
+        notes: str = "",
+        recorded_by: str = "",
+    ) -> int:
+        investment = normalize_private_investment(
+            platform=platform,
+            project_name=project_name,
+            invested_amount=invested_amount,
+            current_value=current_value,
+            expected_return_pct=expected_return_pct,
+            start_date=start_date,
+            maturity_date=maturity_date,
+            status=status,
+            notes=notes,
+        )
+        response = self._request(
+            "POST",
+            endpoint=self.private_investments_endpoint,
+            json={
+                "owner": self.owner,
+                **investment,
+                "recorded_by": recorded_by.strip().lower(),
+            },
+            headers={**self.headers, "Prefer": "return=representation"},
+        )
+        rows = response.json()
+        if not isinstance(rows, list) or not rows or "id" not in rows[0]:
+            raise JournalStorageError(
+                "Supabase guardó una inversión privada con respuesta inesperada."
+            )
+        return int(rows[0]["id"])
+
+    def list_private_investments(self) -> pd.DataFrame:
+        response = self._request(
+            "GET",
+            endpoint=self.private_investments_endpoint,
+            params={
+                "owner": f"eq.{self.owner}",
+                "select": ",".join(PRIVATE_INVESTMENT_COLUMNS),
+                "order": "start_date.desc,id.desc",
+            },
+        )
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise JournalStorageError("Supabase devolvió inversiones privadas inválidas.")
+        if not rows:
+            return pd.DataFrame(columns=PRIVATE_INVESTMENT_COLUMNS)
+        frame = pd.DataFrame(rows)
+        for column in PRIVATE_INVESTMENT_COLUMNS:
+            if column not in frame.columns:
+                frame[column] = None
+        return frame.loc[:, PRIVATE_INVESTMENT_COLUMNS]
+
+    def update_private_investment(
+        self,
+        investment_id: int,
+        *,
+        current_value: float,
+        status: str,
+        notes: str,
+    ) -> None:
+        if current_value < 0:
+            raise ValueError("El valor actual no puede ser negativo.")
+        if status not in PRIVATE_INVESTMENT_STATUSES:
+            raise ValueError("El estado de la inversión no es válido.")
+        self._request(
+            "PATCH",
+            endpoint=self.private_investments_endpoint,
+            params={"id": f"eq.{int(investment_id)}", "owner": f"eq.{self.owner}"},
+            json={
+                "current_value": float(current_value),
+                "status": status,
+                "notes": notes.strip()[:1_000],
+            },
+        )
+
+    def delete_private_investment(self, investment_id: int) -> None:
+        self._request(
+            "DELETE",
+            endpoint=self.private_investments_endpoint,
+            params={"id": f"eq.{int(investment_id)}", "owner": f"eq.{self.owner}"},
         )
 
     def add_favorite(
