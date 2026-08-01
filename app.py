@@ -87,6 +87,11 @@ from src.recommendations import (
     build_profit_taking_plan,
     historical_forward_return_study,
 )
+from src.return_calibration import (
+    MINIMUM_RELIABLE_SAMPLES,
+    calibrate_score_returns,
+    calibration_for_score,
+)
 from src.risk import calculate_position_plan
 from src.sector_comparison import HORIZON_SESSIONS, compare_sector
 from src.segofactoring_import import (
@@ -112,6 +117,7 @@ from src.visualization import (
     portfolio_snapshot_history_chart,
     price_chart,
     private_investments_chart,
+    return_calibration_chart,
     risk_return_chart,
 )
 
@@ -1424,6 +1430,314 @@ def render_backtest(ticker: str, frame: pd.DataFrame, strategy: StrategyConfig, 
             file_name=f"backtest_{ticker}.csv",
             mime="text/csv",
         )
+
+
+def render_long_horizon_calibration(
+    prepared: dict[str, pd.DataFrame],
+    summary: list[dict[str, object]],
+    settings: BacktestConfig,
+    fundamental_results: dict[str, FundamentalResult],
+) -> None:
+    """Traduce las señales históricas a objetivos de rentabilidad de 30+ días."""
+
+    st.subheader("Objetivo de rentabilidad a 30 días o más")
+    st.write(
+        "Esta prueba no intenta ganar en una operación rápida. Simula una compra en "
+        "la apertura posterior a cada nueva señal y mantiene la inversión durante todo "
+        "el periodo elegido. Después compara el resultado neto con Segofactoring y "
+        "Civislend en el mismo número de días."
+    )
+    if not prepared:
+        st.info(
+            "Selecciona tus favoritas, elige al menos cinco años de historial y pulsa "
+            "«Actualizar análisis». Cuantas más empresas válidas, mejor será la muestra."
+        )
+        return
+
+    horizon_options = {
+        "≈ 30 días · 21 sesiones": 21,
+        "≈ 2 meses · 42 sesiones": 42,
+        "≈ 3 meses · 63 sesiones": 63,
+        "≈ 6 meses · 126 sesiones": 126,
+        "≈ 12 meses · 252 sesiones": 252,
+    }
+    control_a, control_b, control_c, control_d = st.columns(4)
+    horizon_label = control_a.selectbox(
+        "Tiempo mínimo invertido",
+        list(horizon_options),
+        index=0,
+        key="calibration_horizon",
+    )
+    sego_rate = control_b.number_input(
+        "Segofactoring anual (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=5.5,
+        step=0.5,
+        key="calibration_sego_rate",
+        help="Rentabilidad anual media utilizada como referencia, no como garantía.",
+    )
+    civislend_rate = control_c.number_input(
+        "Civislend anual (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=10.5,
+        step=0.5,
+        key="calibration_civislend_rate",
+        help="Rentabilidad anual media utilizada como referencia, no como garantía.",
+    )
+    default_position = min(max(float(settings.initial_capital) / 10.0, 100.0), 5_000.0)
+    position_value = control_d.number_input(
+        "Importe simulado por empresa",
+        min_value=10.0,
+        value=float(default_position),
+        step=100.0,
+        key="calibration_position_value",
+        help="Sirve para calcular el peso real de las comisiones fijas.",
+    )
+
+    try:
+        result = calibrate_score_returns(
+            prepared,
+            horizon_sessions=horizon_options[horizon_label],
+            sego_annual_rate_pct=float(sego_rate),
+            civislend_annual_rate_pct=float(civislend_rate),
+            position_value=float(position_value),
+            fee_per_order=1.0,
+            slippage_pct=float(settings.slippage_pct),
+            minimum_samples=MINIMUM_RELIABLE_SAMPLES,
+        )
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+
+    target_cols = st.columns(4)
+    target_cols[0].metric("Horizonte", f"{result.horizon_sessions} sesiones")
+    target_cols[1].metric(
+        "Meta Segofactoring equivalente",
+        format_pct(result.sego_target_return_pct),
+    )
+    target_cols[2].metric(
+        "Meta Civislend equivalente",
+        format_pct(result.civislend_target_return_pct),
+    )
+    target_cols[3].metric(
+        "Coste fijo simulado",
+        "2,00 €",
+        help="1 € en la compra y 1 € en la venta, además del deslizamiento configurado.",
+    )
+    st.caption(
+        "Las metas se convierten desde una tasa anual compuesta al mismo horizonte. "
+        "Así no se compara erróneamente un mes de bolsa con un año completo de una "
+        "inversión alternativa."
+    )
+
+    if result.events.empty:
+        st.warning(
+            "No existen señales completas con tiempo posterior suficiente. Amplía el "
+            "historial o carga más empresas."
+        )
+        return
+
+    aggregate = result.by_score.loc[
+        result.by_score["score_tier"] == "Todas las entradas · 65+"
+    ].iloc[0]
+    result_cols = st.columns(5)
+    result_cols[0].metric("Señales estudiadas", int(aggregate["samples"]))
+    result_cols[1].metric(
+        "Rentabilidad mediana neta",
+        format_pct(float(aggregate["median_net_return_pct"])),
+    )
+    result_cols[2].metric(
+        "Terminó en positivo",
+        f"{float(aggregate['positive_rate_pct']):.1f}%",
+    )
+    result_cols[3].metric(
+        "Superó Segofactoring",
+        f"{float(aggregate['beat_sego_rate_pct']):.1f}%",
+    )
+    result_cols[4].metric(
+        "Superó Civislend",
+        f"{float(aggregate['beat_civislend_rate_pct']):.1f}%",
+    )
+    if int(aggregate["samples"]) < MINIMUM_RELIABLE_SAMPLES:
+        st.warning(
+            f"Sólo hay {int(aggregate['samples'])} casos. La cifra todavía es orientativa; "
+            f"se necesitan al menos {MINIMUM_RELIABLE_SAMPLES} señales no solapadas."
+        )
+    else:
+        st.info(
+            "La frecuencia de superar Civislend tiene un intervalo de incertidumbre del "
+            f"95% entre {float(aggregate['beat_civislend_ci_low_pct']):.1f}% y "
+            f"{float(aggregate['beat_civislend_ci_high_pct']):.1f}%. No es una garantía."
+        )
+
+    st.plotly_chart(
+        return_calibration_chart(result.by_score),
+        width="stretch",
+        config=PLOTLY_CONFIG,
+    )
+    visible_calibration = result.by_score.rename(
+        columns={
+            "score_tier": "Nivel de entrada",
+            "samples": "Casos",
+            "enough_evidence": "30+ casos",
+            "median_net_return_pct": "Mediana neta",
+            "positive_rate_pct": "Positivos",
+            "beat_sego_rate_pct": "Supera Sego",
+            "beat_civislend_rate_pct": "Supera Civislend",
+            "lower_quartile_pct": "Cuartil débil",
+            "upper_quartile_pct": "Cuartil favorable",
+            "median_drawdown_pct": "Caída mediana",
+            "worst_decile_drawdown_pct": "Caída del 10% peor",
+        }
+    )
+    visible_calibration["30+ casos"] = visible_calibration["30+ casos"].map(
+        {True: "Sí", False: "Todavía no"}
+    )
+    st.dataframe(
+        visible_calibration.loc[
+            :,
+            [
+                "Nivel de entrada",
+                "Casos",
+                "30+ casos",
+                "Mediana neta",
+                "Positivos",
+                "Supera Sego",
+                "Supera Civislend",
+                "Cuartil débil",
+                "Cuartil favorable",
+                "Caída mediana",
+                "Caída del 10% peor",
+            ],
+        ],
+        width="stretch",
+        hide_index=True,
+        column_config={
+            column: st.column_config.NumberColumn(format="%+.1f%%")
+            for column in [
+                "Mediana neta",
+                "Cuartil débil",
+                "Cuartil favorable",
+                "Caída mediana",
+                "Caída del 10% peor",
+            ]
+        }
+        | {
+            column: st.column_config.NumberColumn(format="%.1f%%")
+            for column in ["Positivos", "Supera Sego", "Supera Civislend"]
+        },
+    )
+
+    current_rows: list[dict[str, object]] = []
+    for row in summary:
+        ticker = str(row.get("Ticker") or "")
+        current_score = int(row.get("Momento entrada") or 0)
+        calibrated = calibration_for_score(result, current_score)
+        fundamentals = fundamental_results.get(ticker)
+        current_rows.append(
+            {
+                "Ticker": ticker,
+                "Empresa /100": fundamentals.score if fundamentals else None,
+                "Entrada /100": current_score,
+                "Lectura": row.get("Lectura entrada"),
+                "Casos del nivel": (
+                    int(calibrated["samples"]) if calibrated is not None else None
+                ),
+                "Mediana neta": (
+                    float(calibrated["median_net_return_pct"])
+                    if calibrated is not None
+                    else None
+                ),
+                "Supera Civislend": (
+                    float(calibrated["beat_civislend_rate_pct"])
+                    if calibrated is not None
+                    else None
+                ),
+                "Evidencia": (
+                    "Suficiente"
+                    if calibrated is not None
+                    and bool(calibrated["enough_evidence"])
+                    else "Insuficiente"
+                ),
+            }
+        )
+    if current_rows:
+        st.markdown("### Cómo se traduce al seguimiento actual")
+        st.dataframe(
+            pd.DataFrame(current_rows).sort_values(
+                ["Entrada /100", "Empresa /100"],
+                ascending=False,
+                na_position="last",
+            ),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Empresa /100": st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d"
+                ),
+                "Entrada /100": st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d"
+                ),
+                "Mediana neta": st.column_config.NumberColumn(format="%+.1f%%"),
+                "Supera Civislend": st.column_config.NumberColumn(format="%.1f%%"),
+            },
+        )
+
+    currencies = sorted(
+        {
+            result.currency
+            for result in fundamental_results.values()
+            if result.currency and result.currency != "EUR"
+        }
+    )
+    if currencies:
+        st.warning(
+            "Hay cotizaciones en " + ", ".join(currencies) + ". Esta primera calibración "
+            "mide el rendimiento en la moneda de cotización; el cambio histórico a euros "
+            "puede mejorar o empeorar el resultado real."
+        )
+    with st.expander("Ver los casos históricos utilizados"):
+        events = result.events.rename(
+            columns={
+                "ticker": "Ticker",
+                "signal_date": "Fecha señal",
+                "entry_date": "Fecha compra simulada",
+                "exit_date": "Fecha final",
+                "score": "Score",
+                "score_tier": "Nivel",
+                "net_return_pct": "Rentabilidad neta",
+                "maximum_drawdown_pct": "Peor caída durante el periodo",
+                "beat_sego": "Superó Sego",
+                "beat_civislend": "Superó Civislend",
+            }
+        )
+        st.dataframe(
+            events.loc[
+                :,
+                [
+                    "Ticker",
+                    "Fecha señal",
+                    "Fecha compra simulada",
+                    "Fecha final",
+                    "Score",
+                    "Nivel",
+                    "Rentabilidad neta",
+                    "Peor caída durante el periodo",
+                    "Superó Sego",
+                    "Superó Civislend",
+                ],
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+    st.caption(
+        "Usa precios ajustados para incorporar splits y dividendos distribuidos por el "
+        "proveedor. La calidad empresarial actual se muestra aparte porque no disponemos "
+        "todavía de fundamentales históricos punto en el tiempo; introducirlos en el "
+        "pasado produciría look-ahead bias."
+    )
 
 
 def render_operation_form(
@@ -4623,6 +4937,10 @@ def render_methodology() -> None:
           del precio medio de compra.
         - **Beneficio esperado:** mediana histórica de señales parecidas, no una
           rentabilidad garantizada.
+        - **Objetivo 30+ días:** frecuencia histórica con la que una nueva señal,
+          mantenida durante todo el periodo, terminó en positivo o superó la tasa
+          anual equivalente de Segofactoring y Civislend. Exige 30 casos para
+          considerar suficiente la muestra.
         - **Liderazgo sectorial:** posición relativa dentro de las empresas elegidas,
           basada en rentabilidad y caídas; no mide monopolio ni garantiza continuidad.
 
@@ -4639,6 +4957,8 @@ def render_methodology() -> None:
         - El backtest incluye comisión, deslizamiento y gaps a través del stop.
         - Las estimaciones de retorno usan eventos no solapados y no se muestran
           con menos de ocho casos comparables.
+        - La calibración de 30+ días compra en la apertura siguiente, descuenta
+          comisiones fijas y muestra un intervalo de incertidumbre del 95%.
 
         **Limitaciones que siguen abiertas**
 
@@ -4655,6 +4975,9 @@ def render_methodology() -> None:
           expectativas. Se consulta manualmente y no modifica el score ni el backtest.
         - Dividendos, fiscalidad, préstamos de valores y el coste de cambio del broker no están modelados.
         - Los tipos del BCE son referencias informativas y pueden diferir del cambio real del broker.
+        - La primera calibración de 30+ días mide cada cotización en su propia moneda;
+          para una comparación estricta con objetivos en euros falta incorporar el
+          histórico diario de divisas.
         - Los niveles de venta y stops son referencias: una orden puede ejecutarse
           a otro precio durante gaps o mercados volátiles.
         - Las correlaciones y el liderazgo dependen del periodo y del grupo elegido;
@@ -4830,6 +5153,7 @@ def main() -> None:
     elif selected_section == "Analizar":
         analysis_options = [
             "Oportunidades",
+            "Objetivo 30+ días",
             "Comparador sectorial",
             "Historial guardado",
             "Prueba histórica",
@@ -4858,6 +5182,13 @@ def main() -> None:
                 raw_fundamentals,
                 price_verifications,
                 journal,
+            )
+        elif analysis_section == "Objetivo 30+ días":
+            render_long_horizon_calibration(
+                prepared,
+                summary,
+                backtest,
+                fundamental_results,
             )
         elif analysis_section == "Comparador sectorial":
             render_sector_comparison(

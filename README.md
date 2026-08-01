@@ -47,6 +47,7 @@ La instalación local solicita las credenciales guardadas en
 │   ├── navigation.py         # Estado seguro entre favoritos y análisis directo
 │   ├── segofactoring_import.py # Importación idempotente del resumen XLSX
 │   ├── recommendations.py    # Entradas, retornos históricos y ventas parciales
+│   ├── return_calibration.py # Probabilidad histórica de superar objetivos a 30+ días
 │   └── journal.py            # Diario SQLite y exportación mediante la UI
 └── tests/                    # Pruebas unitarias sin red
 ```
@@ -134,6 +135,16 @@ La sección **Comparador sectorial** enfrenta de 2 a 10 empresas cargadas durant
 volatilidad, drawdown, distancia al máximo y correlaciones, y asigna un liderazgo
 relativo únicamente dentro de la selección. Calidad, valoración y riesgo continúan
 separados para evitar que una subida reciente se interprete como calidad empresarial.
+
+La sección **Objetivo 30+ días** estudia cada nueva señal de entrada sin convertirla
+en una operación rápida: compra de forma simulada en la apertura siguiente y mantiene
+la posición durante 21, 42, 63, 126 o 252 sesiones. Descuenta 1 euro al comprar, otro
+al vender y el deslizamiento configurado. Convierte las rentabilidades anuales elegidas
+para Segofactoring y Civislend al mismo horizonte y muestra por separado la frecuencia
+de acabar en positivo, superar Segofactoring y superar Civislend. La evidencia sólo se
+marca como suficiente desde 30 casos no solapados e incluye un intervalo de incertidumbre
+del 95%. La calibración utiliza el score técnico histórico; no aplica fundamentales
+actuales a fechas pasadas porque eso introduciría *look-ahead bias*.
 
 Desde la ficha de una empresa se puede guardar una fotografía privada del análisis:
 precio, fecha, seis notas, lecturas, expectativa histórica y una nota personal. El
