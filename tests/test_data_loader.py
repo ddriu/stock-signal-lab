@@ -73,3 +73,44 @@ def test_search_instruments_returns_only_stocks_and_etfs(monkeypatch) -> None:
     assert results[0].label == (
         "Taiwan Semiconductor Manufacturing (TSM) · NYSE"
     )
+    assert results[0].country == "Estados Unidos"
+    assert results[0].currency == "USD"
+    assert results[0].details == (
+        "Acción · Estados Unidos · USD · Cotización estadounidense"
+    )
+
+
+def test_market_metadata_recognizes_japan_and_international_london() -> None:
+    assert data_loader._market_metadata("7974.T", "Tokyo") == (
+        "Japón",
+        "JPY",
+        "Acción local",
+    )
+    assert data_loader._market_metadata("KAP.IL", "London IOB") == (
+        "Londres internacional",
+        "USD",
+        "GDR internacional",
+    )
+
+
+def test_market_group_supports_results_from_older_sessions() -> None:
+    class OldSearchResult:
+        country = ""
+        exchange = "Tokyo"
+
+    assert data_loader.search_result_market_group(OldSearchResult()) == "Tokyo"
+    assert data_loader.search_result_market_group(object()) == "Otros mercados"
+
+
+def test_curated_international_search_survives_yahoo_failure(monkeypatch) -> None:
+    class FailingSearch:
+        def __init__(self, *args, **kwargs) -> None:
+            raise RuntimeError("Yahoo temporalmente no disponible")
+
+    monkeypatch.setattr(data_loader.yf, "Search", FailingSearch)
+
+    results = data_loader.search_instruments("Nintendo")
+
+    assert [result.ticker for result in results] == ["7974.T", "NTDOY"]
+    assert results[0].country == "Japón"
+    assert results[1].listing_type == "ADR / OTC"
