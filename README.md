@@ -43,6 +43,8 @@ La instalación local solicita las credenciales guardadas en
 │   ├── portfolio_history.py  # Evolución diaria y resumen anual de cartera
 │   ├── portfolio_export.py   # Libro Excel con tablas y gráficos editables
 │   ├── portfolio_snapshot_import.py # Fotografías XLSX sin inventar operaciones
+│   ├── portfolio_snapshot.py # KPIs de la última fotografía sin mezclar fechas
+│   ├── navigation.py         # Estado seguro entre favoritos y análisis directo
 │   ├── segofactoring_import.py # Importación idempotente del resumen XLSX
 │   ├── recommendations.py    # Entradas, retornos históricos y ventas parciales
 │   └── journal.py            # Diario SQLite y exportación mediante la UI
@@ -82,7 +84,9 @@ no un precio objetivo ni una predicción.
 ## Interfaz y dispositivos
 
 La portada reúne primero el valor de la cartera, el resultado latente, las posiciones,
-el seguimiento y las alertas del día. La navegación separa inicio, análisis,
+el seguimiento y las alertas del día. Cuando existe una fotografía importada, muestra
+sus cifras aunque todavía no haya operaciones reconstruidas, junto con gráficos por
+plataforma y por activos. La navegación separa inicio, análisis,
 favoritos, carteras y guía para cargar únicamente la sección que se está consultando.
 Las oportunidades se presentan en tarjetas fáciles de leer y conservan el ranking
 completo y los gráficos técnicos como detalle desplegable.

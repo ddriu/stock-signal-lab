@@ -27,6 +27,7 @@ from src.data_loader import (
     TickerSearchResult,
     download_fundamental_snapshot,
     download_prices,
+    search_result_market_group,
     search_instruments,
 )
 from src.data_sources import (
@@ -60,6 +61,7 @@ from src.journal import (
     PORTFOLIO_ACCOUNT_STATUSES,
 )
 from src.msn_research import build_msn_research_links
+from src.navigation import analysis_refresh_tickers, sanitize_favorite_selection
 from src.supabase_journal import JournalStorageError
 from src.storage import GROUP_PORTFOLIO_OWNER, create_journal
 from src.opportunity import (
@@ -79,6 +81,7 @@ from src.portfolio_snapshot_import import (
     import_portfolio_workbook_snapshot,
     parse_portfolio_snapshot_excel,
 )
+from src.portfolio_snapshot import latest_portfolio_snapshot
 from src.recommendations import (
     build_entry_guide,
     build_profit_taking_plan,
@@ -105,6 +108,7 @@ from src.visualization import (
     normalized_comparison_chart,
     portfolio_evolution_chart,
     portfolio_snapshot_allocation_chart,
+    portfolio_snapshot_assets_chart,
     portfolio_snapshot_history_chart,
     price_chart,
     private_investments_chart,
@@ -293,6 +297,15 @@ def build_sidebar(
 ]:
     favorite_tickers = favorite_tickers or []
     favorite_labels = favorite_labels or {}
+    previous_selection = st.session_state.get("selected_favorite_tickers", [])
+    safe_selection = sanitize_favorite_selection(
+        previous_selection,
+        favorite_tickers,
+    )
+    if previous_selection != safe_selection:
+        # Versiones anteriores introducían aquí tickers temporales abiertos desde
+        # el buscador. Streamlit rechaza valores que no existen en ``options``.
+        st.session_state["selected_favorite_tickers"] = safe_selection
     st.sidebar.markdown("## Configurar análisis")
     st.sidebar.caption(
         "Este panel sólo aparece en Analizar. Los cambios se aplican al pulsar "
@@ -3256,6 +3269,8 @@ def render_favorites_manager(
             _search_market_options(results),
             key="favorite_market_filter",
             help="Útil cuando una empresa cotiza en varios países o monedas.",
+            on_change=_clear_session_key,
+            args=("favorite_search_result",),
         )
         result_indices = _search_result_indices(results, market)
         result_index = st.selectbox(
@@ -3579,7 +3594,7 @@ def _search_result_label(result: TickerSearchResult) -> str:
 
 def _search_market_options(results: list[TickerSearchResult]) -> list[str]:
     markets = sorted(
-        {result.market_group for result in results},
+        {search_result_market_group(result) for result in results},
         key=lambda value: (value == "Otros mercados", value.casefold()),
     )
     return ["Todos los mercados", *markets]
@@ -3592,8 +3607,15 @@ def _search_result_indices(
     return [
         index
         for index, result in enumerate(results)
-        if market == "Todos los mercados" or result.market_group == market
+        if market == "Todos los mercados"
+        or search_result_market_group(result) == market
     ]
+
+
+def _clear_session_key(key: str) -> None:
+    """Descarta una selección dependiente cuando cambia su filtro."""
+
+    st.session_state.pop(key, None)
 
 
 def _set_navigation(
@@ -3623,7 +3645,8 @@ def _open_ticker_analysis(ticker: str) -> None:
     """Abre una favorita y solicita sus datos sin obligar a volver a escribirla."""
 
     normalized = ticker.strip().upper()
-    st.session_state["selected_favorite_tickers"] = [normalized]
+    if not normalized:
+        return
     st.session_state["main_navigation"] = "Analizar"
     st.session_state["analysis_navigation"] = "Oportunidades"
     st.session_state["analysis_ticker"] = normalized
@@ -3676,6 +3699,8 @@ def render_quick_company_search() -> None:
             "Mercado",
             _search_market_options(results),
             key="quick_company_market_filter",
+            on_change=_clear_session_key,
+            args=("quick_company_search_result",),
         )
         result_indices = _search_result_indices(results, market)
         if not result_indices:
@@ -3718,23 +3743,35 @@ def render_home(
     private_favorites: pd.DataFrame,
     group_favorites: pd.DataFrame,
 ) -> None:
+    latest_snapshot = pd.DataFrame()
+    snapshot_summary = None
+    if hasattr(journal, "list_portfolio_snapshot_positions"):
+        try:
+            stored_snapshots = journal.list_portfolio_snapshot_positions()
+            latest_snapshot, snapshot_summary = latest_portfolio_snapshot(
+                stored_snapshots
+            )
+        except (JournalStorageError, ValueError) as exc:
+            st.warning(f"No se pudo leer la fotografía piloto: {exc}")
+
     update_dates = [
         pd.Timestamp(frame.index[-1])
         for frame in prepared.values()
         if not frame.empty
     ]
-    update_text = (
-        max(update_dates).date().isoformat()
-        if update_dates
-        else "pendiente de actualización"
-    )
+    if update_dates:
+        update_text = f"precios de mercado {max(update_dates).date().isoformat()}"
+    elif snapshot_summary is not None:
+        update_text = f"fotografía piloto {snapshot_summary.snapshot_date}"
+    else:
+        update_text = "pendiente de actualización"
     st.markdown(
         f"""
         <section class="ssl-hero">
             <h2>Tu resumen de inversión</h2>
             <p>
                 Hola, {html.escape(user.display_name)}. Aquí tienes lo importante sin
-                perderte entre indicadores. Últimos precios: {html.escape(update_text)}.
+                perderte entre indicadores. Datos mostrados: {html.escape(update_text)}.
             </p>
         </section>
         """,
@@ -3749,40 +3786,72 @@ def render_home(
         private_kpis = None
         group_kpis = None
 
-    if private_kpis is not None:
-        value_text = (
-            f"{private_kpis.current_net_value_eur:,.0f} €"
-            if private_kpis.priced_positions_count
-            else "Sin actualizar"
-        )
-        result_text = (
-            f"{private_kpis.unrealized_pnl_eur:+,.0f} €"
-            if private_kpis.priced_positions_count
-            else "—"
-        )
-        result_detail = (
-            f"{private_kpis.unrealized_return_pct:+.2f}% sobre posiciones valoradas"
-            if private_kpis.priced_positions_count
-            else "Actualiza para conocer el resultado"
-        )
+    if snapshot_summary is not None or private_kpis is not None:
+        if snapshot_summary is not None:
+            value_text = f"{snapshot_summary.value_eur:,.2f} €"
+            result_text = (
+                f"{snapshot_summary.gain_loss_eur:+,.2f} €"
+                if snapshot_summary.gain_loss_eur is not None
+                else "N/D"
+            )
+            result_detail = (
+                f"{snapshot_summary.return_pct:+.2f}% estimado sobre el coste"
+                if snapshot_summary.return_pct is not None
+                else "El archivo no incluye un coste completo"
+            )
+            positions_text = snapshot_summary.investment_count
+            positions_detail = (
+                f"{snapshot_summary.line_count} partidas · "
+                f"{snapshot_summary.platform_count} plataformas"
+            )
+            value_detail = (
+                f"Fotografía del {snapshot_summary.snapshot_date} · pendiente de actualizar"
+            )
+        else:
+            value_text = (
+                f"{private_kpis.current_net_value_eur:,.0f} €"
+                if private_kpis and private_kpis.priced_positions_count
+                else "Sin actualizar"
+            )
+            result_text = (
+                f"{private_kpis.unrealized_pnl_eur:+,.0f} €"
+                if private_kpis and private_kpis.priced_positions_count
+                else "—"
+            )
+            result_detail = (
+                f"{private_kpis.unrealized_return_pct:+.2f}% sobre posiciones valoradas"
+                if private_kpis and private_kpis.priced_positions_count
+                else "Actualiza para conocer el resultado"
+            )
+            positions_text = private_kpis.open_positions_count if private_kpis else 0
+            positions_detail = (
+                f"{private_kpis.operations_count} operaciones registradas"
+                if private_kpis
+                else "Sin operaciones registradas"
+            )
+            value_detail = (
+                f"{private_kpis.priced_positions_count}/{private_kpis.open_positions_count} "
+                "posiciones con precio"
+                if private_kpis
+                else "Sin posiciones valoradas"
+            )
         st.markdown(
             f"""
             <div class="ssl-kpi-grid">
                 <div class="ssl-kpi-card">
                     <small>Valor de mi cartera</small>
                     <strong>{value_text}</strong>
-                    <em>{private_kpis.priced_positions_count}/{private_kpis.open_positions_count}
-                    posiciones con precio</em>
+                    <em>{value_detail}</em>
                 </div>
                 <div class="ssl-kpi-card">
-                    <small>Resultado latente</small>
+                    <small>Resultado de la fotografía</small>
                     <strong>{result_text}</strong>
                     <em>{result_detail}</em>
                 </div>
                 <div class="ssl-kpi-card">
-                    <small>Posiciones abiertas</small>
-                    <strong>{private_kpis.open_positions_count}</strong>
-                    <em>{private_kpis.operations_count} operaciones registradas</em>
+                    <small>Inversiones declaradas</small>
+                    <strong>{positions_text}</strong>
+                    <em>{positions_detail}</em>
                 </div>
                 <div class="ssl-kpi-card">
                     <small>Seguimiento</small>
@@ -3797,6 +3866,26 @@ def render_home(
             st.caption(
                 f"Cartera del grupo: {group_kpis.open_positions_count} posiciones · "
                 f"resultado latente valorado {group_kpis.unrealized_pnl_eur:+,.2f} EUR."
+            )
+
+    if snapshot_summary is not None:
+        st.markdown("### Mi cartera piloto")
+        st.caption(
+            "Distribución basada en la fotografía guardada, no en cotizaciones en tiempo real. "
+            f"{snapshot_summary.analyzable_count} partidas tienen ticker reconocible para análisis."
+        )
+        chart_a, chart_b = st.columns(2)
+        with chart_a:
+            st.plotly_chart(
+                portfolio_snapshot_allocation_chart(latest_snapshot),
+                width="stretch",
+                config=PLOTLY_CONFIG,
+            )
+        with chart_b:
+            st.plotly_chart(
+                portfolio_snapshot_assets_chart(latest_snapshot),
+                width="stretch",
+                config=PLOTLY_CONFIG,
             )
 
     action_a, action_b, action_c = st.columns(3)
@@ -4626,6 +4715,9 @@ def main() -> None:
     pending_analysis_ticker = str(
         st.session_state.get("_pending_analysis_ticker", "")
     ).strip().upper()
+    active_analysis_ticker = str(
+        st.session_state.get("analysis_ticker", "")
+    ).strip().upper()
     if load_clicked or pending_analysis_ticker:
         held_tickers: list[str] = []
         owners_to_load = [authenticated_user.username, GROUP_PORTFOLIO_OWNER]
@@ -4646,14 +4738,11 @@ def main() -> None:
                 continue
             if not saved_positions.empty:
                 held_tickers.extend(saved_positions["ticker"].astype(str).tolist())
-        tickers_to_load = list(
-            dict.fromkeys(
-                [
-                    *([pending_analysis_ticker] if pending_analysis_ticker else []),
-                    *tickers,
-                    *held_tickers,
-                ]
-            )
+        tickers_to_load = analysis_refresh_tickers(
+            tickers,
+            held_tickers,
+            pending_ticker=pending_analysis_ticker,
+            active_ticker=active_analysis_ticker,
         )
         load_market_data(
             tickers_to_load,
@@ -4664,6 +4753,7 @@ def main() -> None:
             fundamental_tickers={
                 *tickers,
                 *([pending_analysis_ticker] if pending_analysis_ticker else []),
+                *([active_analysis_ticker] if active_analysis_ticker else []),
             },
         )
         st.session_state.pop("_pending_analysis_ticker", None)
