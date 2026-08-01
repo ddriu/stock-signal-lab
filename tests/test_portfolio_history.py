@@ -63,6 +63,9 @@ def test_portfolio_excel_contains_readable_sheets() -> None:
         private_investments=pd.DataFrame(
             [{"platform": "Civislend", "invested_amount": 1_000}]
         ),
+        portfolio_accounts=pd.DataFrame(
+            [{"account_name": "MyInvestor", "investments_value": 2_500}]
+        ),
     )
 
     assert workbook.startswith(b"PK")
@@ -70,3 +73,4 @@ def test_portfolio_excel_contains_readable_sheets() -> None:
         workbook_xml = archive.read("xl/workbook.xml").decode("utf-8")
     assert "Resumen anual" in workbook_xml
     assert "Civislend y Sego" in workbook_xml
+    assert "Cuentas y plataformas" in workbook_xml

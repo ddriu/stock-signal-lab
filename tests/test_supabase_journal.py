@@ -239,6 +239,57 @@ def test_supabase_private_investments_are_always_filtered_by_owner(monkeypatch) 
     assert calls[3]["params"] == {"id": "eq.21", "owner": "eq.ddriu"}
 
 
+def test_supabase_portfolio_accounts_are_upserted_and_filtered_by_owner(monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+    responses = [
+        FakeResponse([{"id": 31}]),
+        FakeResponse(
+            [
+                {
+                    "id": 31,
+                    "account_name": "Trade Republic",
+                    "account_type": "Bróker",
+                    "investments_value": 3_000,
+                    "cash_balance": 400,
+                    "currency": "EUR",
+                    "status": "Actualizada",
+                    "notes": "Resumen provisional",
+                    "updated_at": "2026-08-01T10:00:00Z",
+                    "created_at": "2026-08-01T09:00:00Z",
+                }
+            ]
+        ),
+    ]
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        return responses.pop(0)
+
+    monkeypatch.setattr("src.supabase_journal.requests.request", fake_request)
+    journal = SupabaseTradingJournal(
+        "https://example.supabase.co",
+        "sb_secret_test",
+        "ddriu",
+    )
+
+    account_id = journal.upsert_portfolio_account(
+        account_name="Trade Republic",
+        account_type="Bróker",
+        investments_value=3_000,
+        cash_balance=400,
+        status="Actualizada",
+        notes="Resumen provisional",
+    )
+    accounts = journal.list_portfolio_accounts()
+
+    assert account_id == 31
+    assert accounts.iloc[0]["account_name"] == "Trade Republic"
+    assert all(call["url"].endswith("/rest/v1/portfolio_accounts") for call in calls)
+    assert calls[0]["params"] == {"on_conflict": "owner,account_name"}
+    assert calls[0]["json"]["owner"] == "ddriu"
+    assert calls[1]["params"]["owner"] == "eq.ddriu"
+
+
 def test_supabase_analysis_history_uses_owner_and_separate_table(monkeypatch) -> None:
     calls: list[dict[str, Any]] = []
     responses = [

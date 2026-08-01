@@ -129,6 +129,43 @@ def test_private_investment_rejects_invalid_dates(tmp_path) -> None:
         )
 
 
+def test_portfolio_accounts_are_saved_and_updated(tmp_path) -> None:
+    journal = TradingJournal(tmp_path / "journal.db", owner="ddriu")
+
+    account_id = journal.upsert_portfolio_account(
+        account_name="MyInvestor",
+        account_type="Bróker",
+        investments_value=2_500,
+        cash_balance=350,
+        status="Pendiente de actualizar",
+    )
+    repeated_id = journal.upsert_portfolio_account(
+        account_name="MyInvestor",
+        account_type="Bróker",
+        investments_value=2_650,
+        cash_balance=200,
+        status="Actualizada",
+        notes="Resumen del bróker",
+    )
+
+    account = journal.list_portfolio_accounts().iloc[0]
+    assert repeated_id == account_id
+    assert account["account_name"] == "MyInvestor"
+    assert account["investments_value"] == 2_650
+    assert account["cash_balance"] == 200
+    assert account["status"] == "Actualizada"
+
+
+def test_portfolio_account_rejects_negative_values(tmp_path) -> None:
+    journal = TradingJournal(tmp_path / "journal.db", owner="ddriu")
+    with pytest.raises(ValueError, match="no pueden ser negativos"):
+        journal.upsert_portfolio_account(
+            account_name="Revolut",
+            account_type="Bróker",
+            investments_value=-1,
+        )
+
+
 def test_analysis_snapshots_are_private_lightweight_history(tmp_path) -> None:
     journal = TradingJournal(tmp_path / "journal.db")
     snapshot_id = journal.add_analysis_snapshot(
