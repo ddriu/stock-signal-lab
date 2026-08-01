@@ -23,6 +23,7 @@ class SupabaseConfig:
     favorites_table: str = "favorites"
     analysis_table: str = "analysis_snapshots"
     private_investments_table: str = "private_investments"
+    portfolio_accounts_table: str = "portfolio_accounts"
 
 
 def _secret_section(name: str) -> dict[str, object]:
@@ -57,6 +58,10 @@ def load_supabase_config() -> SupabaseConfig | None:
         section.get("private_investments_table")
         or os.getenv("SUPABASE_PRIVATE_INVESTMENTS_TABLE", "private_investments")
     ).strip()
+    portfolio_accounts_table = str(
+        section.get("portfolio_accounts_table")
+        or os.getenv("SUPABASE_PORTFOLIO_ACCOUNTS_TABLE", "portfolio_accounts")
+    ).strip()
     if not url and not secret_key:
         return None
     if not url or not secret_key:
@@ -72,6 +77,7 @@ def load_supabase_config() -> SupabaseConfig | None:
         private_investments_table=(
             private_investments_table or "private_investments"
         ),
+        portfolio_accounts_table=portfolio_accounts_table or "portfolio_accounts",
     )
 
 
@@ -94,4 +100,5 @@ def create_journal(owner: str) -> TradingJournal | SupabaseTradingJournal:
         favorites_table=config.favorites_table,
         analysis_table=config.analysis_table,
         private_investments_table=config.private_investments_table,
+        portfolio_accounts_table=config.portfolio_accounts_table,
     )

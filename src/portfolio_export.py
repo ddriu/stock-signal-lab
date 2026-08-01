@@ -14,6 +14,7 @@ def build_portfolio_excel(
     annual: pd.DataFrame,
     daily: pd.DataFrame,
     private_investments: pd.DataFrame | None = None,
+    portfolio_accounts: pd.DataFrame | None = None,
 ) -> bytes:
     """Crea un XLSX con hojas, filtros, formatos y gráficos editables."""
 
@@ -32,6 +33,8 @@ def build_portfolio_excel(
         }
         if private_investments is not None and not private_investments.empty:
             sheets["Civislend y Sego"] = private_investments
+        if portfolio_accounts is not None and not portfolio_accounts.empty:
+            sheets["Cuentas y plataformas"] = portfolio_accounts
 
         for sheet_name, frame in sheets.items():
             safe = frame.copy()

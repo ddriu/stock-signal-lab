@@ -23,11 +23,13 @@ from src.journal import (
     OPERATION_COLUMNS,
     PRIVATE_INVESTMENT_COLUMNS,
     PRIVATE_INVESTMENT_STATUSES,
+    PORTFOLIO_ACCOUNT_COLUMNS,
     calculate_open_positions,
     normalize_analysis_snapshot,
     normalize_favorite,
     normalize_operation,
     normalize_private_investment,
+    normalize_portfolio_account,
 )
 
 
@@ -50,6 +52,7 @@ class SupabaseTradingJournal:
         favorites_table: str = "favorites",
         analysis_table: str = "analysis_snapshots",
         private_investments_table: str = "private_investments",
+        portfolio_accounts_table: str = "portfolio_accounts",
         timeout: float = 20.0,
     ) -> None:
         normalized_url = url.strip().rstrip("/")
@@ -67,6 +70,8 @@ class SupabaseTradingJournal:
             raise JournalStorageError("El nombre de tabla de análisis no es válido.")
         if not private_investments_table.replace("_", "").isalnum():
             raise JournalStorageError("El nombre de tabla de inversión privada no es válido.")
+        if not portfolio_accounts_table.replace("_", "").isalnum():
+            raise JournalStorageError("El nombre de tabla de cuentas no es válido.")
         self.url = normalized_url
         self.secret_key = secret_key.strip()
         self.owner = owner.strip()
@@ -74,6 +79,7 @@ class SupabaseTradingJournal:
         self.favorites_table = favorites_table
         self.analysis_table = analysis_table
         self.private_investments_table = private_investments_table
+        self.portfolio_accounts_table = portfolio_accounts_table
         self.timeout = timeout
 
     @property
@@ -91,6 +97,10 @@ class SupabaseTradingJournal:
     @property
     def private_investments_endpoint(self) -> str:
         return f"{self.url}/rest/v1/{self.private_investments_table}"
+
+    @property
+    def portfolio_accounts_endpoint(self) -> str:
+        return f"{self.url}/rest/v1/{self.portfolio_accounts_table}"
 
     @property
     def alert_preferences_endpoint(self) -> str:
@@ -317,6 +327,75 @@ class SupabaseTradingJournal:
             "DELETE",
             endpoint=self.private_investments_endpoint,
             params={"id": f"eq.{int(investment_id)}", "owner": f"eq.{self.owner}"},
+        )
+
+    def upsert_portfolio_account(
+        self,
+        *,
+        account_name: str,
+        account_type: str,
+        investments_value: float = 0.0,
+        cash_balance: float = 0.0,
+        currency: str = "EUR",
+        status: str = "Pendiente de actualizar",
+        notes: str = "",
+    ) -> int:
+        account = normalize_portfolio_account(
+            account_name=account_name,
+            account_type=account_type,
+            investments_value=investments_value,
+            cash_balance=cash_balance,
+            currency=currency,
+            status=status,
+            notes=notes,
+        )
+        response = self._request(
+            "POST",
+            endpoint=self.portfolio_accounts_endpoint,
+            params={"on_conflict": "owner,account_name"},
+            json={"owner": self.owner, **account},
+            headers={
+                **self.headers,
+                "Prefer": "resolution=merge-duplicates,return=representation",
+            },
+        )
+        rows = response.json()
+        if not isinstance(rows, list) or not rows or "id" not in rows[0]:
+            raise JournalStorageError("Supabase guardó una cuenta con respuesta inesperada.")
+        return int(rows[0]["id"])
+
+    def list_portfolio_accounts(self) -> pd.DataFrame:
+        response = self._request(
+            "GET",
+            endpoint=self.portfolio_accounts_endpoint,
+            params={
+                "owner": f"eq.{self.owner}",
+                "select": ",".join(PORTFOLIO_ACCOUNT_COLUMNS),
+                "order": "account_name.asc",
+            },
+        )
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise JournalStorageError("Supabase devolvió una lista de cuentas inválida.")
+        if not rows:
+            return pd.DataFrame(columns=PORTFOLIO_ACCOUNT_COLUMNS)
+        frame = pd.DataFrame(rows)
+        for column in PORTFOLIO_ACCOUNT_COLUMNS:
+            if column not in frame.columns:
+                frame[column] = None
+        order = {
+            "MyInvestor": 1,
+            "Trade Republic": 2,
+            "Revolut": 3,
+            "Segofactoring": 4,
+            "Civislend": 5,
+        }
+        frame["_order"] = frame["account_name"].map(order).fillna(6)
+        return (
+            frame.sort_values(["_order", "account_name"])
+            .drop(columns="_order")
+            .loc[:, PORTFOLIO_ACCOUNT_COLUMNS]
+            .reset_index(drop=True)
         )
 
     def add_favorite(

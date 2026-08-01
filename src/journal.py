@@ -82,6 +82,27 @@ PRIVATE_INVESTMENT_COLUMNS = [
 ]
 PRIVATE_INVESTMENT_PLATFORMS = ("Civislend", "Segofactoring")
 PRIVATE_INVESTMENT_STATUSES = ("Activa", "Finalizada", "Retrasada", "Impagada")
+PORTFOLIO_ACCOUNT_COLUMNS = [
+    "id",
+    "account_name",
+    "account_type",
+    "investments_value",
+    "cash_balance",
+    "currency",
+    "status",
+    "notes",
+    "updated_at",
+    "created_at",
+]
+PORTFOLIO_ACCOUNT_TYPES = ("Bróker", "Inversión alternativa")
+PORTFOLIO_ACCOUNT_STATUSES = ("Pendiente de actualizar", "Actualizada", "Inactiva")
+DEFAULT_DDRIU_ACCOUNTS = (
+    ("MyInvestor", "Bróker"),
+    ("Trade Republic", "Bróker"),
+    ("Revolut", "Bróker"),
+    ("Segofactoring", "Inversión alternativa"),
+    ("Civislend", "Inversión alternativa"),
+)
 MAX_FAVORITES = 300
 
 
@@ -280,6 +301,44 @@ def normalize_private_investment(
         "status": status,
         "notes": notes.strip()[:1_000],
         "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def normalize_portfolio_account(
+    *,
+    account_name: str,
+    account_type: str,
+    investments_value: float = 0.0,
+    cash_balance: float = 0.0,
+    currency: str = "EUR",
+    status: str = "Pendiente de actualizar",
+    notes: str = "",
+) -> dict[str, object]:
+    """Valida una cuenta de inversión o plataforma agregada."""
+
+    normalized_name = account_name.strip()
+    if not normalized_name:
+        raise ValueError("La cuenta necesita un nombre.")
+    if account_type not in PORTFOLIO_ACCOUNT_TYPES:
+        raise ValueError("El tipo de cuenta no es válido.")
+    if investments_value < 0 or cash_balance < 0:
+        raise ValueError("El valor de inversiones y el efectivo no pueden ser negativos.")
+    normalized_currency = currency.strip().upper()
+    if len(normalized_currency) != 3:
+        raise ValueError("La moneda debe tener tres letras, por ejemplo EUR o USD.")
+    if status not in PORTFOLIO_ACCOUNT_STATUSES:
+        raise ValueError("El estado de actualización no es válido.")
+    now = datetime.now().isoformat(timespec="seconds")
+    return {
+        "account_name": normalized_name[:100],
+        "account_type": account_type,
+        "investments_value": float(investments_value),
+        "cash_balance": float(cash_balance),
+        "currency": normalized_currency,
+        "status": status,
+        "notes": notes.strip()[:1_000],
+        "updated_at": now,
+        "created_at": now,
     }
 
 
@@ -523,6 +582,25 @@ class TradingJournal:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS portfolio_accounts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_name TEXT NOT NULL UNIQUE,
+                    account_type TEXT NOT NULL
+                        CHECK (account_type IN ('Bróker', 'Inversión alternativa')),
+                    investments_value REAL NOT NULL DEFAULT 0
+                        CHECK (investments_value >= 0),
+                    cash_balance REAL NOT NULL DEFAULT 0 CHECK (cash_balance >= 0),
+                    currency TEXT NOT NULL DEFAULT 'EUR',
+                    status TEXT NOT NULL DEFAULT 'Pendiente de actualizar'
+                        CHECK (status IN ('Pendiente de actualizar', 'Actualizada', 'Inactiva')),
+                    notes TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
 
     def add_operation(
         self,
@@ -664,6 +742,66 @@ class TradingJournal:
             connection.execute(
                 "DELETE FROM private_investments WHERE id = ?",
                 (int(investment_id),),
+            )
+
+    def upsert_portfolio_account(
+        self,
+        *,
+        account_name: str,
+        account_type: str,
+        investments_value: float = 0.0,
+        cash_balance: float = 0.0,
+        currency: str = "EUR",
+        status: str = "Pendiente de actualizar",
+        notes: str = "",
+    ) -> int:
+        account = normalize_portfolio_account(
+            account_name=account_name,
+            account_type=account_type,
+            investments_value=investments_value,
+            cash_balance=cash_balance,
+            currency=currency,
+            status=status,
+            notes=notes,
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO portfolio_accounts (
+                    account_name, account_type, investments_value, cash_balance,
+                    currency, status, notes, updated_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_name) DO UPDATE SET
+                    account_type = excluded.account_type,
+                    investments_value = excluded.investments_value,
+                    cash_balance = excluded.cash_balance,
+                    currency = excluded.currency,
+                    status = excluded.status,
+                    notes = excluded.notes,
+                    updated_at = excluded.updated_at
+                """,
+                tuple(account[column] for column in PORTFOLIO_ACCOUNT_COLUMNS if column != "id"),
+            )
+            row = connection.execute(
+                "SELECT id FROM portfolio_accounts WHERE account_name = ?",
+                (account["account_name"],),
+            ).fetchone()
+            return int(row["id"])
+
+    def list_portfolio_accounts(self) -> pd.DataFrame:
+        with self._connect() as connection:
+            return pd.read_sql_query(
+                """
+                SELECT * FROM portfolio_accounts
+                ORDER BY CASE account_name
+                    WHEN 'MyInvestor' THEN 1
+                    WHEN 'Trade Republic' THEN 2
+                    WHEN 'Revolut' THEN 3
+                    WHEN 'Segofactoring' THEN 4
+                    WHEN 'Civislend' THEN 5
+                    ELSE 6 END, account_name
+                """,
+                connection,
             )
 
     def add_favorite(
