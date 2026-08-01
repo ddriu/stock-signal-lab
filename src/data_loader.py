@@ -75,6 +75,17 @@ class TickerSearchResult:
         return self.country or self.exchange or "Otros mercados"
 
 
+def search_result_market_group(result: object) -> str:
+    """Obtiene el mercado incluso para resultados conservados por una sesión antigua."""
+
+    explicit = str(getattr(result, "market_group", "") or "").strip()
+    if explicit:
+        return explicit
+    country = str(getattr(result, "country", "") or "").strip()
+    exchange = str(getattr(result, "exchange", "") or "").strip()
+    return country or exchange or "Otros mercados"
+
+
 _SUFFIX_MARKETS: dict[str, tuple[str, str, str]] = {
     "AS": ("Países Bajos", "EUR", "Acción local"),
     "AX": ("Australia", "AUD", "Acción local"),

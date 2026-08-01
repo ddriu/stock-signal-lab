@@ -311,6 +311,45 @@ def portfolio_snapshot_allocation_chart(positions: pd.DataFrame) -> go.Figure:
     return figure
 
 
+def portfolio_snapshot_assets_chart(
+    positions: pd.DataFrame,
+    *,
+    max_assets: int = 12,
+) -> go.Figure:
+    """Muestra las partidas con mayor peso en la última fotografía."""
+
+    summary = (
+        positions.groupby(["asset_name", "platform"], as_index=False)["value_eur"]
+        .sum()
+        .sort_values("value_eur", ascending=False)
+        .head(max(1, int(max_assets)))
+        .sort_values("value_eur")
+    )
+    labels = summary["asset_name"].astype(str) + " · " + summary["platform"].astype(str)
+    figure = go.Figure(
+        go.Bar(
+            x=summary["value_eur"],
+            y=labels,
+            orientation="h",
+            marker_color=COLORS["medium"],
+            text=summary["value_eur"].map(lambda value: f"{value:,.0f} €"),
+            textposition="outside",
+            hovertemplate="%{y}<br>%{x:,.2f} €<extra></extra>",
+        )
+    )
+    figure.update_layout(
+        title=f"{len(summary)} partidas con mayor valor",
+        height=max(390, 32 * len(summary) + 115),
+        template="plotly_white",
+        margin={"l": 20, "r": 55, "t": 65, "b": 35},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#FFFFFF",
+        xaxis_title="Valor declarado (€)",
+        yaxis_title="",
+    )
+    return figure
+
+
 def portfolio_snapshot_history_chart(positions: pd.DataFrame) -> go.Figure:
     """Evolución del valor declarado por plataforma entre fotografías."""
 
