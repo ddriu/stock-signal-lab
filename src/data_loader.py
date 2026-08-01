@@ -47,11 +47,149 @@ class TickerSearchResult:
     name: str
     exchange: str
     instrument_type: str
+    country: str = ""
+    currency: str = ""
+    listing_type: str = ""
 
     @property
     def label(self) -> str:
         market = f" · {self.exchange}" if self.exchange else ""
         return f"{self.name} ({self.ticker}){market}"
+
+    @property
+    def details(self) -> str:
+        """Descripción corta para distinguir cotizaciones del mismo activo."""
+
+        values = [
+            self.instrument_type,
+            self.country,
+            self.currency,
+            self.listing_type,
+        ]
+        return " · ".join(value for value in values if value)
+
+    @property
+    def market_group(self) -> str:
+        """Grupo sencillo utilizado por el filtro del buscador."""
+
+        return self.country or self.exchange or "Otros mercados"
+
+
+_SUFFIX_MARKETS: dict[str, tuple[str, str, str]] = {
+    "AS": ("Países Bajos", "EUR", "Acción local"),
+    "AX": ("Australia", "AUD", "Acción local"),
+    "BA": ("Argentina", "ARS", "Acción local"),
+    "BR": ("Bélgica", "EUR", "Acción local"),
+    "CO": ("Dinamarca", "DKK", "Acción local"),
+    "DE": ("Alemania", "EUR", "Acción local"),
+    "F": ("Alemania", "EUR", "Cotización en Fráncfort"),
+    "HE": ("Finlandia", "EUR", "Acción local"),
+    "HK": ("Hong Kong", "HKD", "Acción local"),
+    "IL": ("Londres internacional", "USD", "GDR internacional"),
+    "IS": ("Turquía", "TRY", "Acción local"),
+    "JO": ("Sudáfrica", "ZAR", "Acción local"),
+    "KQ": ("Corea del Sur", "KRW", "Acción local"),
+    "KS": ("Corea del Sur", "KRW", "Acción local"),
+    "L": ("Reino Unido", "GBP", "Acción local"),
+    "LS": ("Portugal", "EUR", "Acción local"),
+    "MC": ("España", "EUR", "Acción local"),
+    "MI": ("Italia", "EUR", "Acción local"),
+    "MX": ("México", "MXN", "Acción local"),
+    "NZ": ("Nueva Zelanda", "NZD", "Acción local"),
+    "OL": ("Noruega", "NOK", "Acción local"),
+    "PA": ("Francia", "EUR", "Acción local"),
+    "SA": ("Brasil", "BRL", "Acción local"),
+    "SI": ("Singapur", "SGD", "Acción local"),
+    "ST": ("Suecia", "SEK", "Acción local"),
+    "SW": ("Suiza", "CHF", "Acción local"),
+    "T": ("Japón", "JPY", "Acción local"),
+    "TA": ("Israel", "ILS", "Acción local"),
+    "TO": ("Canadá", "CAD", "Acción local"),
+    "V": ("Canadá", "CAD", "Acción local"),
+    "VI": ("Austria", "EUR", "Acción local"),
+    "WA": ("Polonia", "PLN", "Acción local"),
+}
+
+
+def _market_metadata(
+    symbol: str,
+    exchange: str,
+    currency: str = "",
+) -> tuple[str, str, str]:
+    """Infiere país, moneda y clase de cotización con información pública de bolsa."""
+
+    suffix = symbol.rsplit(".", 1)[1] if "." in symbol else ""
+    if suffix in _SUFFIX_MARKETS:
+        country, inferred_currency, listing_type = _SUFFIX_MARKETS[suffix]
+        return country, currency or inferred_currency, listing_type
+
+    normalized_exchange = exchange.upper()
+    exchange_rules = (
+        (("NASDAQ", "NMS", "NGM", "NCM", "NYSE", "NYQ", "AMEX", "ASE", "PCX", "BATS"),
+         ("Estados Unidos", "USD", "Cotización estadounidense")),
+        (("OTC", "PNK"), ("Estados Unidos", "USD", "Cotización OTC")),
+        (("TOKYO", "JPX"), ("Japón", "JPY", "Acción local")),
+        (("LONDON", "LSE"), ("Reino Unido", "GBP", "Acción local")),
+        (("MADRID", "BME"), ("España", "EUR", "Acción local")),
+        (("TORONTO", "TSX"), ("Canadá", "CAD", "Acción local")),
+        (("XETRA", "FRANKFURT"), ("Alemania", "EUR", "Acción local")),
+    )
+    for aliases, metadata in exchange_rules:
+        if any(alias in normalized_exchange for alias in aliases):
+            country, inferred_currency, listing_type = metadata
+            return country, currency or inferred_currency, listing_type
+    return "Otros mercados", currency, ""
+
+
+_CURATED_INTERNATIONAL_LISTINGS: tuple[tuple[tuple[str, ...], TickerSearchResult], ...] = (
+    (
+        ("kazatomprom", "national atomic company", "kap.il"),
+        TickerSearchResult(
+            ticker="KAP.IL",
+            name="NAC Kazatomprom",
+            exchange="London IOB",
+            instrument_type="Acción",
+            country="Londres internacional",
+            currency="USD",
+            listing_type="GDR internacional",
+        ),
+    ),
+    (
+        ("nintendo", "7974", "7974.t"),
+        TickerSearchResult(
+            ticker="7974.T",
+            name="Nintendo Co., Ltd.",
+            exchange="Tokyo",
+            instrument_type="Acción",
+            country="Japón",
+            currency="JPY",
+            listing_type="Acción local",
+        ),
+    ),
+    (
+        ("nintendo", "ntdoy"),
+        TickerSearchResult(
+            ticker="NTDOY",
+            name="Nintendo Co., Ltd.",
+            exchange="OTC",
+            instrument_type="Acción",
+            country="Estados Unidos",
+            currency="USD",
+            listing_type="ADR / OTC",
+        ),
+    ),
+)
+
+
+def _curated_search_results(query: str) -> list[TickerSearchResult]:
+    normalized_query = query.strip().casefold()
+    if not normalized_query:
+        return []
+    return [
+        result
+        for aliases, result in _CURATED_INTERNATIONAL_LISTINGS
+        if any(normalized_query in alias or alias in normalized_query for alias in aliases)
+    ]
 
 
 def normalize_ticker(ticker: str) -> str:
@@ -68,6 +206,7 @@ def search_instruments(query: str, max_results: int = 12) -> list[TickerSearchRe
     if len(cleaned) < 2:
         return []
     requested = max(1, min(int(max_results), 25))
+    curated_results = _curated_search_results(cleaned)
     try:
         try:
             search = yf.Search(
@@ -91,12 +230,17 @@ def search_instruments(query: str, max_results: int = 12) -> list[TickerSearchRe
             )
         quotes = search.quotes
     except Exception as exc:
+        if curated_results:
+            return curated_results[:requested]
         raise DataDownloadError(
             "El buscador de empresas no respondió. Puedes escribir el ticker manualmente."
         ) from exc
 
     results: list[TickerSearchResult] = []
     seen: set[str] = set()
+    for result in curated_results:
+        results.append(result)
+        seen.add(result.ticker)
     for quote in quotes if isinstance(quotes, list) else []:
         if not isinstance(quote, dict):
             continue
@@ -119,6 +263,12 @@ def search_instruments(query: str, max_results: int = 12) -> list[TickerSearchRe
             or quote.get("exchangeDisplay")
             or ""
         ).strip()
+        quoted_currency = str(quote.get("currency") or "").strip().upper()
+        country, currency, listing_type = _market_metadata(
+            symbol,
+            exchange,
+            quoted_currency,
+        )
         instrument_type = "ETF" if quote_type == "ETF" else "Acción"
         results.append(
             TickerSearchResult(
@@ -126,10 +276,13 @@ def search_instruments(query: str, max_results: int = 12) -> list[TickerSearchRe
                 name=name,
                 exchange=exchange,
                 instrument_type=instrument_type,
+                country=country,
+                currency=currency,
+                listing_type=listing_type,
             )
         )
         seen.add(symbol)
-    return results
+    return results[:requested]
 
 
 def _stooq_symbol(symbol: str) -> str:
