@@ -176,6 +176,69 @@ def test_supabase_favorite_tags_are_updated_by_owner(monkeypatch) -> None:
     assert calls[0]["json"] == {"tags": "Energía, Dividendos"}
 
 
+def test_supabase_private_investments_are_always_filtered_by_owner(monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+    responses = [
+        FakeResponse([{"id": 21}]),
+        FakeResponse(
+            [
+                {
+                    "id": 21,
+                    "platform": "Segofactoring",
+                    "project_name": "Factura 44",
+                    "invested_amount": 800,
+                    "current_value": 820,
+                    "expected_return_pct": 8,
+                    "start_date": "2026-03-01T00:00:00Z",
+                    "maturity_date": "2026-09-01T00:00:00Z",
+                    "status": "Activa",
+                    "notes": "",
+                    "recorded_by": "ddriu",
+                    "created_at": "2026-03-01T10:00:00Z",
+                }
+            ]
+        ),
+        FakeResponse(None, status_code=204),
+        FakeResponse(None, status_code=204),
+    ]
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        return responses.pop(0)
+
+    monkeypatch.setattr("src.supabase_journal.requests.request", fake_request)
+    journal = SupabaseTradingJournal(
+        "https://example.supabase.co",
+        "sb_secret_test",
+        "ddriu",
+    )
+    investment_id = journal.add_private_investment(
+        platform="Segofactoring",
+        project_name="Factura 44",
+        invested_amount=800,
+        current_value=820,
+        expected_return_pct=8,
+        start_date="2026-03-01",
+        maturity_date="2026-09-01",
+        recorded_by="ddriu",
+    )
+    stored = journal.list_private_investments()
+    journal.update_private_investment(
+        investment_id,
+        current_value=825,
+        status="Finalizada",
+        notes="Cobrada",
+    )
+    journal.delete_private_investment(investment_id)
+
+    assert stored.iloc[0]["project_name"] == "Factura 44"
+    assert all(call["url"].endswith("/rest/v1/private_investments") for call in calls)
+    assert calls[0]["json"]["owner"] == "ddriu"
+    assert calls[1]["params"]["owner"] == "eq.ddriu"
+    assert calls[2]["params"] == {"id": "eq.21", "owner": "eq.ddriu"}
+    assert calls[3]["params"] == {"id": "eq.21", "owner": "eq.ddriu"}
+
+
 def test_supabase_analysis_history_uses_owner_and_separate_table(monkeypatch) -> None:
     calls: list[dict[str, Any]] = []
     responses = [

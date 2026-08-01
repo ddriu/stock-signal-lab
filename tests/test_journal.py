@@ -82,6 +82,53 @@ def test_favorite_tags_can_be_saved_and_updated(tmp_path) -> None:
         journal.update_favorite_tags("NOPE", ["Otra"])
 
 
+def test_private_investments_are_saved_updated_and_deleted(tmp_path) -> None:
+    journal = TradingJournal(tmp_path / "journal.db", owner="ddriu")
+    investment_id = journal.add_private_investment(
+        platform="Civislend",
+        project_name="Promoción Centro",
+        invested_amount=2_000,
+        current_value=2_050,
+        expected_return_pct=9.5,
+        start_date="2026-01-10",
+        maturity_date="2027-01-10",
+        notes="Garantía hipotecaria",
+        recorded_by="ddriu",
+    )
+
+    investments = journal.list_private_investments()
+    assert investments.iloc[0]["id"] == investment_id
+    assert investments.iloc[0]["platform"] == "Civislend"
+    assert investments.iloc[0]["recorded_by"] == "ddriu"
+
+    journal.update_private_investment(
+        investment_id,
+        current_value=2_075,
+        status="Retrasada",
+        notes="Vencimiento ampliado",
+    )
+    updated = journal.list_private_investments().iloc[0]
+    assert updated["current_value"] == 2_075
+    assert updated["status"] == "Retrasada"
+
+    journal.delete_private_investment(investment_id)
+    assert journal.list_private_investments().empty
+
+
+def test_private_investment_rejects_invalid_dates(tmp_path) -> None:
+    journal = TradingJournal(tmp_path / "journal.db", owner="ddriu")
+    with pytest.raises(ValueError, match="vencimiento"):
+        journal.add_private_investment(
+            platform="Segofactoring",
+            project_name="Factura 01",
+            invested_amount=500,
+            current_value=500,
+            expected_return_pct=7,
+            start_date="2026-06-01",
+            maturity_date="2026-05-01",
+        )
+
+
 def test_analysis_snapshots_are_private_lightweight_history(tmp_path) -> None:
     journal = TradingJournal(tmp_path / "journal.db")
     snapshot_id = journal.add_analysis_snapshot(
