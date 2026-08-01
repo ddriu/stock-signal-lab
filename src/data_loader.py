@@ -37,6 +37,21 @@ STOOQ_INDEX_SYMBOLS = {
     "^IXIC": "^NDQ",
 }
 
+# Nombres y abreviaturas habituales de algunos brókeres no siempre coinciden
+# con el símbolo que utilizan las fuentes gratuitas. La app conserva el nombre
+# original en la cartera, pero usa esta cotización principal para el análisis.
+ANALYSIS_TICKER_ALIASES = {
+    "6VO": "RDDT",
+    "AMAZON": "AMZN",
+    "AMAZON.COM": "AMZN",
+    "AMZ": "AMZN",
+    "NETFLIX": "NFLX",
+    "ORACLE": "ORCL",
+    "REDDIT": "RDDT",
+    "SERVICE NOW": "NOW",
+    "SERVICENOW": "NOW",
+}
+
 
 class DataDownloadError(RuntimeError):
     """Error recuperable al obtener o validar precios."""
@@ -230,11 +245,19 @@ def _curated_search_results(query: str) -> list[TickerSearchResult]:
     ]
 
 
-def normalize_ticker(ticker: str) -> str:
+def resolve_analysis_ticker(ticker: str) -> str:
+    """Convierte nombres/abreviaturas de bróker en un ticker analizable."""
+
     value = ticker.strip().upper()
     if not value:
         raise ValueError("El ticker no puede estar vacío.")
-    return value
+    return ANALYSIS_TICKER_ALIASES.get(value, value)
+
+
+def normalize_ticker(ticker: str) -> str:
+    """Normaliza y resuelve aliases conocidos antes de consultar proveedores."""
+
+    return resolve_analysis_ticker(ticker)
 
 
 def search_instruments(query: str, max_results: int = 12) -> list[TickerSearchResult]:
@@ -440,8 +463,10 @@ def _download_yahoo_chart_prices(
         frame.attrs["provider"] = "Yahoo Finance (conexión directa)"
         return frame
     except (requests.RequestException, AttributeError, KeyError, TypeError, ValueError) as exc:
+        # No se expone la URL completa ni la respuesta interna del proveedor en
+        # la interfaz móvil. El detalle técnico sigue encadenado en la excepción.
         raise DataDownloadError(
-            f"Yahoo directo no encontró precios para {symbol}: {exc}"
+            f"Yahoo directo no tiene una serie diaria utilizable para {symbol}."
         ) from exc
 
 
@@ -464,7 +489,6 @@ def download_prices(
     if start_ts >= end_ts:
         raise ValueError("La fecha inicial debe ser anterior a la final.")
 
-    yahoo_error = ""
     try:
         frame = yf.download(
             symbol,
@@ -475,11 +499,9 @@ def download_prices(
             actions=False,
             threads=False,
         )
-    except Exception as exc:  # yfinance puede lanzar errores de red heterogéneos
+    except Exception:  # yfinance puede lanzar errores de red heterogéneos
         frame = pd.DataFrame()
-        yahoo_error = str(exc)
 
-    direct_error = ""
     if frame.empty:
         try:
             frame = _download_yahoo_chart_prices(
@@ -488,21 +510,18 @@ def download_prices(
                 end_ts,
                 auto_adjust=auto_adjust,
             )
-        except DataDownloadError as exc:
-            direct_error = str(exc)
+        except DataDownloadError:
+            # Se intenta Stooq a continuación; el detalle del proveedor no es
+            # útil para quien usa la aplicación desde el móvil.
+            pass
 
     if frame.empty:
         try:
             frame = _download_stooq_prices(symbol, start_ts, end_ts)
         except DataDownloadError as exc:
-            detail = (
-                f" Yahoo indicó: {yahoo_error}."
-                if yahoo_error
-                else " Yahoo no devolvió precios."
-            )
             raise DataDownloadError(
-                f"No se encontraron precios para {symbol} en ese intervalo."
-                f"{detail} {direct_error}. {exc}"
+                f"No encontramos precios para {symbol} en ese periodo. "
+                "Busca la empresa por nombre o comprueba el ticker y su mercado."
             ) from exc
 
     if isinstance(frame.columns, pd.MultiIndex):

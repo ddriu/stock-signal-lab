@@ -31,6 +31,9 @@ PORTFOLIO_IMPORT_NOTE_PREFIX = "Importado desde fotografía de cartera."
 CIVISLEND_IMPORT_NOTE_PREFIX = "Importado desde fotografía de cartera de Civislend."
 
 ANALYSIS_TICKER_OVERRIDES = {
+    "6VO": "RDDT",
+    "AMZ": "AMZN",
+    "NETFLIX": "NFLX",
     "7974 / NTDOY": "NTDOY",
     "KAP": "KAP.IL",
     "1801": "1801.HK",
