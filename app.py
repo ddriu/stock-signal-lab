@@ -75,6 +75,10 @@ from src.opportunity import (
 from src.portfolio import compare_switch, value_holding
 from src.portfolio_export import build_portfolio_excel
 from src.portfolio_history import build_portfolio_history
+from src.portfolio_snapshot_import import (
+    import_portfolio_workbook_snapshot,
+    parse_portfolio_snapshot_excel,
+)
 from src.recommendations import (
     build_entry_guide,
     build_profit_taking_plan,
@@ -100,6 +104,8 @@ from src.visualization import (
     momentum_chart,
     normalized_comparison_chart,
     portfolio_evolution_chart,
+    portfolio_snapshot_allocation_chart,
+    portfolio_snapshot_history_chart,
     price_chart,
     private_investments_chart,
     risk_return_chart,
@@ -1531,6 +1537,15 @@ def render_private_investments(
             "Ejecuta `supabase/migration_portfolio_accounts.sql` en SQL Editor."
         )
         accounts = pd.DataFrame()
+    snapshot_storage_ready = hasattr(journal, "list_portfolio_snapshot_positions")
+    if snapshot_storage_ready:
+        try:
+            portfolio_snapshots = journal.list_portfolio_snapshot_positions()
+        except JournalStorageError:
+            portfolio_snapshots = pd.DataFrame()
+            snapshot_storage_ready = False
+    else:
+        portfolio_snapshots = pd.DataFrame()
 
     if accounts.empty and hasattr(journal, "upsert_portfolio_account"):
         try:
@@ -1546,6 +1561,85 @@ def render_private_investments(
             # La migración remota puede estar todavía pendiente; el mensaje anterior
             # explica cómo habilitar la tabla sin bloquear el resto de la cartera.
             accounts = pd.DataFrame()
+
+    with st.expander("Importar una fotografía completa de mi cartera (.xlsx)"):
+        st.caption(
+            "Guarda las posiciones tal como aparecen en el archivo, sin inventar compras. "
+            "Si faltan cantidades o el coste es estimado, la app lo indica. Volver a subir "
+            "la misma fecha actualiza esa fotografía; una fecha nueva crea histórico."
+        )
+        portfolio_file = st.file_uploader(
+            "Excel de cartera",
+            type=["xlsx"],
+            key=f"{view_key}_portfolio_snapshot_excel",
+        )
+        if portfolio_file is not None:
+            try:
+                workbook_snapshot = parse_portfolio_snapshot_excel(
+                    portfolio_file.getvalue()
+                )
+            except (ValueError, ImportError) as exc:
+                st.error(str(exc))
+            else:
+                preview = workbook_snapshot.positions
+                preview_cost = float(
+                    pd.to_numeric(preview["cost_estimate_eur"], errors="coerce").sum()
+                )
+                preview_value = float(preview["value_eur"].sum())
+                preview_pnl = float(
+                    pd.to_numeric(preview["gain_loss_eur"], errors="coerce").sum()
+                )
+                preview_cols = st.columns(4)
+                preview_cols[0].metric("Fecha", workbook_snapshot.snapshot_date)
+                preview_cols[1].metric("Valor declarado", f"{preview_value:,.2f} €")
+                preview_cols[2].metric("Coste estimado", f"{preview_cost:,.2f} €")
+                preview_cols[3].metric("Resultado estimado", f"{preview_pnl:+,.2f} €")
+                missing_quantities = int(preview["quantity"].isna().sum())
+                if missing_quantities:
+                    st.info(
+                        f"{missing_quantities} líneas no incluyen cantidad. Se guardarán "
+                        "como valoración, no como operaciones de compra."
+                    )
+                st.dataframe(
+                    workbook_snapshot.accounts.rename(
+                        columns={
+                            "account_name": "Cuenta",
+                            "investments_value": "Inversiones €",
+                            "cash_balance": "Efectivo €",
+                        }
+                    ).loc[:, ["Cuenta", "Inversiones €", "Efectivo €"]],
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "Inversiones €": st.column_config.NumberColumn(format="%.2f €"),
+                        "Efectivo €": st.column_config.NumberColumn(format="%.2f €"),
+                    },
+                )
+                if not snapshot_storage_ready:
+                    st.error(
+                        "Falta la tabla de fotografías. Ejecuta "
+                        "`supabase/migration_portfolio_snapshots.sql` en Supabase."
+                    )
+                elif st.button(
+                    "Guardar esta fotografía histórica",
+                    type="primary",
+                    key=f"{view_key}_save_portfolio_snapshot",
+                ):
+                    try:
+                        import_result = import_portfolio_workbook_snapshot(
+                            journal,
+                            workbook_snapshot,
+                            recorded_by=actor_username,
+                        )
+                    except (ValueError, JournalStorageError) as exc:
+                        st.error(str(exc))
+                    else:
+                        st.success(
+                            f"Guardadas {import_result.positions_saved} posiciones, "
+                            f"{import_result.accounts_saved} cuentas y "
+                            f"{import_result.civislend_created} proyectos nuevos de Civislend."
+                        )
+                        st.rerun()
 
     if not accounts.empty:
         account_view = accounts.copy()
@@ -1691,6 +1785,107 @@ def render_private_investments(
                     st.rerun()
     else:
         st.info("Todavía no hay cuentas agregadas para mostrar.")
+
+    if not portfolio_snapshots.empty:
+        snapshot_view = portfolio_snapshots.copy()
+        snapshot_view["snapshot_date"] = pd.to_datetime(
+            snapshot_view["snapshot_date"], errors="coerce"
+        )
+        latest_date = snapshot_view["snapshot_date"].max()
+        latest_positions = snapshot_view.loc[
+            snapshot_view["snapshot_date"] == latest_date
+        ].copy()
+        for column in [
+            "value_eur", "cost_estimate_eur", "gain_loss_eur", "return_pct"
+        ]:
+            latest_positions[column] = pd.to_numeric(
+                latest_positions[column], errors="coerce"
+            )
+        latest_value = float(latest_positions["value_eur"].sum())
+        latest_cost = float(latest_positions["cost_estimate_eur"].sum())
+        latest_pnl = float(latest_positions["gain_loss_eur"].sum())
+        st.subheader("Fotografía de posiciones")
+        st.caption(
+            f"Última fotografía guardada: {latest_date:%d/%m/%Y}. "
+            "Es una valoración histórica; no sustituye el diario de compras y ventas."
+        )
+        snapshot_cols = st.columns(4)
+        snapshot_cols[0].metric("Valor declarado", f"{latest_value:,.2f} €")
+        snapshot_cols[1].metric("Coste estimado", f"{latest_cost:,.2f} €")
+        snapshot_cols[2].metric("Resultado estimado", f"{latest_pnl:+,.2f} €")
+        snapshot_cols[3].metric("Líneas de cartera", len(latest_positions))
+        chart_cols = st.columns(2)
+        with chart_cols[0]:
+            st.plotly_chart(
+                portfolio_snapshot_allocation_chart(latest_positions),
+                width="stretch",
+                config=PLOTLY_CONFIG,
+            )
+        with chart_cols[1]:
+            st.plotly_chart(
+                portfolio_snapshot_history_chart(snapshot_view),
+                width="stretch",
+                config=PLOTLY_CONFIG,
+            )
+
+        snapshot_display = latest_positions.rename(
+            columns={
+                "platform": "Plataforma",
+                "asset_name": "Activo",
+                "analysis_ticker": "Ticker para analizar",
+                "asset_type": "Tipo",
+                "portfolio_block": "Bloque",
+                "quantity": "Cantidad",
+                "currency": "Moneda",
+                "value_eur": "Valor €",
+                "return_pct": "Rentabilidad estimada %",
+                "cost_estimate_eur": "Coste estimado €",
+                "gain_loss_eur": "Resultado estimado €",
+                "comments": "Comentarios",
+            }
+        )
+        st.dataframe(
+            snapshot_display.loc[
+                :,
+                [
+                    "Plataforma", "Activo", "Ticker para analizar", "Tipo", "Bloque",
+                    "Cantidad", "Moneda", "Valor €", "Coste estimado €",
+                    "Resultado estimado €", "Rentabilidad estimada %", "Comentarios",
+                ],
+            ],
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Cantidad": st.column_config.NumberColumn(format="%.4f"),
+                "Valor €": st.column_config.NumberColumn(format="%.2f €"),
+                "Coste estimado €": st.column_config.NumberColumn(format="%.2f €"),
+                "Resultado estimado €": st.column_config.NumberColumn(format="%+.2f €"),
+                "Rentabilidad estimada %": st.column_config.NumberColumn(format="%+.2f%%"),
+            },
+        )
+        analyzable = latest_positions.loc[
+            latest_positions["analysis_ticker"].fillna("").astype(str).str.strip() != ""
+        ]
+        if not analyzable.empty:
+            analysis_options = {
+                f"{row.analysis_ticker} · {row.asset_name} · {row.platform}": str(
+                    row.analysis_ticker
+                )
+                for row in analyzable.itertuples(index=False)
+            }
+            analysis_cols = st.columns([3, 1])
+            selected_snapshot_position = analysis_cols[0].selectbox(
+                "Abrir una posición en el análisis",
+                list(analysis_options),
+                key=f"{view_key}_snapshot_analysis_position",
+            )
+            analysis_cols[1].button(
+                "Analizar posición",
+                type="primary",
+                key=f"{view_key}_open_snapshot_analysis",
+                on_click=_open_ticker_analysis,
+                args=(analysis_options[selected_snapshot_position],),
+            )
 
     st.divider()
     st.subheader("Proyectos de Civislend y Segofactoring")

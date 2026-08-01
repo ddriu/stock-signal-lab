@@ -42,6 +42,7 @@ La instalación local solicita las credenciales guardadas en
 │   ├── portfolio.py          # Valoración y comparación de cambios
 │   ├── portfolio_history.py  # Evolución diaria y resumen anual de cartera
 │   ├── portfolio_export.py   # Libro Excel con tablas y gráficos editables
+│   ├── portfolio_snapshot_import.py # Fotografías XLSX sin inventar operaciones
 │   ├── segofactoring_import.py # Importación idempotente del resumen XLSX
 │   ├── recommendations.py    # Entradas, retornos históricos y ventas parciales
 │   └── journal.py            # Diario SQLite y exportación mediante la UI
@@ -162,6 +163,16 @@ las participaciones repetidas del documento se conservan como inversiones indepe
 y los proyectos añadidos manualmente no se borran. Una operación cobrada queda en el
 histórico, pero deja de contarse como capital todavía invertido. Cuando el fichero sea
 antiguo puede marcarse como pendiente de actualizar para no presentar sus cifras como actuales.
+
+También se puede importar una **fotografía completa de cartera** en `.xlsx`. Las posiciones
+se guardan en una tabla histórica separada del diario de compraventas: una valoración del
+bróker no se convierte en una compra si faltan la cantidad, la fecha o el precio ejecutado.
+La misma fecha se actualiza de forma idempotente y una fecha distinta añade un nuevo punto
+al gráfico de evolución. El panel conserva valor, coste y resultado estimados, muestra la
+distribución por plataforma y permite abrir directamente los tickers reconocidos en el análisis.
+Segofactoring se separa de MyInvestor al sumar cuentas para evitar contarlo dos veces; los
+proyectos genéricos de Civislend se copian al detalle de inversiones privadas con una nota
+visible cuando faltan fecha real, vencimiento o rentabilidad prevista.
 
 El comparador de cambios resta por defecto 1 € por vender y otro por comprar,
 muestra cuántas unidades de la alternativa podrían adquirirse y calcula la mejora técnica.
