@@ -53,10 +53,11 @@ from src.favorite_tags import (
     suggest_favorite_tags,
 )
 from src.indicators import add_indicators
-from src.journal import MAX_FAVORITES, calculate_open_positions
+from src.journal import DEFAULT_DDRIU_ACCOUNTS, MAX_FAVORITES, calculate_open_positions
 from src.journal import (
     PRIVATE_INVESTMENT_PLATFORMS,
     PRIVATE_INVESTMENT_STATUSES,
+    PORTFOLIO_ACCOUNT_STATUSES,
 )
 from src.msn_research import build_msn_research_links
 from src.supabase_journal import JournalStorageError
@@ -1502,13 +1503,13 @@ def render_private_investments(
     *,
     actor_username: str,
     view_key: str,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Gestiona proyectos manuales de Civislend y Segofactoring para ddriu."""
 
-    st.subheader("Civislend y Segofactoring")
+    st.subheader("Mis cuentas y plataformas")
     st.caption(
-        "Aquí se registran inversiones que no cotizan en bolsa. Su valor no se descarga: "
-        "debes actualizarlo según los datos de cada plataforma."
+        "Vista conjunta de MyInvestor, Trade Republic, Revolut, Segofactoring y Civislend. "
+        "Los importes provisionales se pueden completar poco a poco."
     )
     try:
         investments = journal.list_private_investments()
@@ -1517,7 +1518,182 @@ def render_private_investments(
             "La tabla de inversiones privadas todavía no existe en Supabase. "
             "Ejecuta `supabase/migration_private_investments.sql` en SQL Editor."
         )
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
+    try:
+        accounts = journal.list_portfolio_accounts()
+    except (JournalStorageError, AttributeError):
+        st.error(
+            "La tabla de cuentas todavía no existe en Supabase. "
+            "Ejecuta `supabase/migration_portfolio_accounts.sql` en SQL Editor."
+        )
+        accounts = pd.DataFrame()
+
+    if accounts.empty and hasattr(journal, "upsert_portfolio_account"):
+        try:
+            for account_name, account_type in DEFAULT_DDRIU_ACCOUNTS:
+                journal.upsert_portfolio_account(
+                    account_name=account_name,
+                    account_type=account_type,
+                    status="Pendiente de actualizar",
+                    notes="Cuenta provisional: faltan posiciones e importes.",
+                )
+            accounts = journal.list_portfolio_accounts()
+        except (JournalStorageError, ValueError):
+            # La migración remota puede estar todavía pendiente; el mensaje anterior
+            # explica cómo habilitar la tabla sin bloquear el resto de la cartera.
+            accounts = pd.DataFrame()
+
+    if not accounts.empty:
+        account_view = accounts.copy()
+        account_view["investments_value"] = pd.to_numeric(
+            account_view["investments_value"], errors="coerce"
+        ).fillna(0.0)
+        account_view["cash_balance"] = pd.to_numeric(
+            account_view["cash_balance"], errors="coerce"
+        ).fillna(0.0)
+        project_values: dict[str, float] = {}
+        if not investments.empty:
+            project_values = (
+                investments.groupby("platform")["current_value"].sum().astype(float).to_dict()
+            )
+        account_view["source"] = "Valor provisional manual"
+        for row_index, row in account_view.iterrows():
+            account_name = str(row["account_name"])
+            if account_name in project_values:
+                account_view.at[row_index, "investments_value"] = project_values[account_name]
+                account_view.at[row_index, "source"] = "Calculado con proyectos registrados"
+        account_view["total_value"] = (
+            account_view["investments_value"] + account_view["cash_balance"]
+        )
+        euro_accounts = account_view.loc[account_view["currency"] == "EUR"]
+        total_accounts = float(euro_accounts["total_value"].sum())
+        total_cash = float(euro_accounts["cash_balance"].sum())
+        pending_accounts = int(
+            (account_view["status"] == "Pendiente de actualizar").sum()
+        )
+        account_cols = st.columns(3)
+        account_cols[0].metric("Valor agregado provisional", f"{total_accounts:,.2f} €")
+        account_cols[1].metric("Efectivo declarado", f"{total_cash:,.2f} €")
+        account_cols[2].metric("Cuentas pendientes", pending_accounts)
+        if len(euro_accounts) != len(account_view):
+            st.caption(
+                "El total superior suma sólo cuentas declaradas en EUR; los importes en "
+                "otras monedas permanecen visibles en la tabla sin mezclarse."
+            )
+        account_display = account_view.rename(
+            columns={
+                "account_name": "Cuenta",
+                "account_type": "Tipo",
+                "investments_value": "Inversiones",
+                "cash_balance": "Efectivo",
+                "total_value": "Total",
+                "currency": "Moneda",
+                "status": "Estado",
+                "source": "Origen del valor",
+                "updated_at": "Actualizada el",
+            }
+        )
+        st.dataframe(
+            account_display.loc[
+                :,
+                [
+                    "Cuenta", "Tipo", "Inversiones", "Efectivo", "Total", "Moneda",
+                    "Estado", "Origen del valor", "Actualizada el",
+                ],
+            ],
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Inversiones": st.column_config.NumberColumn(format="%.2f"),
+                "Efectivo": st.column_config.NumberColumn(format="%.2f"),
+                "Total": st.column_config.NumberColumn(format="%.2f"),
+            },
+        )
+        if total_accounts <= 0:
+            st.info(
+                "Las cinco cuentas ya están creadas, pero sus valores están a cero hasta "
+                "que introduzcas importes o proyectos."
+            )
+        with st.expander("Actualizar el total provisional de una cuenta"):
+            account_names = account_view["account_name"].astype(str).tolist()
+            selected_account_name = st.selectbox(
+                "Cuenta",
+                account_names,
+                key=f"{view_key}_portfolio_account_name",
+            )
+            selected_account = account_view.loc[
+                account_view["account_name"] == selected_account_name
+            ].iloc[0]
+            with st.form(f"{view_key}_portfolio_account_form"):
+                account_amount_cols = st.columns(2)
+                provisional_investments = account_amount_cols[0].number_input(
+                    "Valor de las inversiones",
+                    min_value=0.0,
+                    value=float(selected_account["investments_value"]),
+                    step=100.0,
+                    help=(
+                        "Para Civislend y Segofactoring, los proyectos registrados debajo "
+                        "tienen prioridad sobre este total manual."
+                    ),
+                )
+                provisional_cash = account_amount_cols[1].number_input(
+                    "Efectivo disponible",
+                    min_value=0.0,
+                    value=float(selected_account["cash_balance"]),
+                    step=100.0,
+                )
+                account_currency = st.selectbox(
+                    "Moneda",
+                    ["EUR", "USD", "GBP", "CHF", "JPY"],
+                    index=(
+                        ["EUR", "USD", "GBP", "CHF", "JPY"].index(
+                            str(selected_account["currency"])
+                        )
+                        if str(selected_account["currency"])
+                        in ["EUR", "USD", "GBP", "CHF", "JPY"]
+                        else 0
+                    ),
+                )
+                selected_status = str(selected_account["status"])
+                account_status = st.selectbox(
+                    "Estado de los datos",
+                    PORTFOLIO_ACCOUNT_STATUSES,
+                    index=(
+                        PORTFOLIO_ACCOUNT_STATUSES.index(selected_status)
+                        if selected_status in PORTFOLIO_ACCOUNT_STATUSES
+                        else 0
+                    ),
+                )
+                account_notes = st.text_area(
+                    "Notas",
+                    value=str(selected_account.get("notes") or ""),
+                )
+                save_account = st.form_submit_button("Actualizar cuenta", type="primary")
+            if save_account:
+                try:
+                    journal.upsert_portfolio_account(
+                        account_name=selected_account_name,
+                        account_type=str(selected_account["account_type"]),
+                        investments_value=float(provisional_investments),
+                        cash_balance=float(provisional_cash),
+                        currency=account_currency,
+                        status=account_status,
+                        notes=account_notes,
+                    )
+                except (ValueError, JournalStorageError) as exc:
+                    st.error(str(exc))
+                else:
+                    st.success(f"{selected_account_name} actualizada.")
+                    st.rerun()
+    else:
+        st.info("Todavía no hay cuentas agregadas para mostrar.")
+
+    st.divider()
+    st.subheader("Proyectos de Civislend y Segofactoring")
+    st.caption(
+        "Estas inversiones no cotizan en bolsa. Su valor no se descarga: debes "
+        "actualizarlo según los datos de cada plataforma."
+    )
     if investments.empty:
         st.info("Todavía no has registrado proyectos de estas plataformas.")
     else:
@@ -1683,7 +1859,7 @@ def render_private_investments(
             ):
                 journal.delete_private_investment(int(selected_id))
                 st.rerun()
-    return investments
+    return investments, accounts
 
 
 def render_portfolio_evolution(
@@ -1693,6 +1869,7 @@ def render_portfolio_evolution(
     prepared: dict[str, pd.DataFrame],
     fx_snapshot: FxSnapshot,
     private_investments: pd.DataFrame,
+    portfolio_accounts: pd.DataFrame,
     view_key: str,
 ) -> None:
     """Muestra evolución diaria/anual y prepara un Excel completo."""
@@ -1760,6 +1937,7 @@ def render_portfolio_evolution(
             annual=result.annual,
             daily=result.daily,
             private_investments=private_investments,
+            portfolio_accounts=portfolio_accounts,
         )
     except (ImportError, ModuleNotFoundError) as exc:
         st.error(f"No se pudo preparar Excel: {exc}")
@@ -1817,7 +1995,7 @@ def render_journal(
         "Historial",
     ]
     if private_platforms_enabled:
-        tab_labels.append("Civislend / Sego")
+        tab_labels.append("Mis cuentas")
     journal_tabs = st.tabs(tab_labels)
     positions_tab, register_tab, evolution_tab, switch_tab, history_tab = journal_tabs[:5]
     private_tab = journal_tabs[5] if private_platforms_enabled else None
@@ -1834,9 +2012,10 @@ def render_journal(
         )
 
     private_investments = pd.DataFrame()
+    portfolio_accounts = pd.DataFrame()
     if private_tab is not None:
         with private_tab:
-            private_investments = render_private_investments(
+            private_investments, portfolio_accounts = render_private_investments(
                 journal,
                 actor_username=actor_username,
                 view_key=view_key,
@@ -1912,6 +2091,7 @@ def render_journal(
             prepared=prepared,
             fx_snapshot=fx_snapshot,
             private_investments=private_investments,
+            portfolio_accounts=portfolio_accounts,
             view_key=view_key,
         )
     analysis_rows: list[dict[str, object]] = []

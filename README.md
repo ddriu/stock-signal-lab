@@ -147,8 +147,12 @@ mercado y resultado acumulado. Incluye una gráfica temporal, otra anual y un Ex
 hojas de resumen, operaciones, posiciones y evolución diaria. Para años pasados usa los
 cierres disponibles y el tipo de cambio actual del BCE, por lo que es una herramienta de
 seguimiento y no una contabilidad fiscal exacta. En la cartera privada de `ddriu` aparece
-además un apartado para registrar y actualizar manualmente proyectos de **Civislend** y
-**Segofactoring**; esos activos no tienen una cotización pública automática.
+además **Mis cuentas**, una vista conjunta y editable de **MyInvestor, Trade Republic,
+Revolut, Segofactoring y Civislend**. Las cinco se crean con valor cero y el estado
+«Pendiente de actualizar», para poder completar importes sin inventar datos. En Civislend
+y Segofactoring el detalle por proyectos registrado manualmente tiene prioridad sobre el
+total provisional, porque esos activos no tienen una cotización pública automática. El
+Excel incorpora también una hoja independiente con las cuentas y plataformas.
 
 El comparador de cambios resta por defecto 1 € por vender y otro por comprar,
 muestra cuántas unidades de la alternativa podrían adquirirse y calcula la mejora técnica.
