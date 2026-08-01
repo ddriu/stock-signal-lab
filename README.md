@@ -40,6 +40,8 @@ La instalación local solicita las credenciales guardadas en
 │   ├── ui.py                 # Diseño responsive y perfiles de configuración
 │   ├── risk.py               # Tamaño orientativo de posición y riesgo monetario
 │   ├── portfolio.py          # Valoración y comparación de cambios
+│   ├── portfolio_history.py  # Evolución diaria y resumen anual de cartera
+│   ├── portfolio_export.py   # Libro Excel con tablas y gráficos editables
 │   ├── recommendations.py    # Entradas, retornos históricos y ventas parciales
 │   └── journal.py            # Diario SQLite y exportación mediante la UI
 └── tests/                    # Pruebas unitarias sin red
@@ -84,8 +86,9 @@ Las oportunidades se presentan en tarjetas fáciles de leer y conservan el ranki
 completo y los gráficos técnicos como detalle desplegable.
 
 El diseño se adapta a escritorio, tablet y móvil: las columnas se apilan, la navegación
-permanece accesible y las tablas y pestañas pueden desplazarse horizontalmente. En
-pantallas estrechas la barra lateral se abre con el control superior de Streamlit.
+permanece accesible y las tablas y pestañas pueden desplazarse horizontalmente. La barra
+lateral con periodos, estrategia y riesgo sólo aparece dentro de **Analizar**; el resto
+de secciones conserva un buscador compacto para no ocupar espacio innecesario.
 
 Los perfiles **Equilibrado**, **Crecimiento** y **Prudente** ajustan juntos los umbrales
 técnicos y de riesgo. **Personalizado** conserva los valores elegidos manualmente.
@@ -100,11 +103,18 @@ y beneficio neto si se vendiera al último cierre. Las posiciones guardadas se a
 automáticamente a la próxima descarga.
 
 La pestaña **Favoritos** permite buscar una empresa por su nombre normal, sin conocer el
-ticker, y guardarla en una lista privada o compartida. Cada lista admite 300 empresas.
-Cada tarjeta tiene acceso directo a su análisis completo, con búsqueda y paginación
-para que las listas largas sigan siendo manejables desde móvil.
+ticker, y guardarla en una lista privada o compartida. Los resultados indican mercado,
+país, moneda y tipo de cotización para distinguir una acción local de alternativas ADR,
+GDR u OTC. Admite mercados internacionales como Madrid (`.MC`), Tokio (`.T`), Londres
+(`.L`) o el mercado internacional de Londres (`.IL`). Cada lista admite 300 empresas.
+La vista principal es una tabla densa, no una colección de tarjetas: cada fila conserva
+ticker, nombre, mercado y etiquetas. Al seleccionar una fila aparece el acceso al análisis
+completo. Se muestran hasta 25 empresas por página, con búsqueda y paginación para que las
+listas largas sigan siendo manejables desde móvil.
 Se pueden escoger hasta 25 a la vez para descargar fundamentales y hacer el análisis completo.
-Si el buscador externo no responde, también permite guardar el ticker manualmente.
+Si el buscador externo no responde, el modo avanzado permite guardar el ticker exacto
+manualmente. Nintendo y Kazatomprom conservan además cotizaciones conocidas como respaldo
+del buscador (`7974.T`, `NTDOY` y `KAP.IL`).
 Cada favorita admite hasta cinco etiquetas visuales —por ejemplo Energía,
 Biotecnología, Tecnología, ETF, Fondo o Small cap— que pueden corregirse y utilizarse
 como filtro. La aplicación propone etiquetas a partir del tipo de instrumento, sector,
@@ -131,6 +141,14 @@ lo añadió; un usuario puede eliminar los suyos y el administrador puede correg
 Ambas carteras muestran capital pendiente, valor neto, beneficio latente y realizado,
 rentabilidad, comisiones y cobertura de precios. El rol administrador también ve un
 resumen de las cuatro carteras privadas y puede registrar operaciones para un usuario.
+
+La pestaña **Evolución por años** separa compras, ventas, dinero neto aportado, valor de
+mercado y resultado acumulado. Incluye una gráfica temporal, otra anual y un Excel con
+hojas de resumen, operaciones, posiciones y evolución diaria. Para años pasados usa los
+cierres disponibles y el tipo de cambio actual del BCE, por lo que es una herramienta de
+seguimiento y no una contabilidad fiscal exacta. En la cartera privada de `ddriu` aparece
+además un apartado para registrar y actualizar manualmente proyectos de **Civislend** y
+**Segofactoring**; esos activos no tienen una cotización pública automática.
 
 El comparador de cambios resta por defecto 1 € por vender y otro por comprar,
 muestra cuántas unidades de la alternativa podrían adquirirse y calcula la mejora técnica.
@@ -248,3 +266,8 @@ La aplicación está preparada para Streamlit Community Cloud con acceso privado
 contraseña. Consulta [DEPLOYMENT.md](DEPLOYMENT.md). En alojamiento gratuito el
 diario SQLite se desactiva deliberadamente porque el disco puede reiniciarse; los
 análisis, gráficos y backtests continúan disponibles.
+
+Community Cloud hiberna las aplicaciones gratuitas después de 12 horas sin tráfico.
+La primera visita posterior debe despertarla y puede tardar algo más; no significa que
+se haya borrado. Las cachés de precios, fundamentales y búsquedas tienen un tamaño máximo
+para reducir el riesgo de superar la memoria disponible del alojamiento gratuito.

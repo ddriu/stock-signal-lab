@@ -49,12 +49,15 @@ from src.email_sender import (
 )
 from src.favorite_tags import (
     FAVORITE_TAGS,
-    favorite_tag_css_class,
     favorite_tags_from_value,
     suggest_favorite_tags,
 )
 from src.indicators import add_indicators
 from src.journal import MAX_FAVORITES, calculate_open_positions
+from src.journal import (
+    PRIVATE_INVESTMENT_PLATFORMS,
+    PRIVATE_INVESTMENT_STATUSES,
+)
 from src.msn_research import build_msn_research_links
 from src.supabase_journal import JournalStorageError
 from src.storage import GROUP_PORTFOLIO_OWNER, create_journal
@@ -69,6 +72,8 @@ from src.opportunity import (
     evaluate_valuation,
 )
 from src.portfolio import compare_switch, value_holding
+from src.portfolio_export import build_portfolio_excel
+from src.portfolio_history import build_portfolio_history
 from src.recommendations import (
     build_entry_guide,
     build_profit_taking_plan,
@@ -84,16 +89,21 @@ from src.ui import (
     strategy_profile_defaults,
 )
 from src.visualization import (
+    annual_portfolio_chart,
     backtest_chart,
     correlation_heatmap,
     momentum_chart,
     normalized_comparison_chart,
+    portfolio_evolution_chart,
     price_chart,
+    private_investments_chart,
     risk_return_chart,
 )
 
 
 st.set_page_config(page_title="Stock Signal Lab", page_icon="📈", layout="wide")
+
+MAIN_OPTIONS = ["Inicio", "Analizar", "Favoritos", "Carteras", "Más"]
 
 
 def apply_visual_theme() -> None:
@@ -102,39 +112,57 @@ def apply_visual_theme() -> None:
     st.markdown(f"<style>{APP_CSS}</style>", unsafe_allow_html=True)
 
 
-@st.cache_data(ttl=3_600, show_spinner=False)
+@st.cache_data(ttl=3_600, max_entries=350, show_spinner=False)
 def cached_download(ticker: str, start: date, end: date, auto_adjust: bool) -> pd.DataFrame:
     """Caché de red; los indicadores se recalculan fuera con la configuración actual."""
 
     return download_prices(ticker, start, end, auto_adjust=auto_adjust)
 
 
-@st.cache_data(ttl=21_600, show_spinner=False)
+@st.cache_data(ttl=21_600, max_entries=300, show_spinner=False)
 def cached_fundamentals(ticker: str) -> dict[str, object]:
     """Caché más largo para datos empresariales, que cambian menos que el precio."""
 
     return download_fundamental_snapshot(ticker)
 
 
-@st.cache_data(ttl=86_400, show_spinner=False)
+@st.cache_data(ttl=86_400, max_entries=2, show_spinner=False)
 def cached_fx_rates() -> FxSnapshot:
     """Tipos de referencia diarios; una consulta basta para todas las empresas."""
 
     return download_ecb_fx_snapshot()
 
 
-@st.cache_data(ttl=86_400, show_spinner=False)
+@st.cache_data(ttl=86_400, max_entries=100, show_spinner=False)
 def cached_price_verification(ticker: str, api_key: str) -> PriceVerification:
     """Comprobación opcional del cierre mediante un segundo proveedor."""
 
     return download_alpha_vantage_latest_close(ticker, api_key)
 
 
-@st.cache_data(ttl=86_400, show_spinner=False)
+@st.cache_data(ttl=86_400, max_entries=200, show_spinner=False)
 def cached_company_search(query: str) -> list[TickerSearchResult]:
     """Evita repetir búsquedas iguales durante el día."""
 
-    return search_instruments(query)
+    return search_instruments(query, max_results=25)
+
+
+def apply_section_layout(section: str) -> None:
+    """Reserva la barra lateral completa para la zona que realmente la necesita."""
+
+    if section == "Analizar":
+        return
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"],
+        [data-testid="stSidebarCollapsedControl"] {
+            display: none !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def parse_tickers(raw_value: str) -> list[str]:
@@ -254,7 +282,11 @@ def build_sidebar(
 ]:
     favorite_tickers = favorite_tickers or []
     favorite_labels = favorite_labels or {}
-    st.sidebar.markdown("## Radar de empresas")
+    st.sidebar.markdown("## Configurar análisis")
+    st.sidebar.caption(
+        "Este panel sólo aparece en Analizar. Los cambios se aplican al pulsar "
+        "«Actualizar análisis»."
+    )
     selected_favorites = st.sidebar.multiselect(
         "Empresas que quieres analizar",
         options=favorite_tickers,
@@ -266,13 +298,16 @@ def build_sidebar(
         ),
         key="selected_favorite_tickers",
     )
-    with st.sidebar.expander("Añadir símbolos manualmente"):
+    with st.sidebar.expander("Modo avanzado: ticker exacto"):
         manual_tickers = parse_tickers(
             st.text_area(
                 "Símbolos bursátiles",
                 "" if favorite_tickers else "AAPL, MSFT, SAN.MC",
                 height=78,
-                help="Escribe símbolos separados por comas; SAN.MC es Banco Santander en Madrid.",
+                help=(
+                    "Sólo es necesario si el buscador no encuentra la empresa. Ejemplos: "
+                    "SAN.MC (Madrid), 7974.T (Tokio) o KAP.IL (Londres internacional)."
+                ),
                 key="manual_tickers",
             )
         )
@@ -1462,6 +1497,283 @@ def operation_history_for_display(operations: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def render_private_investments(
+    journal: object,
+    *,
+    actor_username: str,
+    view_key: str,
+) -> pd.DataFrame:
+    """Gestiona proyectos manuales de Civislend y Segofactoring para ddriu."""
+
+    st.subheader("Civislend y Segofactoring")
+    st.caption(
+        "Aquí se registran inversiones que no cotizan en bolsa. Su valor no se descarga: "
+        "debes actualizarlo según los datos de cada plataforma."
+    )
+    try:
+        investments = journal.list_private_investments()
+    except JournalStorageError:
+        st.error(
+            "La tabla de inversiones privadas todavía no existe en Supabase. "
+            "Ejecuta `supabase/migration_private_investments.sql` en SQL Editor."
+        )
+        return pd.DataFrame()
+    if investments.empty:
+        st.info("Todavía no has registrado proyectos de estas plataformas.")
+    else:
+        invested = float(pd.to_numeric(investments["invested_amount"], errors="coerce").sum())
+        current = float(pd.to_numeric(investments["current_value"], errors="coerce").sum())
+        active = int(investments["status"].isin(["Activa", "Retrasada"]).sum())
+        weighted_return = (
+            float(
+                (
+                    pd.to_numeric(investments["invested_amount"], errors="coerce")
+                    * pd.to_numeric(investments["expected_return_pct"], errors="coerce")
+                ).sum()
+                / invested
+            )
+            if invested > 0
+            else 0.0
+        )
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Importe registrado", f"{invested:,.2f} €")
+        metric_cols[1].metric("Valor actual manual", f"{current:,.2f} €")
+        metric_cols[2].metric("Diferencia", f"{current - invested:+,.2f} €")
+        metric_cols[3].metric(
+            "Rentabilidad esperada media",
+            f"{weighted_return:.2f}%",
+            help="Media ponderada por el importe inicial; no es una rentabilidad garantizada.",
+        )
+        st.caption(f"{active} proyectos activos o retrasados.")
+        st.plotly_chart(
+            private_investments_chart(investments),
+            width="stretch",
+            config=PLOTLY_CONFIG,
+        )
+        display = investments.rename(
+            columns={
+                "id": "ID",
+                "platform": "Plataforma",
+                "project_name": "Proyecto",
+                "invested_amount": "Invertido €",
+                "current_value": "Valor actual €",
+                "expected_return_pct": "Rentabilidad esperada %",
+                "start_date": "Inicio",
+                "maturity_date": "Vencimiento",
+                "status": "Estado",
+                "notes": "Notas",
+            }
+        )
+        st.dataframe(
+            display.loc[
+                :,
+                [
+                    "ID", "Plataforma", "Proyecto", "Invertido €", "Valor actual €",
+                    "Rentabilidad esperada %", "Inicio", "Vencimiento", "Estado", "Notas",
+                ],
+            ],
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Invertido €": st.column_config.NumberColumn(format="%.2f €"),
+                "Valor actual €": st.column_config.NumberColumn(format="%.2f €"),
+                "Rentabilidad esperada %": st.column_config.NumberColumn(format="%.2f%%"),
+            },
+        )
+
+    add_tab, update_tab = st.tabs(["Añadir proyecto", "Actualizar o eliminar"])
+    with add_tab:
+        with st.form(f"{view_key}_private_investment_form", clear_on_submit=True):
+            platform = st.selectbox("Plataforma", PRIVATE_INVESTMENT_PLATFORMS)
+            project_name = st.text_input(
+                "Proyecto o referencia",
+                placeholder="Ej.: Préstamo promoción Madrid 2026",
+            )
+            amount_cols = st.columns(3)
+            invested_amount = amount_cols[0].number_input(
+                "Importe invertido (€)", min_value=0.01, value=1_000.0, step=100.0
+            )
+            current_value = amount_cols[1].number_input(
+                "Valor actual (€)",
+                min_value=0.0,
+                value=1_000.0,
+                step=100.0,
+                help="Introduce el capital pendiente más intereses ya cobrados, según tu criterio.",
+            )
+            expected_return = amount_cols[2].number_input(
+                "Rentabilidad esperada (%)",
+                min_value=-100.0,
+                max_value=1_000.0,
+                value=8.0,
+                step=0.25,
+            )
+            date_cols = st.columns(2)
+            start_date = date_cols[0].date_input("Fecha de inversión", value=date.today())
+            maturity_date = date_cols[1].date_input(
+                "Vencimiento previsto", value=date.today() + timedelta(days=365)
+            )
+            status = st.selectbox("Estado", PRIVATE_INVESTMENT_STATUSES)
+            notes = st.text_area("Notas y riesgos")
+            submitted = st.form_submit_button("Guardar proyecto", type="primary")
+        if submitted:
+            try:
+                journal.add_private_investment(
+                    platform=platform,
+                    project_name=project_name,
+                    invested_amount=float(invested_amount),
+                    current_value=float(current_value),
+                    expected_return_pct=float(expected_return),
+                    start_date=start_date,
+                    maturity_date=maturity_date,
+                    status=status,
+                    notes=notes,
+                    recorded_by=actor_username,
+                )
+            except (ValueError, JournalStorageError) as exc:
+                st.error(str(exc))
+            else:
+                st.success("Proyecto guardado.")
+                st.rerun()
+
+    with update_tab:
+        if investments.empty:
+            st.caption("Añade un proyecto para poder actualizarlo.")
+        else:
+            labels = {
+                int(row.id): f"{row.platform} · {row.project_name}"
+                for row in investments.itertuples(index=False)
+            }
+            selected_id = st.selectbox(
+                "Proyecto",
+                list(labels),
+                format_func=lambda value: labels[int(value)],
+                key=f"{view_key}_private_investment_id",
+            )
+            selected = investments.loc[investments["id"] == selected_id].iloc[0]
+            with st.form(f"{view_key}_update_private_investment"):
+                updated_value = st.number_input(
+                    "Valor actual (€)",
+                    min_value=0.0,
+                    value=float(selected["current_value"]),
+                    step=50.0,
+                )
+                updated_status = st.selectbox(
+                    "Estado",
+                    PRIVATE_INVESTMENT_STATUSES,
+                    index=PRIVATE_INVESTMENT_STATUSES.index(str(selected["status"])),
+                )
+                updated_notes = st.text_area("Notas", value=str(selected["notes"] or ""))
+                update_submitted = st.form_submit_button("Actualizar", type="primary")
+            if update_submitted:
+                try:
+                    journal.update_private_investment(
+                        int(selected_id),
+                        current_value=float(updated_value),
+                        status=updated_status,
+                        notes=updated_notes,
+                    )
+                except (ValueError, JournalStorageError) as exc:
+                    st.error(str(exc))
+                else:
+                    st.success("Proyecto actualizado.")
+                    st.rerun()
+            if st.button(
+                "Eliminar proyecto seleccionado",
+                key=f"{view_key}_delete_private_investment",
+            ):
+                journal.delete_private_investment(int(selected_id))
+                st.rerun()
+    return investments
+
+
+def render_portfolio_evolution(
+    *,
+    operations: pd.DataFrame,
+    positions_dashboard: pd.DataFrame,
+    prepared: dict[str, pd.DataFrame],
+    fx_snapshot: FxSnapshot,
+    private_investments: pd.DataFrame,
+    view_key: str,
+) -> None:
+    """Muestra evolución diaria/anual y prepara un Excel completo."""
+
+    st.subheader("Evolución y resumen por años")
+    st.caption(
+        "Las compras añaden capital y las ventas lo retiran. Así puedes ver por separado "
+        "el dinero aportado, el valor de lo que mantienes y el resultado acumulado."
+    )
+    if operations.empty:
+        st.info("Registra al menos una compra para crear el seguimiento histórico.")
+        return
+    result = build_portfolio_history(
+        operations,
+        prepared,
+        fx_snapshot.rates_per_eur,
+    )
+    if result.missing_tickers:
+        st.warning(
+            "Para completar la gráfica faltan precios de: "
+            + ", ".join(result.missing_tickers)
+            + ". Añádelas al radar desde Analizar y actualiza los datos."
+        )
+    if result.missing_currencies:
+        st.warning(
+            "No se pudieron convertir a euros estas monedas: "
+            + ", ".join(result.missing_currencies)
+            + "."
+        )
+    if not result.daily.empty:
+        st.plotly_chart(
+            portfolio_evolution_chart(result.daily),
+            width="stretch",
+            config=PLOTLY_CONFIG,
+        )
+    if not result.annual.empty:
+        st.plotly_chart(
+            annual_portfolio_chart(result.annual),
+            width="stretch",
+            config=PLOTLY_CONFIG,
+        )
+        st.dataframe(
+            result.annual,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Compras EUR": st.column_config.NumberColumn(format="%.2f €"),
+                "Ventas EUR": st.column_config.NumberColumn(format="%.2f €"),
+                "Aportación neta EUR": st.column_config.NumberColumn(format="%+.2f €"),
+                "Comisiones EUR": st.column_config.NumberColumn(format="%.2f €"),
+                "Resultado realizado EUR": st.column_config.NumberColumn(format="%+.2f €"),
+                "Valor al cierre EUR": st.column_config.NumberColumn(format="%.2f €"),
+                "Resultado acumulado EUR": st.column_config.NumberColumn(format="%+.2f €"),
+                "Resultado acumulado %": st.column_config.NumberColumn(format="%+.2f%%"),
+            },
+        )
+    st.caption(
+        "Estimación de seguimiento: emplea cierres de mercado ajustados y el tipo de cambio "
+        "actual del BCE para todos los años. No sustituye el extracto del bróker ni el cálculo fiscal."
+    )
+    try:
+        workbook = build_portfolio_excel(
+            operations=operation_history_for_display(operations),
+            positions=positions_dashboard,
+            annual=result.annual,
+            daily=result.daily,
+            private_investments=private_investments,
+        )
+    except (ImportError, ModuleNotFoundError) as exc:
+        st.error(f"No se pudo preparar Excel: {exc}")
+    else:
+        st.download_button(
+            "Descargar cartera completa en Excel",
+            workbook,
+            file_name=f"cartera_{view_key}_{date.today().isoformat()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{view_key}_download_excel",
+            type="primary",
+        )
+
+
 def render_journal(
     prepared: dict[str, pd.DataFrame],
     fundamental_results: dict[str, FundamentalResult],
@@ -1496,9 +1808,19 @@ def render_journal(
         ),
         key=f"{view_key}_fixed_fee",
     )
-    positions_tab, register_tab, switch_tab, history_tab = st.tabs(
-        ["Posiciones analizadas", "Registrar operación", "Comparar un cambio", "Historial"]
-    )
+    private_platforms_enabled = not shared and actor_username.strip().lower() == "ddriu"
+    tab_labels = [
+        "Posiciones analizadas",
+        "Comprar / vender",
+        "Evolución por años",
+        "Comparar un cambio",
+        "Historial",
+    ]
+    if private_platforms_enabled:
+        tab_labels.append("Civislend / Sego")
+    journal_tabs = st.tabs(tab_labels)
+    positions_tab, register_tab, evolution_tab, switch_tab, history_tab = journal_tabs[:5]
+    private_tab = journal_tabs[5] if private_platforms_enabled else None
 
     with register_tab:
         render_operation_form(
@@ -1510,6 +1832,15 @@ def render_journal(
             recorded_by=actor_username,
             notes_label="Motivo o acuerdo del grupo" if shared else "Notas",
         )
+
+    private_investments = pd.DataFrame()
+    if private_tab is not None:
+        with private_tab:
+            private_investments = render_private_investments(
+                journal,
+                actor_username=actor_username,
+                view_key=view_key,
+            )
 
     with history_tab:
         st.subheader("Histórico")
@@ -1567,13 +1898,22 @@ def render_journal(
         for ticker, frame in prepared.items()
         if not frame.empty
     }
-    _, portfolio_kpis = build_position_dashboard(
+    positions_dashboard, portfolio_kpis = build_position_dashboard(
         operations,
         positions,
         latest_prices,
         fx_snapshot.rates_per_eur,
         sell_fee_eur=float(fixed_fee),
     )
+    with evolution_tab:
+        render_portfolio_evolution(
+            operations=operations,
+            positions_dashboard=positions_dashboard,
+            prepared=prepared,
+            fx_snapshot=fx_snapshot,
+            private_investments=private_investments,
+            view_key=view_key,
+        )
     analysis_rows: list[dict[str, object]] = []
     details: dict[str, dict[str, object]] = {}
     for position in positions.itertuples(index=False):
@@ -1720,7 +2060,8 @@ def render_journal(
                 st.warning(
                     "Faltan precios para: "
                     + ", ".join(missing)
-                    + ". Pulsa «Descargar / actualizar»; las posiciones guardadas se incluyen automáticamente."
+                    + ". Abre «Analizar» y pulsa «Actualizar análisis»; las posiciones "
+                    "guardadas se incluyen automáticamente."
                 )
             if details:
                 selected_position = st.selectbox(
@@ -2084,8 +2425,8 @@ def render_admin_panel(
         )
         if total_positions and not latest_prices:
             st.info(
-                "Pulsa «Descargar / actualizar» para valorar las posiciones con precios "
-                "actuales y calcular sus rendimientos."
+                "Abre «Analizar» y pulsa «Actualizar análisis» para valorar las "
+                "posiciones con precios actuales y calcular sus rendimientos."
             )
 
     with register_tab:
@@ -2160,43 +2501,6 @@ def render_admin_panel(
             st.dataframe(operations, width="stretch", hide_index=True)
 
 
-def _favorite_cards_html(favorites: pd.DataFrame, *, shared: bool) -> str:
-    cards: list[str] = []
-    for favorite in favorites.itertuples(index=False):
-        ticker = html.escape(str(favorite.ticker))
-        name = html.escape(str(getattr(favorite, "name", "") or favorite.ticker))
-        exchange = html.escape(str(getattr(favorite, "exchange", "") or "Mercado N/D"))
-        tags = favorite_tags_from_value(getattr(favorite, "tags", ""))
-        if not tags:
-            tags = ["Otra"]
-        badges = "".join(
-            (
-                f'<span class="ssl-favorite-tag ssl-tag-{favorite_tag_css_class(tag)}">'
-                f"{html.escape(tag)}</span>"
-            )
-            for tag in tags
-        )
-        actor = ""
-        if shared:
-            recorded_by = html.escape(
-                str(getattr(favorite, "recorded_by", "") or "grupo")
-            )
-            actor = f"<small>Añadida por {recorded_by}</small>"
-        cards.append(
-            (
-                '<article class="ssl-favorite-card">'
-                '<div class="ssl-favorite-card-top">'
-                f"<strong>{ticker}</strong><span>{exchange}</span>"
-                "</div>"
-                f"<p>{name}</p>"
-                f'<div class="ssl-favorite-tags">{badges}</div>'
-                f"{actor}"
-                "</article>"
-            )
-        )
-    return '<div class="ssl-favorite-grid">' + "".join(cards) + "</div>"
-
-
 def _favorites_matching_tags(
     favorites: pd.DataFrame,
     selected_tags: list[str],
@@ -2247,7 +2551,7 @@ def render_favorite_list(
     if filtered.empty:
         st.info("Ninguna empresa coincide con la búsqueda o las etiquetas elegidas.")
     else:
-        page_size = 12
+        page_size = 25
         page_count = (len(filtered) + page_size - 1) // page_size
         page = 1
         if page_count > 1:
@@ -2258,55 +2562,53 @@ def render_favorite_list(
                 key=f"favorite_page_{scope_key}",
             )
         page_frame = filtered.iloc[(page - 1) * page_size : page * page_size]
-        card_columns = st.columns(3)
-        for position, favorite in enumerate(page_frame.itertuples(index=False)):
-            ticker = str(favorite.ticker).strip().upper()
-            with card_columns[position % 3]:
-                with st.container(border=True):
-                    st.markdown(
-                        _favorite_cards_html(
-                            pd.DataFrame(
-                                [
-                                    {
-                                        "ticker": ticker,
-                                        "name": getattr(favorite, "name", ticker),
-                                        "exchange": getattr(favorite, "exchange", ""),
-                                        "tags": getattr(favorite, "tags", ""),
-                                        "recorded_by": getattr(
-                                            favorite, "recorded_by", ""
-                                        ),
-                                    }
-                                ]
-                            ),
-                            shared=shared,
-                        ),
-                        unsafe_allow_html=True,
-                    )
-                    st.button(
-                        f"Analizar {ticker}",
-                        key=f"open_favorite_{scope_key}_{ticker}_{position}",
-                        width="stretch",
-                        type="primary",
-                        on_click=_open_ticker_analysis,
-                        args=(ticker,),
-                    )
-
-    visible = filtered.loc[
-        :, ["name", "ticker", "exchange", "tags", "recorded_by"]
-    ].rename(
-        columns={
-            "name": "Empresa",
-            "ticker": "Ticker",
-            "exchange": "Mercado",
-            "tags": "Etiquetas",
-            "recorded_by": "Añadida por",
-        }
-    )
-    if not shared:
-        visible = visible.drop(columns=["Añadida por"])
-    if not visible.empty:
-        with st.expander("Ver lista en tabla"):
-            st.dataframe(visible, width="stretch", hide_index=True)
+        first_visible = (page - 1) * page_size + 1
+        last_visible = first_visible + len(page_frame) - 1
+        st.caption(
+            f"Mostrando {first_visible}–{last_visible} de {len(filtered)}. "
+            "Selecciona una fila para abrir el análisis."
+        )
+        visible = page_frame.loc[
+            :, ["ticker", "name", "exchange", "tags", "recorded_by"]
+        ].rename(
+            columns={
+                "ticker": "Ticker",
+                "name": "Empresa",
+                "exchange": "Mercado",
+                "tags": "Etiquetas",
+                "recorded_by": "Añadida por",
+            }
+        ).reset_index(drop=True)
+        if not shared:
+            visible = visible.drop(columns=["Añadida por"])
+        table_event = st.dataframe(
+            visible,
+            width="stretch",
+            height=min(820, 38 + 35 * len(visible)),
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key=f"favorite_table_{scope_key}_{page}",
+            column_config={
+                "Ticker": st.column_config.TextColumn(width="small"),
+                "Empresa": st.column_config.TextColumn(width="large"),
+                "Mercado": st.column_config.TextColumn(width="medium"),
+                "Etiquetas": st.column_config.TextColumn(width="large"),
+            },
+        )
+        selected_rows = list(getattr(table_event.selection, "rows", []))
+        if selected_rows:
+            selected_ticker = str(visible.iloc[selected_rows[0]]["Ticker"]).upper()
+            open_label, open_action = st.columns([3, 1], vertical_alignment="center")
+            open_label.caption(f"Has seleccionado {selected_ticker}.")
+            open_action.button(
+                f"Analizar {selected_ticker}",
+                key=f"open_favorite_{scope_key}_{selected_ticker}",
+                width="stretch",
+                type="primary",
+                on_click=_open_ticker_analysis,
+                args=(selected_ticker,),
+            )
 
     editable = favorites
     if shared and not can_delete_all:
@@ -2376,17 +2678,21 @@ def render_favorites_manager(
     actor_username: str,
     is_admin: bool,
 ) -> None:
-    st.subheader("Favoritos y buscador de empresas")
+    st.subheader("Favoritos y buscador internacional")
     st.write(
-        "Busca por el nombre normal de la empresa, guárdala en tu lista o en la del "
-        "grupo y después selecciónala en la barra izquierda para analizarla."
+        "Busca por el nombre normal de la empresa. Verás sus distintas cotizaciones, "
+        "el mercado y la moneda antes de guardarla o abrir su análisis."
     )
     with st.form("company_search_form"):
         search_col, button_col = st.columns([4, 1])
         query = search_col.text_input(
             "Nombre o símbolo",
-            placeholder="Ejemplo: Taiwan Semiconductor, Inditex o Microsoft",
-            help="El buscador muestra acciones y ETF de los mercados disponibles en Yahoo.",
+            placeholder="Ejemplo: Nintendo, Kazatomprom, Inditex o Microsoft",
+            help=(
+                "Puedes escribir el nombre. El buscador muestra acciones y ETF de los "
+                "mercados internacionales disponibles en Yahoo."
+            ),
+            key="favorite_search_query",
         )
         submitted = button_col.form_submit_button(
             "Buscar",
@@ -2394,6 +2700,8 @@ def render_favorites_manager(
             width="stretch",
         )
     if submitted:
+        st.session_state.pop("favorite_search_result", None)
+        st.session_state.pop("favorite_market_filter", None)
         try:
             st.session_state["favorite_search_results"] = cached_company_search(query)
         except (DataDownloadError, ValueError) as exc:
@@ -2406,14 +2714,21 @@ def render_favorites_manager(
     )
     if submitted and not results:
         st.warning(
-            "No se encontraron acciones o ETF. Prueba con el nombre en inglés o usa "
-            "«Añadir un ticker manualmente» debajo."
+            "No se encontraron acciones o ETF. Prueba con el nombre en inglés o abre "
+            "el modo avanzado de ticker exacto."
         )
     if results:
+        market = st.selectbox(
+            "Filtrar por mercado o país",
+            _search_market_options(results),
+            key="favorite_market_filter",
+            help="Útil cuando una empresa cotiza en varios países o monedas.",
+        )
+        result_indices = _search_result_indices(results, market)
         result_index = st.selectbox(
-            "Resultado correcto",
-            options=range(len(results)),
-            format_func=lambda index: results[index].label,
+            "Elige la cotización correcta",
+            options=result_indices,
+            format_func=lambda index: _search_result_label(results[index]),
             key="favorite_search_result",
         )
         destination = st.radio(
@@ -2423,6 +2738,15 @@ def render_favorites_manager(
             help="Guardar una empresa no es una recomendación de compra.",
         )
         selected = results[result_index]
+        st.caption(
+            f"Código: {selected.ticker} · Mercado: {selected.exchange or 'no indicado'}"
+            + (f" · {selected.details}" if selected.details else "")
+        )
+        if selected.listing_type in {"ADR / OTC", "Cotización OTC", "GDR internacional"}:
+            st.info(
+                "Esta es una cotización internacional o extrabursátil. Puede tener "
+                "moneda, horario y liquidez distintos de la acción local."
+            )
         try:
             selected_fundamentals = cached_fundamentals(selected.ticker)
         except (DataDownloadError, ValueError):
@@ -2441,11 +2765,21 @@ def render_favorites_manager(
             key=f"new_favorite_tags_{selected.ticker}",
             help="Puedes aceptar la clasificación automática o corregirla.",
         )
-        if st.button(
+        save_col, analyze_col = st.columns(2)
+        save_clicked = save_col.button(
             f"Guardar {selected.ticker}",
             type="primary",
             key="save_favorite",
-        ):
+            width="stretch",
+        )
+        analyze_col.button(
+            "Analizar sin guardar",
+            key="analyze_search_result",
+            width="stretch",
+            on_click=_open_ticker_analysis,
+            args=(selected.ticker,),
+        )
+        if save_clicked:
             target = (
                 private_journal
                 if destination == "Mi lista privada"
@@ -2469,11 +2803,15 @@ def render_favorites_manager(
                 st.session_state.pop("favorite_search_results", None)
                 st.rerun()
 
-    with st.expander("Añadir un ticker manualmente"):
+    with st.expander("Modo avanzado: añadir un ticker exacto"):
+        st.caption(
+            "Úsalo sólo si la búsqueda por nombre no funciona. Los sufijos identifican "
+            "el mercado: .MC España, .T Japón, .L Londres y .IL Londres internacional."
+        )
         with st.form("manual_favorite_form", clear_on_submit=True):
             manual_ticker = st.text_input(
                 "Ticker",
-                placeholder="Ejemplo: ASML, SAN.MC o IBE.MC",
+                placeholder="Ejemplo: SAN.MC, 7974.T o KAP.IL",
             )
             manual_name = st.text_input(
                 "Nombre opcional",
@@ -2528,8 +2866,8 @@ def render_favorites_manager(
                 st.rerun()
 
     st.info(
-        "Puedes guardar hasta 300 favoritas. Pulsa «Analizar» en cualquier tarjeta para "
-        "abrir su ficha directamente; se hará análisis completo de hasta 25 empresas por "
+        "Puedes guardar hasta 300 favoritas. Pulsa «Ver» en cualquier fila para abrir "
+        "su ficha directamente; se hará análisis completo de hasta 25 empresas por "
         "actualización."
     )
     tag_filter = st.multiselect(
@@ -2580,23 +2918,42 @@ def _score_text(value: object) -> str:
     return f"{score:.0f}" if score is not None else "N/D"
 
 
+def _logout_current_user() -> None:
+    st.session_state.pop("_authenticated_user", None)
+
+
 def render_app_header(user: AuthConfig) -> None:
     role = "Administrador" if user.is_admin else f"Hola, {user.display_name}"
-    st.markdown(
-        f"""
-        <div class="ssl-app-header">
-            <div class="ssl-logo" aria-hidden="true">↗</div>
-            <div>
-                <h1 class="ssl-app-title">Stock Signal Lab</h1>
-                <p class="ssl-app-subtitle">
-                    {html.escape(role)} · señales explicadas, cartera y riesgo
-                </p>
+    header_col, account_col = st.columns([7, 1], vertical_alignment="center")
+    with header_col:
+        st.markdown(
+            f"""
+            <div class="ssl-app-header">
+                <div class="ssl-logo" aria-hidden="true">↗</div>
+                <div>
+                    <h1 class="ssl-app-title">Stock Signal Lab</h1>
+                    <p class="ssl-app-subtitle">
+                        {html.escape(role)} · señales explicadas, cartera y riesgo
+                    </p>
+                </div>
+                <span class="ssl-status-pill">Sólo análisis</span>
             </div>
-            <span class="ssl-status-pill">Sólo análisis</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+            """,
+            unsafe_allow_html=True,
+        )
+    with account_col:
+        with st.popover(
+            "Mi cuenta",
+            icon=":material/account_circle:",
+            width="stretch",
+        ):
+            st.caption(f"Sesión iniciada como {user.display_name}.")
+            st.button(
+                "Cerrar sesión",
+                width="stretch",
+                key="header_logout",
+                on_click=_logout_current_user,
+            )
 
 
 def render_opportunity_cards(
@@ -2682,6 +3039,30 @@ def _portfolio_snapshot(
     )
 
 
+def _search_result_label(result: TickerSearchResult) -> str:
+    details = f" — {result.details}" if result.details else ""
+    return f"{result.label}{details}"
+
+
+def _search_market_options(results: list[TickerSearchResult]) -> list[str]:
+    markets = sorted(
+        {result.market_group for result in results},
+        key=lambda value: (value == "Otros mercados", value.casefold()),
+    )
+    return ["Todos los mercados", *markets]
+
+
+def _search_result_indices(
+    results: list[TickerSearchResult],
+    market: str,
+) -> list[int]:
+    return [
+        index
+        for index, result in enumerate(results)
+        if market == "Todos los mercados" or result.market_group == market
+    ]
+
+
 def _set_navigation(
     section: str,
     subsection_key: str | None = None,
@@ -2690,6 +3071,19 @@ def _set_navigation(
     st.session_state["main_navigation"] = section
     if subsection_key and subsection:
         st.session_state[subsection_key] = subsection
+
+
+def _continue_search_in_favorites(
+    query: str,
+    results: list[TickerSearchResult],
+) -> None:
+    """Lleva una búsqueda rápida a la pantalla donde puede guardarse."""
+
+    st.session_state["main_navigation"] = "Favoritos"
+    st.session_state["favorite_search_query"] = query
+    st.session_state["favorite_search_results"] = results
+    st.session_state.pop("favorite_market_filter", None)
+    st.session_state.pop("favorite_search_result", None)
 
 
 def _open_ticker_analysis(ticker: str) -> None:
@@ -2701,6 +3095,84 @@ def _open_ticker_analysis(ticker: str) -> None:
     st.session_state["analysis_navigation"] = "Oportunidades"
     st.session_state["analysis_ticker"] = normalized
     st.session_state["_pending_analysis_ticker"] = normalized
+
+
+def render_quick_company_search() -> None:
+    """Buscador compacto disponible sin mantener abierta toda la configuración."""
+
+    with st.popover(
+        "Buscar empresa",
+        icon=":material/search:",
+        width="stretch",
+    ):
+        st.caption(
+            "Escribe el nombre normal. No necesitas saber códigos como .T, .MC o .IL."
+        )
+        with st.form("quick_company_search_form"):
+            query = st.text_input(
+                "Empresa, ETF o ticker",
+                placeholder="Nintendo, Kazatomprom, Inditex…",
+                key="quick_company_search_query",
+            )
+            submitted = st.form_submit_button(
+                "Buscar",
+                type="primary",
+                width="stretch",
+            )
+        if submitted:
+            st.session_state.pop("quick_company_market_filter", None)
+            st.session_state.pop("quick_company_search_result", None)
+            try:
+                st.session_state["quick_company_search_results"] = (
+                    cached_company_search(query)
+                )
+            except (DataDownloadError, ValueError) as exc:
+                st.session_state["quick_company_search_results"] = []
+                st.error(str(exc))
+
+        results: list[TickerSearchResult] = st.session_state.get(
+            "quick_company_search_results",
+            [],
+        )
+        if submitted and not results:
+            st.warning("No se encontraron acciones o ETF con ese nombre.")
+        if not results:
+            return
+
+        market = st.selectbox(
+            "Mercado",
+            _search_market_options(results),
+            key="quick_company_market_filter",
+        )
+        result_indices = _search_result_indices(results, market)
+        if not result_indices:
+            st.info("No hay resultados en ese mercado.")
+            return
+        selected_index = st.selectbox(
+            "Cotización",
+            result_indices,
+            format_func=lambda index: _search_result_label(results[index]),
+            key="quick_company_search_result",
+        )
+        selected = results[selected_index]
+        if selected.details:
+            st.caption(selected.details)
+        open_col, save_col = st.columns(2)
+        open_col.button(
+            "Abrir análisis",
+            type="primary",
+            width="stretch",
+            key="quick_open_analysis",
+            on_click=_open_ticker_analysis,
+            args=(selected.ticker,),
+        )
+        save_col.button(
+            "Guardar",
+            width="stretch",
+            key="quick_save_favorite",
+            on_click=_continue_search_in_favorites,
+            args=(query, results),
+        )
 
 
 def render_home(
@@ -2828,8 +3300,9 @@ def render_home(
     st.markdown("### Atención hoy")
     if not summary:
         st.info(
-            "Selecciona empresas en la barra lateral y pulsa «Actualizar análisis». "
-            "Las posiciones abiertas se añadirán automáticamente."
+            "Abre «Analizar», elige tus empresas y pulsa «Actualizar análisis». "
+            "También puedes usar el buscador superior; las posiciones abiertas se "
+            "añadirán automáticamente."
         )
     elif not risk_alerts and not entry_alerts:
         st.success(
@@ -2875,8 +3348,8 @@ def render_opportunities_page(
     )
     if not raw_data:
         st.info(
-            "Busca empresas en «Favoritos», selecciónalas en la barra lateral y "
-            "pulsa «Actualizar análisis»."
+            "Usa «Buscar empresa» o guarda favoritas. En esta sección puedes elegirlas "
+            "en el panel de configuración y pulsar «Actualizar análisis»."
         )
         return
     if not prepared:
@@ -2997,7 +3470,7 @@ def render_sector_comparison(
     )
     if len(prepared) < 2:
         st.info(
-            "Selecciona al menos dos favoritas en la barra lateral y pulsa "
+            "En «Analizar», selecciona al menos dos favoritas en el panel y pulsa "
             "«Actualizar análisis» para utilizar el comparador."
         )
         return
@@ -3579,6 +4052,10 @@ def main() -> None:
         st.error(str(exc))
         st.stop()
     render_app_header(authenticated_user)
+    if st.session_state.get("main_navigation") not in MAIN_OPTIONS:
+        st.session_state["main_navigation"] = "Inicio"
+    current_section = str(st.session_state["main_navigation"])
+    apply_section_layout(current_section)
     favorite_storage_error = ""
     try:
         private_favorites = journal.list_favorites()
@@ -3686,23 +4163,34 @@ def main() -> None:
         else ({}, [], {}, {}, {}, {}, {})
     )
 
-    main_options = ["Inicio", "Analizar", "Favoritos", "Carteras", "Más"]
-    if st.session_state.get("main_navigation") not in main_options:
-        st.session_state["main_navigation"] = "Inicio"
-    selected_section = st.segmented_control(
-        "Navegación principal",
-        main_options,
-        key="main_navigation",
-        required=True,
-        label_visibility="collapsed",
-        format_func=lambda value: {
-            "Inicio": "⌂ Inicio",
-            "Analizar": "⌁ Analizar",
-            "Favoritos": "☆ Favoritos",
-            "Carteras": "▣ Carteras",
-            "Más": "••• Más",
-        }[value],
-    )
+    navigation_container = st.container()
+    with navigation_container:
+        if current_section == "Favoritos":
+            navigation_col = st.container()
+            search_col = None
+        else:
+            navigation_col, search_col = st.columns(
+                [6, 1],
+                vertical_alignment="center",
+            )
+        with navigation_col:
+            selected_section = st.segmented_control(
+                "Navegación principal",
+                MAIN_OPTIONS,
+                key="main_navigation",
+                required=True,
+                label_visibility="collapsed",
+                format_func=lambda value: {
+                    "Inicio": "⌂ Inicio",
+                    "Analizar": "⌁ Analizar",
+                    "Favoritos": "☆ Favoritos",
+                    "Carteras": "▣ Carteras",
+                    "Más": "••• Más",
+                }[value],
+            )
+        if search_col is not None:
+            with search_col:
+                render_quick_company_search()
 
     if selected_section == "Inicio":
         render_home(

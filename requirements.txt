@@ -4,4 +4,5 @@ numpy>=1.26,<3
 yfinance>=0.2.50,<2
 requests>=2.32,<3
 plotly>=5.24,<7
+XlsxWriter>=3.2,<4
 pytest>=8,<10
