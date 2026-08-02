@@ -21,6 +21,15 @@ from src.auth import (
     require_login,
 )
 from src.backtesting import BacktestResult, run_backtest
+from src.current_positions import (
+    REFERENCE_COST,
+    REFERENCE_ENTRY,
+    REFERENCE_GAIN,
+    REFERENCE_OPTIONS,
+    REFERENCE_RETURN,
+    estimate_current_position,
+    snapshot_with_current_position,
+)
 from src.dashboard import build_position_dashboard
 from src.data_loader import (
     DataDownloadError,
@@ -1853,27 +1862,354 @@ def operation_history_for_display(operations: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def render_current_position_form(
+    journal: object,
+    *,
+    portfolio_snapshots: pd.DataFrame,
+    accounts: pd.DataFrame,
+    actor_username: str,
+    view_key: str,
+) -> None:
+    """Alta guiada de una posición actual, sin exigir una fecha de compra inventada."""
+
+    expanded = portfolio_snapshots.empty
+    with st.expander("Añadir o actualizar una posición", expanded=expanded):
+        st.caption(
+            "Copia lo que ves ahora en tu bróker. No hace falta conocer la fecha de compra: "
+            "la app guarda una foto de hoy y calcula coste, ganancia y rentabilidad."
+        )
+
+        with st.form(f"{view_key}_current_position_search_form"):
+            query = st.text_input(
+                "Buscar empresa o ETF",
+                placeholder="Nintendo, BAE Systems, Netflix…",
+                key=f"{view_key}_current_position_query",
+            )
+            search_submitted = st.form_submit_button(
+                "Buscar empresa",
+                icon=":material/search:",
+            )
+        search_state_key = f"{view_key}_current_position_results"
+        if search_submitted:
+            try:
+                found_results = cached_company_search(query)
+                st.session_state[search_state_key] = found_results
+                if found_results:
+                    st.session_state[f"{view_key}_current_position_direct"] = False
+            except (DataDownloadError, ValueError) as exc:
+                st.session_state[search_state_key] = []
+                st.error(str(exc))
+
+        results: list[TickerSearchResult] = st.session_state.get(search_state_key, [])
+        selected_result: TickerSearchResult | None = None
+        direct_entry = st.checkbox(
+            "Escribir el ticker directamente",
+            value=not bool(results),
+            key=f"{view_key}_current_position_direct",
+            help="Úsalo si el buscador no encuentra una cotización concreta.",
+        )
+        if results and not direct_entry:
+            market = st.selectbox(
+                "Mercado",
+                _search_market_options(results),
+                key=f"{view_key}_current_position_market",
+            )
+            result_indices = _search_result_indices(results, market)
+            if result_indices:
+                selected_index = st.selectbox(
+                    "Empresa y cotización",
+                    result_indices,
+                    format_func=lambda index: _search_result_label(results[index]),
+                    key=f"{view_key}_current_position_result",
+                )
+                selected_result = results[selected_index]
+                if selected_result.details:
+                    st.caption(selected_result.details)
+            else:
+                st.info("No hay resultados en ese mercado.")
+
+        if direct_entry:
+            identity_cols = st.columns(2)
+            raw_ticker = identity_cols[0].text_input(
+                "Ticker",
+                placeholder="NFLX, NTDOY, BA.L…",
+                key=f"{view_key}_current_position_ticker",
+            )
+            asset_name = identity_cols[1].text_input(
+                "Nombre de la empresa",
+                placeholder="Netflix",
+                key=f"{view_key}_current_position_name",
+            )
+        elif selected_result is not None:
+            raw_ticker = selected_result.ticker
+            asset_name = selected_result.name
+        else:
+            raw_ticker = ""
+            asset_name = ""
+
+        existing_accounts = (
+            accounts["account_name"].dropna().astype(str).tolist()
+            if not accounts.empty and "account_name" in accounts
+            else []
+        )
+        common_accounts = ["Trade Republic", "Revolut", "MyInvestor"]
+        account_options = list(dict.fromkeys([*existing_accounts, *common_accounts]))
+        account_options.append("Otra plataforma")
+        chosen_account = st.selectbox(
+            "¿Dónde la tienes?",
+            account_options,
+            key=f"{view_key}_current_position_account",
+        )
+        platform = (
+            st.text_input(
+                "Nombre de la plataforma",
+                placeholder="Interactive Brokers, DEGIRO…",
+                key=f"{view_key}_current_position_custom_account",
+            )
+            if chosen_account == "Otra plataforma"
+            else chosen_account
+        )
+
+        value_col, reference_col = st.columns(2)
+        current_value = value_col.number_input(
+            "Valor actual de la posición (€)",
+            min_value=0.0,
+            value=100.0,
+            step=10.0,
+            format="%.2f",
+            key=f"{view_key}_current_position_value",
+            help="El importe total que aparece hoy para esa empresa, ya convertido a euros.",
+        )
+        reference_kind = reference_col.selectbox(
+            "¿Qué otro dato muestra tu bróker?",
+            REFERENCE_OPTIONS,
+            key=f"{view_key}_current_position_reference_kind",
+        )
+
+        reference_value: float | None = None
+        quantity: float | None = None
+        average_entry_price: float | None = None
+        buy_fee = 0.0
+        if reference_kind == REFERENCE_GAIN:
+            reference_value = st.number_input(
+                "Ganancia o pérdida total (€)",
+                value=0.0,
+                step=5.0,
+                format="%.2f",
+                key=f"{view_key}_current_position_gain",
+                help="Escribe una pérdida con signo menos, por ejemplo -52,89.",
+            )
+        elif reference_kind == REFERENCE_RETURN:
+            reference_value = st.number_input(
+                "Rentabilidad desde la compra (%)",
+                value=0.0,
+                step=0.5,
+                format="%.2f",
+                key=f"{view_key}_current_position_return",
+                help="Escribe -9,67 si el bróker muestra una pérdida del 9,67%.",
+            )
+        elif reference_kind == REFERENCE_COST:
+            reference_value = st.number_input(
+                "Dinero invertido (€)",
+                min_value=0.0,
+                value=100.0,
+                step=10.0,
+                format="%.2f",
+                key=f"{view_key}_current_position_cost",
+            )
+        else:
+            exact_cols = st.columns(3)
+            quantity = exact_cols[0].number_input(
+                "Cantidad",
+                min_value=0.0,
+                value=1.0,
+                step=0.1,
+                format="%.6f",
+                key=f"{view_key}_current_position_quantity",
+            )
+            average_entry_price = exact_cols[1].number_input(
+                "Precio medio de compra (€)",
+                min_value=0.0,
+                value=100.0,
+                step=1.0,
+                format="%.4f",
+                key=f"{view_key}_current_position_entry",
+            )
+            buy_fee = exact_cols[2].number_input(
+                "Comisión de compra (€)",
+                min_value=0.0,
+                value=1.0,
+                step=0.5,
+                format="%.2f",
+                key=f"{view_key}_current_position_fee",
+            )
+
+        with st.expander("Datos opcionales"):
+            if reference_kind != REFERENCE_ENTRY:
+                optional_cols = st.columns(2)
+                optional_quantity = optional_cols[0].number_input(
+                    "Cantidad de acciones (si la sabes)",
+                    min_value=0.0,
+                    value=0.0,
+                    step=0.1,
+                    format="%.6f",
+                    key=f"{view_key}_current_position_optional_quantity",
+                )
+                optional_entry = optional_cols[1].number_input(
+                    "Precio medio de compra en euros (si lo sabes)",
+                    min_value=0.0,
+                    value=0.0,
+                    step=1.0,
+                    format="%.4f",
+                    key=f"{view_key}_current_position_optional_entry",
+                )
+                quantity = float(optional_quantity) or None
+                average_entry_price = float(optional_entry) or None
+            valuation_date = st.date_input(
+                "Fecha de esta valoración",
+                value=date.today(),
+                max_value=date.today(),
+                key=f"{view_key}_current_position_date",
+                help="Déjala en hoy salvo que estés copiando una captura anterior.",
+            )
+            comments = st.text_input(
+                "Nota personal",
+                placeholder="Cuenta de largo plazo, posición parcial…",
+                key=f"{view_key}_current_position_comments",
+            )
+
+        estimate = None
+        try:
+            estimate = estimate_current_position(
+                current_value_eur=float(current_value),
+                reference_kind=reference_kind,
+                reference_value=reference_value,
+                quantity=quantity,
+                average_entry_price=average_entry_price,
+                buy_fee_eur=float(buy_fee),
+            )
+        except ValueError as exc:
+            st.caption(f"Completa los importes para calcular el resultado: {exc}")
+        if estimate is not None:
+            preview_cols = st.columns(3)
+            preview_cols[0].metric("Coste calculado", f"{estimate.cost_estimate_eur:,.2f} €")
+            preview_cols[1].metric("Ganancia / pérdida", f"{estimate.gain_loss_eur:+,.2f} €")
+            preview_cols[2].metric("Rentabilidad", f"{estimate.return_pct:+.2f}%")
+            if estimate.warning:
+                st.warning(estimate.warning)
+
+        save_disabled = estimate is None or not raw_ticker.strip() or not platform.strip()
+        if st.button(
+            "Guardar en mi cartera actual",
+            type="primary",
+            width="stretch",
+            disabled=save_disabled,
+            key=f"{view_key}_save_current_position",
+        ):
+            try:
+                ticker = resolve_analysis_ticker(raw_ticker)
+                display_name = asset_name.strip() or ticker
+                assert estimate is not None
+                position = {
+                    "platform": platform.strip(),
+                    "asset_name": display_name,
+                    "raw_identifier": raw_ticker.strip().upper(),
+                    "analysis_ticker": ticker,
+                    "asset_type": (
+                        selected_result.instrument_type
+                        if selected_result is not None
+                        else "Acción / ETF"
+                    ),
+                    "portfolio_block": "Cartera actual",
+                    "quantity": estimate.quantity,
+                    "current_price": estimate.current_price,
+                    "currency": "EUR",
+                    "value_eur": estimate.current_value_eur,
+                    "return_pct": estimate.return_pct,
+                    "cost_estimate_eur": estimate.cost_estimate_eur,
+                    "gain_loss_eur": estimate.gain_loss_eur,
+                    "comments": comments,
+                    "source": "Introducida manualmente por el usuario",
+                    "notes": (
+                        "Posición actual calculada con datos declarados por el usuario; "
+                        "no representa una operación histórica."
+                    ),
+                }
+                updated_snapshot = snapshot_with_current_position(
+                    portfolio_snapshots,
+                    snapshot_date=valuation_date,
+                    position=position,
+                )
+                journal.upsert_portfolio_snapshot_positions(
+                    updated_snapshot,
+                    recorded_by=actor_username,
+                )
+                platform_rows = updated_snapshot.loc[
+                    updated_snapshot["platform"].fillna("").astype(str) == platform.strip()
+                ]
+                non_cash = (
+                    platform_rows["asset_type"].fillna("").astype(str).str.casefold()
+                    != "efectivo"
+                )
+                platform_value = float(
+                    pd.to_numeric(
+                        platform_rows.loc[non_cash, "value_eur"], errors="coerce"
+                    ).fillna(0.0).sum()
+                )
+                existing_account = (
+                    accounts.loc[
+                        accounts["account_name"].fillna("").astype(str) == platform.strip()
+                    ].head(1)
+                    if not accounts.empty
+                    else pd.DataFrame()
+                )
+                cash_balance = (
+                    float(existing_account.iloc[0]["cash_balance"])
+                    if not existing_account.empty
+                    and pd.notna(existing_account.iloc[0]["cash_balance"])
+                    else 0.0
+                )
+                journal.upsert_portfolio_account(
+                    account_name=platform.strip(),
+                    account_type="Bróker",
+                    investments_value=platform_value,
+                    cash_balance=cash_balance,
+                    currency="EUR",
+                    status="Actualizada",
+                    notes=f"Calculada con las posiciones del {valuation_date.isoformat()}.",
+                )
+            except (AssertionError, ValueError, JournalStorageError) as exc:
+                st.error(str(exc))
+            else:
+                st.success(f"{display_name} se ha guardado en tu cartera.")
+                st.rerun()
+
+
 def render_private_investments(
     journal: object,
     *,
     actor_username: str,
     view_key: str,
+    include_alternative_investments: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Gestiona proyectos manuales de Civislend y Segofactoring para ddriu."""
+    """Gestiona la cartera actual y, sólo para ddriu, proyectos alternativos."""
 
-    st.subheader("Mis cuentas y plataformas")
+    st.subheader("Mi cartera actual")
     st.caption(
-        "Vista conjunta de MyInvestor, Trade Republic, Revolut, Segofactoring y Civislend. "
-        "Los importes provisionales se pueden completar poco a poco."
+        "Añade lo que tienes en cada bróker y consulta el valor, la ganancia o pérdida "
+        "y la distribución de tu cartera. Cada usuario ve únicamente sus propios datos."
     )
-    try:
-        investments = journal.list_private_investments()
-    except JournalStorageError:
-        st.error(
-            "La tabla de inversiones privadas todavía no existe en Supabase. "
-            "Ejecuta `supabase/migration_private_investments.sql` en SQL Editor."
-        )
-        return pd.DataFrame(), pd.DataFrame()
+    if include_alternative_investments:
+        try:
+            investments = journal.list_private_investments()
+        except JournalStorageError:
+            st.error(
+                "La tabla de inversiones privadas todavía no existe en Supabase. "
+                "Ejecuta `supabase/migration_private_investments.sql` en SQL Editor."
+            )
+            investments = pd.DataFrame()
+    else:
+        investments = pd.DataFrame()
     try:
         accounts = journal.list_portfolio_accounts()
     except (JournalStorageError, AttributeError):
@@ -1892,7 +2228,11 @@ def render_private_investments(
     else:
         portfolio_snapshots = pd.DataFrame()
 
-    if accounts.empty and hasattr(journal, "upsert_portfolio_account"):
+    if (
+        include_alternative_investments
+        and accounts.empty
+        and hasattr(journal, "upsert_portfolio_account")
+    ):
         try:
             for account_name, account_type in DEFAULT_DDRIU_ACCOUNTS:
                 journal.upsert_portfolio_account(
@@ -1906,6 +2246,19 @@ def render_private_investments(
             # La migración remota puede estar todavía pendiente; el mensaje anterior
             # explica cómo habilitar la tabla sin bloquear el resto de la cartera.
             accounts = pd.DataFrame()
+
+    if snapshot_storage_ready:
+        render_current_position_form(
+            journal,
+            portfolio_snapshots=portfolio_snapshots,
+            accounts=accounts,
+            actor_username=actor_username,
+            view_key=view_key,
+        )
+    else:
+        st.error(
+            "No se pueden guardar posiciones hasta crear la tabla de cartera en Supabase."
+        )
 
     with st.expander("Importar una fotografía completa de mi cartera (.xlsx)"):
         st.caption(
@@ -2054,8 +2407,7 @@ def render_private_investments(
         )
         if total_accounts <= 0:
             st.info(
-                "Las cinco cuentas ya están creadas, pero sus valores están a cero hasta "
-                "que introduzcas importes o proyectos."
+                "Las cuentas están a cero hasta que introduzcas sus posiciones o importes."
             )
         with st.expander("Actualizar el total provisional de una cuenta"):
             account_names = account_view["account_name"].astype(str).tolist()
@@ -2231,6 +2583,9 @@ def render_private_investments(
                 on_click=_open_ticker_analysis,
                 args=(analysis_options[selected_snapshot_position],),
             )
+
+    if not include_alternative_investments:
+        return investments, accounts
 
     st.divider()
     st.subheader("Proyectos de Civislend y Segofactoring")
@@ -2684,7 +3039,10 @@ def render_journal(
         ),
         key=f"{view_key}_fixed_fee",
     )
-    private_platforms_enabled = not shared and actor_username.strip().lower() == "ddriu"
+    current_portfolio_enabled = not shared
+    alternative_investments_enabled = (
+        current_portfolio_enabled and actor_username.strip().lower() == "ddriu"
+    )
     tab_labels = [
         "Posiciones analizadas",
         "Comprar / vender",
@@ -2692,11 +3050,11 @@ def render_journal(
         "Comparar un cambio",
         "Historial",
     ]
-    if private_platforms_enabled:
-        tab_labels.append("Mis cuentas")
+    if current_portfolio_enabled:
+        tab_labels.append("Mi cartera actual")
     journal_tabs = st.tabs(tab_labels)
     positions_tab, register_tab, evolution_tab, switch_tab, history_tab = journal_tabs[:5]
-    private_tab = journal_tabs[5] if private_platforms_enabled else None
+    private_tab = journal_tabs[5] if current_portfolio_enabled else None
 
     with register_tab:
         render_operation_form(
@@ -2717,6 +3075,7 @@ def render_journal(
                 journal,
                 actor_username=actor_username,
                 view_key=view_key,
+                include_alternative_investments=alternative_investments_enabled,
             )
 
     with history_tab:
@@ -4211,7 +4570,7 @@ def render_home(
     if update_dates:
         update_text = f"precios de mercado {max(update_dates).date().isoformat()}"
     elif snapshot_summary is not None:
-        update_text = f"fotografía piloto {snapshot_summary.snapshot_date}"
+        update_text = f"cartera valorada el {snapshot_summary.snapshot_date}"
     else:
         update_text = "pendiente de actualización"
     st.markdown(
@@ -4254,7 +4613,7 @@ def render_home(
                 f"{snapshot_summary.platform_count} plataformas"
             )
             value_detail = (
-                f"Fotografía del {snapshot_summary.snapshot_date} · pendiente de actualizar"
+                f"Cartera valorada el {snapshot_summary.snapshot_date}"
             )
         else:
             value_text = (
@@ -4320,7 +4679,7 @@ def render_home(
     if snapshot_summary is not None:
         st.markdown("### Mi cartera")
         st.caption(
-            "Distribución basada en la fotografía guardada, no en cotizaciones en tiempo real. "
+            "Distribución basada en los últimos valores guardados, no en cotizaciones en tiempo real. "
             f"{snapshot_summary.analyzable_count} partidas tienen ticker reconocible para análisis."
         )
         chart_a, chart_b = st.columns(2)
@@ -4336,6 +4695,41 @@ def render_home(
                 width="stretch",
                 config=PLOTLY_CONFIG,
             )
+        position_summary = latest_snapshot.copy()
+        for column in ["value_eur", "gain_loss_eur", "return_pct"]:
+            position_summary[column] = pd.to_numeric(
+                position_summary[column], errors="coerce"
+            )
+        position_summary = position_summary.rename(
+            columns={
+                "asset_name": "Empresa",
+                "analysis_ticker": "Ticker",
+                "platform": "Cuenta",
+                "value_eur": "Valor actual",
+                "gain_loss_eur": "Ganancia / pérdida",
+                "return_pct": "Rentabilidad",
+            }
+        )
+        st.dataframe(
+            position_summary.loc[
+                :,
+                [
+                    "Empresa",
+                    "Ticker",
+                    "Cuenta",
+                    "Valor actual",
+                    "Ganancia / pérdida",
+                    "Rentabilidad",
+                ],
+            ],
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Valor actual": st.column_config.NumberColumn(format="%.2f €"),
+                "Ganancia / pérdida": st.column_config.NumberColumn(format="%+.2f €"),
+                "Rentabilidad": st.column_config.NumberColumn(format="%+.2f%%"),
+            },
+        )
 
     action_a, action_b, action_c = st.columns(3)
     action_a.button(
