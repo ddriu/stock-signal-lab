@@ -1,4 +1,4 @@
-# Este comentario permite solicitar un reinicio limpio del despliegue cuando cambia la app.
+# Reinicio limpio: cartera actual multiusuario publicada el 2026-08-02.
 streamlit>=1.40,<2
 pandas>=2.1,<3
 numpy>=1.26,<3
