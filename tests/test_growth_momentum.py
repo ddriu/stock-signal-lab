@@ -76,6 +76,24 @@ def test_growth_momentum_keeps_three_scores_separate() -> None:
     assert result.sector_key == "technology"
 
 
+def test_quick_scan_cannot_be_presented_as_a_complete_entry() -> None:
+    stock = _frame(100, 190)
+    market = _frame(100, 135)
+    result = evaluate_growth_momentum(
+        ticker="QUICK",
+        frame=stock,
+        info={"symbol": "QUICK", "_quick_mode": True},
+        relative=evaluate_relative_strength(
+            "QUICK", stock, market, broad_name="SPY"
+        ),
+        risk=evaluate_risk("QUICK", stock),
+        broad_market=market,
+        config=GrowthMomentumConfig(),
+    )
+    assert result.growth_score is None
+    assert result.label == "Pendiente de fundamentales"
+
+
 def test_small_cap_reduces_risk_and_position_limit() -> None:
     stock = _frame()
     market = _frame(100, 130)
