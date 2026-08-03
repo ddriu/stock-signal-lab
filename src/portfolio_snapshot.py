@@ -7,6 +7,9 @@ from dataclasses import dataclass
 import pandas as pd
 
 
+HOME_GROUPED_PLATFORMS = ("Civislend", "Segofactoring")
+
+
 @dataclass(frozen=True)
 class PortfolioSnapshotSummary:
     """Cifras reconciliadas de la última fotografía disponible."""
@@ -20,6 +23,72 @@ class PortfolioSnapshotSummary:
     cost_estimate_eur: float | None
     gain_loss_eur: float | None
     return_pct: float | None
+
+
+def group_portfolio_snapshot_for_home(positions: pd.DataFrame) -> pd.DataFrame:
+    """Agrupa inversiones alternativas en Inicio sin alterar su detalle guardado.
+
+    Civislend y Segofactoring pueden contener muchos proyectos. En la portada interesa
+    ver cuánto capital representan en conjunto; la pestaña de cartera conserva cada
+    proyecto por separado.
+    """
+
+    if positions.empty or "platform" not in positions.columns:
+        return positions.copy()
+
+    frame = positions.copy()
+    frame["platform"] = frame["platform"].fillna("").astype(str)
+    regular = frame.loc[~frame["platform"].isin(HOME_GROUPED_PLATFORMS)].copy()
+    grouped_rows: list[pd.Series] = []
+
+    for platform in HOME_GROUPED_PLATFORMS:
+        platform_rows = frame.loc[frame["platform"] == platform].copy()
+        if platform_rows.empty:
+            continue
+
+        grouped = platform_rows.iloc[0].copy()
+        project_count = len(platform_rows)
+        grouped["asset_name"] = (
+            f"{platform} · total invertido"
+            + (f" ({project_count} proyectos)" if project_count > 1 else "")
+        )
+        grouped["asset_type"] = "Inversión alternativa"
+        for column in ("analysis_ticker", "raw_identifier"):
+            if column in grouped.index:
+                grouped[column] = ""
+        for column in ("quantity", "current_price"):
+            if column in grouped.index:
+                grouped[column] = None
+
+        values = pd.to_numeric(platform_rows.get("value_eur"), errors="coerce")
+        grouped["value_eur"] = float(values.fillna(0.0).sum())
+
+        cost_values = pd.to_numeric(
+            platform_rows.get("cost_estimate_eur", pd.Series(dtype=float)),
+            errors="coerce",
+        )
+        gain_values = pd.to_numeric(
+            platform_rows.get("gain_loss_eur", pd.Series(dtype=float)),
+            errors="coerce",
+        )
+        cost = float(cost_values.sum()) if cost_values.notna().any() else None
+        gain = float(gain_values.sum()) if gain_values.notna().any() else None
+        if "cost_estimate_eur" in grouped.index:
+            grouped["cost_estimate_eur"] = cost
+        if "gain_loss_eur" in grouped.index:
+            grouped["gain_loss_eur"] = gain
+        if "return_pct" in grouped.index:
+            grouped["return_pct"] = (
+                gain / cost * 100.0
+                if cost is not None and cost > 0 and gain is not None
+                else None
+            )
+        grouped_rows.append(grouped)
+
+    if not grouped_rows:
+        return regular.reset_index(drop=True)
+    grouped_frame = pd.DataFrame(grouped_rows, columns=frame.columns)
+    return pd.concat([regular, grouped_frame], ignore_index=True)
 
 
 def latest_portfolio_snapshot(
