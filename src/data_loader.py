@@ -560,6 +560,7 @@ def download_fundamental_snapshot(ticker: str) -> dict[str, object]:
         "country",
         "sector",
         "industry",
+        "quoteType",
         "currency",
         "returnOnEquity",
         "profitMargins",
