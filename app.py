@@ -1,7 +1,7 @@
 """Interfaz Streamlit de Stock Signal Lab.
 
 Ejecutar con: ``streamlit run app.py``
-Versión de despliegue auditada: 2026-08-03.
+Versión de despliegue auditada: 2026-08-04.
 """
 
 from __future__ import annotations
@@ -100,7 +100,10 @@ from src.portfolio_snapshot_import import (
     import_portfolio_workbook_snapshot,
     parse_portfolio_snapshot_excel,
 )
-from src.portfolio_snapshot import latest_portfolio_snapshot
+from src.portfolio_snapshot import (
+    group_portfolio_snapshot_for_home,
+    latest_portfolio_snapshot,
+)
 from src.recommendations import (
     build_entry_guide,
     build_profit_taking_plan,
@@ -4711,22 +4714,24 @@ def render_home(
         st.markdown("### Mi cartera")
         st.caption(
             "Distribución basada en los últimos valores guardados, no en cotizaciones en tiempo real. "
-            f"{snapshot_summary.analyzable_count} partidas tienen ticker reconocible para análisis."
+            f"{snapshot_summary.analyzable_count} partidas tienen ticker reconocible para análisis. "
+            "Civislend y Segofactoring aparecen agrupados para mostrar el capital total invertido."
         )
+        home_snapshot = group_portfolio_snapshot_for_home(latest_snapshot)
         chart_a, chart_b = st.columns(2)
         with chart_a:
             st.plotly_chart(
-                portfolio_snapshot_allocation_chart(latest_snapshot),
+                portfolio_snapshot_allocation_chart(home_snapshot),
                 width="stretch",
                 config=PLOTLY_CONFIG,
             )
         with chart_b:
             st.plotly_chart(
-                portfolio_snapshot_assets_chart(latest_snapshot),
+                portfolio_snapshot_assets_chart(home_snapshot),
                 width="stretch",
                 config=PLOTLY_CONFIG,
             )
-        position_summary = latest_snapshot.copy()
+        position_summary = home_snapshot.copy()
         for column in ["value_eur", "gain_loss_eur", "return_pct"]:
             position_summary[column] = pd.to_numeric(
                 position_summary[column], errors="coerce"
