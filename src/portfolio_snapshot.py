@@ -87,8 +87,8 @@ def group_portfolio_snapshot_for_home(positions: pd.DataFrame) -> pd.DataFrame:
 
     if not grouped_rows:
         return regular.reset_index(drop=True)
-    grouped_frame = pd.DataFrame(grouped_rows, columns=frame.columns)
-    return pd.concat([regular, grouped_frame], ignore_index=True)
+    rows = regular.to_dict("records") + [row.to_dict() for row in grouped_rows]
+    return pd.DataFrame(rows, columns=frame.columns)
 
 
 def latest_portfolio_snapshot(
