@@ -687,6 +687,7 @@ def load_market_data(
     alpha_vantage_key: str = "",
     *,
     fundamental_tickers: set[str] | None = None,
+    merge_existing: bool = False,
 ) -> None:
     if not tickers:
         st.sidebar.error("Elige al menos una favorita o registra una posición.")
@@ -706,9 +707,17 @@ def load_market_data(
             "Se hará análisis empresarial profundo de las primeras 25 empresas. "
             "Las demás conservarán valoración rápida de precio y tendencia."
         )
-    downloaded: dict[str, pd.DataFrame] = {}
-    fundamentals: dict[str, dict[str, object]] = {}
-    verifications: dict[str, PriceVerification] = {}
+    downloaded: dict[str, pd.DataFrame] = (
+        dict(st.session_state.get("market_data", {})) if merge_existing else {}
+    )
+    fundamentals: dict[str, dict[str, object]] = (
+        dict(st.session_state.get("fundamental_data", {})) if merge_existing else {}
+    )
+    verifications: dict[str, PriceVerification] = (
+        dict(st.session_state.get("price_verifications", {}))
+        if merge_existing
+        else {}
+    )
     errors: list[str] = []
     progress = st.progress(0, text="Descargando precios…")
     for position, ticker in enumerate(tickers, start=1):
@@ -730,7 +739,10 @@ def load_market_data(
             try:
                 fundamentals[ticker] = cached_fundamentals(ticker)
             except (DataDownloadError, ValueError) as exc:
-                fundamentals[ticker] = {"symbol": ticker}
+                fundamentals[ticker] = {
+                    "symbol": ticker,
+                    "_fundamental_error": str(exc),
+                }
                 errors.append(str(exc))
             if alpha_vantage_key and ticker in downloaded:
                 try:
@@ -757,8 +769,11 @@ def load_market_data(
         )
         if sector_reference:
             reference_symbols.add(sector_reference)
-    references: dict[str, pd.DataFrame] = {}
-    for symbol in sorted(reference_symbols.difference(downloaded)):
+    references: dict[str, pd.DataFrame] = (
+        dict(st.session_state.get("reference_data", {})) if merge_existing else {}
+    )
+    missing_references = reference_symbols.difference(downloaded).difference(references)
+    for symbol in sorted(missing_references):
         try:
             references[symbol] = cached_download(symbol, start, end, auto_adjust)
         except (DataDownloadError, ValueError) as exc:
@@ -774,7 +789,14 @@ def load_market_data(
     st.session_state["reference_data"] = references
     st.session_state["price_verifications"] = verifications
     st.session_state["fx_snapshot"] = fx_snapshot
-    st.session_state["quick_mode_tickers"] = sorted(set(tickers).difference(deep_tickers))
+    quick_mode_tickers = (
+        set(st.session_state.get("quick_mode_tickers", []))
+        if merge_existing
+        else set()
+    )
+    quick_mode_tickers.update(set(tickers).difference(deep_tickers))
+    quick_mode_tickers.difference_update(deep_tickers)
+    st.session_state["quick_mode_tickers"] = sorted(quick_mode_tickers)
     st.session_state["download_errors"] = errors
     st.session_state.pop("backtest_result", None)
 
@@ -4908,6 +4930,8 @@ def render_growth_momentum_page(
     relative_results: dict[str, RelativeStrengthResult],
     risk_results: dict[str, RiskResult],
     journal: object,
+    private_favorites: pd.DataFrame,
+    group_favorites: pd.DataFrame,
 ) -> None:
     """Muestra el plan mensual dinámico sin modificar el motor equilibrado."""
 
@@ -4920,6 +4944,78 @@ def render_growth_momentum_page(
         "Busca empresas que ya muestran crecimiento y fortaleza. Si no aparece una "
         "entrada válida, la aportación mensual queda disponible: no es obligatorio comprar."
     )
+
+    st.markdown("### Universo de favoritas")
+    scan_scope = st.radio(
+        "Listas que quieres revisar",
+        ["Mi lista privada", "Mi lista privada y la del grupo"],
+        horizontal=True,
+        key="growth_favorite_scope",
+        help="La lista del grupo puede contener ideas compartidas por los cuatro usuarios.",
+    )
+    included_group = (
+        group_favorites
+        if scan_scope == "Mi lista privada y la del grupo"
+        else pd.DataFrame()
+    )
+    favorite_universe, _ = build_favorite_catalog(
+        private_favorites,
+        included_group,
+    )
+    favorite_universe = list(
+        dict.fromkeys(resolve_analysis_ticker(ticker) for ticker in favorite_universe)
+    )
+    loaded_favorites = [ticker for ticker in favorite_universe if ticker in prepared]
+    complete_fundamentals = [
+        ticker
+        for ticker in loaded_favorites
+        if raw_fundamentals.get(ticker)
+        and not raw_fundamentals.get(ticker, {}).get("_quick_mode")
+        and not raw_fundamentals.get(ticker, {}).get("_fundamental_error")
+    ]
+    scan_cols = st.columns(3)
+    scan_cols[0].metric("Favoritas en la lista", len(favorite_universe))
+    scan_cols[1].metric("Precio y momentum cargados", len(loaded_favorites))
+    scan_cols[2].metric("Análisis empresarial completo", len(complete_fundamentals))
+    completed_scan = int(st.session_state.pop("_growth_scan_completed", 0) or 0)
+    if completed_scan:
+        st.success(
+            f"Se han actualizado {completed_scan} empresas. El radar conserva también "
+            "los bloques revisados anteriormente."
+        )
+    if favorite_universe:
+        missing_favorites = [
+            ticker for ticker in favorite_universe if ticker not in prepared
+        ]
+        scan_batch = (
+            missing_favorites[:200]
+            if missing_favorites
+            else favorite_universe[:200]
+        )
+        scan_label = (
+            f"Revisar favoritas pendientes ({len(scan_batch)})"
+            if missing_favorites
+            else f"Actualizar radar de favoritas ({len(scan_batch)})"
+        )
+        if st.button(
+            scan_label,
+            type="primary",
+            width="stretch",
+            icon=":material/travel_explore:",
+            key="growth_scan_favorites",
+        ):
+            st.session_state["_growth_scan_tickers"] = scan_batch
+            st.rerun()
+        if len(missing_favorites) > len(scan_batch):
+            st.caption(
+                f"Quedarán {len(missing_favorites) - len(scan_batch)} empresas para el "
+                "siguiente bloque. Se divide la descarga para no bloquear el alojamiento gratuito."
+            )
+    else:
+        st.warning(
+            "Esta lista todavía no tiene favoritas. Añádelas en Favoritos o utiliza "
+            "las empresas cargadas manualmente en la barra lateral."
+        )
 
     with st.expander("1. Configurar capital y límites", expanded=True):
         capital_a, capital_b, capital_c, capital_d = st.columns(4)
@@ -5087,16 +5183,31 @@ def render_growth_momentum_page(
         help="Suma de las pérdidas previstas si se activaran todos los niveles de invalidación.",
     )
 
-    if not prepared:
+    radar_prepared = prepared
+    if favorite_universe:
+        only_favorites = st.checkbox(
+            "Mostrar sólo favoritas en este radar",
+            value=True,
+            key="growth_only_favorites",
+            help="Desmárcalo para incluir también tickers cargados manualmente o posiciones abiertas.",
+        )
+        if only_favorites:
+            radar_prepared = {
+                ticker: prepared[ticker]
+                for ticker in favorite_universe
+                if ticker in prepared
+            }
+
+    if not radar_prepared:
         st.warning(
-            "Todavía no hay empresas cargadas. Elige favoritas o busca una empresa, "
-            "pulsa «Actualizar análisis» y vuelve a esta sección."
+            "Todavía no hay empresas de este universo cargadas. Pulsa el botón de "
+            "revisión de favoritas o actualiza empresas desde la barra lateral."
         )
         return
 
     results: dict[str, GrowthMomentumResult] = {}
     errors: list[str] = []
-    for ticker, frame in prepared.items():
+    for ticker, frame in radar_prepared.items():
         try:
             results[ticker] = evaluate_growth_momentum(
                 ticker=ticker,
@@ -5137,6 +5248,8 @@ def render_growth_momentum_page(
             "Small cap": "Sí" if result.is_small_cap else "No",
             "Riesgo por entrada": result.suggested_risk_pct,
             "Stop por volatilidad": result.atr_stop_pct,
+            "Último cierre": result.price,
+            "Datos hasta": result.as_of.date(),
         }
         for result in sorted(
             results.values(),
@@ -5144,8 +5257,25 @@ def render_growth_momentum_page(
             reverse=True,
         )
     ]
+    radar_frame = pd.DataFrame(radar_rows)
+    entry_count = int(
+        radar_frame["Lectura"].isin(["Entrada fuerte", "Entrada candidata"]).sum()
+    )
+    watch_count = int(
+        radar_frame["Lectura"].isin(["Vigilancia activa", "Esperar mejor precio"]).sum()
+    )
+    pending_count = int(
+        radar_frame["Lectura"].isin(
+            ["Pendiente de fundamentales", "Datos empresariales insuficientes"]
+        ).sum()
+    )
+    radar_cols = st.columns(4)
+    radar_cols[0].metric("Empresas revisadas", len(radar_frame))
+    radar_cols[1].metric("Entradas para validar", entry_count)
+    radar_cols[2].metric("En vigilancia", watch_count)
+    radar_cols[3].metric("Pendientes de datos", pending_count)
     st.dataframe(
-        pd.DataFrame(radar_rows),
+        radar_frame,
         width="stretch",
         hide_index=True,
         column_config={
@@ -5156,10 +5286,42 @@ def render_growth_momentum_page(
             "Confianza datos": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d%%"),
             "Riesgo por entrada": st.column_config.NumberColumn(format="%.2f%%"),
             "Stop por volatilidad": st.column_config.NumberColumn(format="%.1f%%"),
+            "Último cierre": st.column_config.NumberColumn(format="%.2f"),
+            "Datos hasta": st.column_config.DateColumn(format="DD/MM/YYYY"),
         },
+    )
+    st.download_button(
+        "Descargar radar completo en CSV",
+        radar_frame.to_csv(index=False).encode("utf-8-sig"),
+        file_name="radar_favoritos_crecimiento_momentum.csv",
+        mime="text/csv",
+        width="stretch",
+        key="growth_download_radar",
     )
 
     ordered_tickers = [row["Ticker"] for row in radar_rows]
+    quick_tickers = [
+        ticker
+        for ticker in ordered_tickers
+        if raw_fundamentals.get(ticker, {}).get("_quick_mode")
+        or raw_fundamentals.get(ticker, {}).get("_fundamental_error")
+    ]
+    if quick_tickers:
+        deep_batch = quick_tickers[:25]
+        st.info(
+            f"{len(quick_tickers)} empresas tienen ya precio y momentum, pero les falta "
+            "la revisión empresarial. Mientras tanto no se mostrarán como entradas completas."
+        )
+        if st.button(
+            f"Completar las siguientes {len(deep_batch)} empresas",
+            width="stretch",
+            icon=":material/fact_check:",
+            key="growth_complete_fundamentals",
+        ):
+            st.session_state["_growth_scan_tickers"] = deep_batch
+            st.rerun()
+    if st.session_state.get("growth_selected_ticker") not in ordered_tickers:
+        st.session_state.pop("growth_selected_ticker", None)
     selected = st.selectbox(
         "Empresa para preparar el plan",
         ordered_tickers,
@@ -6071,12 +6233,18 @@ def main() -> None:
         if requested_active_ticker
         else ""
     )
+    growth_scan_tickers = [
+        resolve_analysis_ticker(str(ticker))
+        for ticker in st.session_state.pop("_growth_scan_tickers", [])
+        if str(ticker).strip()
+    ]
+    growth_scan_tickers = list(dict.fromkeys(growth_scan_tickers))[:200]
     if requested_pending_ticker and requested_pending_ticker != pending_analysis_ticker:
         st.info(
             f"{requested_pending_ticker} es el símbolo mostrado por el bróker; "
             f"el análisis utilizará {pending_analysis_ticker}."
         )
-    if load_clicked or pending_analysis_ticker:
+    if load_clicked or pending_analysis_ticker or growth_scan_tickers:
         held_tickers: list[str] = []
         owners_to_load = [authenticated_user.username, GROUP_PORTFOLIO_OWNER]
         if authenticated_user.is_admin:
@@ -6100,11 +6268,15 @@ def main() -> None:
                     for ticker in saved_positions["ticker"].astype(str).tolist()
                     if ticker.strip()
                 )
-        tickers_to_load = analysis_refresh_tickers(
-            tickers,
-            held_tickers,
-            pending_ticker=pending_analysis_ticker,
-            active_ticker=active_analysis_ticker,
+        tickers_to_load = (
+            growth_scan_tickers
+            if growth_scan_tickers
+            else analysis_refresh_tickers(
+                tickers,
+                held_tickers,
+                pending_ticker=pending_analysis_ticker,
+                active_ticker=active_analysis_ticker,
+            )
         )
         load_market_data(
             tickers_to_load,
@@ -6113,11 +6285,14 @@ def main() -> None:
             auto_adjust,
             alpha_vantage_key,
             fundamental_tickers={
-                *tickers,
+                *(growth_scan_tickers or tickers),
                 *([pending_analysis_ticker] if pending_analysis_ticker else []),
                 *([active_analysis_ticker] if active_analysis_ticker else []),
             },
+            merge_existing=bool(growth_scan_tickers),
         )
+        if growth_scan_tickers:
+            st.session_state["_growth_scan_completed"] = len(growth_scan_tickers)
         st.session_state.pop("_pending_analysis_ticker", None)
     for error in st.session_state.get("download_errors", []):
         st.warning(error)
@@ -6231,6 +6406,8 @@ def main() -> None:
                 relative_results,
                 risk_results,
                 journal,
+                private_favorites,
+                group_favorites,
             )
         elif analysis_section == "Objetivo 30+ días":
             render_long_horizon_calibration(
