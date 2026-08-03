@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import textwrap
+
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -16,6 +18,55 @@ COLORS = {
     "negative": "#FF6B6B",
     "muted": "#73849A",
 }
+
+
+def _wrapped_title(value: object, *, width: int = 38) -> str:
+    """Divide títulos largos para que no desaparezcan en móvil o media columna."""
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return "<br>".join(
+        textwrap.wrap(
+            text,
+            width=width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+    )
+
+
+def _finalize_figure(figure: go.Figure) -> go.Figure:
+    """Aplica legibilidad común sin fijar el ancho que decide Streamlit."""
+
+    title_text = str(figure.layout.title.text or "").strip()
+    wrapped_title = _wrapped_title(title_text)
+    margin = figure.layout.margin.to_plotly_json()
+    title_lines = wrapped_title.count("<br>") + 1 if wrapped_title else 0
+    margin["t"] = max(int(margin.get("t") or 0), 70 + max(title_lines - 1, 0) * 24)
+    margin["l"] = max(int(margin.get("l") or 0), 28)
+    margin["r"] = max(int(margin.get("r") or 0), 28)
+    margin["b"] = max(int(margin.get("b") or 0), 42)
+    figure.update_layout(
+        autosize=True,
+        margin=margin,
+        title={
+            "text": wrapped_title,
+            "x": 0.01,
+            "xanchor": "left",
+            "font": {"size": 18},
+        },
+        font={"size": 12},
+        hoverlabel={"namelength": -1},
+    )
+    figure.update_xaxes(automargin=True)
+    figure.update_yaxes(automargin=True)
+    for trace in figure.data:
+        if isinstance(trace, go.Pie):
+            trace.automargin = True
+        if isinstance(trace, (go.Bar, go.Scatter)):
+            trace.cliponaxis = False
+    return figure
 
 
 def price_chart(frame: pd.DataFrame, ticker: str) -> go.Figure:
@@ -78,7 +129,7 @@ def price_chart(frame: pd.DataFrame, ticker: str) -> go.Figure:
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="#FFFFFF",
     )
-    return figure
+    return _finalize_figure(figure)
 
 
 def momentum_chart(frame: pd.DataFrame, overbought: float = 75.0) -> go.Figure:
@@ -108,7 +159,7 @@ def momentum_chart(frame: pd.DataFrame, overbought: float = 75.0) -> go.Figure:
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="#FFFFFF",
     )
-    return figure
+    return _finalize_figure(figure)
 
 
 def backtest_chart(curve: pd.DataFrame) -> go.Figure:
@@ -143,7 +194,7 @@ def backtest_chart(curve: pd.DataFrame) -> go.Figure:
     )
     figure.update_yaxes(title_text="Capital", row=1, col=1)
     figure.update_yaxes(title_text="Drawdown %", row=2, col=1)
-    return figure
+    return _finalize_figure(figure)
 
 
 def return_calibration_chart(summary: pd.DataFrame) -> go.Figure:
@@ -179,7 +230,7 @@ def return_calibration_chart(summary: pd.DataFrame) -> go.Figure:
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="#FFFFFF",
     )
-    return figure
+    return _finalize_figure(figure)
 
 
 def portfolio_evolution_chart(history: pd.DataFrame) -> go.Figure:
@@ -227,7 +278,7 @@ def portfolio_evolution_chart(history: pd.DataFrame) -> go.Figure:
         plot_bgcolor="#FFFFFF",
         yaxis_title="Euros estimados",
     )
-    return figure
+    return _finalize_figure(figure)
 
 
 def annual_portfolio_chart(annual: pd.DataFrame) -> go.Figure:
@@ -275,7 +326,7 @@ def annual_portfolio_chart(annual: pd.DataFrame) -> go.Figure:
     )
     figure.update_yaxes(title_text="Movimientos (€)", secondary_y=False)
     figure.update_yaxes(title_text="Valor (€)", secondary_y=True)
-    return figure
+    return _finalize_figure(figure)
 
 
 def private_investments_chart(investments: pd.DataFrame) -> go.Figure:
@@ -316,7 +367,7 @@ def private_investments_chart(investments: pd.DataFrame) -> go.Figure:
         plot_bgcolor="#FFFFFF",
         yaxis_title="Euros",
     )
-    return figure
+    return _finalize_figure(figure)
 
 
 def portfolio_snapshot_allocation_chart(positions: pd.DataFrame) -> go.Figure:
@@ -344,7 +395,7 @@ def portfolio_snapshot_allocation_chart(positions: pd.DataFrame) -> go.Figure:
         margin={"l": 20, "r": 20, "t": 65, "b": 55},
         paper_bgcolor="rgba(0,0,0,0)",
     )
-    return figure
+    return _finalize_figure(figure)
 
 
 def portfolio_snapshot_assets_chart(
@@ -362,20 +413,23 @@ def portfolio_snapshot_assets_chart(
         .sort_values("value_eur")
     )
     labels = summary["asset_name"].astype(str) + " · " + summary["platform"].astype(str)
+    wrapped_labels = labels.map(lambda value: _wrapped_title(value, width=28))
+    label_lines = sum(value.count("<br>") + 1 for value in wrapped_labels)
     figure = go.Figure(
         go.Bar(
             x=summary["value_eur"],
-            y=labels,
+            y=wrapped_labels,
+            customdata=labels,
             orientation="h",
             marker_color=COLORS["medium"],
             text=summary["value_eur"].map(lambda value: f"{value:,.0f} €"),
             textposition="outside",
-            hovertemplate="%{y}<br>%{x:,.2f} €<extra></extra>",
+            hovertemplate="%{customdata}<br>%{x:,.2f} €<extra></extra>",
         )
     )
     figure.update_layout(
         title=f"{len(summary)} partidas con mayor valor",
-        height=max(390, 32 * len(summary) + 115),
+        height=max(390, 24 * label_lines + 115),
         template="plotly_white",
         margin={"l": 20, "r": 55, "t": 65, "b": 35},
         paper_bgcolor="rgba(0,0,0,0)",
@@ -383,7 +437,7 @@ def portfolio_snapshot_assets_chart(
         xaxis_title="Valor declarado (€)",
         yaxis_title="",
     )
-    return figure
+    return _finalize_figure(figure)
 
 
 def portfolio_snapshot_history_chart(positions: pd.DataFrame) -> go.Figure:
@@ -417,7 +471,7 @@ def portfolio_snapshot_history_chart(positions: pd.DataFrame) -> go.Figure:
         plot_bgcolor="#FFFFFF",
         yaxis_title="Valor declarado (€)",
     )
-    return figure
+    return _finalize_figure(figure)
 
 
 def normalized_comparison_chart(
@@ -451,7 +505,7 @@ def normalized_comparison_chart(
         plot_bgcolor="#FFFFFF",
         yaxis_title="Evolución con inicio = 100",
     )
-    return figure
+    return _finalize_figure(figure)
 
 
 def risk_return_chart(metrics: pd.DataFrame, *, horizon_label: str) -> go.Figure:
@@ -495,7 +549,7 @@ def risk_return_chart(metrics: pd.DataFrame, *, horizon_label: str) -> go.Figure
         xaxis_title="Volatilidad anualizada (%)",
         yaxis_title="Rentabilidad del periodo (%)",
     )
-    return figure
+    return _finalize_figure(figure)
 
 
 def correlation_heatmap(correlations: pd.DataFrame) -> go.Figure:
@@ -524,4 +578,4 @@ def correlation_heatmap(correlations: pd.DataFrame) -> go.Figure:
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="#FFFFFF",
     )
-    return figure
+    return _finalize_figure(figure)

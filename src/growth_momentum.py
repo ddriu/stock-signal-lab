@@ -587,7 +587,12 @@ def evaluate_growth_momentum(
     )
 
     market_broken = context_score < 35
-    if confidence < 45:
+    company_data_missing = profile.key != "etf" and growth_score is None
+    if company_data_missing and bool(info.get("_quick_mode")):
+        label = "Pendiente de fundamentales"
+    elif company_data_missing:
+        label = "Datos empresariales insuficientes"
+    elif confidence < 45:
         label = "Datos insuficientes"
     elif extended and score >= config.candidate_score:
         label = "Esperar mejor precio"
