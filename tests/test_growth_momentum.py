@@ -8,6 +8,7 @@ from src.growth_momentum import (
     calculate_growth_position_plan,
     classify_sector_profile,
     evaluate_growth_momentum,
+    quote_price_to_eur,
 )
 from src.indicators import add_indicators
 from src.opportunity import evaluate_relative_strength, evaluate_risk
@@ -92,6 +93,7 @@ def test_quick_scan_cannot_be_presented_as_a_complete_entry() -> None:
     )
     assert result.growth_score is None
     assert result.label == "Pendiente de fundamentales"
+    assert result.score <= 60
 
 
 def test_small_cap_reduces_risk_and_position_limit() -> None:
@@ -137,6 +139,26 @@ def test_position_plan_respects_monthly_budget_and_strategy_cap() -> None:
     assert plan.suggested_position_value <= 200
     assert plan.loss_at_stop <= plan.risk_budget
     assert plan.round_trip_commission == 2
+
+
+def test_position_plan_uses_euro_price_for_cross_currency_quantity() -> None:
+    result = _evaluate()
+    plan = calculate_growth_position_plan(
+        result=result,
+        config=GrowthMomentumConfig(monthly_allocation_pct=20, strategy_cap_pct=15),
+        liquid_capital=10_000,
+        monthly_investable=1_000,
+        entry_price=120,
+        entry_price_eur=100,
+    )
+    assert plan.quantity == pytest.approx(plan.suggested_position_value / 100)
+    assert plan.stop_price == pytest.approx(120 * (1 - plan.stop_distance_pct / 100))
+
+
+def test_quote_price_conversion_handles_usd_and_london_pence() -> None:
+    rates = {"EUR": 1.0, "USD": 1.2, "GBP": 0.8}
+    assert quote_price_to_eur(120, "USD", rates) == pytest.approx(100)
+    assert quote_price_to_eur(2_000, "GBp", rates) == pytest.approx(25)
 
 
 def test_position_plan_stops_when_sector_or_open_risk_is_exhausted() -> None:
