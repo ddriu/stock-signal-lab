@@ -34,6 +34,7 @@ La instalación local solicita las credenciales guardadas en
 │   ├── signal_engine.py      # Momento de entrada y gestión de posición
 │   ├── fundamentals.py       # Calidad empresarial con cobertura de datos
 │   ├── opportunity.py        # Valoración, fortaleza relativa, riesgo y score conjunto
+│   ├── growth_momentum.py    # Estrategia mensual dinámica y perfiles sectoriales
 │   ├── sector_comparison.py  # Comparación normalizada y liderazgo entre pares
 │   ├── backtesting.py        # Simulador long-only sin anticipación
 │   ├── visualization.py      # Gráficos Plotly
@@ -101,6 +102,15 @@ Los perfiles **Equilibrado**, **Crecimiento** y **Prudente** ajustan juntos los 
 técnicos y de riesgo. **Personalizado** conserva los valores elegidos manualmente.
 Cambiar de perfil facilita la configuración, pero no modifica la calidad de los datos
 ni convierte una señal retrospectiva en una predicción.
+
+La página independiente **Crecimiento y momentum** no es otro preset del score principal.
+Reserva un porcentaje configurable de la aportación mensual, limita el bloque dinámico
+sobre la cartera líquida y mantiene separadas tres notas: crecimiento empresarial,
+momentum y contexto de mercado/riesgo. El tamaño se limita simultáneamente por presupuesto
+mensual, riesgo monetario, máximo individual y techo total de estrategia. Los perfiles de
+tecnología, consumo, energía/uranio, biotecnología, industria/defensa, finanzas y ETF
+adaptan el riesgo y la lista de comprobaciones; el usuario puede corregir manualmente una
+clasificación automática. Segofactoring y Civislend quedan fuera de estos cálculos.
 
 ## Cartera y cambios
 

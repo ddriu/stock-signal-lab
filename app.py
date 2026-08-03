@@ -52,6 +52,13 @@ from src.data_sources import (
     sector_benchmark,
 )
 from src.fundamentals import FundamentalResult, evaluate_fundamentals
+from src.growth_momentum import (
+    SECTOR_PROFILES,
+    GrowthMomentumConfig,
+    GrowthMomentumResult,
+    calculate_growth_position_plan,
+    evaluate_growth_momentum,
+)
 from src.email_sender import (
     EmailConfigurationError,
     EmailDeliveryError,
@@ -4894,6 +4901,482 @@ def render_opportunities_page(
     )
 
 
+def render_growth_momentum_page(
+    prepared: dict[str, pd.DataFrame],
+    raw_fundamentals: dict[str, dict[str, object]],
+    reference_data: dict[str, pd.DataFrame],
+    relative_results: dict[str, RelativeStrengthResult],
+    risk_results: dict[str, RiskResult],
+    journal: object,
+) -> None:
+    """Muestra el plan mensual dinámico sin modificar el motor equilibrado."""
+
+    st.subheader("Crecimiento y momentum")
+    st.caption(
+        "Estrategia anexa para una parte del dinero nuevo. No cambia Sego, Civislend, "
+        "la cartera actual ni las señales del análisis principal."
+    )
+    st.info(
+        "Busca empresas que ya muestran crecimiento y fortaleza. Si no aparece una "
+        "entrada válida, la aportación mensual queda disponible: no es obligatorio comprar."
+    )
+
+    with st.expander("1. Configurar capital y límites", expanded=True):
+        capital_a, capital_b, capital_c, capital_d = st.columns(4)
+        liquid_capital = capital_a.number_input(
+            "Cartera líquida aproximada (€)",
+            min_value=100.0,
+            value=10_000.0,
+            step=500.0,
+            help="No incluye Sego ni Civislend si no puedes disponer de ese dinero rápidamente.",
+            key="growth_liquid_capital",
+        )
+        monthly_investable = capital_b.number_input(
+            "Dinero mensual disponible (€)",
+            min_value=0.0,
+            value=1_000.0,
+            step=50.0,
+            help="Cantidad que queda después de gastos y aportaciones ya comprometidas.",
+            key="growth_monthly_investable",
+        )
+        current_strategy_value = capital_c.number_input(
+            "Ya invertido con esta estrategia (€)",
+            min_value=0.0,
+            value=0.0,
+            step=100.0,
+            help="Sirve para no superar el techo reservado al bloque dinámico.",
+            key="growth_current_strategy_value",
+        )
+        current_open_risk = capital_d.number_input(
+            "Riesgo ya abierto (€)",
+            min_value=0.0,
+            value=0.0,
+            step=10.0,
+            help="Suma de las pérdidas previstas hasta la invalidación de las posiciones dinámicas abiertas.",
+            key="growth_current_open_risk",
+        )
+
+        limits_a, limits_b, limits_c = st.columns(3)
+        monthly_allocation = limits_a.slider(
+            "% mensual para esta estrategia",
+            5.0,
+            50.0,
+            20.0,
+            1.0,
+            format="%.0f%%",
+            key="growth_monthly_allocation",
+        )
+        strategy_cap = limits_b.slider(
+            "Techo sobre cartera líquida",
+            5.0,
+            40.0,
+            15.0,
+            1.0,
+            format="%.0f%%",
+            key="growth_strategy_cap",
+        )
+        normal_risk = limits_c.slider(
+            "Riesgo normal por entrada",
+            0.10,
+            1.50,
+            0.50,
+            0.05,
+            format="%.2f%%",
+            key="growth_normal_risk",
+        )
+
+        max_open_risk = 2.0
+        max_sector = 20.0
+        watch_score = 65
+        candidate_score = 75
+        strong_score = 82
+        minimum_turnover_millions = 5.0
+        commission_per_order = 1.0
+        show_growth_advanced = st.checkbox(
+            "Mostrar ajustes avanzados",
+            value=False,
+            key="growth_show_advanced",
+        )
+        if show_growth_advanced:
+            advanced_a, advanced_b = st.columns(2)
+            max_open_risk = advanced_a.slider(
+                "Riesgo máximo simultáneo",
+                0.50,
+                5.0,
+                2.0,
+                0.25,
+                format="%.2f%%",
+                key="growth_max_open_risk",
+            )
+            max_sector = advanced_b.slider(
+                "Máximo del bloque dinámico en un sector",
+                5.0,
+                40.0,
+                20.0,
+                1.0,
+                format="%.0f%%",
+                key="growth_max_sector",
+            )
+            score_a, score_b, score_c = st.columns(3)
+            watch_score = score_a.slider(
+                "Vigilancia desde", 50, 75, 65, key="growth_watch_score"
+            )
+            candidate_score = score_b.slider(
+                "Entrada candidata", 60, 90, 75, key="growth_candidate_score"
+            )
+            strong_score = score_c.slider(
+                "Entrada fuerte", 70, 95, 82, key="growth_strong_score"
+            )
+            execution_a, execution_b = st.columns(2)
+            minimum_turnover_millions = execution_a.number_input(
+                "Liquidez diaria preferida (millones €)",
+                min_value=0.0,
+                value=5.0,
+                step=1.0,
+                key="growth_min_turnover_millions",
+            )
+            commission_per_order = execution_b.number_input(
+                "Comisión por compra o venta (€)",
+                min_value=0.0,
+                value=1.0,
+                step=0.25,
+                key="growth_commission_per_order",
+            )
+
+    config = GrowthMomentumConfig(
+        monthly_allocation_pct=float(monthly_allocation),
+        strategy_cap_pct=float(strategy_cap),
+        normal_risk_pct=float(normal_risk),
+        max_open_risk_pct=float(max_open_risk),
+        max_sector_pct=float(max_sector),
+        min_turnover_eur=float(minimum_turnover_millions) * 1_000_000.0,
+        watch_score=int(watch_score),
+        candidate_score=int(candidate_score),
+        strong_score=int(strong_score),
+        commission_per_order_eur=float(commission_per_order),
+    )
+    try:
+        config.validate()
+    except ValueError as exc:
+        st.error(f"Configuración dinámica inválida: {exc}")
+        return
+
+    monthly_budget = float(monthly_investable) * config.monthly_allocation_pct / 100
+    strategy_limit = float(liquid_capital) * config.strategy_cap_pct / 100
+    remaining_limit = max(strategy_limit - float(current_strategy_value), 0.0)
+    summary_cols = st.columns(4)
+    summary_cols[0].metric(
+        "Reserva mensual dinámica",
+        f"{monthly_budget:,.2f} €",
+        help="Puede acumularse si este mes no aparece una entrada válida.",
+    )
+    summary_cols[1].metric(
+        "Espacio hasta el techo",
+        f"{remaining_limit:,.2f} €",
+        help=f"Techo configurado: {strategy_limit:,.2f} €.",
+    )
+    summary_cols[2].metric(
+        "Pérdida normal máxima",
+        f"{float(liquid_capital) * config.normal_risk_pct / 100:,.2f} €",
+        help="Los sectores de mayor incertidumbre utilizan una cifra inferior.",
+    )
+    maximum_open_risk_eur = float(liquid_capital) * config.max_open_risk_pct / 100
+    summary_cols[3].metric(
+        "Riesgo abierto disponible",
+        f"{max(maximum_open_risk_eur - float(current_open_risk), 0.0):,.2f} €",
+        help="Suma de las pérdidas previstas si se activaran todos los niveles de invalidación.",
+    )
+
+    if not prepared:
+        st.warning(
+            "Todavía no hay empresas cargadas. Elige favoritas o busca una empresa, "
+            "pulsa «Actualizar análisis» y vuelve a esta sección."
+        )
+        return
+
+    results: dict[str, GrowthMomentumResult] = {}
+    errors: list[str] = []
+    for ticker, frame in prepared.items():
+        try:
+            results[ticker] = evaluate_growth_momentum(
+                ticker=ticker,
+                frame=frame,
+                info=raw_fundamentals.get(ticker, {}),
+                relative=relative_results.get(ticker),
+                risk=risk_results.get(ticker),
+                broad_market=reference_data.get(benchmark_for_ticker(ticker)),
+                config=config,
+            )
+        except ValueError as exc:
+            errors.append(f"{ticker}: {exc}")
+    for error in errors:
+        st.warning(error)
+    if not results:
+        st.error("No hay suficiente información para calcular el perfil dinámico.")
+        return
+
+    st.markdown("### 2. Radar independiente")
+    st.caption(
+        "Crecimiento, momentum y contexto permanecen separados. La confianza indica "
+        "cobertura de datos, no la probabilidad de ganar."
+    )
+    radar_rows = [
+        {
+            "Ticker": result.ticker,
+            "Lectura": result.label,
+            "Total": result.score,
+            "Crecimiento": (
+                float(result.growth_score)
+                if result.growth_score is not None
+                else float("nan")
+            ),
+            "Momentum": result.momentum_score,
+            "Mercado y riesgo": result.context_score,
+            "Confianza datos": result.confidence_pct,
+            "Perfil": result.sector_label,
+            "Small cap": "Sí" if result.is_small_cap else "No",
+            "Riesgo por entrada": result.suggested_risk_pct,
+            "Stop por volatilidad": result.atr_stop_pct,
+        }
+        for result in sorted(
+            results.values(),
+            key=lambda item: (item.score, item.momentum_score, item.confidence_pct),
+            reverse=True,
+        )
+    ]
+    st.dataframe(
+        pd.DataFrame(radar_rows),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Total": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
+            "Crecimiento": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
+            "Momentum": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
+            "Mercado y riesgo": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
+            "Confianza datos": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d%%"),
+            "Riesgo por entrada": st.column_config.NumberColumn(format="%.2f%%"),
+            "Stop por volatilidad": st.column_config.NumberColumn(format="%.1f%%"),
+        },
+    )
+
+    ordered_tickers = [row["Ticker"] for row in radar_rows]
+    selected = st.selectbox(
+        "Empresa para preparar el plan",
+        ordered_tickers,
+        key="growth_selected_ticker",
+    )
+    automatic_result = results[selected]
+    sector_options = ["automatic", *SECTOR_PROFILES]
+    sector_choice = st.selectbox(
+        "Perfil sectorial aplicado",
+        sector_options,
+        index=0,
+        format_func=lambda value: (
+            f"Automático · {automatic_result.sector_label}"
+            if value == "automatic"
+            else SECTOR_PROFILES[value].label
+        ),
+        help="Corrígelo si el proveedor clasifica mal una empresa híbrida.",
+        key=f"growth_sector_override_{selected}",
+    )
+    selected_result = automatic_result
+    if sector_choice != "automatic":
+        selected_result = evaluate_growth_momentum(
+            ticker=selected,
+            frame=prepared[selected],
+            info=raw_fundamentals.get(selected, {}),
+            relative=relative_results.get(selected),
+            risk=risk_results.get(selected),
+            broad_market=reference_data.get(benchmark_for_ticker(selected)),
+            config=config,
+            sector_override=sector_choice,
+        )
+
+    score_cols = st.columns(5)
+    score_cols[0].metric("Lectura dinámica", f"{selected_result.score}/100", selected_result.label)
+    score_cols[1].metric(
+        "Crecimiento",
+        f"{selected_result.growth_score}/100"
+        if selected_result.growth_score is not None
+        else "N/D",
+    )
+    score_cols[2].metric("Momentum", f"{selected_result.momentum_score}/100")
+    score_cols[3].metric("Mercado y riesgo", f"{selected_result.context_score}/100")
+    score_cols[4].metric("Datos disponibles", f"{selected_result.confidence_pct}%")
+    message = (
+        f"**{selected_result.label}.** La nota total es {selected_result.score}/100. "
+        "Antes de utilizar dinero real deben completarse las comprobaciones sectoriales."
+    )
+    if selected_result.label in {"Entrada fuerte", "Entrada candidata"}:
+        st.success(message)
+    elif selected_result.label in {"Vigilancia activa", "Esperar mejor precio"}:
+        st.info(message)
+    else:
+        st.warning(message)
+
+    factor_a, factor_b = st.columns(2)
+    with factor_a:
+        st.markdown("**Lo que apoya la hipótesis**")
+        if selected_result.positive_factors:
+            for factor in selected_result.positive_factors:
+                st.markdown(f"- {friendly_factor(factor)}")
+        else:
+            st.caption("No hay suficientes factores favorables cuantificados.")
+    with factor_b:
+        st.markdown("**Lo que puede hacerla fallar**")
+        if selected_result.risk_factors:
+            for factor in selected_result.risk_factors:
+                st.markdown(f"- {friendly_factor(factor)}")
+        else:
+            st.caption("No aparecen alertas cuantificadas importantes.")
+
+    st.markdown("### 3. Tamaño orientativo de la entrada")
+    plan_inputs_a, plan_inputs_b, plan_inputs_c = st.columns(3)
+    entry_price = plan_inputs_a.number_input(
+        "Precio que estás considerando",
+        min_value=0.01,
+        value=float(selected_result.price),
+        step=0.01,
+        key=f"growth_entry_price_{selected}",
+    )
+    manual_stop = plan_inputs_b.number_input(
+        "Distancia hasta la invalidación",
+        min_value=1.0,
+        max_value=40.0,
+        value=float(selected_result.atr_stop_pct),
+        step=0.5,
+        format="%.1f",
+        help="La propuesta usa ATR y el perfil sectorial. Puedes sustituirla por un soporte razonado.",
+        key=f"growth_stop_{selected}_{selected_result.sector_key}",
+    )
+    current_sector_value = plan_inputs_c.number_input(
+        "Ya invertido en el mismo sector o tema (€)",
+        min_value=0.0,
+        value=0.0,
+        step=100.0,
+            help=(
+                "Incluye empresas diferentes que dependan de la misma narrativa, como nuclear y uranio. "
+                "El límite sectorial se calcula dentro del bloque dinámico."
+            ),
+        key=f"growth_sector_value_{selected_result.sector_key}",
+    )
+    try:
+        plan = calculate_growth_position_plan(
+            result=selected_result,
+            config=config,
+            liquid_capital=float(liquid_capital),
+            monthly_investable=float(monthly_investable),
+            current_strategy_value=float(current_strategy_value),
+            current_sector_value=float(current_sector_value),
+            current_open_risk=float(current_open_risk),
+            entry_price=float(entry_price),
+            manual_stop_pct=float(manual_stop),
+        )
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+
+    plan_cols = st.columns(4)
+    plan_cols[0].metric(
+        "Entrada máxima este mes",
+        f"{plan.suggested_position_value:,.2f} €",
+        help="Es el menor límite entre presupuesto mensual, riesgo, tamaño sectorial y techo de estrategia.",
+    )
+    plan_cols[1].metric("Cantidad aproximada", f"{plan.quantity:,.4f}")
+    plan_cols[2].metric(
+        "Invalidación orientativa",
+        f"{plan.stop_price:,.2f}",
+        f"-{plan.stop_distance_pct:.1f}%",
+    )
+    plan_cols[3].metric(
+        "Pérdida si se ejecutara allí",
+        f"{plan.loss_at_stop:,.2f} €",
+        help="Puede ser mayor durante un gap o si el activo tiene poca liquidez.",
+    )
+    st.caption(
+        f"Referencia 2R: {plan.reference_target_2r:,.2f} · Comisión de ida y vuelta: "
+        f"{plan.round_trip_commission:,.2f} € ({plan.commission_drag_pct:.2f}% de la entrada) · "
+        f"Riesgo sectorial utilizado: {selected_result.suggested_risk_pct:.3f}% de la cartera líquida · "
+        f"Capacidad restante del sector/tema: {plan.remaining_sector_capacity:,.2f} €."
+    )
+    if plan.suggested_position_value <= 0:
+        st.error("El bloque dinámico ya ha alcanzado su techo; no queda capacidad configurada.")
+    elif selected_result.label not in {"Entrada fuerte", "Entrada candidata"}:
+        st.warning(
+            "El cálculo de tamaño no convierte la señal en compra. Con la lectura actual, "
+            "la aplicación reservaría el dinero y esperaría confirmación."
+        )
+
+    profile = SECTOR_PROFILES[selected_result.sector_key]
+    with st.expander(f"4. Validación obligatoria · {profile.label}", expanded=True):
+        st.write(profile.description)
+        st.caption(
+            f"Tamaño máximo individual: {selected_result.max_position_pct:.1f}% de la cartera líquida · "
+            f"Máximo por sector/tema: {config.max_sector_pct:.1f}% del bloque dinámico · "
+            f"Riesgo simultáneo total: {config.max_open_risk_pct:.2f}%."
+        )
+        for check in selected_result.manual_checks:
+            st.checkbox(
+                check,
+                value=False,
+                key=f"growth_check_{selected}_{selected_result.sector_key}_{abs(hash(check))}",
+            )
+        st.caption(
+            "Estas casillas son una lista de preparación. La aplicación no afirma que "
+            "una comprobación esté resuelta sólo porque la marques."
+        )
+
+    with st.expander("Guardar esta evaluación para medir si funcionó"):
+        note = st.text_area(
+            "Hipótesis o nota personal",
+            placeholder="Ejemplo: crecimiento de contratos; invalidar si recorta guía o pierde soporte",
+            max_chars=1_000,
+            key=f"growth_note_{selected}",
+        )
+        if st.button(
+            "Guardar evaluación dinámica",
+            type="primary",
+            key=f"growth_save_{selected}",
+        ):
+            explanation = (
+                "Estrategia Crecimiento y momentum. "
+                f"Total {selected_result.score}/100; crecimiento "
+                f"{selected_result.growth_score if selected_result.growth_score is not None else 'N/D'}; "
+                f"momentum {selected_result.momentum_score}; contexto {selected_result.context_score}; "
+                f"lectura {selected_result.label}; perfil {selected_result.sector_label}; "
+                f"entrada orientativa máxima {plan.suggested_position_value:.2f} €."
+            )
+            try:
+                journal.add_analysis_snapshot(
+                    ticker=selected,
+                    analyzed_at=selected_result.as_of,
+                    price=float(entry_price),
+                    opportunity_score=selected_result.score,
+                    company_score=selected_result.growth_score,
+                    entry_score=selected_result.momentum_score,
+                    valuation_score=None,
+                    relative_score=(
+                        relative_results[selected].score
+                        if selected in relative_results
+                        else None
+                    ),
+                    risk_score=selected_result.context_score,
+                    opportunity_label=f"Dinámica · {selected_result.label}",
+                    entry_label=selected_result.label,
+                    position_label="Plan mensual",
+                    horizon_days=126,
+                    sector=selected_result.sector_label,
+                    explanation=explanation,
+                    note=note,
+                )
+            except (JournalStorageError, ValueError) as exc:
+                st.error(str(exc))
+            else:
+                st.success(
+                    "Evaluación guardada. Podrás contrastarla después con el precio real."
+                )
+
+
 def _comparison_groups(
     prepared: dict[str, pd.DataFrame],
     private_favorites: pd.DataFrame,
@@ -5470,6 +5953,14 @@ def render_methodology() -> None:
           mantenida durante todo el periodo, terminó en positivo o superó la tasa
           anual equivalente de Segofactoring y Civislend. Exige 30 casos para
           considerar suficiente la muestra.
+        - **Crecimiento y momentum:** estrategia anexa para una parte del dinero
+          mensual nuevo. Mantiene separadas las notas de crecimiento empresarial,
+          fortaleza del precio y contexto de mercado/riesgo. Adapta el tamaño y las
+          comprobaciones a tecnología, consumo, energía, biotecnología, industria,
+          finanzas y ETF sin modificar Sego, Civislend ni el score principal.
+        - **Stop por volatilidad:** distancia orientativa calculada con ATR y un
+          multiplicador sectorial. Sirve para dimensionar; un gap puede ejecutarse
+          peor y en biotecnología no protege de un resultado clínico adverso.
         - **Liderazgo sectorial:** posición relativa dentro de las empresas elegidas,
           basada en rentabilidad y caídas; no mide monopolio ni garantiza continuidad.
 
@@ -5701,6 +6192,7 @@ def main() -> None:
     elif selected_section == "Analizar":
         analysis_options = [
             "Oportunidades",
+            "Crecimiento y momentum",
             "Objetivo 30+ días",
             "Comparador sectorial",
             "Historial guardado",
@@ -5729,6 +6221,15 @@ def main() -> None:
                 opportunity_results,
                 raw_fundamentals,
                 price_verifications,
+                journal,
+            )
+        elif analysis_section == "Crecimiento y momentum":
+            render_growth_momentum_page(
+                prepared,
+                raw_fundamentals,
+                reference_data,
+                relative_results,
+                risk_results,
                 journal,
             )
         elif analysis_section == "Objetivo 30+ días":
