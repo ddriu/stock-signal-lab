@@ -58,6 +58,7 @@ from src.growth_momentum import (
     GrowthMomentumResult,
     calculate_growth_position_plan,
     evaluate_growth_momentum,
+    quote_price_to_eur,
 )
 from src.email_sender import (
     EmailConfigurationError,
@@ -4929,6 +4930,7 @@ def render_growth_momentum_page(
     reference_data: dict[str, pd.DataFrame],
     relative_results: dict[str, RelativeStrengthResult],
     risk_results: dict[str, RiskResult],
+    fx_snapshot: FxSnapshot,
     journal: object,
     private_favorites: pd.DataFrame,
     group_favorites: pd.DataFrame,
@@ -5249,6 +5251,9 @@ def render_growth_momentum_page(
             "Riesgo por entrada": result.suggested_risk_pct,
             "Stop por volatilidad": result.atr_stop_pct,
             "Último cierre": result.price,
+            "Moneda": str(
+                raw_fundamentals.get(result.ticker, {}).get("currency") or "N/D"
+            ),
             "Datos hasta": result.as_of.date(),
         }
         for result in sorted(
@@ -5393,9 +5398,16 @@ def render_growth_momentum_page(
             st.caption("No aparecen alertas cuantificadas importantes.")
 
     st.markdown("### 3. Tamaño orientativo de la entrada")
+    quote_currency = str(
+        raw_fundamentals.get(selected, {}).get("currency") or ""
+    ).strip()
     plan_inputs_a, plan_inputs_b, plan_inputs_c = st.columns(3)
     entry_price = plan_inputs_a.number_input(
-        "Precio que estás considerando",
+        (
+            f"Precio que estás considerando ({quote_currency})"
+            if quote_currency
+            else "Precio que estás considerando"
+        ),
         min_value=0.01,
         value=float(selected_result.price),
         step=0.01,
@@ -5416,12 +5428,33 @@ def render_growth_momentum_page(
         min_value=0.0,
         value=0.0,
         step=100.0,
-            help=(
-                "Incluye empresas diferentes que dependan de la misma narrativa, como nuclear y uranio. "
-                "El límite sectorial se calcula dentro del bloque dinámico."
-            ),
+        help=(
+            "Incluye empresas diferentes que dependan de la misma narrativa, como nuclear y uranio. "
+            "El límite sectorial se calcula dentro del bloque dinámico."
+        ),
         key=f"growth_sector_value_{selected_result.sector_key}",
     )
+    try:
+        entry_price_eur = quote_price_to_eur(
+            float(entry_price),
+            quote_currency,
+            fx_snapshot.rates_per_eur,
+        )
+    except ValueError as exc:
+        st.error(
+            "No se puede calcular una cantidad fiable sin convertir la cotización "
+            f"a euros: {exc}"
+        )
+        st.caption(
+            "Completa primero el análisis empresarial para obtener la moneda o espera "
+            "a que el Banco Central Europeo publique un tipo compatible."
+        )
+        return
+    if quote_currency.upper() != "EUR":
+        st.caption(
+            f"Conversión aplicada: una acción a {float(entry_price):,.2f} {quote_currency} "
+            f"equivale aproximadamente a {entry_price_eur:,.2f} € por unidad."
+        )
     try:
         plan = calculate_growth_position_plan(
             result=selected_result,
@@ -5432,6 +5465,7 @@ def render_growth_momentum_page(
             current_sector_value=float(current_sector_value),
             current_open_risk=float(current_open_risk),
             entry_price=float(entry_price),
+            entry_price_eur=entry_price_eur,
             manual_stop_pct=float(manual_stop),
         )
     except ValueError as exc:
@@ -5447,7 +5481,7 @@ def render_growth_momentum_page(
     plan_cols[1].metric("Cantidad aproximada", f"{plan.quantity:,.4f}")
     plan_cols[2].metric(
         "Invalidación orientativa",
-        f"{plan.stop_price:,.2f}",
+        f"{plan.stop_price:,.2f} {quote_currency}",
         f"-{plan.stop_distance_pct:.1f}%",
     )
     plan_cols[3].metric(
@@ -5456,7 +5490,7 @@ def render_growth_momentum_page(
         help="Puede ser mayor durante un gap o si el activo tiene poca liquidez.",
     )
     st.caption(
-        f"Referencia 2R: {plan.reference_target_2r:,.2f} · Comisión de ida y vuelta: "
+        f"Referencia 2R: {plan.reference_target_2r:,.2f} {quote_currency} · Comisión de ida y vuelta: "
         f"{plan.round_trip_commission:,.2f} € ({plan.commission_drag_pct:.2f}% de la entrada) · "
         f"Riesgo sectorial utilizado: {selected_result.suggested_risk_pct:.3f}% de la cartera líquida · "
         f"Capacidad restante del sector/tema: {plan.remaining_sector_capacity:,.2f} €."
@@ -6405,6 +6439,7 @@ def main() -> None:
                 reference_data,
                 relative_results,
                 risk_results,
+                fx_snapshot,
                 journal,
                 private_favorites,
                 group_favorites,
