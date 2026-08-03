@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from src.opportunity import RelativeStrengthResult, RiskResult
+from src.data_sources import convert_currency
 
 
 @dataclass(frozen=True)
@@ -551,10 +552,21 @@ def evaluate_growth_momentum(
         config,
     )
 
-    components: list[tuple[float, int]] = [(40, momentum_score), (20, context_score)]
-    if growth_score is not None:
-        components.append((40, growth_score))
-    score = int(_weighted_score(components) or 0)
+    if profile.key == "etf":
+        # Un ETF no tiene ventas o beneficios propios. Su total se construye con
+        # momentum y contexto, normalizados a 100 sólo para este tipo de activo.
+        score = int(_weighted_score([(40, momentum_score), (20, context_score)]) or 0)
+    elif growth_score is None:
+        # No renormalizamos el 60 % disponible como si fuera el 100 %. Ese
+        # comportamiento hacía que una empresa sin fundamentales pareciese una
+        # entrada fuerte únicamente por precio y mercado.
+        score = round(momentum_score * 0.40 + context_score * 0.20)
+    else:
+        score = round(
+            growth_score * 0.40
+            + momentum_score * 0.40
+            + context_score * 0.20
+        )
     confidence = min(100, round(40 + context_coverage * 0.20 + growth_coverage * 0.40))
 
     risk_pct = config.normal_risk_pct * profile.risk_multiplier
@@ -647,6 +659,7 @@ def calculate_growth_position_plan(
     current_sector_value: float = 0.0,
     current_open_risk: float = 0.0,
     entry_price: float | None = None,
+    entry_price_eur: float | None = None,
     manual_stop_pct: float | None = None,
 ) -> GrowthPositionPlan:
     """Dimensiona una entrada con riesgo, presupuesto mensual y techo de cartera."""
@@ -663,6 +676,9 @@ def calculate_growth_position_plan(
     price = float(entry_price if entry_price is not None else result.price)
     if price <= 0:
         raise ValueError("El precio de entrada debe ser positivo.")
+    euro_price = float(entry_price_eur if entry_price_eur is not None else price)
+    if euro_price <= 0:
+        raise ValueError("El precio de entrada convertido a euros debe ser positivo.")
     stop_pct = float(manual_stop_pct if manual_stop_pct is not None else result.atr_stop_pct)
     if not 0 < stop_pct < 100:
         raise ValueError("La distancia al stop debe estar entre 0 y 100%.")
@@ -690,7 +706,7 @@ def calculate_growth_position_plan(
             value_by_position_cap,
         ),
     )
-    quantity = suggested_value / price
+    quantity = suggested_value / euro_price
     stop_price = price * (1 - stop_pct / 100.0)
     target_2r = price * (1 + 2 * stop_pct / 100.0)
     loss_at_stop = suggested_value * stop_pct / 100.0
@@ -711,3 +727,37 @@ def calculate_growth_position_plan(
         round_trip_commission=commission,
         commission_drag_pct=commission_drag,
     )
+
+
+def quote_price_to_eur(
+    price: float,
+    currency: str,
+    rates_per_eur: dict[str, float],
+) -> float:
+    """Convierte una cotización a EUR, incluyendo mercados que publican céntimos.
+
+    Yahoo utiliza ``GBp`` para peniques británicos, ``ZAc`` para céntimos de rand
+    e ``ILA`` para agorot israelíes. Diferenciar mayúsculas y minúsculas evita
+    tratar 2.094 peniques como 2.094 libras.
+    """
+
+    amount = float(price)
+    if amount <= 0:
+        raise ValueError("El precio debe ser positivo.")
+    quoted_currency = str(currency or "").strip()
+    subunit_map = {
+        "GBp": "GBP",
+        "GBX": "GBP",
+        "ZAc": "ZAR",
+        "ZAC": "ZAR",
+        "ILA": "ILS",
+    }
+    normalized_currency = subunit_map.get(
+        quoted_currency,
+        quoted_currency.upper(),
+    )
+    if quoted_currency in subunit_map:
+        amount /= 100.0
+    if not normalized_currency:
+        raise ValueError("La fuente no indicó la moneda de cotización.")
+    return float(convert_currency(amount, normalized_currency, "EUR", rates_per_eur))
