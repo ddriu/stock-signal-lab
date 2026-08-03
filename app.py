@@ -1,6 +1,7 @@
 """Interfaz Streamlit de Stock Signal Lab.
 
 Ejecutar con: ``streamlit run app.py``
+Versión de despliegue auditada: 2026-08-03.
 """
 
 from __future__ import annotations
