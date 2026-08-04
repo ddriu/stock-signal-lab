@@ -5,6 +5,15 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 
+GROWTH_RADAR_ENTRY_LABELS = frozenset({"Entrada fuerte", "Entrada candidata"})
+GROWTH_RADAR_WATCH_LABELS = frozenset(
+    {"Vigilancia activa", "Esperar mejor precio"}
+)
+GROWTH_RADAR_PENDING_LABELS = frozenset(
+    {"Pendiente de fundamentales", "Datos empresariales insuficientes"}
+)
+
+
 def normalize_ticker(value: object) -> str:
     """Devuelve un símbolo uniforme sin aceptar valores vacíos."""
 
@@ -43,3 +52,29 @@ def analysis_refresh_tickers(
         if ticker and ticker not in result:
             result.append(ticker)
     return result
+
+
+def growth_radar_ticker_groups(
+    readings: Iterable[tuple[object, object]],
+) -> dict[str, list[str]]:
+    """Agrupa los tickers del radar para ofrecer accesos rápidos navegables."""
+
+    groups: dict[str, list[str]] = {
+        "all": [],
+        "entries": [],
+        "watch": [],
+        "pending": [],
+    }
+    for raw_ticker, raw_label in readings:
+        ticker = normalize_ticker(raw_ticker)
+        label = str(raw_label or "").strip()
+        if not ticker or ticker in groups["all"]:
+            continue
+        groups["all"].append(ticker)
+        if label in GROWTH_RADAR_ENTRY_LABELS:
+            groups["entries"].append(ticker)
+        if label in GROWTH_RADAR_WATCH_LABELS:
+            groups["watch"].append(ticker)
+        if label in GROWTH_RADAR_PENDING_LABELS:
+            groups["pending"].append(ticker)
+    return groups

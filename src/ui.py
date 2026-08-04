@@ -168,6 +168,24 @@ div[data-testid="stMetric"] {
     border-radius: 16px;
 }
 
+div[data-testid="stExpander"] {
+    background: rgba(255, 255, 255, 0.9);
+    border: 1px solid var(--ssl-border);
+    box-shadow: 0 5px 18px rgba(15, 23, 42, 0.035);
+    overflow: hidden;
+}
+
+div[data-testid="stExpander"] summary {
+    font-weight: 720;
+    color: var(--ssl-ink);
+}
+
+div[data-testid="stVerticalBlockBorderWrapper"] {
+    background: rgba(255, 255, 255, 0.88);
+    border-radius: 16px;
+    box-shadow: 0 5px 18px rgba(15, 23, 42, 0.035);
+}
+
 div[data-testid="stMetric"] {
     background: var(--ssl-surface);
     border: 1px solid var(--ssl-border);
@@ -197,6 +215,24 @@ div[data-testid="stMetricValue"] {
 button[data-baseweb="tab"] {
     min-height: 2.75rem;
     border-radius: 12px;
+}
+
+.stButton > button,
+.stFormSubmitButton > button {
+    font-weight: 680;
+    transition: border-color 150ms ease, box-shadow 150ms ease, transform 150ms ease;
+}
+
+.stButton > button:hover,
+.stFormSubmitButton > button:hover {
+    border-color: rgba(8, 127, 91, 0.55);
+    box-shadow: 0 7px 18px rgba(15, 23, 42, 0.08);
+    transform: translateY(-1px);
+}
+
+[data-testid="stPopover"] > button {
+    background: rgba(255, 255, 255, 0.92);
+    border-color: var(--ssl-border);
 }
 
 [data-testid="stSegmentedControl"] {
@@ -281,6 +317,48 @@ button[data-baseweb="tab"] {
     color: rgba(255, 255, 255, 0.82);
     margin: 0;
     max-width: 50rem;
+}
+
+.ssl-page-intro {
+    position: relative;
+    overflow: hidden;
+    padding: clamp(1rem, 3vw, 1.45rem);
+    margin: 0.75rem 0 1rem;
+    border: 1px solid var(--ssl-border);
+    border-radius: 20px;
+    background:
+        linear-gradient(125deg, rgba(255, 255, 255, 0.98), rgba(231, 247, 241, 0.82));
+    box-shadow: 0 8px 25px rgba(15, 23, 42, 0.05);
+}
+
+.ssl-page-intro::after {
+    content: "";
+    position: absolute;
+    width: 9rem;
+    height: 9rem;
+    right: -3rem;
+    top: -4rem;
+    border-radius: 50%;
+    background: rgba(8, 127, 91, 0.08);
+}
+
+.ssl-page-intro span {
+    display: block;
+    color: var(--ssl-primary);
+    font-size: 0.72rem;
+    font-weight: 820;
+    letter-spacing: 0.09em;
+}
+
+.ssl-page-intro h2 {
+    margin: 0.18rem 0 0.28rem;
+    font-size: clamp(1.35rem, 4vw, 1.85rem);
+}
+
+.ssl-page-intro p {
+    margin: 0;
+    max-width: 54rem;
+    color: var(--ssl-muted);
 }
 
 .ssl-card-grid,
