@@ -162,6 +162,7 @@ from src.visualization import (
 st.set_page_config(page_title="Stock Signal Lab", page_icon="📈", layout="wide")
 
 MAIN_OPTIONS = ["Inicio", "Analizar", "Favoritos", "Carteras", "Más"]
+HOME_OPTIONS = ["Resumen", "Mi cartera", "Alertas"]
 ANALYSIS_OPTIONS = [
     "Oportunidades",
     "Crecimiento y momentum",
@@ -4014,92 +4015,111 @@ def render_favorite_list(
         st.caption(
             f"Mostrando {first_visible}–{last_visible} de {len(filtered)}"
         )
-        for position, (_, selected_row) in enumerate(page_frame.iterrows()):
-            selected_ticker = str(selected_row.get("ticker", "")).strip().upper()
-            selected_name = str(selected_row.get("name", "") or selected_ticker).strip()
-            exchange = str(selected_row.get("exchange", "") or "").strip()
-            tags = favorite_tags_from_value(selected_row.get("tags", ""))
-            selected_owner = str(selected_row.get("recorded_by", "") or "").lower()
+        visible = page_frame.loc[
+            :, ["ticker", "name", "exchange", "tags", "recorded_by"]
+        ].rename(
+            columns={
+                "ticker": "Ticker",
+                "name": "Empresa",
+                "exchange": "Mercado",
+                "tags": "Etiquetas",
+                "recorded_by": "Añadida por",
+            }
+        ).reset_index(drop=True)
+        visible["Ticker"] = visible["Ticker"].fillna("").astype(str).str.upper()
+        visible["Etiquetas"] = visible["Etiquetas"].map(favorite_tags_from_value)
+        visible["Analizar"] = False
+        visible["Quitar"] = False
+        if not shared:
+            visible = visible.drop(columns=["Añadida por"])
+
+        revision_key = f"favorite_editor_revision_{scope_key}"
+        editor_revision = int(st.session_state.get(revision_key, 0) or 0)
+        edited = st.data_editor(
+            visible,
+            width="stretch",
+            height=min(820, 38 + 35 * len(visible)),
+            hide_index=True,
+            disabled=[
+                column
+                for column in ["Ticker", "Empresa", "Mercado", "Añadida por"]
+                if column in visible.columns
+            ],
+            key=f"favorite_editor_{scope_key}_{page}_{editor_revision}",
+            column_config={
+                "Ticker": st.column_config.TextColumn(width="small"),
+                "Empresa": st.column_config.TextColumn(width="large"),
+                "Mercado": st.column_config.TextColumn(width="medium"),
+                "Etiquetas": st.column_config.MultiselectColumn(
+                    options=list(FAVORITE_TAGS),
+                    width="large",
+                    help="Edita la clasificación directamente en la tabla.",
+                ),
+                "Analizar": st.column_config.CheckboxColumn(
+                    width="small",
+                    help="Marca para abrir el análisis de esta empresa.",
+                ),
+                "Quitar": st.column_config.CheckboxColumn(
+                    width="small",
+                    help="Marca para quitarla de favoritos; no afecta a tu cartera.",
+                ),
+            },
+        )
+
+        original_by_ticker = {
+            str(row.get("ticker", "")).strip().upper(): row
+            for _, row in page_frame.iterrows()
+        }
+        for _, edited_row in edited.iterrows():
+            selected_ticker = str(edited_row.get("Ticker", "")).strip().upper()
+            original_row = original_by_ticker.get(selected_ticker)
+            if original_row is None:
+                continue
+            selected_owner = str(original_row.get("recorded_by", "") or "").lower()
             can_edit_selected = (
                 not shared
                 or can_delete_all
                 or selected_owner == actor_username.lower()
             )
-            details = [value for value in [exchange, " · ".join(tags)] if value]
-            if shared and selected_owner:
-                details.append(f"Añadida por {selected_owner}")
-            detail_text = " · ".join(details) or "Sin clasificación"
-            with st.container(
-                key=f"favorite_row_{scope_key}_{position}_{selected_ticker}",
-            ):
-                info_col, open_col, tags_col, remove_col = st.columns(
-                    [5, 1.25, 1.45, 1.35],
-                    vertical_alignment="center",
-                )
-                info_col.markdown(
-                    f"""
-                    <div class="ssl-favorite-row-copy">
-                        <strong>{html.escape(selected_name)}</strong>
-                        <span>{html.escape(selected_ticker)} · {html.escape(detail_text)}</span>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-                open_col.button(
-                    "Analizar",
-                    icon=":material/query_stats:",
-                    key=f"open_favorite_{scope_key}_{selected_ticker}",
-                    width="stretch",
-                    on_click=_open_ticker_analysis,
-                    args=(selected_ticker,),
-                )
-                with tags_col.popover(
-                    "Etiquetas",
-                    icon=":material/label:",
-                    width="stretch",
-                    disabled=not can_edit_selected,
-                    key=f"favorite_tags_popover_{scope_key}_{selected_ticker}",
-                ):
-                    edited_tags = st.multiselect(
-                        "Clasificación",
-                        FAVORITE_TAGS,
-                        default=favorite_tags_from_value(selected_row.get("tags", "")),
-                        max_selections=5,
-                        key=f"edit_favorite_tags_{scope_key}_{selected_ticker}",
-                        help="Una empresa puede pertenecer a varias categorías.",
+            original_tags = favorite_tags_from_value(original_row.get("tags", ""))
+            edited_tags = favorite_tags_from_value(edited_row.get("Etiquetas", []))
+            wants_remove = bool(edited_row.get("Quitar", False))
+            wants_analysis = bool(edited_row.get("Analizar", False))
+
+            if wants_remove:
+                if not can_edit_selected:
+                    st.warning(
+                        "En la lista del grupo sólo puedes quitar las empresas que tú añadiste."
                     )
-                    if st.button(
-                        "Guardar cambios",
-                        key=f"update_favorite_tags_{scope_key}_{selected_ticker}",
-                        type="primary",
-                        width="stretch",
-                    ):
-                        try:
-                            journal.update_favorite_tags(selected_ticker, edited_tags)
-                        except (JournalStorageError, ValueError) as exc:
-                            st.error(str(exc))
-                        else:
-                            st.success(f"Etiquetas de {selected_ticker} actualizadas.")
-                            st.rerun()
-                if remove_col.button(
-                    "Quitar",
-                    icon=":material/delete_outline:",
-                    key=f"remove_favorite_{scope_key}_{selected_ticker}",
-                    width="stretch",
-                    disabled=not can_edit_selected,
-                    help=(
-                        "Sólo puedes quitar del grupo las empresas que tú añadiste."
-                        if not can_edit_selected
-                        else "Quita esta empresa de la lista; no afecta a tu cartera."
-                    ),
-                ):
+                else:
                     try:
                         journal.delete_favorite(selected_ticker)
                     except (JournalStorageError, ValueError) as exc:
                         st.error(str(exc))
                     else:
                         st.success(f"{selected_ticker} ya no está en esta lista.")
-                        st.rerun()
+                st.session_state[revision_key] = editor_revision + 1
+                st.rerun()
+
+            if edited_tags != original_tags:
+                if not can_edit_selected:
+                    st.warning(
+                        "En la lista del grupo sólo puedes editar las empresas que tú añadiste."
+                    )
+                else:
+                    try:
+                        journal.update_favorite_tags(selected_ticker, edited_tags)
+                    except (JournalStorageError, ValueError) as exc:
+                        st.error(str(exc))
+                    else:
+                        st.success(f"Etiquetas de {selected_ticker} actualizadas.")
+                st.session_state[revision_key] = editor_revision + 1
+                st.rerun()
+
+            if wants_analysis:
+                st.session_state[revision_key] = editor_revision + 1
+                _open_ticker_analysis(selected_ticker)
+                st.rerun()
 
 
 def render_favorite_tabs(
@@ -4155,21 +4175,14 @@ def render_favorites_manager(
     *,
     actor_username: str,
     is_admin: bool,
+    favorite_view: str,
 ) -> None:
-    st.subheader("Favoritos")
-    st.caption(
-        "Tu lista de seguimiento. Cada línea permite analizar, clasificar o quitar."
-    )
-    if st.session_state.pop("_return_to_favorite_lists", False):
-        st.session_state["favorite_view"] = "Mis listas"
-    favorite_view = st.segmented_control(
-        "Vista de favoritos",
-        ["Mis listas", "Añadir empresa"],
-        default="Mis listas",
-        key="favorite_view",
-        label_visibility="collapsed",
-    )
     if favorite_view == "Mis listas":
+        render_page_intro(
+            "FAVORITOS",
+            "Mis listas",
+            "Consulta, clasifica o quita empresas directamente desde su fila.",
+        )
         render_favorite_tabs(
             private_journal,
             group_journal,
@@ -4180,7 +4193,11 @@ def render_favorites_manager(
         )
         return
 
-    st.markdown("##### Añadir empresa")
+    render_page_intro(
+        "FAVORITOS",
+        "Añadir empresa",
+        "Busca por nombre y elige la cotización y el mercado correctos.",
+    )
     with st.form("company_search_form"):
         search_col, button_col = st.columns([4, 1])
         query = search_col.text_input(
@@ -4440,6 +4457,27 @@ def render_page_intro(eyebrow: str, title: str, description: str) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_subnavigation(
+    label: str,
+    options: list[str],
+    *,
+    key: str,
+    format_func=None,
+) -> str:
+    """Mantiene todos los submenús en la misma franja visual."""
+
+    with st.container(key="section_subnavigation"):
+        selected = st.segmented_control(
+            label,
+            options,
+            key=key,
+            required=True,
+            label_visibility="collapsed",
+            format_func=format_func,
+        )
+    return str(selected or options[0])
 
 
 def render_opportunity_cards(
@@ -4881,6 +4919,7 @@ def render_home(
     fx_snapshot: FxSnapshot,
     private_favorites: pd.DataFrame,
     group_favorites: pd.DataFrame,
+    section: str = "Resumen",
 ) -> None:
     latest_snapshot = pd.DataFrame()
     snapshot_summary = None
@@ -4904,18 +4943,24 @@ def render_home(
         update_text = f"cartera valorada el {snapshot_summary.snapshot_date}"
     else:
         update_text = "pendiente de actualización"
-    st.markdown(
-        f"""
-        <section class="ssl-hero">
-            <h2>Tu resumen de inversión</h2>
-            <p>
-                Hola, {html.escape(user.display_name)}. Aquí tienes lo importante sin
-                perderte entre indicadores. Datos mostrados: {html.escape(update_text)}.
-            </p>
-        </section>
-        """,
-        unsafe_allow_html=True,
-    )
+    if section == "Mi cartera":
+        render_page_intro(
+            "INICIO",
+            "Mi cartera",
+            f"Distribución, posiciones y resultados guardados · {update_text}.",
+        )
+    elif section == "Alertas":
+        render_page_intro(
+            "INICIO",
+            "Alertas",
+            f"Señales que merecen revisión hoy · {update_text}.",
+        )
+    else:
+        render_page_intro(
+            "INICIO",
+            "Resumen",
+            f"Hola, {user.display_name}. Lo esencial de tu inversión · {update_text}.",
+        )
 
     try:
         _, private_kpis = _portfolio_snapshot(journal, prepared, fx_snapshot)
@@ -4925,7 +4970,9 @@ def render_home(
         private_kpis = None
         group_kpis = None
 
-    if snapshot_summary is not None or private_kpis is not None:
+    if section == "Resumen" and (
+        snapshot_summary is not None or private_kpis is not None
+    ):
         if snapshot_summary is not None:
             value_text = f"{snapshot_summary.value_eur:,.2f} €"
             result_text = (
@@ -5007,7 +5054,7 @@ def render_home(
                 f"resultado latente valorado {group_kpis.unrealized_pnl_eur:+,.2f} EUR."
             )
 
-    if snapshot_summary is not None:
+    if section == "Mi cartera" and snapshot_summary is not None:
         st.markdown("### Mi cartera")
         st.caption(
             "Distribución basada en los últimos valores guardados, no en cotizaciones en tiempo real. "
@@ -5064,26 +5111,37 @@ def render_home(
             },
         )
 
-    action_a, action_b, action_c = st.columns(3)
-    action_a.button(
-        "Analizar empresas",
-        width="stretch",
-        type="primary",
-        on_click=_set_navigation,
-        args=("Analizar",),
-    )
-    action_b.button(
-        "Buscar y guardar",
-        width="stretch",
-        on_click=_set_navigation,
-        args=("Favoritos",),
-    )
-    action_c.button(
-        "Abrir mi cartera",
-        width="stretch",
-        on_click=_set_navigation,
-        args=("Carteras", "portfolio_navigation", "Privada"),
-    )
+    if section == "Mi cartera" and snapshot_summary is None:
+        st.info(
+            "Todavía no hay una fotografía de cartera disponible. Puedes importarla "
+            "desde «Carteras» o reconstruir las posiciones con operaciones."
+        )
+
+    if section == "Resumen":
+        action_a, action_b, action_c = st.columns(3)
+        action_a.button(
+            "Analizar empresas",
+            width="stretch",
+            type="primary",
+            on_click=_set_navigation,
+            args=("Analizar",),
+        )
+        action_b.button(
+            "Buscar y guardar",
+            width="stretch",
+            on_click=_set_navigation,
+            args=("Favoritos",),
+        )
+        action_c.button(
+            "Abrir mi cartera",
+            width="stretch",
+            on_click=_set_navigation,
+            args=("Carteras", "portfolio_navigation", "Privada"),
+        )
+        return
+
+    if section != "Alertas":
+        return
 
     risk_alerts = [
         row
@@ -6991,6 +7049,8 @@ def main() -> None:
     render_app_header(authenticated_user)
     if st.session_state.get("main_navigation") not in MAIN_OPTIONS:
         st.session_state["main_navigation"] = "Inicio"
+    if st.session_state.get("home_navigation") not in HOME_OPTIONS:
+        st.session_state["home_navigation"] = "Resumen"
     if st.session_state.get("analysis_navigation") not in ANALYSIS_OPTIONS:
         st.session_state["analysis_navigation"] = "Oportunidades"
     current_section = str(st.session_state["main_navigation"])
@@ -7138,36 +7198,32 @@ def main() -> None:
         else ({}, [], {}, {}, {}, {}, {})
     )
 
-    navigation_container = st.container()
-    with navigation_container:
-        if current_section == "Favoritos":
-            navigation_col = st.container()
-            search_col = None
-        else:
-            navigation_col, search_col = st.columns(
-                [6, 1],
-                vertical_alignment="center",
-            )
-        with navigation_col:
-            selected_section = st.segmented_control(
-                "Navegación principal",
-                MAIN_OPTIONS,
-                key="main_navigation",
-                required=True,
-                label_visibility="collapsed",
-                format_func=lambda value: {
-                    "Inicio": "⌂ Inicio",
-                    "Analizar": "⌁ Analizar",
-                    "Favoritos": "☆ Favoritos",
-                    "Carteras": "▣ Carteras",
-                    "Más": "••• Más",
-                }[value],
-            )
-        if search_col is not None:
-            with search_col:
-                render_quick_company_search()
+    selected_section = st.segmented_control(
+        "Navegación principal",
+        MAIN_OPTIONS,
+        key="main_navigation",
+        required=True,
+        label_visibility="collapsed",
+        format_func=lambda value: {
+            "Inicio": "⌂ Inicio",
+            "Analizar": "⌁ Analizar",
+            "Favoritos": "☆ Favoritos",
+            "Carteras": "▣ Carteras",
+            "Más": "••• Más",
+        }[value],
+    )
 
     if selected_section == "Inicio":
+        home_section = render_subnavigation(
+            "Inicio",
+            HOME_OPTIONS,
+            key="home_navigation",
+            format_func=lambda value: {
+                "Resumen": "Resumen",
+                "Mi cartera": "Mi cartera",
+                "Alertas": "Alertas",
+            }[value],
+        )
         render_home(
             authenticated_user,
             journal,
@@ -7177,15 +7233,14 @@ def main() -> None:
             fx_snapshot,
             private_favorites,
             group_favorites,
+            section=home_section,
         )
 
     elif selected_section == "Analizar":
-        analysis_section = st.segmented_control(
+        analysis_section = render_subnavigation(
             "Tipo de análisis",
             ANALYSIS_OPTIONS,
             key="analysis_navigation",
-            required=True,
-            label_visibility="collapsed",
             format_func=lambda value: ANALYSIS_LABELS[value],
         )
         if analysis_section != "Proyección de capital":
@@ -7260,6 +7315,16 @@ def main() -> None:
             )
 
     elif selected_section == "Favoritos":
+        favorite_options = ["Mis listas", "Añadir empresa"]
+        if st.session_state.pop("_return_to_favorite_lists", False):
+            st.session_state["favorite_view"] = "Mis listas"
+        if st.session_state.get("favorite_view") not in favorite_options:
+            st.session_state["favorite_view"] = "Mis listas"
+        favorite_view = render_subnavigation(
+            "Favoritos",
+            favorite_options,
+            key="favorite_view",
+        )
         if not persistent_journal_enabled():
             st.warning(
                 "Los favoritos necesitan almacenamiento persistente. En local se "
@@ -7279,18 +7344,17 @@ def main() -> None:
                 group_favorites,
                 actor_username=authenticated_user.username,
                 is_admin=authenticated_user.is_admin,
+                favorite_view=favorite_view,
             )
 
     elif selected_section == "Carteras":
         portfolio_options = ["Privada", "Grupo"]
         if st.session_state.get("portfolio_navigation") not in portfolio_options:
             st.session_state["portfolio_navigation"] = "Privada"
-        portfolio_section = st.segmented_control(
+        portfolio_section = render_subnavigation(
             "Cartera",
             portfolio_options,
             key="portfolio_navigation",
-            required=True,
-            label_visibility="collapsed",
             format_func=lambda value: (
                 "Mi cartera privada" if value == "Privada" else "Cartera del grupo"
             ),
@@ -7336,12 +7400,10 @@ def main() -> None:
         more_options.append("Guía y riesgos")
         if st.session_state.get("more_navigation") not in more_options:
             st.session_state["more_navigation"] = "Guía y riesgos"
-        more_section = st.segmented_control(
+        more_section = render_subnavigation(
             "Más secciones",
             more_options,
             key="more_navigation",
-            required=True,
-            label_visibility="collapsed",
         )
         if more_section == "Alertas por correo":
             if persistent_journal_enabled():
