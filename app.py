@@ -4635,10 +4635,10 @@ def _open_ticker_analysis(ticker: str) -> None:
         [normalized],
         recent if isinstance(recent, list) else [],
     )[:20]
-    st.session_state["main_navigation"] = "Analizar"
-    st.session_state["analysis_navigation"] = "Oportunidades"
-    # No se modifica directamente la clave del selectbox. Streamlit puede
-    # rechazar ese cambio si el widget ya se creó durante la misma interacción.
+    # No se modifican directamente claves pertenecientes a widgets. Streamlit
+    # rechaza esos cambios si los menús ya se crearon durante la interacción.
+    st.session_state["_requested_main_navigation"] = "Analizar"
+    st.session_state["_requested_analysis_navigation"] = "Oportunidades"
     st.session_state["_requested_analysis_ticker"] = normalized
     st.session_state["_pending_analysis_ticker"] = normalized
 
@@ -7127,6 +7127,16 @@ def main() -> None:
         st.error(str(exc))
         st.stop()
     render_app_header(authenticated_user)
+    requested_main_navigation = st.session_state.pop(
+        "_requested_main_navigation", None
+    )
+    if requested_main_navigation in MAIN_OPTIONS:
+        st.session_state["main_navigation"] = requested_main_navigation
+    requested_analysis_navigation = st.session_state.pop(
+        "_requested_analysis_navigation", None
+    )
+    if requested_analysis_navigation in ANALYSIS_OPTIONS:
+        st.session_state["analysis_navigation"] = requested_analysis_navigation
     if st.session_state.get("main_navigation") not in MAIN_OPTIONS:
         st.session_state["main_navigation"] = "Inicio"
     if st.session_state.get("home_navigation") not in HOME_OPTIONS:
