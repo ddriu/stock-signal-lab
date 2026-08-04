@@ -33,12 +33,27 @@ render_opportunities_page(
 def test_favorite_picker_requests_analysis_without_mutating_selectbox_key() -> None:
     script = '''
 import pandas as pd
+import streamlit as st
 from app import render_analysis_company_picker
 
 class Journal:
     def list_analysis_snapshots(self):
         return pd.DataFrame()
 
+st.session_state.setdefault("main_navigation", "Analizar")
+st.session_state.setdefault("analysis_navigation", "Oportunidades")
+st.segmented_control(
+    "Navegación principal",
+    ["Inicio", "Analizar"],
+    key="main_navigation",
+    required=True,
+)
+st.segmented_control(
+    "Tipo de análisis",
+    ["Oportunidades", "Historial"],
+    key="analysis_navigation",
+    required=True,
+)
 render_analysis_company_picker(
     ["MA", "RTX"],
     {"MA": "Mastercard (MA)", "RTX": "RTX (RTX)"},
@@ -53,6 +68,9 @@ render_analysis_company_picker(
     state = app.session_state.filtered_state
     assert not app.exception
     assert state.get("analysis_ticker") is None
+    assert state["main_navigation"] == "Analizar"
+    assert state["analysis_navigation"] == "Oportunidades"
+    assert state["_requested_main_navigation"] == "Analizar"
+    assert state["_requested_analysis_navigation"] == "Oportunidades"
     assert state["_requested_analysis_ticker"] == "MA"
     assert state["_pending_analysis_ticker"] == "MA"
-    assert state["analysis_navigation"] == "Oportunidades"
