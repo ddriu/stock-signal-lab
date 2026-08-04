@@ -864,7 +864,10 @@ def load_market_data(
     quick_mode_tickers.difference_update(deep_tickers)
     st.session_state["quick_mode_tickers"] = sorted(quick_mode_tickers)
     st.session_state["download_errors"] = errors
-    st.session_state.pop("backtest_result", None)
+    # Los resultados dependen del histórico y de toda la configuración. Se
+    # descartan sólo cuando se actualizan precios; cambiar de pestaña no obliga
+    # a repetir la simulación.
+    st.session_state.pop("backtest_results", None)
 
 
 def prepare_data(
@@ -1004,6 +1007,57 @@ def render_analysis(
         if study.reliable and study.median_return_pct is not None
         else None
     )
+    auto_snapshot_saved = False
+    if journal is not None:
+        try:
+            existing_snapshots = journal.list_analysis_snapshots(ticker)
+            already_recorded = False
+            if not existing_snapshots.empty:
+                existing_dates = pd.to_datetime(
+                    existing_snapshots["analyzed_at"], errors="coerce"
+                ).dt.date
+                target_date = pd.Timestamp(signal.as_of).date()
+                same_day = existing_snapshots.loc[existing_dates == target_date]
+                if not same_day.empty:
+                    same_opportunity = pd.to_numeric(
+                        same_day.get("opportunity_score"), errors="coerce"
+                    ).eq(float(opportunity.score))
+                    same_entry = pd.to_numeric(
+                        same_day.get("entry_score"), errors="coerce"
+                    ).eq(float(signal.score))
+                    already_recorded = bool((same_opportunity & same_entry).any())
+            if not already_recorded:
+                journal.add_analysis_snapshot(
+                    ticker=ticker,
+                    analyzed_at=signal.as_of,
+                    price=float(latest["close"]),
+                    opportunity_score=opportunity.score,
+                    company_score=fundamentals.score,
+                    entry_score=signal.score,
+                    valuation_score=valuation.score,
+                    relative_score=relative.score,
+                    risk_score=risk.score,
+                    opportunity_label=opportunity.label,
+                    entry_label=signal.label,
+                    position_label=signal.position_label,
+                    expected_return_pct=(
+                        study.median_return_pct if study.reliable else None
+                    ),
+                    positive_rate_pct=(
+                        study.positive_rate_pct if study.reliable else None
+                    ),
+                    expected_price=expected_price,
+                    horizon_days=study.horizon_days if study.reliable else None,
+                    sector=fundamentals.sector or "",
+                    explanation=opportunity.explanation,
+                    note="Seguimiento automático al abrir el análisis",
+                )
+                auto_snapshot_saved = True
+        except (JournalStorageError, ValueError, KeyError, AttributeError):
+            # El análisis sigue siendo utilizable aunque la base de datos esté
+            # temporalmente indisponible; la opción de guardado manual mostrará
+            # el error con más detalle.
+            pass
     previous = frame["close"].iloc[-2]
     daily_change = (latest["close"] / previous - 1) * 100
     col1, col2, col3, col4 = st.columns(4)
@@ -1045,6 +1099,10 @@ def render_analysis(
         help="Una nota alta indica menor volatilidad, menor caída y mejor liquidez; no elimina el riesgo.",
     )
     col8.metric("Último cierre", f"{latest['close']:.2f}", format_pct(daily_change))
+    if auto_snapshot_saved:
+        st.caption(
+            "✓ Seguimiento de hoy guardado automáticamente en «Historial guardado»."
+        )
     if opportunity.label in {"Oportunidad destacada", "Candidata"}:
         st.success(f"**{opportunity.label}:** {opportunity.explanation}")
     elif opportunity.label == "Vigilancia":
@@ -1495,24 +1553,53 @@ def render_analysis(
     )
 
 
-def render_backtest(ticker: str, frame: pd.DataFrame, strategy: StrategyConfig, settings: BacktestConfig) -> None:
+def _backtest_cache_key(
+    ticker: str,
+    frame: pd.DataFrame,
+    strategy: StrategyConfig,
+    settings: BacktestConfig,
+) -> tuple[object, ...]:
+    """Identifica un resultado sin volver a simular en cada rerun de Streamlit."""
+
+    return (
+        ticker,
+        len(frame),
+        str(frame.index[0]) if not frame.empty else "",
+        str(frame.index[-1]) if not frame.empty else "",
+        round(float(frame["close"].iloc[-1]), 8) if not frame.empty else None,
+        strategy,
+        settings,
+    )
+
+
+def render_backtest(
+    ticker: str,
+    frame: pd.DataFrame,
+    strategy: StrategyConfig,
+    settings: BacktestConfig,
+) -> None:
     st.caption(
         "Esta prueba simula qué habría pasado aplicando las mismas reglas en el pasado. "
         "Incluye costes y límites de pérdida, pero el pasado no garantiza resultados futuros."
     )
-    if st.button("Probar las reglas con datos pasados", type="primary"):
+    cache_key = _backtest_cache_key(ticker, frame, strategy, settings)
+    cached_results: dict[tuple[object, ...], BacktestResult] = st.session_state.setdefault(
+        "backtest_results", {}
+    )
+    recalculate = st.button(
+        "Recalcular prueba histórica",
+        help="Úsalo si quieres repetir el cálculo. Al abrir esta pestaña se ejecuta automáticamente.",
+    )
+    if recalculate or cache_key not in cached_results:
         try:
             with st.spinner("Simulando estrategia…"):
                 result = run_backtest(frame, strategy, settings)
-            st.session_state["backtest_result"] = result
-            st.session_state["backtest_ticker"] = ticker
+            cached_results[cache_key] = result
+            st.session_state["backtest_results"] = cached_results
         except ValueError as exc:
             st.error(str(exc))
             return
-    result: BacktestResult | None = st.session_state.get("backtest_result")
-    if result is None or st.session_state.get("backtest_ticker") != ticker:
-        st.info("Pulsa el botón para probar este ticker con datos pasados.")
-        return
+    result = cached_results[cache_key]
     metrics = result.metrics
     cols = st.columns(5)
     cols[0].metric("Resultado de las reglas", format_pct(float(metrics["total_return_pct"])))
@@ -1787,14 +1874,14 @@ def render_long_horizon_calibration(
         )
     if current_rows:
         st.markdown("### Cómo se traduce al seguimiento actual")
-        st.dataframe(
+        st.caption("Pulsa una fila para abrir el análisis completo de esa empresa.")
+        render_ticker_dataframe(
             pd.DataFrame(current_rows).sort_values(
                 ["Entrada /100", "Empresa /100"],
                 ascending=False,
                 na_position="last",
             ),
-            width="stretch",
-            hide_index=True,
+            key="calibration_current_companies",
             column_config={
                 "Empresa /100": st.column_config.ProgressColumn(
                     min_value=0, max_value=100, format="%d"
@@ -1835,7 +1922,7 @@ def render_long_horizon_calibration(
                 "beat_civislend": "Superó Civislend",
             }
         )
-        st.dataframe(
+        render_ticker_dataframe(
             events.loc[
                 :,
                 [
@@ -1851,8 +1938,7 @@ def render_long_horizon_calibration(
                     "Superó Civislend",
                 ],
             ],
-            width="stretch",
-            hide_index=True,
+            key="calibration_historical_events",
         )
     st.caption(
         "Usa precios ajustados para incorporar splits y dividendos distribuidos por el "
@@ -2636,7 +2722,8 @@ def render_private_investments(
                 "comments": "Comentarios",
             }
         )
-        st.dataframe(
+        st.caption("Pulsa una fila con ticker reconocido para abrir su análisis.")
+        render_ticker_dataframe(
             snapshot_display.loc[
                 :,
                 [
@@ -2645,8 +2732,8 @@ def render_private_investments(
                     "Resultado estimado €", "Rentabilidad estimada %", "Comentarios",
                 ],
             ],
-            width="stretch",
-            hide_index=True,
+            key=f"{view_key}_portfolio_snapshot_positions",
+            ticker_column="Ticker para analizar",
             column_config={
                 "Cantidad": st.column_config.NumberColumn(format="%.4f"),
                 "Valor €": st.column_config.NumberColumn(format="%.2f €"),
@@ -3361,10 +3448,10 @@ def render_journal(
                 "Los totales convierten monedas con el último tipo del BCE disponible."
             )
             if analysis_rows:
-                st.dataframe(
+                st.caption("Pulsa una posición para abrir su análisis completo.")
+                render_ticker_dataframe(
                     pd.DataFrame(analysis_rows),
-                    width="stretch",
-                    hide_index=True,
+                    key=f"{view_key}_open_positions_analysis",
                     column_config={
                         "Coste medio": st.column_config.NumberColumn(format="%.2f"),
                         "Precio actual": st.column_config.NumberColumn(format="%.2f"),
@@ -3925,10 +4012,9 @@ def render_admin_panel(
                     "allocation_pct": "Peso en cartera",
                 }
             )
-            st.dataframe(
+            render_ticker_dataframe(
                 visible_dashboard,
-                width="stretch",
-                hide_index=True,
+                key="admin_user_open_positions",
                 column_config={
                     "Coste medio": st.column_config.NumberColumn(format="%.2f"),
                     "Capital pendiente": st.column_config.NumberColumn(format="%.2f"),
@@ -4485,6 +4571,7 @@ def render_opportunity_cards(
     summary: list[dict[str, object]],
     *,
     limit: int = 6,
+    key_prefix: str = "opportunity_card",
 ) -> None:
     if not summary:
         return
@@ -4496,9 +4583,10 @@ def render_opportunity_cards(
         ),
         reverse=True,
     )[:limit]
-    cards: list[str] = []
-    for row in ordered:
-        ticker = html.escape(str(row.get("Ticker") or "N/D"))
+    columns = st.columns(3)
+    for index, row in enumerate(ordered):
+        raw_ticker = str(row.get("Ticker") or "N/D")
+        ticker = html.escape(raw_ticker)
         label = str(row.get("Lectura conjunta") or row.get("Estado") or "Sin lectura")
         position_label = str(row.get("Si ya la tienes") or "Sin posición")
         tone = signal_tone(label)
@@ -4511,42 +4599,31 @@ def render_opportunity_cards(
             if confidence is not None
             else str(row.get("Comprobación") or "Pendiente de actualizar")
         )
-        cards.append(
-            f"""
-            <article class="ssl-card">
-                <div class="ssl-card-top">
-                    <span class="ssl-ticker">{ticker}</span>
-                    <span class="ssl-badge ssl-{tone}">{html.escape(label)}</span>
-                </div>
-                <div class="ssl-score-row">
-                    <div class="ssl-score">
-                        <span>Oportunidad</span>
-                        <strong>{_score_text(row.get("Oportunidad"))}/100</strong>
+        with columns[index % len(columns)]:
+            with st.container(border=True):
+                st.markdown(
+                    f"""
+                    <div class="ssl-card-top">
+                        <span class="ssl-ticker">{ticker}</span>
+                        <span class="ssl-badge ssl-{tone}">{html.escape(label)}</span>
                     </div>
-                    <div class="ssl-score">
-                        <span>Empresa</span>
-                        <strong>{_score_text(row.get("Calidad empresa"))}</strong>
+                    <div class="ssl-score-row">
+                        <div class="ssl-score"><span>Oportunidad</span><strong>{_score_text(row.get("Oportunidad"))}/100</strong></div>
+                        <div class="ssl-score"><span>Empresa</span><strong>{_score_text(row.get("Calidad empresa"))}</strong></div>
+                        <div class="ssl-score"><span>Entrada</span><strong>{_score_text(row.get("Momento entrada"))}</strong></div>
                     </div>
-                    <div class="ssl-score">
-                        <span>Entrada</span>
-                        <strong>{_score_text(row.get("Momento entrada"))}</strong>
-                    </div>
-                </div>
-                <div class="ssl-card-footer">
-                    <span>Cierre {close_text}</span>
-                    <span>Si la tienes: {html.escape(position_label)}</span>
-                </div>
-                <div class="ssl-card-footer">
-                    <span>{html.escape(data_text)}</span>
-                    <span>{date_value}</span>
-                </div>
-            </article>
-            """
-        )
-    cards_html = ('<div class="ssl-card-grid">' + "".join(cards) + "</div>").replace(
-        "\n", ""
-    )
-    st.markdown(cards_html, unsafe_allow_html=True)
+                    <div class="ssl-card-footer"><span>Cierre {close_text}</span><span>Si la tienes: {html.escape(position_label)}</span></div>
+                    <div class="ssl-card-footer"><span>{html.escape(data_text)}</span><span>{date_value}</span></div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                st.button(
+                    f"Ver análisis de {raw_ticker}",
+                    key=f"{key_prefix}_{index}_{raw_ticker}",
+                    width="stretch",
+                    on_click=_open_ticker_analysis,
+                    args=(raw_ticker,),
+                )
 
 
 def _portfolio_snapshot(
@@ -4611,6 +4688,14 @@ def _set_navigation(
         st.session_state[subsection_key] = subsection
 
 
+def _sync_analysis_ticker(source_key: str) -> None:
+    """Mantiene la misma empresa activa entre las herramientas de Analizar."""
+
+    ticker = str(st.session_state.get(source_key, "") or "").strip()
+    if ticker:
+        st.session_state["analysis_ticker"] = resolve_analysis_ticker(ticker)
+
+
 def _continue_search_in_favorites(
     query: str,
     results: list[TickerSearchResult],
@@ -4641,6 +4726,44 @@ def _open_ticker_analysis(ticker: str) -> None:
     st.session_state["_requested_analysis_navigation"] = "Oportunidades"
     st.session_state["_requested_analysis_ticker"] = normalized
     st.session_state["_pending_analysis_ticker"] = normalized
+
+
+def render_ticker_dataframe(
+    frame: pd.DataFrame,
+    *,
+    key: str,
+    ticker_column: str = "Ticker",
+    column_config: dict[str, object] | None = None,
+    height: int | str = "auto",
+) -> None:
+    """Muestra una tabla cuya fila abre el análisis completo del ticker."""
+
+    visible = frame.reset_index(drop=True)
+    revision_key = f"{key}_selection_revision"
+    revision = int(st.session_state.get(revision_key, 0) or 0)
+    event = st.dataframe(
+        visible,
+        width="stretch",
+        height=height,
+        hide_index=True,
+        column_config=column_config,
+        key=f"{key}_{revision}",
+        on_select="rerun",
+        selection_mode="single-row",
+    )
+    selected_rows = list(getattr(event.selection, "rows", []) or [])
+    if not selected_rows or ticker_column not in visible.columns:
+        return
+    selected_ticker = str(
+        visible.iloc[int(selected_rows[0])].get(ticker_column, "") or ""
+    ).strip()
+    if not selected_ticker:
+        return
+    # Una clave nueva limpia la selección antes del siguiente render y evita
+    # que una fila ya marcada provoque un bucle de reruns.
+    st.session_state[revision_key] = revision + 1
+    _open_ticker_analysis(selected_ticker)
+    st.rerun()
 
 
 def _set_growth_radar_group(group: str) -> None:
@@ -5099,7 +5222,8 @@ def render_home(
                 "return_pct": "Rentabilidad",
             }
         )
-        st.dataframe(
+        st.caption("Pulsa una posición con ticker para abrir su análisis.")
+        render_ticker_dataframe(
             position_summary.loc[
                 :,
                 [
@@ -5111,8 +5235,7 @@ def render_home(
                     "Rentabilidad",
                 ],
             ],
-            width="stretch",
-            hide_index=True,
+            key="home_portfolio_positions",
             column_config={
                 "Valor actual": st.column_config.NumberColumn(format="%.2f €"),
                 "Ganancia / pérdida": st.column_config.NumberColumn(format="%+.2f €"),
@@ -5256,7 +5379,8 @@ def render_opportunities_page(
     st.markdown("### Todas tus favoritas")
     st.caption(
         "Una nota guardada sirve como referencia, pero no se presenta como actual. "
-        "La columna Comprobación te indica cuáles debes volver a revisar."
+        "La columna Comprobación te indica cuáles debes volver a revisar. Pulsa una "
+        "fila para abrir directamente la empresa."
     )
     radar = pd.DataFrame(catalog_summary)
     if "Momento entrada" in radar.columns:
@@ -5280,10 +5404,9 @@ def render_opportunities_page(
     essential_columns = [
         column for column in essential_columns if column in radar.columns
     ]
-    st.dataframe(
+    render_ticker_dataframe(
         radar.loc[:, essential_columns],
-        width="stretch",
-        hide_index=True,
+        key="opportunity_essential_table",
         column_config={
             "Oportunidad": st.column_config.ProgressColumn(
                 min_value=0, max_value=100, format="%d"
@@ -5298,10 +5421,9 @@ def render_opportunities_page(
     )
 
     with st.expander("Ver indicadores y ranking completo"):
-        st.dataframe(
+        render_ticker_dataframe(
             radar,
-            width="stretch",
-            hide_index=True,
+            key="opportunity_full_table",
             column_config={
                 "Oportunidad": st.column_config.ProgressColumn(
                     min_value=0, max_value=100, format="%d"
@@ -6193,10 +6315,10 @@ def render_growth_momentum_page(
                 args=(radar_pick,),
             )
 
-    st.dataframe(
+    st.caption("Pulsa cualquier fila del radar para abrir el análisis completo.")
+    render_ticker_dataframe(
         radar_frame,
-        width="stretch",
-        hide_index=True,
+        key="growth_momentum_radar",
         column_config={
             "Total": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
             "Crecimiento": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
@@ -6635,7 +6757,8 @@ def render_sector_comparison(
             "risk_score": "Riesgo controlado",
         }
     )
-    st.dataframe(
+    st.caption("Pulsa una fila para abrir el análisis completo de la empresa.")
+    render_ticker_dataframe(
         visible_metrics.loc[
             :,
             [
@@ -6654,8 +6777,7 @@ def render_sector_comparison(
                 "Riesgo controlado",
             ],
         ],
-        width="stretch",
-        hide_index=True,
+        key="sector_comparison_companies",
         column_config={
             "Liderazgo": st.column_config.ProgressColumn(
                 min_value=0, max_value=100, format="%d"
@@ -6725,6 +6847,8 @@ def render_saved_analysis_history(journal: object) -> None:
     st.subheader("Historial de análisis guardados")
     st.write(
         "Comprueba cómo han cambiado el precio y las notas desde cada revisión. "
+        "Al abrir el detalle de una empresa se guarda como máximo una fotografía "
+        "automática por día y combinación de notas. También puedes añadir notas manuales. "
         "Es un seguimiento de decisiones, no un registro de operaciones."
     )
     try:
@@ -6738,8 +6862,8 @@ def render_saved_analysis_history(journal: object) -> None:
         return
     if snapshots.empty:
         st.info(
-            "Todavía no has guardado ningún análisis. Abre una empresa y utiliza "
-            "«Guardar este análisis y consultar su evolución»."
+            "Todavía no hay análisis guardados. Abre el detalle de una empresa: "
+            "la primera revisión del día se registrará automáticamente."
         )
         return
 
@@ -7013,7 +7137,7 @@ def render_email_alert_settings(journal: object) -> None:
                 "evaluated_at": "Revisada",
             }
         )
-        st.dataframe(
+        render_ticker_dataframe(
             visible.loc[
                 :,
                 [
@@ -7025,8 +7149,7 @@ def render_email_alert_settings(journal: object) -> None:
                     "Revisada",
                 ],
             ],
-            width="stretch",
-            hide_index=True,
+            key="alert_states_companies",
         )
 
 
@@ -7410,10 +7533,23 @@ def main() -> None:
         elif not prepared:
             st.info("Actualiza empresas antes de ejecutar una prueba histórica.")
         else:
+            preferred_backtest = str(
+                st.session_state.get("analysis_ticker", "") or ""
+            )
+            if preferred_backtest not in prepared:
+                preferred_backtest = next(iter(prepared))
+            if st.session_state.get("backtest_select") not in prepared:
+                st.session_state["backtest_select"] = preferred_backtest
             selected_backtest = st.selectbox(
                 "Empresa para la prueba histórica",
                 list(prepared),
                 key="backtest_select",
+                on_change=_sync_analysis_ticker,
+                args=("backtest_select",),
+            )
+            st.info(
+                "El cálculo se ejecuta automáticamente con el historial ya descargado. "
+                "Cambiar de pestaña no vuelve a consultar el mercado."
             )
             render_backtest(
                 selected_backtest,
