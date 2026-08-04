@@ -54,6 +54,18 @@ def analysis_refresh_tickers(
     return result
 
 
+def merge_analysis_ticker_sources(*sources: Iterable[object]) -> list[str]:
+    """Une favoritas, revisadas y recientes manteniendo un orden estable."""
+
+    merged: list[str] = []
+    for source in sources:
+        for value in source:
+            ticker = normalize_ticker(value)
+            if ticker and ticker not in merged:
+                merged.append(ticker)
+    return merged
+
+
 def growth_radar_ticker_groups(
     readings: Iterable[tuple[object, object]],
 ) -> dict[str, list[str]]:
