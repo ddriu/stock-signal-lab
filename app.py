@@ -80,7 +80,11 @@ from src.journal import (
     PORTFOLIO_ACCOUNT_STATUSES,
 )
 from src.msn_research import build_msn_research_links
-from src.navigation import analysis_refresh_tickers, sanitize_favorite_selection
+from src.navigation import (
+    analysis_refresh_tickers,
+    growth_radar_ticker_groups,
+    sanitize_favorite_selection,
+)
 from src.supabase_journal import JournalStorageError
 from src.storage import GROUP_PORTFOLIO_OWNER, create_journal
 from src.opportunity import (
@@ -157,6 +161,31 @@ from src.visualization import (
 st.set_page_config(page_title="Stock Signal Lab", page_icon="📈", layout="wide")
 
 MAIN_OPTIONS = ["Inicio", "Analizar", "Favoritos", "Carteras", "Más"]
+ANALYSIS_OPTIONS = [
+    "Oportunidades",
+    "Crecimiento y momentum",
+    "Proyección de capital",
+    "Objetivo 30+ días",
+    "Comparador sectorial",
+    "Historial guardado",
+    "Prueba histórica",
+]
+ANALYSIS_LABELS = {
+    "Oportunidades": "◎ Oportunidades",
+    "Crecimiento y momentum": "↗ Crecimiento",
+    "Proyección de capital": "◫ Proyección",
+    "Objetivo 30+ días": "⌁ 30+ días",
+    "Comparador sectorial": "◇ Comparar",
+    "Historial guardado": "◷ Historial",
+    "Prueba histórica": "⟲ Backtest",
+}
+SIDEBAR_ANALYSIS_SECTIONS = {
+    "Oportunidades",
+    "Crecimiento y momentum",
+    "Objetivo 30+ días",
+    "Comparador sectorial",
+    "Prueba histórica",
+}
 
 
 def apply_visual_theme() -> None:
@@ -200,10 +229,10 @@ def cached_company_search(query: str) -> list[TickerSearchResult]:
     return search_instruments(query, max_results=25)
 
 
-def apply_section_layout(section: str) -> None:
+def apply_section_layout(section: str, analysis_section: str = "") -> None:
     """Reserva la barra lateral completa para la zona que realmente la necesita."""
 
-    if section == "Analizar":
+    if section == "Analizar" and analysis_section in SIDEBAR_ANALYSIS_SECTIONS:
         return
     st.markdown(
         """
@@ -350,11 +379,12 @@ def build_sidebar(
         # Versiones anteriores introducían aquí tickers temporales abiertos desde
         # el buscador. Streamlit rechaza valores que no existen en ``options``.
         st.session_state["selected_favorite_tickers"] = safe_selection
-    st.sidebar.markdown("## Configurar análisis")
+    st.sidebar.markdown("## Preparar análisis")
     st.sidebar.caption(
-        "Este panel sólo aparece en Analizar. Los cambios se aplican al pulsar "
-        "«Actualizar análisis»."
+        "Primero elige empresas y un estilo. Los controles técnicos quedan guardados "
+        "en los apartados avanzados."
     )
+    st.sidebar.markdown("### 1 · Empresas")
     selected_favorites = st.sidebar.multiselect(
         "Empresas que quieres analizar",
         options=favorite_tickers,
@@ -392,6 +422,8 @@ def build_sidebar(
     ]
     tickers = list(dict.fromkeys([*selected_analysis_tickers, *manual_tickers]))
 
+    st.sidebar.divider()
+    st.sidebar.markdown("### 2 · Lectura")
     years = st.sidebar.select_slider(
         "Historial utilizado",
         options=[1, 2, 3, 5, 10],
@@ -421,6 +453,7 @@ def build_sidebar(
         }[profile_name]
     )
 
+    st.sidebar.markdown("#### Riesgo básico")
     quick_a, quick_b = st.sidebar.columns(2)
     stop_loss = quick_a.slider(
         "Stop",
@@ -442,21 +475,26 @@ def build_sidebar(
         help="Capital total que aceptarías perder si se alcanza el stop.",
         key="cfg_max_risk",
     )
-    forward_horizon = st.sidebar.selectbox(
-        "Horizonte de la estimación",
-        options=[10, 20, 40, 60],
-        index=[10, 20, 40, 60].index(int(defaults["forward_horizon"])),
-        format_func=lambda value: f"{value} sesiones",
-        key="cfg_forward_horizon",
-    )
-    initial_capital = st.sidebar.number_input(
-        "Capital para simulaciones",
-        min_value=100.0,
-        value=10_000.0,
-        step=1_000.0,
-        key="cfg_initial_capital",
-    )
+    with st.sidebar.expander("Objetivo y prueba histórica"):
+        forward_horizon = st.selectbox(
+            "Horizonte de la estimación",
+            options=[10, 20, 40, 60],
+            index=[10, 20, 40, 60].index(int(defaults["forward_horizon"])),
+            format_func=lambda value: f"{value} sesiones",
+            key="cfg_forward_horizon",
+            help="Sólo afecta a la estimación futura y a su comparación histórica.",
+        )
+        initial_capital = st.number_input(
+            "Capital para el backtest (€)",
+            min_value=100.0,
+            value=10_000.0,
+            step=1_000.0,
+            key="cfg_initial_capital",
+            help="Es capital ficticio; no modifica tu cartera real.",
+        )
 
+    st.sidebar.divider()
+    st.sidebar.markdown("### 3 · Ajustes opcionales")
     with st.sidebar.expander("Periodo y fuentes"):
         end = st.date_input(
             "Analizar hasta",
@@ -645,8 +683,18 @@ def build_sidebar(
             key="cfg_slippage",
         )
 
+    selected_count = len(tickers)
+    st.sidebar.divider()
+    st.sidebar.caption(
+        f"Selección manual: {selected_count} empresas. También se añadirán las "
+        "posiciones abiertas de la cartera."
+    )
     load_clicked = st.sidebar.button(
-        "Actualizar análisis",
+        (
+            f"Analizar {selected_count} empresas"
+            if selected_count
+            else "Actualizar cartera y análisis"
+        ),
         type="primary",
         width="stretch",
         icon=":material/refresh:",
@@ -4356,6 +4404,21 @@ def render_app_header(user: AuthConfig) -> None:
             )
 
 
+def render_page_intro(eyebrow: str, title: str, description: str) -> None:
+    """Cabecera breve y consistente para distinguir cada herramienta."""
+
+    st.markdown(
+        f"""
+        <section class="ssl-page-intro">
+            <span>{html.escape(eyebrow)}</span>
+            <h2>{html.escape(title)}</h2>
+            <p>{html.escape(description)}</p>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_opportunity_cards(
     summary: list[dict[str, object]],
     *,
@@ -4505,13 +4568,52 @@ def _open_ticker_analysis(ticker: str) -> None:
     st.session_state["_pending_analysis_ticker"] = normalized
 
 
+def _set_growth_radar_group(group: str) -> None:
+    """Activa uno de los accesos rápidos del radar dinámico."""
+
+    st.session_state["growth_radar_group"] = group
+
+
+def _select_growth_radar_ticker(ticker: str) -> None:
+    """Selecciona una empresa sin abandonar el plan de crecimiento y momentum."""
+
+    normalized = resolve_analysis_ticker(ticker)
+    if normalized:
+        st.session_state["growth_selected_ticker"] = normalized
+
+
+def _close_quick_company_search() -> None:
+    """Fuerza un panel nuevo y cerrado después de completar una acción."""
+
+    revision = int(st.session_state.get("quick_company_search_revision", 0) or 0)
+    st.session_state["quick_company_search_revision"] = revision + 1
+    st.session_state.pop("quick_company_search_results", None)
+    st.session_state.pop("quick_company_market_filter", None)
+    st.session_state.pop("quick_company_search_result", None)
+
+
+def _open_quick_company_analysis(ticker: str) -> None:
+    _open_ticker_analysis(ticker)
+    _close_quick_company_search()
+
+
+def _save_quick_company_favorite(
+    query: str,
+    results: list[TickerSearchResult],
+) -> None:
+    _continue_search_in_favorites(query, results)
+    _close_quick_company_search()
+
+
 def render_quick_company_search() -> None:
     """Buscador compacto disponible sin mantener abierta toda la configuración."""
 
+    revision = int(st.session_state.get("quick_company_search_revision", 0) or 0)
     with st.popover(
         "Buscar empresa",
         icon=":material/search:",
         width="stretch",
+        key=f"quick_company_search_popover_{revision}",
     ):
         st.caption(
             "Escribe el nombre normal. No necesitas saber códigos como .T, .MC o .IL."
@@ -4573,14 +4675,14 @@ def render_quick_company_search() -> None:
             type="primary",
             width="stretch",
             key="quick_open_analysis",
-            on_click=_open_ticker_analysis,
+            on_click=_open_quick_company_analysis,
             args=(selected.ticker,),
         )
         save_col.button(
             "Guardar",
             width="stretch",
             key="quick_save_favorite",
-            on_click=_continue_search_in_favorites,
+            on_click=_save_quick_company_favorite,
             args=(query, results),
         )
 
@@ -4852,10 +4954,11 @@ def render_opportunities_page(
     price_verifications: dict[str, PriceVerification],
     journal: object,
 ) -> None:
-    st.subheader("Oportunidades")
-    st.caption(
-        "Primero ves una lectura sencilla; el detalle técnico y la tabla completa "
-        "siguen disponibles debajo."
+    render_page_intro(
+        "ANÁLISIS PRINCIPAL",
+        "Oportunidades",
+        "Primero ves una lectura sencilla. El detalle técnico, los riesgos y la tabla "
+        "completa siguen disponibles cuando quieras profundizar.",
     )
     if not raw_data:
         st.info(
@@ -4951,12 +5054,12 @@ def render_staircase_projection(
     """Simula aportaciones fijas y una ampliación condicionada de la escalera."""
 
     is_ddriu = username.strip().lower() == "ddriu"
-    st.markdown("### 2. Proyección de aportaciones y estrategia escalonada")
+    st.markdown("### Capital inicial, aportaciones y horizonte")
     st.caption(
         "Separa el dinero que tú aportas del rendimiento estimado. La escalera sólo "
         "recibe más aportación después de un año favorable; nunca se amplía una pérdida."
     )
-    with st.expander("Configurar simulador hasta 10 años", expanded=True):
+    with st.expander("1. Capital que ya tienes", expanded=True):
         initial_a, initial_b, initial_c, initial_d = st.columns(4)
         initial_civislend = initial_a.number_input(
             "Civislend actual (€)",
@@ -4991,25 +5094,42 @@ def render_staircase_projection(
             key="projection_initial_dynamic",
         )
 
-        monthly_a, monthly_b, monthly_c = st.columns(3)
-        monthly_civislend = monthly_a.number_input(
+    with st.expander("2. Aportación mensual y reparto", expanded=True):
+        monthly_a, monthly_b, monthly_c, monthly_d = st.columns(4)
+        monthly_total = monthly_a.number_input(
+            "Aportación mensual total (€)",
+            min_value=0.0,
+            value=float(monthly_total),
+            step=50.0,
+            help=(
+                "Todo el dinero nuevo que prevés repartir entre Civislend, facturas, "
+                "acciones tradicionales y la estrategia escalonada."
+            ),
+            key="projection_monthly_total",
+        )
+        monthly_civislend = monthly_b.number_input(
             "Aportación mensual Civislend (€)",
             min_value=0.0,
             value=250.0 if is_ddriu else 0.0,
             step=50.0,
             key="projection_monthly_civislend",
         )
-        monthly_factoring = monthly_b.number_input(
+        monthly_factoring = monthly_c.number_input(
             "Aportación mensual facturas (€)",
             min_value=0.0,
             value=250.0 if is_ddriu else 0.0,
             step=50.0,
             key="projection_monthly_factoring",
         )
-        monthly_c.metric(
-            "Aportación mensual total",
-            f"{float(monthly_total):,.0f} €",
-            help="Se edita arriba, en «Configurar capital y límites».",
+        initial_staircase_pct = monthly_d.slider(
+            "% inicial para la escalera",
+            0.0,
+            100.0,
+            float(initial_staircase_pct),
+            1.0,
+            format="%.0f%%",
+            help="Porcentaje del total mensual reservado inicialmente a esta estrategia.",
+            key="projection_initial_staircase_pct",
         )
 
         fixed_monthly = float(monthly_civislend) + float(monthly_factoring)
@@ -5034,6 +5154,7 @@ def render_staircase_projection(
         split_c.metric("Acciones tradicionales/mes", f"{initial_traditional_eur:,.0f} €")
         split_d.metric("Escalera inicial/mes", f"{initial_dynamic_eur:,.0f} €")
 
+    with st.expander("3. Regla de ampliación y supuestos", expanded=False):
         scale_a, scale_b, scale_c = st.columns(3)
         step_pct = scale_a.slider(
             "Aumento tras un año favorable",
@@ -5067,7 +5188,22 @@ def render_staircase_projection(
             key="projection_scale_threshold",
         )
 
-        with st.expander("Rentabilidades y volatilidad utilizadas"):
+        civislend_return = 10.5
+        factoring_return = 6.0
+        traditional_return = 8.0
+        central_dynamic_return = 10.0
+        traditional_volatility = 16.0
+        dynamic_volatility = 28.0
+        show_projection_assumptions = st.checkbox(
+            "Editar rentabilidades y volatilidad",
+            value=False,
+            key="projection_show_assumptions",
+            help=(
+                "Déjalo cerrado para utilizar supuestos centrales fáciles de comparar. "
+                "Ábrelo sólo si quieres construir otro escenario."
+            ),
+        )
+        if show_projection_assumptions:
             return_a, return_b, return_c, return_d = st.columns(4)
             civislend_return = return_a.number_input(
                 "Civislend anual (%)",
@@ -5107,6 +5243,11 @@ def render_staircase_projection(
                 value=28.0,
                 step=1.0,
                 key="projection_dynamic_volatility",
+            )
+        else:
+            st.caption(
+                "Supuestos centrales: Civislend 10,5% · facturas 6% · acciones 8% · "
+                "escalera 10%. Volatilidad: acciones 16% y escalera 28%."
             )
 
     projection_config = StaircaseProjectionConfig(
@@ -5195,13 +5336,13 @@ def render_staircase_projection(
         staircase_projection_chart(projections),
         width="stretch",
         config={"displaylogo": False},
-        key="growth_staircase_projection_chart",
+        key="capital_staircase_projection_chart",
     )
     st.plotly_chart(
         staircase_range_chart(simulation),
         width="stretch",
         config={"displaylogo": False},
-        key="growth_staircase_range_chart",
+        key="capital_staircase_range_chart",
     )
 
     uncertainty_rows = []
@@ -5246,6 +5387,47 @@ def render_staircase_projection(
     )
 
 
+def render_capital_projection_page(username: str) -> None:
+    """Aísla la simulación patrimonial del radar de selección de empresas."""
+
+    is_ddriu = username.strip().lower() == "ddriu"
+    default_liquid = 4_400.0 if is_ddriu else 10_000.0
+    liquid_capital = float(
+        st.session_state.get("growth_liquid_capital", default_liquid) or default_liquid
+    )
+    monthly_total = float(
+        st.session_state.get("growth_monthly_investable", 1_000.0) or 0.0
+    )
+    current_strategy_value = float(
+        st.session_state.get(
+            "growth_current_strategy_value",
+            640.0 if is_ddriu else 0.0,
+        )
+        or 0.0
+    )
+    initial_staircase_pct = float(
+        st.session_state.get("growth_monthly_allocation", 20.0) or 0.0
+    )
+
+    render_page_intro(
+        "PLANIFICACIÓN",
+        "Proyección de capital",
+        "Separa cuánto aportas de cuánto podría valer el conjunto desde diciembre hasta "
+        "10 años. No interviene en el score ni promete una rentabilidad.",
+    )
+    st.info(
+        "Los valores iniciales toman como referencia la configuración de Crecimiento y "
+        "momentum cuando ya la has utilizado. Puedes cambiarlos aquí sin alterar el radar."
+    )
+    render_staircase_projection(
+        username=username,
+        liquid_capital=liquid_capital,
+        monthly_total=monthly_total,
+        current_strategy_value=current_strategy_value,
+        initial_staircase_pct=initial_staircase_pct,
+    )
+
+
 def render_growth_momentum_page(
     prepared: dict[str, pd.DataFrame],
     raw_fundamentals: dict[str, dict[str, object]],
@@ -5261,10 +5443,11 @@ def render_growth_momentum_page(
     """Muestra el plan mensual dinámico sin modificar el motor equilibrado."""
 
     is_ddriu = username.strip().lower() == "ddriu"
-    st.subheader("Crecimiento y momentum")
-    st.caption(
-        "Estrategia anexa para una parte del dinero nuevo. No cambia Sego, Civislend, "
-        "la cartera actual ni las señales del análisis principal."
+    render_page_intro(
+        "ESTRATEGIA DINÁMICA",
+        "Crecimiento y momentum",
+        "Busca crecimiento empresarial y fortaleza de precio para una parte del dinero "
+        "nuevo, sin modificar Sego, Civislend ni el análisis principal.",
     )
     st.info(
         "Busca empresas que ya muestran crecimiento y fortaleza. Si no aparece una "
@@ -5343,7 +5526,7 @@ def render_growth_momentum_page(
             "las empresas cargadas manualmente en la barra lateral."
         )
 
-    with st.expander("1. Configurar capital y límites", expanded=True):
+    with st.expander("1. Capital disponible", expanded=True):
         capital_a, capital_b, capital_c, capital_d = st.columns(4)
         liquid_capital = capital_a.number_input(
             "Cartera líquida aproximada (€)",
@@ -5381,6 +5564,7 @@ def render_growth_momentum_page(
             key="growth_current_open_risk",
         )
 
+    with st.expander("2. Límites de la estrategia", expanded=True):
         limits_a, limits_b, limits_c = st.columns(3)
         monthly_allocation = limits_a.slider(
             "% mensual para esta estrategia",
@@ -5511,13 +5695,17 @@ def render_growth_momentum_page(
         f"{max(maximum_open_risk_eur - float(current_open_risk), 0.0):,.2f} €",
         help="Suma de las pérdidas previstas si se activaran todos los niveles de invalidación.",
     )
-
-    render_staircase_projection(
-        username=username,
-        liquid_capital=float(liquid_capital),
-        monthly_total=float(monthly_investable),
-        current_strategy_value=float(current_strategy_value),
-        initial_staircase_pct=float(monthly_allocation),
+    st.caption(
+        "La estimación del capital a diciembre, 1, 2, 3, 4 y 10 años está ahora "
+        "separada del radar."
+    )
+    st.button(
+        "Abrir proyección de capital",
+        icon=":material/monitoring:",
+        width="stretch",
+        key="growth_open_capital_projection",
+        on_click=_set_navigation,
+        args=("Analizar", "analysis_navigation", "Proyección de capital"),
     )
 
     radar_prepared = prepared
@@ -5598,22 +5786,85 @@ def render_growth_momentum_page(
         )
     ]
     radar_frame = pd.DataFrame(radar_rows)
-    entry_count = int(
-        radar_frame["Lectura"].isin(["Entrada fuerte", "Entrada candidata"]).sum()
+    radar_groups = growth_radar_ticker_groups(
+        zip(radar_frame["Ticker"], radar_frame["Lectura"])
     )
-    watch_count = int(
-        radar_frame["Lectura"].isin(["Vigilancia activa", "Esperar mejor precio"]).sum()
-    )
-    pending_count = int(
-        radar_frame["Lectura"].isin(
-            ["Pendiente de fundamentales", "Datos empresariales insuficientes"]
-        ).sum()
-    )
+    radar_group_specs = [
+        ("all", "Empresas revisadas", ":material/domain_verification:"),
+        ("entries", "Entradas para validar", ":material/rocket_launch:"),
+        ("watch", "En vigilancia", ":material/visibility:"),
+        ("pending", "Pendientes de datos", ":material/pending_actions:"),
+    ]
+    valid_group_keys = {group_key for group_key, _, _ in radar_group_specs}
+    if st.session_state.get("growth_radar_group") not in valid_group_keys:
+        st.session_state["growth_radar_group"] = "all"
+    active_group = str(st.session_state["growth_radar_group"])
     radar_cols = st.columns(4)
-    radar_cols[0].metric("Empresas revisadas", len(radar_frame))
-    radar_cols[1].metric("Entradas para validar", entry_count)
-    radar_cols[2].metric("En vigilancia", watch_count)
-    radar_cols[3].metric("Pendientes de datos", pending_count)
+    for column, (group_key, group_label, group_icon) in zip(
+        radar_cols,
+        radar_group_specs,
+    ):
+        column.button(
+            f"{group_label} · {len(radar_groups[group_key])}",
+            icon=group_icon,
+            type="primary" if active_group == group_key else "secondary",
+            width="stretch",
+            key=f"growth_radar_group_button_{group_key}",
+            on_click=_set_growth_radar_group,
+            args=(group_key,),
+            help=f"Mostrar las empresas de «{group_label}».",
+        )
+
+    active_group = str(st.session_state.get("growth_radar_group", "all"))
+    active_group_label = next(
+        label for key, label, _ in radar_group_specs if key == active_group
+    )
+    active_group_tickers = radar_groups[active_group]
+    radar_lookup = radar_frame.set_index("Ticker").to_dict(orient="index")
+
+    def radar_company_label(ticker: str) -> str:
+        row = radar_lookup[ticker]
+        info = raw_fundamentals.get(ticker, {})
+        company_name = str(info.get("shortName") or info.get("longName") or "").strip()
+        identity = (
+            f"{ticker} · {company_name}"
+            if company_name and company_name.upper() != ticker
+            else ticker
+        )
+        return f"{identity} — {row['Lectura']} · {float(row['Total']):.0f}/100"
+
+    with st.container(border=True):
+        st.markdown(
+            f"**{active_group_label}** · {len(active_group_tickers)} empresas"
+        )
+        if not active_group_tickers:
+            st.info("Ahora mismo no hay empresas dentro de este grupo.")
+        else:
+            radar_pick = st.selectbox(
+                "Elige una empresa del grupo",
+                active_group_tickers,
+                format_func=radar_company_label,
+                key=f"growth_radar_pick_{active_group}",
+            )
+            radar_action_a, radar_action_b = st.columns(2)
+            radar_action_a.button(
+                f"Preparar plan de {radar_pick}",
+                icon=":material/checklist:",
+                width="stretch",
+                key=f"growth_radar_plan_{active_group}",
+                on_click=_select_growth_radar_ticker,
+                args=(radar_pick,),
+            )
+            radar_action_b.button(
+                f"Abrir análisis completo de {radar_pick}",
+                icon=":material/open_in_new:",
+                type="primary",
+                width="stretch",
+                key=f"growth_radar_analysis_{active_group}",
+                on_click=_open_ticker_analysis,
+                args=(radar_pick,),
+            )
+
     st.dataframe(
         radar_frame,
         width="stretch",
@@ -6550,8 +6801,13 @@ def main() -> None:
     render_app_header(authenticated_user)
     if st.session_state.get("main_navigation") not in MAIN_OPTIONS:
         st.session_state["main_navigation"] = "Inicio"
+    if st.session_state.get("analysis_navigation") not in ANALYSIS_OPTIONS:
+        st.session_state["analysis_navigation"] = "Oportunidades"
     current_section = str(st.session_state["main_navigation"])
-    apply_section_layout(current_section)
+    current_analysis_section = str(
+        st.session_state.get("analysis_navigation", "Oportunidades")
+    )
+    apply_section_layout(current_section, current_analysis_section)
     favorite_storage_error = ""
     try:
         private_favorites = journal.list_favorites()
@@ -6734,22 +6990,13 @@ def main() -> None:
         )
 
     elif selected_section == "Analizar":
-        analysis_options = [
-            "Oportunidades",
-            "Crecimiento y momentum",
-            "Objetivo 30+ días",
-            "Comparador sectorial",
-            "Historial guardado",
-            "Prueba histórica",
-        ]
-        if st.session_state.get("analysis_navigation") not in analysis_options:
-            st.session_state["analysis_navigation"] = "Oportunidades"
         analysis_section = st.segmented_control(
             "Tipo de análisis",
-            analysis_options,
+            ANALYSIS_OPTIONS,
             key="analysis_navigation",
             required=True,
             label_visibility="collapsed",
+            format_func=lambda value: ANALYSIS_LABELS[value],
         )
         if analysis_section == "Oportunidades":
             render_opportunities_page(
@@ -6780,6 +7027,8 @@ def main() -> None:
                 group_favorites,
                 authenticated_user.username,
             )
+        elif analysis_section == "Proyección de capital":
+            render_capital_projection_page(authenticated_user.username)
         elif analysis_section == "Objetivo 30+ días":
             render_long_horizon_calibration(
                 prepared,
