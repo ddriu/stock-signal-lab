@@ -508,6 +508,122 @@ def normalized_comparison_chart(
     return _finalize_figure(figure)
 
 
+def staircase_projection_chart(projections: pd.DataFrame) -> go.Figure:
+    """Compara escenarios de valor futuro con el dinero realmente aportado."""
+
+    figure = go.Figure()
+    if projections.empty:
+        return _finalize_figure(figure)
+    first_scenario = str(projections["scenario"].iloc[0])
+    contributed = projections.loc[projections["scenario"] == first_scenario]
+    figure.add_trace(
+        go.Scatter(
+            x=contributed["date"],
+            y=contributed["contributed"],
+            name="Capital aportado",
+            mode="lines",
+            line={"color": COLORS["muted"], "width": 2, "dash": "dot"},
+            hovertemplate="%{x|%b %Y}<br>%{y:,.0f} € aportados<extra></extra>",
+        )
+    )
+    palette = [
+        COLORS["short"],
+        COLORS["medium"],
+        COLORS["positive"],
+        "#7C3AED",
+    ]
+    for color, (scenario, group) in zip(
+        palette,
+        projections.groupby("scenario", sort=False),
+    ):
+        figure.add_trace(
+            go.Scatter(
+                x=group["date"],
+                y=group["total_value"],
+                name=str(scenario),
+                mode="lines",
+                line={"color": color, "width": 2.4},
+                hovertemplate=(
+                    "%{x|%b %Y}<br>%{y:,.0f} € estimados<extra>%{fullData.name}</extra>"
+                ),
+            )
+        )
+    figure.update_layout(
+        title="Aportaciones y escenarios de crecimiento",
+        height=480,
+        hovermode="x unified",
+        template="plotly_white",
+        legend={"orientation": "h", "y": 1.12},
+        margin={"l": 45, "r": 20, "t": 90, "b": 35},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#FFFFFF",
+        yaxis_title="Valor estimado (€)",
+    )
+    return _finalize_figure(figure)
+
+
+def staircase_range_chart(simulation: pd.DataFrame) -> go.Figure:
+    """Muestra la mediana y el intervalo central de la simulación Monte Carlo."""
+
+    figure = go.Figure()
+    if simulation.empty:
+        return _finalize_figure(figure)
+    figure.add_trace(
+        go.Scatter(
+            x=simulation["date"],
+            y=simulation["p90"],
+            name="Escenario favorable (P90)",
+            mode="lines",
+            line={"color": "rgba(58,134,255,0.28)", "width": 1},
+            hovertemplate="%{x|%b %Y}<br>%{y:,.0f} €<extra>P90</extra>",
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=simulation["date"],
+            y=simulation["p10"],
+            name="Escenario desfavorable (P10)",
+            mode="lines",
+            fill="tonexty",
+            fillcolor="rgba(58,134,255,0.14)",
+            line={"color": "rgba(58,134,255,0.28)", "width": 1},
+            hovertemplate="%{x|%b %Y}<br>%{y:,.0f} €<extra>P10</extra>",
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=simulation["date"],
+            y=simulation["p50"],
+            name="Resultado central (mediana)",
+            mode="lines",
+            line={"color": COLORS["positive"], "width": 3},
+            hovertemplate="%{x|%b %Y}<br>%{y:,.0f} €<extra>Mediana</extra>",
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=simulation["date"],
+            y=simulation["contributed"],
+            name="Capital aportado",
+            mode="lines",
+            line={"color": COLORS["muted"], "width": 2, "dash": "dot"},
+            hovertemplate="%{x|%b %Y}<br>%{y:,.0f} €<extra>Aportado</extra>",
+        )
+    )
+    figure.update_layout(
+        title="Rango de resultados posibles · no es una promesa",
+        height=480,
+        hovermode="x unified",
+        template="plotly_white",
+        legend={"orientation": "h", "y": 1.12},
+        margin={"l": 45, "r": 20, "t": 90, "b": 35},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#FFFFFF",
+        yaxis_title="Valor estimado (€)",
+    )
+    return _finalize_figure(figure)
+
+
 def risk_return_chart(metrics: pd.DataFrame, *, horizon_label: str) -> go.Figure:
     """Sitúa cada empresa por rendimiento y volatilidad del mismo periodo."""
 
