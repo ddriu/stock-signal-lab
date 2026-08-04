@@ -93,6 +93,11 @@ plataforma y por activos. La navegación separa inicio, análisis,
 favoritos, carteras y guía para cargar únicamente la sección que se está consultando.
 Las oportunidades se presentan en tarjetas fáciles de leer y conservan el ranking
 completo y los gráficos técnicos como detalle desplegable.
+Dentro de **Analizar** hay además un desplegable de favoritas y un buscador con
+autocompletado sobre favoritas, análisis guardados y empresas abiertas recientemente.
+En **Favoritos**, cada fila concentra sus acciones de análisis, etiquetas y borrado;
+ya no existe un segundo selector separado al final de la lista. La consulta diaria y
+el formulario para añadir empresas aparecen como dos vistas separadas para reducir ruido.
 
 El diseño se adapta a escritorio, tablet y móvil: las columnas se apilan, la navegación
 permanece accesible y las tablas y pestañas pueden desplazarse horizontalmente. La barra

@@ -83,6 +83,7 @@ from src.msn_research import build_msn_research_links
 from src.navigation import (
     analysis_refresh_tickers,
     growth_radar_ticker_groups,
+    merge_analysis_ticker_sources,
     sanitize_favorite_selection,
 )
 from src.supabase_journal import JournalStorageError
@@ -4011,108 +4012,139 @@ def render_favorite_list(
         first_visible = (page - 1) * page_size + 1
         last_visible = first_visible + len(page_frame) - 1
         st.caption(
-            f"Mostrando {first_visible}–{last_visible} de {len(filtered)}. "
-            "Selecciona una fila para abrir el análisis."
+            f"Mostrando {first_visible}–{last_visible} de {len(filtered)}"
         )
-        visible = page_frame.loc[
-            :, ["ticker", "name", "exchange", "tags", "recorded_by"]
-        ].rename(
-            columns={
-                "ticker": "Ticker",
-                "name": "Empresa",
-                "exchange": "Mercado",
-                "tags": "Etiquetas",
-                "recorded_by": "Añadida por",
-            }
-        ).reset_index(drop=True)
-        if not shared:
-            visible = visible.drop(columns=["Añadida por"])
-        table_event = st.dataframe(
-            visible,
-            width="stretch",
-            height=min(820, 38 + 35 * len(visible)),
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            key=f"favorite_table_{scope_key}_{page}",
-            column_config={
-                "Ticker": st.column_config.TextColumn(width="small"),
-                "Empresa": st.column_config.TextColumn(width="large"),
-                "Mercado": st.column_config.TextColumn(width="medium"),
-                "Etiquetas": st.column_config.TextColumn(width="large"),
-            },
-        )
-        selected_rows = list(getattr(table_event.selection, "rows", []))
-        if selected_rows:
-            selected_ticker = str(visible.iloc[selected_rows[0]]["Ticker"]).upper()
-            open_label, open_action = st.columns([3, 1], vertical_alignment="center")
-            open_label.caption(f"Has seleccionado {selected_ticker}.")
-            open_action.button(
-                f"Analizar {selected_ticker}",
-                key=f"open_favorite_{scope_key}_{selected_ticker}",
-                width="stretch",
-                type="primary",
-                on_click=_open_ticker_analysis,
-                args=(selected_ticker,),
+        for position, (_, selected_row) in enumerate(page_frame.iterrows()):
+            selected_ticker = str(selected_row.get("ticker", "")).strip().upper()
+            selected_name = str(selected_row.get("name", "") or selected_ticker).strip()
+            exchange = str(selected_row.get("exchange", "") or "").strip()
+            tags = favorite_tags_from_value(selected_row.get("tags", ""))
+            selected_owner = str(selected_row.get("recorded_by", "") or "").lower()
+            can_edit_selected = (
+                not shared
+                or can_delete_all
+                or selected_owner == actor_username.lower()
             )
+            details = [value for value in [exchange, " · ".join(tags)] if value]
+            if shared and selected_owner:
+                details.append(f"Añadida por {selected_owner}")
+            detail_text = " · ".join(details) or "Sin clasificación"
+            with st.container(
+                key=f"favorite_row_{scope_key}_{position}_{selected_ticker}",
+            ):
+                info_col, open_col, tags_col, remove_col = st.columns(
+                    [5, 1.25, 1.45, 1.35],
+                    vertical_alignment="center",
+                )
+                info_col.markdown(
+                    f"""
+                    <div class="ssl-favorite-row-copy">
+                        <strong>{html.escape(selected_name)}</strong>
+                        <span>{html.escape(selected_ticker)} · {html.escape(detail_text)}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                open_col.button(
+                    "Analizar",
+                    icon=":material/query_stats:",
+                    key=f"open_favorite_{scope_key}_{selected_ticker}",
+                    width="stretch",
+                    on_click=_open_ticker_analysis,
+                    args=(selected_ticker,),
+                )
+                with tags_col.popover(
+                    "Etiquetas",
+                    icon=":material/label:",
+                    width="stretch",
+                    disabled=not can_edit_selected,
+                    key=f"favorite_tags_popover_{scope_key}_{selected_ticker}",
+                ):
+                    edited_tags = st.multiselect(
+                        "Clasificación",
+                        FAVORITE_TAGS,
+                        default=favorite_tags_from_value(selected_row.get("tags", "")),
+                        max_selections=5,
+                        key=f"edit_favorite_tags_{scope_key}_{selected_ticker}",
+                        help="Una empresa puede pertenecer a varias categorías.",
+                    )
+                    if st.button(
+                        "Guardar cambios",
+                        key=f"update_favorite_tags_{scope_key}_{selected_ticker}",
+                        type="primary",
+                        width="stretch",
+                    ):
+                        try:
+                            journal.update_favorite_tags(selected_ticker, edited_tags)
+                        except (JournalStorageError, ValueError) as exc:
+                            st.error(str(exc))
+                        else:
+                            st.success(f"Etiquetas de {selected_ticker} actualizadas.")
+                            st.rerun()
+                if remove_col.button(
+                    "Quitar",
+                    icon=":material/delete_outline:",
+                    key=f"remove_favorite_{scope_key}_{selected_ticker}",
+                    width="stretch",
+                    disabled=not can_edit_selected,
+                    help=(
+                        "Sólo puedes quitar del grupo las empresas que tú añadiste."
+                        if not can_edit_selected
+                        else "Quita esta empresa de la lista; no afecta a tu cartera."
+                    ),
+                ):
+                    try:
+                        journal.delete_favorite(selected_ticker)
+                    except (JournalStorageError, ValueError) as exc:
+                        st.error(str(exc))
+                    else:
+                        st.success(f"{selected_ticker} ya no está en esta lista.")
+                        st.rerun()
 
-    editable = favorites
-    if shared and not can_delete_all:
-        editable = favorites.loc[
-            favorites["recorded_by"].fillna("").astype(str).str.lower()
-            == actor_username.lower()
-        ]
-    if editable.empty:
-        st.caption("Sólo puedes quitar del grupo las empresas que tú añadiste.")
-        return
 
-    options = editable["ticker"].astype(str).tolist()
-    labels = {
-        str(row.ticker): f"{row.name} ({row.ticker})"
-        for row in editable.itertuples(index=False)
-    }
-    with st.expander("Editar etiquetas o quitar empresas"):
-        selected = st.selectbox(
-            "Empresa",
-            options,
-            format_func=lambda ticker: labels.get(ticker, ticker),
-            key=f"edit_favorite_{scope_key}",
-        )
-        selected_row = editable.loc[editable["ticker"].astype(str) == selected].iloc[0]
-        edited_tags = st.multiselect(
+def render_favorite_tabs(
+    private_journal,
+    group_journal,
+    private_favorites: pd.DataFrame,
+    group_favorites: pd.DataFrame,
+    *,
+    actor_username: str,
+    is_admin: bool,
+) -> None:
+    """Muestra únicamente las listas y sus filtros opcionales."""
+
+    with st.expander("Filtrar por etiquetas"):
+        tag_filter = st.multiselect(
             "Etiquetas",
             FAVORITE_TAGS,
-            default=favorite_tags_from_value(selected_row.get("tags", "")),
-            max_selections=5,
-            key=f"edit_favorite_tags_{scope_key}_{selected}",
-            help="Una empresa puede pertenecer a varias categorías.",
+            key="favorite_tag_filter",
+            help="Si eliges varias, se muestran las empresas que tengan al menos una.",
+            label_visibility="collapsed",
         )
-        edit_col, remove_col = st.columns(2)
-        if edit_col.button(
-            "Guardar etiquetas",
-            key=f"update_favorite_tags_{scope_key}",
-            type="primary",
-            width="stretch",
-        ):
-            try:
-                journal.update_favorite_tags(selected, edited_tags)
-            except (JournalStorageError, ValueError) as exc:
-                st.error(str(exc))
-            else:
-                st.success(f"Etiquetas de {selected} actualizadas.")
-                st.rerun()
-        if remove_col.button(
-            "Quitar de la lista",
-            key=f"remove_favorite_button_{scope_key}",
-            width="stretch",
-        ):
-            try:
-                journal.delete_favorite(selected)
-            except (JournalStorageError, ValueError) as exc:
-                st.error(str(exc))
-            else:
-                st.success(f"{selected} ya no está en esta lista.")
-                st.rerun()
+    private_tab, group_tab = st.tabs(
+        [
+            f"Mi lista · {len(private_favorites)}",
+            f"Grupo · {len(group_favorites)}",
+        ]
+    )
+    with private_tab:
+        render_favorite_list(
+            private_favorites,
+            title="Mi lista privada",
+            journal=private_journal,
+            actor_username=actor_username,
+            tag_filter=tag_filter,
+        )
+    with group_tab:
+        render_favorite_list(
+            group_favorites,
+            title="Lista del grupo",
+            journal=group_journal,
+            actor_username=actor_username,
+            tag_filter=tag_filter,
+            shared=True,
+            can_delete_all=is_admin,
+        )
 
 
 def render_favorites_manager(
@@ -4124,11 +4156,31 @@ def render_favorites_manager(
     actor_username: str,
     is_admin: bool,
 ) -> None:
-    st.subheader("Favoritos y buscador internacional")
-    st.write(
-        "Busca por el nombre normal de la empresa. Verás sus distintas cotizaciones, "
-        "el mercado y la moneda antes de guardarla o abrir su análisis."
+    st.subheader("Favoritos")
+    st.caption(
+        "Tu lista de seguimiento. Cada línea permite analizar, clasificar o quitar."
     )
+    if st.session_state.pop("_return_to_favorite_lists", False):
+        st.session_state["favorite_view"] = "Mis listas"
+    favorite_view = st.segmented_control(
+        "Vista de favoritos",
+        ["Mis listas", "Añadir empresa"],
+        default="Mis listas",
+        key="favorite_view",
+        label_visibility="collapsed",
+    )
+    if favorite_view == "Mis listas":
+        render_favorite_tabs(
+            private_journal,
+            group_journal,
+            private_favorites,
+            group_favorites,
+            actor_username=actor_username,
+            is_admin=is_admin,
+        )
+        return
+
+    st.markdown("##### Añadir empresa")
     with st.form("company_search_form"):
         search_col, button_col = st.columns([4, 1])
         query = search_col.text_input(
@@ -4249,6 +4301,7 @@ def render_favorites_manager(
                     f"{destination.lower()}."
                 )
                 st.session_state.pop("favorite_search_results", None)
+                st.session_state["_return_to_favorite_lists"] = True
                 st.rerun()
 
     with st.expander("Modo avanzado: añadir un ticker exacto"):
@@ -4311,38 +4364,8 @@ def render_favorites_manager(
                 st.error(str(exc))
             else:
                 st.success(f"{normalized_ticker} se ha guardado.")
+                st.session_state["_return_to_favorite_lists"] = True
                 st.rerun()
-
-    st.info(
-        "Puedes guardar hasta 300 favoritas. Pulsa «Ver» en cualquier fila para abrir "
-        "su ficha directamente; se hará análisis completo de hasta 25 empresas por "
-        "actualización."
-    )
-    tag_filter = st.multiselect(
-        "Filtrar ambas listas por etiquetas",
-        FAVORITE_TAGS,
-        key="favorite_tag_filter",
-        help="Si eliges varias, se muestran las empresas que tengan al menos una.",
-    )
-    private_tab, group_tab = st.tabs(["Mi lista privada", "Lista del grupo"])
-    with private_tab:
-        render_favorite_list(
-            private_favorites,
-            title="Mi lista privada",
-            journal=private_journal,
-            actor_username=actor_username,
-            tag_filter=tag_filter,
-        )
-    with group_tab:
-        render_favorite_list(
-            group_favorites,
-            title="Lista del grupo",
-            journal=group_journal,
-            actor_username=actor_username,
-            tag_filter=tag_filter,
-            shared=True,
-            can_delete_all=is_admin,
-        )
 
 
 PLOTLY_CONFIG = {
@@ -4562,6 +4585,11 @@ def _open_ticker_analysis(ticker: str) -> None:
     if not ticker.strip():
         return
     normalized = resolve_analysis_ticker(ticker)
+    recent = st.session_state.get("recent_analysis_tickers", [])
+    st.session_state["recent_analysis_tickers"] = merge_analysis_ticker_sources(
+        [normalized],
+        recent if isinstance(recent, list) else [],
+    )[:20]
     st.session_state["main_navigation"] = "Analizar"
     st.session_state["analysis_navigation"] = "Oportunidades"
     st.session_state["analysis_ticker"] = normalized
@@ -4685,6 +4713,163 @@ def render_quick_company_search() -> None:
             on_click=_save_quick_company_favorite,
             args=(query, results),
         )
+
+
+def render_analysis_company_picker(
+    favorite_tickers: list[str],
+    favorite_labels: dict[str, str],
+    journal: object,
+    raw_fundamentals: dict[str, dict[str, object]],
+) -> None:
+    """Selector directo de favoritas y buscador con memoria dentro de Analizar."""
+
+    try:
+        snapshots = journal.list_analysis_snapshots()
+    except JournalStorageError:
+        snapshots = pd.DataFrame()
+    saved_tickers = (
+        snapshots["ticker"].dropna().astype(str).tolist()
+        if not snapshots.empty and "ticker" in snapshots.columns
+        else []
+    )
+    recent_state = st.session_state.get("recent_analysis_tickers", [])
+    recent_tickers = recent_state if isinstance(recent_state, list) else []
+    suggestion_tickers = merge_analysis_ticker_sources(
+        favorite_tickers,
+        recent_tickers,
+        saved_tickers,
+    )
+
+    labels: dict[str, str] = {}
+    for ticker in suggestion_tickers:
+        if ticker in favorite_labels:
+            labels[ticker] = favorite_labels[ticker]
+            continue
+        fundamentals = raw_fundamentals.get(ticker, {})
+        name = str(
+            fundamentals.get("longName")
+            or fundamentals.get("shortName")
+            or ticker
+        ).strip()
+        source = (
+            "vista recientemente"
+            if ticker in recent_tickers
+            else "análisis guardado"
+        )
+        labels[ticker] = (
+            f"{name} ({ticker}) · {source}" if name != ticker else f"{ticker} · {source}"
+        )
+    label_to_ticker = {label: ticker for ticker, label in labels.items()}
+    ticker_lookup = {ticker.casefold(): ticker for ticker in suggestion_tickers}
+
+    favorite_key = "analysis_favorite_shortcut"
+    if st.session_state.get(favorite_key) not in favorite_tickers:
+        st.session_state.pop(favorite_key, None)
+
+    with st.container(border=True):
+        st.markdown("#### Abrir una empresa")
+        st.caption(
+            "Elige una favorita o escribe para buscar entre favoritas, análisis "
+            "guardados y empresas abiertas recientemente."
+        )
+        favorite_col, memory_col = st.columns(2)
+        with favorite_col:
+            favorite_choice = st.selectbox(
+                "Mis favoritas",
+                favorite_tickers,
+                index=None,
+                format_func=lambda ticker: favorite_labels.get(ticker, ticker),
+                placeholder=(
+                    "Despliega tus favoritas"
+                    if favorite_tickers
+                    else "Todavía no tienes favoritas"
+                ),
+                key=favorite_key,
+                disabled=not favorite_tickers,
+            )
+            open_favorite = st.button(
+                "Analizar favorita",
+                icon=":material/star:",
+                width="stretch",
+                disabled=not favorite_choice,
+                key="analysis_open_favorite",
+            )
+        with memory_col:
+            search_choice = st.selectbox(
+                "Buscar empresa",
+                [labels[ticker] for ticker in suggestion_tickers],
+                index=None,
+                placeholder="Escribe un nombre o ticker…",
+                accept_new_options=True,
+                filter_mode="fuzzy",
+                key="analysis_smart_search",
+                help=(
+                    "Las coincidencias conocidas aparecen mientras escribes. Si no existe, "
+                    "puedes buscarla en los mercados disponibles."
+                ),
+            )
+            known_ticker = label_to_ticker.get(str(search_choice or ""))
+            if known_ticker is None and search_choice:
+                known_ticker = ticker_lookup.get(str(search_choice).strip().casefold())
+            search_action = st.button(
+                "Abrir análisis" if known_ticker else "Buscar en mercados",
+                icon=":material/search:",
+                type="primary",
+                width="stretch",
+                disabled=not search_choice,
+                key="analysis_smart_search_action",
+            )
+
+        if open_favorite and favorite_choice:
+            _open_ticker_analysis(str(favorite_choice))
+            st.rerun()
+
+        if search_action and search_choice:
+            if known_ticker:
+                _open_ticker_analysis(known_ticker)
+                st.rerun()
+            query = str(search_choice).strip()
+            st.session_state.pop("analysis_picker_market", None)
+            st.session_state.pop("analysis_picker_result", None)
+            try:
+                st.session_state["analysis_picker_results"] = cached_company_search(query)
+            except (DataDownloadError, ValueError) as exc:
+                st.session_state["analysis_picker_results"] = []
+                st.error(str(exc))
+
+        results: list[TickerSearchResult] = st.session_state.get(
+            "analysis_picker_results",
+            [],
+        )
+        if search_action and search_choice and not known_ticker and not results:
+            st.warning("No se encontraron cotizaciones con ese nombre o ticker.")
+        if results:
+            market = st.selectbox(
+                "Mercado de cotización",
+                _search_market_options(results),
+                key="analysis_picker_market",
+                on_change=_clear_session_key,
+                args=("analysis_picker_result",),
+            )
+            result_indices = _search_result_indices(results, market)
+            if result_indices:
+                selected_index = st.selectbox(
+                    "Resultado",
+                    result_indices,
+                    format_func=lambda index: _search_result_label(results[index]),
+                    key="analysis_picker_result",
+                )
+                selected_result = results[selected_index]
+                if st.button(
+                    f"Analizar {selected_result.ticker}",
+                    type="primary",
+                    icon=":material/open_in_new:",
+                    width="stretch",
+                    key="analysis_picker_open_result",
+                ):
+                    _open_ticker_analysis(selected_result.ticker)
+                    st.session_state.pop("analysis_picker_results", None)
+                    st.rerun()
 
 
 def render_home(
@@ -5027,6 +5212,11 @@ def render_opportunities_page(
         list(prepared),
         key="analysis_ticker",
     )
+    recent = st.session_state.get("recent_analysis_tickers", [])
+    st.session_state["recent_analysis_tickers"] = merge_analysis_ticker_sources(
+        [selected],
+        recent if isinstance(recent, list) else [],
+    )[:20]
     render_analysis(
         selected,
         prepared[selected],
@@ -6998,6 +7188,13 @@ def main() -> None:
             label_visibility="collapsed",
             format_func=lambda value: ANALYSIS_LABELS[value],
         )
+        if analysis_section != "Proyección de capital":
+            render_analysis_company_picker(
+                favorite_tickers,
+                favorite_labels,
+                journal,
+                raw_fundamentals,
+            )
         if analysis_section == "Oportunidades":
             render_opportunities_page(
                 raw_data,
