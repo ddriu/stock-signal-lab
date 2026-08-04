@@ -86,6 +86,7 @@ from src.navigation import (
     merge_analysis_ticker_sources,
     sanitize_favorite_selection,
 )
+from src.opportunity_catalog import build_opportunity_catalog
 from src.supabase_journal import JournalStorageError
 from src.storage import GROUP_PORTFOLIO_OWNER, create_journal
 from src.opportunity import (
@@ -4504,6 +4505,12 @@ def render_opportunity_cards(
         close = _numeric_score(row.get("Cierre"))
         close_text = f"{close:,.2f}" if close is not None else "N/D"
         date_value = html.escape(str(row.get("Fecha") or "Sin fecha"))
+        confidence = _numeric_score(row.get("Confianza datos"))
+        data_text = (
+            f"Cobertura {confidence:.0f}%"
+            if confidence is not None
+            else str(row.get("Comprobación") or "Pendiente de actualizar")
+        )
         cards.append(
             f"""
             <article class="ssl-card">
@@ -4530,7 +4537,7 @@ def render_opportunity_cards(
                     <span>Si la tienes: {html.escape(position_label)}</span>
                 </div>
                 <div class="ssl-card-footer">
-                    <span>Datos {_score_text(row.get("Confianza datos"))}%</span>
+                    <span>{html.escape(data_text)}</span>
                     <span>{date_value}</span>
                 </div>
             </article>
@@ -4630,7 +4637,9 @@ def _open_ticker_analysis(ticker: str) -> None:
     )[:20]
     st.session_state["main_navigation"] = "Analizar"
     st.session_state["analysis_navigation"] = "Oportunidades"
-    st.session_state["analysis_ticker"] = normalized
+    # No se modifica directamente la clave del selectbox. Streamlit puede
+    # rechazar ese cambio si el widget ya se creó durante la misma interacción.
+    st.session_state["_requested_analysis_ticker"] = normalized
     st.session_state["_pending_analysis_ticker"] = normalized
 
 
@@ -5196,6 +5205,7 @@ def render_opportunities_page(
     raw_fundamentals: dict[str, dict[str, object]],
     price_verifications: dict[str, PriceVerification],
     journal: object,
+    favorite_tickers: list[str],
 ) -> None:
     render_page_intro(
         "ANÁLISIS PRINCIPAL",
@@ -5203,34 +5213,91 @@ def render_opportunities_page(
         "Primero ves una lectura sencilla. El detalle técnico, los riesgos y la tabla "
         "completa siguen disponibles cuando quieras profundizar.",
     )
-    if not raw_data:
+    try:
+        saved_snapshots = journal.list_analysis_snapshots()
+    except JournalStorageError as exc:
+        saved_snapshots = pd.DataFrame()
+        st.warning(f"No se pudo leer el último análisis guardado: {exc}")
+    catalog_summary = build_opportunity_catalog(
+        favorite_tickers,
+        saved_snapshots,
+        summary,
+    )
+    if not catalog_summary:
         st.info(
-            "Usa «Buscar empresa» o guarda favoritas. En esta sección puedes elegirlas "
-            "en el panel de configuración y pulsar «Actualizar análisis»."
+            "Todavía no tienes empresas en el radar. Guarda una favorita o utiliza "
+            "el buscador de esta sección para abrir la primera."
         )
         return
-    if not prepared:
-        st.error("No hay suficiente histórico válido para generar señales.")
-        return
 
-    render_opportunity_cards(summary)
+    updated_count = sum(
+        row.get("Comprobación") == "Actualizado en esta sesión"
+        for row in catalog_summary
+    )
+    pending_count = len(catalog_summary) - updated_count
+    st.caption(
+        f"{len(catalog_summary)} empresas en el radar · {updated_count} comprobadas "
+        f"en esta sesión · {pending_count} pendientes de actualizar."
+    )
+    scored_summary = [
+        row
+        for row in catalog_summary
+        if _numeric_score(row.get("Oportunidad")) is not None
+    ]
+    render_opportunity_cards(scored_summary)
     alerts = [
         row
-        for row in summary
+        for row in catalog_summary
         if row.get("Lectura conjunta") in {"Oportunidad destacada", "Candidata"}
         or row.get("Si ya la tienes") in {"Reducir", "Vender"}
     ]
     st.caption(f"{len(alerts)} alertas prioritarias con las reglas configuradas.")
 
-    with st.expander("Ver ranking completo en tabla"):
-        radar = pd.DataFrame(summary)
-        if "Momento entrada" in radar.columns:
-            radar = radar.sort_values(
-                ["Oportunidad", "Confianza datos", "Momento entrada"],
-                ascending=[False, False, False],
-                na_position="last",
-            ).reset_index(drop=True)
-            radar.insert(0, "Ranking", range(1, len(radar) + 1))
+    st.markdown("### Todas tus favoritas")
+    st.caption(
+        "Una nota guardada sirve como referencia, pero no se presenta como actual. "
+        "La columna Comprobación te indica cuáles debes volver a revisar."
+    )
+    radar = pd.DataFrame(catalog_summary)
+    if "Momento entrada" in radar.columns:
+        radar = radar.sort_values(
+            ["Oportunidad", "Momento entrada"],
+            ascending=[False, False],
+            na_position="last",
+        ).reset_index(drop=True)
+        radar.insert(0, "Ranking", range(1, len(radar) + 1))
+    essential_columns = [
+        "Ranking",
+        "Ticker",
+        "Oportunidad",
+        "Calidad empresa",
+        "Momento entrada",
+        "Lectura conjunta",
+        "Si ya la tienes",
+        "Comprobación",
+        "Fecha",
+    ]
+    essential_columns = [
+        column for column in essential_columns if column in radar.columns
+    ]
+    st.dataframe(
+        radar.loc[:, essential_columns],
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Oportunidad": st.column_config.ProgressColumn(
+                min_value=0, max_value=100, format="%d"
+            ),
+            "Calidad empresa": st.column_config.ProgressColumn(
+                "Empresa /100", min_value=0, max_value=100, format="%d"
+            ),
+            "Momento entrada": st.column_config.ProgressColumn(
+                "Entrada /100", min_value=0, max_value=100, format="%d"
+            ),
+        },
+    )
+
+    with st.expander("Ver indicadores y ranking completo"):
         st.dataframe(
             radar,
             width="stretch",
@@ -5262,6 +5329,19 @@ def render_opportunities_page(
                 "Actividad": st.column_config.NumberColumn(format="%.2fx"),
             },
         )
+
+    if not raw_data:
+        st.info(
+            "Tus favoritas ya están en el radar. Pulsa «Actualizar cartera y análisis» "
+            "para comprobar de nuevo sus precios y señales."
+        )
+        return
+    if not prepared:
+        st.error(
+            "Las favoritas permanecen en el radar, pero no hay suficiente histórico "
+            "válido para recalcular sus señales."
+        )
+        return
 
     if st.session_state.get("analysis_ticker") not in prepared:
         st.session_state.pop("analysis_ticker", None)
@@ -7197,6 +7277,18 @@ def main() -> None:
         if raw_data
         else ({}, [], {}, {}, {}, {}, {})
     )
+    requested_focus_ticker = resolve_analysis_ticker(
+        str(st.session_state.get("_requested_analysis_ticker", ""))
+    )
+    if requested_focus_ticker and requested_focus_ticker in prepared:
+        # Se aplica antes de crear el selectbox de detalle. Así el acceso desde
+        # Favoritos no intenta modificar un widget ya instanciado.
+        st.session_state["analysis_ticker"] = requested_focus_ticker
+        st.session_state.pop("_requested_analysis_ticker", None)
+    elif requested_focus_ticker and requested_focus_ticker not in raw_data:
+        # La descarga falló o el proveedor no reconoce la cotización. El radar
+        # conserva la favorita y el aviso de descarga explica cómo corregirla.
+        st.session_state.pop("_requested_analysis_ticker", None)
 
     selected_section = st.segmented_control(
         "Navegación principal",
@@ -7265,6 +7357,7 @@ def main() -> None:
                 raw_fundamentals,
                 price_verifications,
                 journal,
+                favorite_tickers,
             )
         elif analysis_section == "Crecimiento y momentum":
             render_growth_momentum_page(
