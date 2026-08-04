@@ -4,6 +4,8 @@ from src.visualization import (
     portfolio_snapshot_allocation_chart,
     portfolio_snapshot_assets_chart,
     private_investments_chart,
+    staircase_projection_chart,
+    staircase_range_chart,
 )
 
 
@@ -55,3 +57,32 @@ def test_pie_labels_can_expand_their_margins() -> None:
     )
     figure = portfolio_snapshot_allocation_chart(positions)
     assert figure.data[0].automargin is True
+
+
+def test_staircase_charts_distinguish_contributions_and_uncertainty() -> None:
+    dates = pd.date_range("2026-08-31", periods=3, freq="ME")
+    projections = pd.DataFrame(
+        {
+            "scenario": ["Central 10%"] * 3,
+            "date": dates,
+            "contributed": [8_750, 9_750, 10_750],
+            "total_value": [8_780, 9_820, 10_880],
+        }
+    )
+    simulation = pd.DataFrame(
+        {
+            "date": dates,
+            "contributed": [8_750, 9_750, 10_750],
+            "p10": [8_600, 9_400, 10_100],
+            "p50": [8_780, 9_820, 10_880],
+            "p90": [8_950, 10_200, 11_650],
+        }
+    )
+    scenario_figure = staircase_projection_chart(projections)
+    range_figure = staircase_range_chart(simulation)
+    assert [trace.name for trace in scenario_figure.data] == [
+        "Capital aportado",
+        "Central 10%",
+    ]
+    assert range_figure.data[1].fill == "tonexty"
+    assert range_figure.data[-1].name == "Capital aportado"
