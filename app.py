@@ -7287,8 +7287,13 @@ def main() -> None:
         if raw_data
         else ({}, [], {}, {}, {}, {}, {})
     )
-    requested_focus_ticker = resolve_analysis_ticker(
-        str(st.session_state.get("_requested_analysis_ticker", ""))
+    requested_focus_value = str(
+        st.session_state.get("_requested_analysis_ticker", "")
+    ).strip()
+    requested_focus_ticker = (
+        resolve_analysis_ticker(requested_focus_value)
+        if requested_focus_value
+        else ""
     )
     if requested_focus_ticker and requested_focus_ticker in prepared:
         # Se aplica antes de crear el selectbox de detalle. Así el acceso desde
