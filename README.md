@@ -35,6 +35,7 @@ La instalación local solicita las credenciales guardadas en
 │   ├── fundamentals.py       # Calidad empresarial con cobertura de datos
 │   ├── opportunity.py        # Valoración, fortaleza relativa, riesgo y score conjunto
 │   ├── growth_momentum.py    # Estrategia mensual dinámica y perfiles sectoriales
+│   ├── staircase_projection.py # Aportaciones, escalera y simulación a diez años
 │   ├── sector_comparison.py  # Comparación normalizada y liderazgo entre pares
 │   ├── backtesting.py        # Simulador long-only sin anticipación
 │   ├── visualization.py      # Gráficos Plotly
@@ -113,6 +114,12 @@ mensual, riesgo monetario, máximo individual y techo total de estrategia. Los p
 tecnología, consumo, energía/uranio, biotecnología, industria/defensa, finanzas y ETF
 adaptan el riesgo y la lista de comprobaciones; el usuario puede corregir manualmente una
 clasificación automática. Segofactoring y Civislend quedan fuera de estos cálculos.
+El simulador anexo sí los muestra como bolsas separadas para explicar el plan mensual:
+capital actual, 250 euros mensuales de Civislend, 250 de facturas y el resto entre
+acciones tradicionales y escalera. La escalera sólo aumenta su porcentaje después de
+un año que supera el umbral elegido. Muestra capital aportado, cuatro escenarios,
+percentiles de 1.000 recorridos y los horizontes diciembre, 12, 24, 36, 48 meses y
+10 años; no modifica operaciones ni presenta la simulación como una garantía.
 Desde esta página se puede revisar toda la lista privada o añadir también la lista del
 grupo. El barrido conserva bloques ya descargados, admite hasta 200 tickers por pasada y
 completa los datos empresariales en grupos de 25 para no bloquear el alojamiento gratuito.

@@ -121,6 +121,14 @@ from src.segofactoring_import import (
     parse_segofactoring_excel,
 )
 from src.signal_engine import add_signal_columns, evaluate_latest_signal
+from src.staircase_projection import (
+    DEFAULT_SCENARIOS,
+    StaircaseProjectionConfig,
+    default_horizons,
+    project_scenarios,
+    simulate_projection_ranges,
+    summarize_projection,
+)
 from src.ui import (
     APP_CSS,
     PROFILE_NAMES,
@@ -141,6 +149,8 @@ from src.visualization import (
     private_investments_chart,
     return_calibration_chart,
     risk_return_chart,
+    staircase_projection_chart,
+    staircase_range_chart,
 )
 
 
@@ -4930,6 +4940,312 @@ def render_opportunities_page(
     )
 
 
+def render_staircase_projection(
+    *,
+    username: str,
+    liquid_capital: float,
+    monthly_total: float,
+    current_strategy_value: float,
+    initial_staircase_pct: float,
+) -> None:
+    """Simula aportaciones fijas y una ampliación condicionada de la escalera."""
+
+    is_ddriu = username.strip().lower() == "ddriu"
+    st.markdown("### 2. Proyección de aportaciones y estrategia escalonada")
+    st.caption(
+        "Separa el dinero que tú aportas del rendimiento estimado. La escalera sólo "
+        "recibe más aportación después de un año favorable; nunca se amplía una pérdida."
+    )
+    with st.expander("Configurar simulador hasta 10 años", expanded=True):
+        initial_a, initial_b, initial_c, initial_d = st.columns(4)
+        initial_civislend = initial_a.number_input(
+            "Civislend actual (€)",
+            min_value=0.0,
+            value=1_500.0 if is_ddriu else 0.0,
+            step=250.0,
+            key="projection_initial_civislend",
+        )
+        initial_factoring = initial_b.number_input(
+            "Sego/facturas actual (€)",
+            min_value=0.0,
+            value=1_850.0 if is_ddriu else 0.0,
+            step=250.0,
+            key="projection_initial_factoring",
+        )
+        initial_equities = initial_c.number_input(
+            "Acciones actuales (€)",
+            min_value=0.0,
+            value=float(liquid_capital),
+            step=100.0,
+            key="projection_initial_equities",
+        )
+        suggested_dynamic = min(float(current_strategy_value), float(initial_equities))
+        if is_ddriu and suggested_dynamic <= 0:
+            suggested_dynamic = min(640.0, float(initial_equities))
+        initial_dynamic = initial_d.number_input(
+            "De ellas, escalera (€)",
+            min_value=0.0,
+            value=float(suggested_dynamic),
+            step=50.0,
+            help="Incluye las posiciones abiertas siguiendo esta estrategia, no todas tus acciones.",
+            key="projection_initial_dynamic",
+        )
+
+        monthly_a, monthly_b, monthly_c = st.columns(3)
+        monthly_civislend = monthly_a.number_input(
+            "Aportación mensual Civislend (€)",
+            min_value=0.0,
+            value=250.0 if is_ddriu else 0.0,
+            step=50.0,
+            key="projection_monthly_civislend",
+        )
+        monthly_factoring = monthly_b.number_input(
+            "Aportación mensual facturas (€)",
+            min_value=0.0,
+            value=250.0 if is_ddriu else 0.0,
+            step=50.0,
+            key="projection_monthly_factoring",
+        )
+        monthly_c.metric(
+            "Aportación mensual total",
+            f"{float(monthly_total):,.0f} €",
+            help="Se edita arriba, en «Configurar capital y límites».",
+        )
+
+        fixed_monthly = float(monthly_civislend) + float(monthly_factoring)
+        initial_dynamic_eur = float(monthly_total) * float(initial_staircase_pct) / 100.0
+        initial_traditional_eur = (
+            float(monthly_total) - fixed_monthly - initial_dynamic_eur
+        )
+        if fixed_monthly > float(monthly_total):
+            st.error(
+                "Las aportaciones a Civislend y facturas superan el dinero mensual total."
+            )
+            return
+        if initial_traditional_eur < 0:
+            st.error(
+                "El porcentaje dinámico deja una aportación negativa para acciones tradicionales."
+            )
+            return
+
+        split_a, split_b, split_c, split_d = st.columns(4)
+        split_a.metric("Civislend/mes", f"{float(monthly_civislend):,.0f} €")
+        split_b.metric("Facturas/mes", f"{float(monthly_factoring):,.0f} €")
+        split_c.metric("Acciones tradicionales/mes", f"{initial_traditional_eur:,.0f} €")
+        split_d.metric("Escalera inicial/mes", f"{initial_dynamic_eur:,.0f} €")
+
+        scale_a, scale_b, scale_c = st.columns(3)
+        step_pct = scale_a.slider(
+            "Aumento tras un año favorable",
+            0.0,
+            15.0,
+            5.0,
+            1.0,
+            format="%.0f puntos",
+            key="projection_step_pct",
+        )
+        available_pct = (
+            100.0
+            if float(monthly_total) <= 0
+            else 100.0 * (float(monthly_total) - fixed_monthly) / float(monthly_total)
+        )
+        default_maximum = min(max(float(initial_staircase_pct), 40.0), available_pct)
+        maximum_dynamic_pct = scale_b.number_input(
+            "Máximo mensual para la escalera (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=float(default_maximum),
+            step=5.0,
+            key="projection_maximum_dynamic_pct",
+        )
+        scale_threshold = scale_c.number_input(
+            "Rentabilidad mínima para ampliarla (%)",
+            min_value=0.0,
+            max_value=50.0,
+            value=10.0,
+            step=1.0,
+            key="projection_scale_threshold",
+        )
+
+        with st.expander("Rentabilidades y volatilidad utilizadas"):
+            return_a, return_b, return_c, return_d = st.columns(4)
+            civislend_return = return_a.number_input(
+                "Civislend anual (%)",
+                value=10.5,
+                step=0.5,
+                key="projection_civislend_return",
+            )
+            factoring_return = return_b.number_input(
+                "Facturas anual (%)",
+                value=6.0,
+                step=0.5,
+                key="projection_factoring_return",
+            )
+            traditional_return = return_c.number_input(
+                "Acciones tradicionales (%)",
+                value=8.0,
+                step=0.5,
+                key="projection_traditional_return",
+            )
+            central_dynamic_return = return_d.number_input(
+                "Escalera esperada en la simulación (%)",
+                value=10.0,
+                step=0.5,
+                key="projection_dynamic_return",
+            )
+            volatility_a, volatility_b = st.columns(2)
+            traditional_volatility = volatility_a.number_input(
+                "Volatilidad tradicional (%)",
+                min_value=0.0,
+                value=16.0,
+                step=1.0,
+                key="projection_traditional_volatility",
+            )
+            dynamic_volatility = volatility_b.number_input(
+                "Volatilidad escalera (%)",
+                min_value=0.0,
+                value=28.0,
+                step=1.0,
+                key="projection_dynamic_volatility",
+            )
+
+    projection_config = StaircaseProjectionConfig(
+        start_date=date.today(),
+        initial_civislend=float(initial_civislend),
+        initial_factoring=float(initial_factoring),
+        initial_equities=float(initial_equities),
+        initial_staircase=float(initial_dynamic),
+        monthly_total=float(monthly_total),
+        monthly_civislend=float(monthly_civislend),
+        monthly_factoring=float(monthly_factoring),
+        initial_staircase_pct=float(initial_staircase_pct),
+        staircase_step_pct=float(step_pct),
+        maximum_staircase_pct=float(maximum_dynamic_pct),
+        scale_return_threshold_pct=float(scale_threshold),
+        civislend_return_pct=float(civislend_return),
+        factoring_return_pct=float(factoring_return),
+        traditional_equity_return_pct=float(traditional_return),
+        traditional_equity_volatility_pct=float(traditional_volatility),
+        staircase_volatility_pct=float(dynamic_volatility),
+    )
+    try:
+        projection_config.validate()
+        projections = project_scenarios(
+            projection_config,
+            DEFAULT_SCENARIOS,
+            months=120,
+        )
+        projection_summary = summarize_projection(
+            projections,
+            default_horizons(projection_config.start_date),
+        )
+        simulation = simulate_projection_ranges(
+            projection_config,
+            expected_staircase_return_pct=float(central_dynamic_return),
+            simulations=1_000,
+            months=120,
+            seed=42,
+        )
+    except ValueError as exc:
+        st.error(f"Configuración de proyección inválida: {exc}")
+        return
+
+    central_projection = projections.loc[projections["scenario"] == "Central 10%"]
+    central_ten_year = central_projection.loc[central_projection["month"] == 120].iloc[0]
+    simulation_ten_year = simulation.loc[simulation["month"] == 120].iloc[0]
+    projection_metrics = st.columns(4)
+    projection_metrics[0].metric(
+        "Capital inicial incluido",
+        f"{projection_config.initial_total:,.0f} €",
+    )
+    projection_metrics[1].metric(
+        "Aportado en 10 años",
+        f"{central_ten_year['contributed']:,.0f} €",
+    )
+    projection_metrics[2].metric(
+        "Central determinista",
+        f"{central_ten_year['total_value']:,.0f} €",
+        f"{central_ten_year['estimated_profit']:,.0f} € sobre aportaciones",
+    )
+    projection_metrics[3].metric(
+        "Recorridos simulados por encima de aportaciones",
+        (
+            ">99%"
+            if simulation_ten_year["probability_above_contributions_pct"] >= 99.5
+            else f"{simulation_ten_year['probability_above_contributions_pct']:.0f}%"
+        ),
+        help=(
+            "Frecuencia dentro de 1.000 recorridos y de estos supuestos. No es la "
+            "probabilidad real ni una garantía."
+        ),
+    )
+
+    display_summary = projection_summary.drop(columns=["Meses"]).copy()
+    st.dataframe(
+        display_summary,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            column: st.column_config.NumberColumn(format="%.0f €")
+            for column in display_summary.columns
+            if column != "Horizonte"
+        },
+    )
+    st.plotly_chart(
+        staircase_projection_chart(projections),
+        width="stretch",
+        config={"displaylogo": False},
+        key="growth_staircase_projection_chart",
+    )
+    st.plotly_chart(
+        staircase_range_chart(simulation),
+        width="stretch",
+        config={"displaylogo": False},
+        key="growth_staircase_range_chart",
+    )
+
+    uncertainty_rows = []
+    for label, month in default_horizons(projection_config.start_date):
+        row = simulation.loc[simulation["month"] == month]
+        if row.empty:
+            continue
+        current = row.iloc[0]
+        uncertainty_rows.append(
+            {
+                "Horizonte": label,
+                "Desfavorable P10": current["p10"],
+                "Central P50": current["p50"],
+                "Favorable P90": current["p90"],
+                "Recorridos sobre aportaciones": current[
+                    "probability_above_contributions_pct"
+                ],
+                "% medio destinado a escalera": current["average_staircase_allocation_pct"],
+            }
+        )
+    uncertainty_frame = pd.DataFrame(uncertainty_rows)
+    with st.expander("Ver intervalos y probabilidad por horizonte"):
+        st.dataframe(
+            uncertainty_frame,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Desfavorable P10": st.column_config.NumberColumn(format="%.0f €"),
+                "Central P50": st.column_config.NumberColumn(format="%.0f €"),
+                "Favorable P90": st.column_config.NumberColumn(format="%.0f €"),
+                "Recorridos sobre aportaciones": st.column_config.NumberColumn(
+                    format="%.1f%%"
+                ),
+                "% medio destinado a escalera": st.column_config.NumberColumn(
+                    format="%.1f%%"
+                ),
+            },
+        )
+    st.warning(
+        "El stop limita el riesgo planificado, pero un gap puede ejecutar la venta a un "
+        "precio peor. Las proyecciones no incluyen impuestos ni garantizan rentabilidad."
+    )
+
+
 def render_growth_momentum_page(
     prepared: dict[str, pd.DataFrame],
     raw_fundamentals: dict[str, dict[str, object]],
@@ -4940,9 +5256,11 @@ def render_growth_momentum_page(
     journal: object,
     private_favorites: pd.DataFrame,
     group_favorites: pd.DataFrame,
+    username: str = "",
 ) -> None:
     """Muestra el plan mensual dinámico sin modificar el motor equilibrado."""
 
+    is_ddriu = username.strip().lower() == "ddriu"
     st.subheader("Crecimiento y momentum")
     st.caption(
         "Estrategia anexa para una parte del dinero nuevo. No cambia Sego, Civislend, "
@@ -5030,23 +5348,26 @@ def render_growth_momentum_page(
         liquid_capital = capital_a.number_input(
             "Cartera líquida aproximada (€)",
             min_value=100.0,
-            value=10_000.0,
+            value=4_400.0 if is_ddriu else 10_000.0,
             step=500.0,
             help="No incluye Sego ni Civislend si no puedes disponer de ese dinero rápidamente.",
             key="growth_liquid_capital",
         )
         monthly_investable = capital_b.number_input(
-            "Dinero mensual disponible (€)",
+            "Dinero mensual total para invertir (€)",
             min_value=0.0,
             value=1_000.0,
             step=50.0,
-            help="Cantidad que queda después de gastos y aportaciones ya comprometidas.",
+            help=(
+                "Incluye las aportaciones a Civislend, facturas, acciones tradicionales "
+                "y la estrategia escalonada."
+            ),
             key="growth_monthly_investable",
         )
         current_strategy_value = capital_c.number_input(
             "Ya invertido con esta estrategia (€)",
             min_value=0.0,
-            value=0.0,
+            value=640.0 if is_ddriu else 0.0,
             step=100.0,
             help="Sirve para no superar el techo reservado al bloque dinámico.",
             key="growth_current_strategy_value",
@@ -5191,6 +5512,14 @@ def render_growth_momentum_page(
         help="Suma de las pérdidas previstas si se activaran todos los niveles de invalidación.",
     )
 
+    render_staircase_projection(
+        username=username,
+        liquid_capital=float(liquid_capital),
+        monthly_total=float(monthly_investable),
+        current_strategy_value=float(current_strategy_value),
+        initial_staircase_pct=float(monthly_allocation),
+    )
+
     radar_prepared = prepared
     if favorite_universe:
         only_favorites = st.checkbox(
@@ -5234,7 +5563,7 @@ def render_growth_momentum_page(
         st.error("No hay suficiente información para calcular el perfil dinámico.")
         return
 
-    st.markdown("### 2. Radar independiente")
+    st.markdown("### 3. Radar independiente")
     st.caption(
         "Crecimiento, momentum y contexto permanecen separados. La confianza indica "
         "cobertura de datos, no la probabilidad de ganar."
@@ -5403,7 +5732,7 @@ def render_growth_momentum_page(
         else:
             st.caption("No aparecen alertas cuantificadas importantes.")
 
-    st.markdown("### 3. Tamaño orientativo de la entrada")
+    st.markdown("### 4. Tamaño orientativo de la entrada")
     quote_currency = str(
         raw_fundamentals.get(selected, {}).get("currency") or ""
     ).strip()
@@ -5510,7 +5839,7 @@ def render_growth_momentum_page(
         )
 
     profile = SECTOR_PROFILES[selected_result.sector_key]
-    with st.expander(f"4. Validación obligatoria · {profile.label}", expanded=True):
+    with st.expander(f"5. Validación obligatoria · {profile.label}", expanded=True):
         st.write(profile.description)
         st.caption(
             f"Tamaño máximo individual: {selected_result.max_position_pct:.1f}% de la cartera líquida · "
@@ -6449,6 +6778,7 @@ def main() -> None:
                 journal,
                 private_favorites,
                 group_favorites,
+                authenticated_user.username,
             )
         elif analysis_section == "Objetivo 30+ días":
             render_long_horizon_calibration(
