@@ -465,36 +465,15 @@ button[data-baseweb="tab"] {
     color: var(--ssl-muted);
 }
 
-[class*="st-key-favorite_row_"] {
-    padding: 0.55rem 0;
-    border-bottom: 1px solid #e8edf3;
+[class*="st-key-section_subnavigation"] {
+    min-height: 3.55rem;
+    margin: 0.55rem 0 0.35rem;
+    display: flex;
+    align-items: flex-start;
 }
 
-[class*="st-key-favorite_row_"] [data-testid="stHorizontalBlock"] {
-    gap: 0.45rem;
-}
-
-.ssl-favorite-row-copy {
-    min-width: 0;
-}
-
-.ssl-favorite-row-copy strong,
-.ssl-favorite-row-copy span {
-    display: block;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-.ssl-favorite-row-copy strong {
-    color: var(--ssl-ink);
-    font-size: 0.96rem;
-}
-
-.ssl-favorite-row-copy span {
-    margin-top: 0.14rem;
-    color: var(--ssl-muted);
-    font-size: 0.76rem;
+[class*="st-key-section_subnavigation"] [data-testid="stSegmentedControl"] {
+    width: 100%;
 }
 
 .ssl-login-brand {
@@ -535,17 +514,6 @@ div[data-testid="stForm"]:has(input[autocomplete="username"]) {
         min-width: 220px;
         flex: 1 1 220px;
     }
-    [class*="st-key-favorite_row_"] [data-testid="stHorizontalBlock"] {
-        flex-wrap: nowrap;
-    }
-    [class*="st-key-favorite_row_"] [data-testid="stColumn"] {
-        min-width: 5.2rem;
-        flex: 0 0 auto;
-    }
-    [class*="st-key-favorite_row_"] [data-testid="stColumn"]:first-child {
-        min-width: 0;
-        flex: 1 1 auto;
-    }
     .ssl-status-pill {
         display: none;
     }
@@ -562,22 +530,6 @@ div[data-testid="stForm"]:has(input[autocomplete="username"]) {
         min-width: 100% !important;
         width: 100% !important;
         flex: 1 1 100% !important;
-    }
-    [class*="st-key-favorite_row_"] [data-testid="stColumn"] {
-        min-width: 4.55rem !important;
-        width: auto !important;
-        flex: 0 0 auto !important;
-    }
-    [class*="st-key-favorite_row_"] [data-testid="stColumn"]:first-child {
-        min-width: 0 !important;
-        width: 1px !important;
-        flex: 1 1 auto !important;
-    }
-    [class*="st-key-favorite_row_"] button {
-        min-height: 2.45rem;
-        padding-left: 0.42rem;
-        padding-right: 0.42rem;
-        font-size: 0.74rem;
     }
     .ssl-app-header {
         align-items: flex-start;
