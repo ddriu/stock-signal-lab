@@ -163,31 +163,50 @@ from src.visualization import (
 st.set_page_config(page_title="Stock Signal Lab", page_icon="📈", layout="wide")
 
 MAIN_OPTIONS = ["Inicio", "Analizar", "Favoritos", "Carteras", "Más"]
-HOME_OPTIONS = ["Resumen", "Mi cartera", "Alertas"]
-ANALYSIS_OPTIONS = [
-    "Oportunidades",
-    "Crecimiento y momentum",
-    "Proyección de capital",
-    "Objetivo 30+ días",
-    "Comparador sectorial",
-    "Historial guardado",
-    "Prueba histórica",
-]
+ANALYSIS_OPTIONS = ["Radar", "Empresa", "Estrategias", "Más análisis"]
 ANALYSIS_LABELS = {
-    "Oportunidades": "◎ Oportunidades",
-    "Crecimiento y momentum": "↗ Crecimiento",
-    "Proyección de capital": "◫ Proyección",
-    "Objetivo 30+ días": "⌁ 30+ días",
-    "Comparador sectorial": "◇ Comparar",
-    "Historial guardado": "◷ Historial",
-    "Prueba histórica": "⟲ Backtest",
+    "Radar": "Radar",
+    "Empresa": "Empresa",
+    "Estrategias": "Estrategias",
+    "Más análisis": "Más",
+}
+STRATEGY_OPTIONS = ["Crecimiento", "Resultado tras 30+ días"]
+ANALYSIS_TOOL_OPTIONS = [
+    "Comparar empresas",
+    "Historial",
+    "Prueba con el pasado",
+    "Plan de capital",
+]
+LEGACY_ANALYSIS_ROUTES = {
+    "Oportunidades": ("Radar", None, None),
+    "Crecimiento y momentum": ("Estrategias", "analysis_strategy_navigation", "Crecimiento"),
+    "Objetivo 30+ días": (
+        "Estrategias",
+        "analysis_strategy_navigation",
+        "Resultado tras 30+ días",
+    ),
+    "Comparador sectorial": (
+        "Más análisis",
+        "analysis_tool_navigation",
+        "Comparar empresas",
+    ),
+    "Historial guardado": ("Más análisis", "analysis_tool_navigation", "Historial"),
+    "Prueba histórica": (
+        "Más análisis",
+        "analysis_tool_navigation",
+        "Prueba con el pasado",
+    ),
+    "Proyección de capital": (
+        "Más análisis",
+        "analysis_tool_navigation",
+        "Plan de capital",
+    ),
 }
 SIDEBAR_ANALYSIS_SECTIONS = {
-    "Oportunidades",
-    "Crecimiento y momentum",
-    "Objetivo 30+ días",
-    "Comparador sectorial",
-    "Prueba histórica",
+    "Radar",
+    "Estrategias",
+    "Comparar empresas",
+    "Prueba con el pasado",
 }
 
 
@@ -382,14 +401,14 @@ def build_sidebar(
         # Versiones anteriores introducían aquí tickers temporales abiertos desde
         # el buscador. Streamlit rechaza valores que no existen en ``options``.
         st.session_state["selected_favorite_tickers"] = safe_selection
-    st.sidebar.markdown("## Preparar análisis")
+    st.sidebar.markdown("## Actualizar datos")
     st.sidebar.caption(
-        "Primero elige empresas y un estilo. Los controles técnicos quedan guardados "
-        "en los apartados avanzados."
+        "Elige qué conjunto quieres recalcular. Para abrir una empresa concreta usa "
+        "«Empresa» en la pantalla principal."
     )
     st.sidebar.markdown("### 1 · Empresas")
     selected_favorites = st.sidebar.multiselect(
-        "Empresas que quieres analizar",
+        "Empresas que quieres actualizar",
         options=favorite_tickers,
         format_func=lambda ticker: favorite_labels.get(ticker, ticker),
         max_selections=25,
@@ -694,9 +713,9 @@ def build_sidebar(
     )
     load_clicked = st.sidebar.button(
         (
-            f"Analizar {selected_count} empresas"
+            f"Actualizar {selected_count} empresas"
             if selected_count
-            else "Actualizar cartera y análisis"
+            else "Actualizar posiciones abiertas"
         ),
         type="primary",
         width="stretch",
@@ -1658,8 +1677,8 @@ def render_long_horizon_calibration(
     )
     if not prepared:
         st.info(
-            "Selecciona tus favoritas, elige al menos cinco años de historial y pulsa "
-            "«Actualizar análisis». Cuantas más empresas válidas, mejor será la muestra."
+            "En el panel «Actualizar datos», elige tus favoritas y al menos cinco años "
+            "de historial. Cuantas más empresas válidas, mejor será la muestra."
         )
         return
 
@@ -4552,10 +4571,11 @@ def render_subnavigation(
     *,
     key: str,
     format_func=None,
+    on_change=None,
 ) -> str:
     """Mantiene todos los submenús en la misma franja visual."""
 
-    with st.container(key="section_subnavigation"):
+    with st.container(key=f"section_subnavigation_{key}"):
         selected = st.segmented_control(
             label,
             options,
@@ -4563,6 +4583,7 @@ def render_subnavigation(
             required=True,
             label_visibility="collapsed",
             format_func=format_func,
+            on_change=on_change,
         )
     return str(selected or options[0])
 
@@ -4688,12 +4709,31 @@ def _set_navigation(
         st.session_state[subsection_key] = subsection
 
 
+def _set_analysis_tool(tool: str) -> None:
+    """Abre una herramienta secundaria sin exponer rutas técnicas al usuario."""
+
+    st.session_state["main_navigation"] = "Analizar"
+    st.session_state["analysis_navigation"] = "Más análisis"
+    st.session_state["analysis_tool_navigation"] = tool
+
+
 def _sync_analysis_ticker(source_key: str) -> None:
     """Mantiene la misma empresa activa entre las herramientas de Analizar."""
 
     ticker = str(st.session_state.get(source_key, "") or "").strip()
     if ticker:
         st.session_state["analysis_ticker"] = resolve_analysis_ticker(ticker)
+
+
+def _reset_analysis_company_picker() -> None:
+    """Limpia el texto de búsqueda sin olvidar la empresa que está abierta."""
+
+    st.session_state["analysis_picker_revision"] = int(
+        st.session_state.get("analysis_picker_revision", 0) or 0
+    ) + 1
+    st.session_state.pop("analysis_picker_results", None)
+    st.session_state.pop("analysis_picker_market", None)
+    st.session_state.pop("analysis_picker_result", None)
 
 
 def _continue_search_in_favorites(
@@ -4723,9 +4763,10 @@ def _open_ticker_analysis(ticker: str) -> None:
     # No se modifican directamente claves pertenecientes a widgets. Streamlit
     # rechaza esos cambios si los menús ya se crearon durante la interacción.
     st.session_state["_requested_main_navigation"] = "Analizar"
-    st.session_state["_requested_analysis_navigation"] = "Oportunidades"
+    st.session_state["_requested_analysis_navigation"] = "Empresa"
     st.session_state["_requested_analysis_ticker"] = normalized
     st.session_state["_pending_analysis_ticker"] = normalized
+    _reset_analysis_company_picker()
 
 
 def render_ticker_dataframe(
@@ -4891,7 +4932,7 @@ def render_analysis_company_picker(
     journal: object,
     raw_fundamentals: dict[str, dict[str, object]],
 ) -> None:
-    """Selector directo de favoritas y buscador con memoria dentro de Analizar."""
+    """Un único selector para favoritas, recientes, guardadas y búsquedas nuevas."""
 
     try:
         snapshots = journal.list_analysis_snapshots()
@@ -4932,39 +4973,20 @@ def render_analysis_company_picker(
     label_to_ticker = {label: ticker for ticker, label in labels.items()}
     ticker_lookup = {ticker.casefold(): ticker for ticker in suggestion_tickers}
 
-    favorite_key = "analysis_favorite_shortcut"
-    if st.session_state.get(favorite_key) not in favorite_tickers:
-        st.session_state.pop(favorite_key, None)
+    revision = int(st.session_state.get("analysis_picker_revision", 0) or 0)
+    picker_key = f"analysis_company_query_{revision}"
+    active_ticker = str(st.session_state.get("analysis_ticker", "") or "").strip()
 
     with st.container(border=True):
-        st.markdown("#### Abrir una empresa")
+        st.markdown("#### Elige una empresa")
         st.caption(
-            "Elige una favorita o escribe para buscar entre favoritas, análisis "
-            "guardados y empresas abiertas recientemente."
+            "Empieza a escribir un nombre o ticker. En la misma lista aparecen tus "
+            "favoritas, las recientes y los análisis guardados."
         )
-        favorite_col, memory_col = st.columns(2)
-        with favorite_col:
-            favorite_choice = st.selectbox(
-                "Mis favoritas",
-                favorite_tickers,
-                index=None,
-                format_func=lambda ticker: favorite_labels.get(ticker, ticker),
-                placeholder=(
-                    "Despliega tus favoritas"
-                    if favorite_tickers
-                    else "Todavía no tienes favoritas"
-                ),
-                key=favorite_key,
-                disabled=not favorite_tickers,
-            )
-            open_favorite = st.button(
-                "Analizar favorita",
-                icon=":material/star:",
-                width="stretch",
-                disabled=not favorite_choice,
-                key="analysis_open_favorite",
-            )
-        with memory_col:
+        if active_ticker:
+            st.caption(f"Empresa abierta ahora: **{active_ticker}**")
+        selector_col, action_col = st.columns([4, 1])
+        with selector_col:
             search_choice = st.selectbox(
                 "Buscar empresa",
                 [labels[ticker] for ticker in suggestion_tickers],
@@ -4972,27 +4994,25 @@ def render_analysis_company_picker(
                 placeholder="Escribe un nombre o ticker…",
                 accept_new_options=True,
                 filter_mode="fuzzy",
-                key="analysis_smart_search",
+                key=picker_key,
                 help=(
-                    "Las coincidencias conocidas aparecen mientras escribes. Si no existe, "
-                    "puedes buscarla en los mercados disponibles."
+                    "Si la empresa no está en tu historial, buscaremos su cotización "
+                    "correcta en los mercados disponibles."
                 ),
             )
-            known_ticker = label_to_ticker.get(str(search_choice or ""))
-            if known_ticker is None and search_choice:
-                known_ticker = ticker_lookup.get(str(search_choice).strip().casefold())
+        known_ticker = label_to_ticker.get(str(search_choice or ""))
+        if known_ticker is None and search_choice:
+            known_ticker = ticker_lookup.get(str(search_choice).strip().casefold())
+        with action_col:
+            st.markdown("<div style='height: 1.75rem'></div>", unsafe_allow_html=True)
             search_action = st.button(
-                "Abrir análisis" if known_ticker else "Buscar en mercados",
+                "Abrir" if known_ticker else "Buscar",
                 icon=":material/search:",
                 type="primary",
                 width="stretch",
                 disabled=not search_choice,
-                key="analysis_smart_search_action",
+                key=f"analysis_company_action_{revision}",
             )
-
-        if open_favorite and favorite_choice:
-            _open_ticker_analysis(str(favorite_choice))
-            st.rerun()
 
         if search_action and search_choice:
             if known_ticker:
@@ -5038,7 +5058,6 @@ def render_analysis_company_picker(
                     key="analysis_picker_open_result",
                 ):
                     _open_ticker_analysis(selected_result.ticker)
-                    st.session_state.pop("analysis_picker_results", None)
                     st.rerun()
 
 
@@ -5051,7 +5070,7 @@ def render_home(
     fx_snapshot: FxSnapshot,
     private_favorites: pd.DataFrame,
     group_favorites: pd.DataFrame,
-    section: str = "Resumen",
+    section: str = "Hoy",
 ) -> None:
     latest_snapshot = pd.DataFrame()
     snapshot_summary = None
@@ -5090,8 +5109,8 @@ def render_home(
     else:
         render_page_intro(
             "INICIO",
-            "Resumen",
-            f"Hola, {user.display_name}. Lo esencial de tu inversión · {update_text}.",
+            "Hoy",
+            f"Hola, {user.display_name}. Tu situación y lo que merece atención · {update_text}.",
         )
 
     try:
@@ -5102,7 +5121,7 @@ def render_home(
         private_kpis = None
         group_kpis = None
 
-    if section == "Resumen" and (
+    if section in {"Resumen", "Hoy"} and (
         snapshot_summary is not None or private_kpis is not None
     ):
         if snapshot_summary is not None:
@@ -5249,7 +5268,7 @@ def render_home(
             "desde «Carteras» o reconstruir las posiciones con operaciones."
         )
 
-    if section == "Resumen":
+    if section in {"Resumen", "Hoy"}:
         action_a, action_b, action_c = st.columns(3)
         action_a.button(
             "Analizar empresas",
@@ -5270,10 +5289,6 @@ def render_home(
             on_click=_set_navigation,
             args=("Carteras", "portfolio_navigation", "Privada"),
         )
-        return
-
-    if section != "Alertas":
-        return
 
     risk_alerts = [
         row
@@ -5288,9 +5303,8 @@ def render_home(
     st.markdown("### Atención hoy")
     if not summary:
         st.info(
-            "Abre «Analizar», elige tus empresas y pulsa «Actualizar análisis». "
-            "También puedes usar el buscador superior; las posiciones abiertas se "
-            "añadirán automáticamente."
+            "Abre «Analizar → Radar» y actualiza las empresas que sigues. Las posiciones "
+            "abiertas se añadirán automáticamente."
         )
     elif not risk_alerts and not entry_alerts:
         st.success(
@@ -5329,12 +5343,13 @@ def render_opportunities_page(
     price_verifications: dict[str, PriceVerification],
     journal: object,
     favorite_tickers: list[str],
+    include_company_detail: bool = True,
 ) -> None:
     render_page_intro(
-        "ANÁLISIS PRINCIPAL",
-        "Oportunidades",
-        "Primero ves una lectura sencilla. El detalle técnico, los riesgos y la tabla "
-        "completa siguen disponibles cuando quieras profundizar.",
+        "RADAR",
+        "Qué merece atención",
+        "Ordena tus favoritas para decidir cuáles revisar primero. Una nota alta abre "
+        "una investigación; no es una orden de compra.",
     )
     try:
         saved_snapshots = journal.list_analysis_snapshots()
@@ -5348,8 +5363,8 @@ def render_opportunities_page(
     )
     if not catalog_summary:
         st.info(
-            "Todavía no tienes empresas en el radar. Guarda una favorita o utiliza "
-            "el buscador de esta sección para abrir la primera."
+            "Todavía no tienes empresas en el radar. Guarda una favorita o abre "
+            "«Empresa» para buscar y analizar la primera."
         )
         return
 
@@ -5452,6 +5467,8 @@ def render_opportunities_page(
             },
         )
 
+    if not include_company_detail:
+        return
     if not raw_data:
         st.info(
             "Tus favoritas ya están en el radar. Pulsa «Actualizar cartera y análisis» "
@@ -5472,6 +5489,53 @@ def render_opportunities_page(
         list(prepared),
         key="analysis_ticker",
     )
+    recent = st.session_state.get("recent_analysis_tickers", [])
+    st.session_state["recent_analysis_tickers"] = merge_analysis_ticker_sources(
+        [selected],
+        recent if isinstance(recent, list) else [],
+    )[:20]
+    render_analysis(
+        selected,
+        prepared[selected],
+        strategy,
+        backtest,
+        fundamental_results[selected],
+        valuation_results[selected],
+        relative_results[selected],
+        risk_results[selected],
+        opportunity_results[selected],
+        raw_fundamentals.get(selected, {}),
+        price_verifications.get(selected),
+        journal,
+    )
+
+
+def render_company_analysis_page(
+    prepared: dict[str, pd.DataFrame],
+    strategy: StrategyConfig,
+    backtest: BacktestConfig,
+    fundamental_results: dict[str, FundamentalResult],
+    valuation_results: dict[str, ValuationResult],
+    relative_results: dict[str, RelativeStrengthResult],
+    risk_results: dict[str, RiskResult],
+    opportunity_results: dict[str, OpportunityResult],
+    raw_fundamentals: dict[str, dict[str, object]],
+    price_verifications: dict[str, PriceVerification],
+    journal: object,
+) -> None:
+    """Muestra sólo la empresa activa; el radar no repite este detalle."""
+
+    selected_value = str(st.session_state.get("analysis_ticker", "") or "").strip()
+    if not selected_value:
+        st.info("Elige una empresa arriba para ver su lectura completa.")
+        return
+    selected = resolve_analysis_ticker(selected_value)
+    if selected not in prepared:
+        st.info(
+            f"{selected} está seleccionada, pero todavía no tiene datos suficientes. "
+            "Vuelve al Radar, abre «Actualizar datos» y prueba de nuevo."
+        )
+        return
     recent = st.session_state.get("recent_analysis_tickers", [])
     st.session_state["recent_analysis_tickers"] = merge_analysis_ticker_sources(
         [selected],
@@ -6154,8 +6218,8 @@ def render_growth_momentum_page(
         icon=":material/monitoring:",
         width="stretch",
         key="growth_open_capital_projection",
-        on_click=_set_navigation,
-        args=("Analizar", "analysis_navigation", "Proyección de capital"),
+        on_click=_set_analysis_tool,
+        args=("Plan de capital",),
     )
 
     radar_prepared = prepared
@@ -6650,8 +6714,8 @@ def render_sector_comparison(
     )
     if len(prepared) < 2:
         st.info(
-            "En «Analizar», selecciona al menos dos favoritas en el panel y pulsa "
-            "«Actualizar análisis» para utilizar el comparador."
+            "En «Analizar», selecciona al menos dos favoritas en «Actualizar datos» "
+            "para utilizar el comparador."
         )
         return
 
@@ -7258,19 +7322,106 @@ def main() -> None:
     requested_analysis_navigation = st.session_state.pop(
         "_requested_analysis_navigation", None
     )
-    if requested_analysis_navigation in ANALYSIS_OPTIONS:
-        st.session_state["analysis_navigation"] = requested_analysis_navigation
     if st.session_state.get("main_navigation") not in MAIN_OPTIONS:
         st.session_state["main_navigation"] = "Inicio"
-    if st.session_state.get("home_navigation") not in HOME_OPTIONS:
-        st.session_state["home_navigation"] = "Resumen"
-    if st.session_state.get("analysis_navigation") not in ANALYSIS_OPTIONS:
-        st.session_state["analysis_navigation"] = "Oportunidades"
-    current_section = str(st.session_state["main_navigation"])
-    current_analysis_section = str(
-        st.session_state.get("analysis_navigation", "Oportunidades")
+    requested_route = requested_analysis_navigation or st.session_state.get(
+        "analysis_navigation"
     )
-    apply_section_layout(current_section, current_analysis_section)
+    if requested_route in LEGACY_ANALYSIS_ROUTES:
+        parent, child_key, child_value = LEGACY_ANALYSIS_ROUTES[str(requested_route)]
+        st.session_state["analysis_navigation"] = parent
+        if child_key and child_value:
+            st.session_state[child_key] = child_value
+    elif requested_route in ANALYSIS_OPTIONS:
+        st.session_state["analysis_navigation"] = requested_route
+    else:
+        st.session_state["analysis_navigation"] = "Radar"
+    if st.session_state.get("analysis_strategy_navigation") not in STRATEGY_OPTIONS:
+        st.session_state["analysis_strategy_navigation"] = STRATEGY_OPTIONS[0]
+    if st.session_state.get("analysis_tool_navigation") not in ANALYSIS_TOOL_OPTIONS:
+        st.session_state["analysis_tool_navigation"] = ANALYSIS_TOOL_OPTIONS[0]
+
+    # La navegación se dibuja antes de cualquier descarga o cálculo. Así permanece
+    # estable y responde al instante incluso cuando actualizar el mercado tarda.
+    selected_section = st.segmented_control(
+        "Navegación principal",
+        MAIN_OPTIONS,
+        key="main_navigation",
+        required=True,
+        label_visibility="collapsed",
+        format_func=lambda value: {
+            "Inicio": "Inicio",
+            "Analizar": "Analizar",
+            "Favoritos": "Favoritos",
+            "Carteras": "Cartera",
+            "Más": "Más",
+        }[value],
+    )
+    analysis_section = ""
+    analysis_detail = ""
+    favorite_view = ""
+    portfolio_section = ""
+    more_section = ""
+    if selected_section == "Analizar":
+        analysis_section = render_subnavigation(
+            "Qué quieres hacer",
+            ANALYSIS_OPTIONS,
+            key="analysis_navigation",
+            format_func=lambda value: ANALYSIS_LABELS[value],
+            on_change=_reset_analysis_company_picker,
+        )
+        if analysis_section == "Estrategias":
+            analysis_detail = render_subnavigation(
+                "Estrategia",
+                STRATEGY_OPTIONS,
+                key="analysis_strategy_navigation",
+            )
+        elif analysis_section == "Más análisis":
+            analysis_detail = render_subnavigation(
+                "Herramienta",
+                ANALYSIS_TOOL_OPTIONS,
+                key="analysis_tool_navigation",
+            )
+    elif selected_section == "Favoritos":
+        favorite_options = ["Mis listas", "Añadir empresa"]
+        if st.session_state.pop("_return_to_favorite_lists", False):
+            st.session_state["favorite_view"] = "Mis listas"
+        if st.session_state.get("favorite_view") not in favorite_options:
+            st.session_state["favorite_view"] = "Mis listas"
+        favorite_view = render_subnavigation(
+            "Favoritos",
+            favorite_options,
+            key="favorite_view",
+        )
+    elif selected_section == "Carteras":
+        portfolio_options = ["Privada", "Grupo"]
+        if st.session_state.get("portfolio_navigation") not in portfolio_options:
+            st.session_state["portfolio_navigation"] = "Privada"
+        portfolio_section = render_subnavigation(
+            "Cartera",
+            portfolio_options,
+            key="portfolio_navigation",
+            format_func=lambda value: (
+                "Mi cartera" if value == "Privada" else "Cartera del grupo"
+            ),
+        )
+    elif selected_section == "Más":
+        more_options = ["Alertas por correo"]
+        if authenticated_user.is_admin:
+            more_options.append("Administración")
+        more_options.append("Guía y riesgos")
+        if st.session_state.get("more_navigation") not in more_options:
+            st.session_state["more_navigation"] = "Guía y riesgos"
+        more_section = render_subnavigation(
+            "Más secciones",
+            more_options,
+            key="more_navigation",
+        )
+
+    layout_analysis_section = (
+        analysis_detail if analysis_section == "Más análisis" else analysis_section
+    )
+    apply_section_layout(str(selected_section), layout_analysis_section)
     favorite_storage_error = ""
     try:
         private_favorites = journal.list_favorites()
@@ -7428,32 +7579,7 @@ def main() -> None:
         # conserva la favorita y el aviso de descarga explica cómo corregirla.
         st.session_state.pop("_requested_analysis_ticker", None)
 
-    selected_section = st.segmented_control(
-        "Navegación principal",
-        MAIN_OPTIONS,
-        key="main_navigation",
-        required=True,
-        label_visibility="collapsed",
-        format_func=lambda value: {
-            "Inicio": "⌂ Inicio",
-            "Analizar": "⌁ Analizar",
-            "Favoritos": "☆ Favoritos",
-            "Carteras": "▣ Carteras",
-            "Más": "••• Más",
-        }[value],
-    )
-
     if selected_section == "Inicio":
-        home_section = render_subnavigation(
-            "Inicio",
-            HOME_OPTIONS,
-            key="home_navigation",
-            format_func=lambda value: {
-                "Resumen": "Resumen",
-                "Mi cartera": "Mi cartera",
-                "Alertas": "Alertas",
-            }[value],
-        )
         render_home(
             authenticated_user,
             journal,
@@ -7463,24 +7589,11 @@ def main() -> None:
             fx_snapshot,
             private_favorites,
             group_favorites,
-            section=home_section,
+            section="Hoy",
         )
 
     elif selected_section == "Analizar":
-        analysis_section = render_subnavigation(
-            "Tipo de análisis",
-            ANALYSIS_OPTIONS,
-            key="analysis_navigation",
-            format_func=lambda value: ANALYSIS_LABELS[value],
-        )
-        if analysis_section != "Proyección de capital":
-            render_analysis_company_picker(
-                favorite_tickers,
-                favorite_labels,
-                journal,
-                raw_fundamentals,
-            )
-        if analysis_section == "Oportunidades":
+        if analysis_section == "Radar":
             render_opportunities_page(
                 raw_data,
                 prepared,
@@ -7496,8 +7609,35 @@ def main() -> None:
                 price_verifications,
                 journal,
                 favorite_tickers,
+                include_company_detail=False,
             )
-        elif analysis_section == "Crecimiento y momentum":
+        elif analysis_section == "Empresa":
+            render_page_intro(
+                "ANÁLISIS DE EMPRESA",
+                "Entender una empresa",
+                "Busca una sola vez y revisa qué apoya la inversión, qué puede fallar "
+                "y si el precio ofrece una entrada razonable.",
+            )
+            render_analysis_company_picker(
+                favorite_tickers,
+                favorite_labels,
+                journal,
+                raw_fundamentals,
+            )
+            render_company_analysis_page(
+                prepared,
+                strategy,
+                backtest,
+                fundamental_results,
+                valuation_results,
+                relative_results,
+                risk_results,
+                opportunity_results,
+                raw_fundamentals,
+                price_verifications,
+                journal,
+            )
+        elif analysis_section == "Estrategias" and analysis_detail == "Crecimiento":
             render_growth_momentum_page(
                 prepared,
                 raw_fundamentals,
@@ -7510,16 +7650,23 @@ def main() -> None:
                 group_favorites,
                 authenticated_user.username,
             )
-        elif analysis_section == "Proyección de capital":
-            render_capital_projection_page(authenticated_user.username)
-        elif analysis_section == "Objetivo 30+ días":
+        elif (
+            analysis_section == "Estrategias"
+            and analysis_detail == "Resultado tras 30+ días"
+        ):
             render_long_horizon_calibration(
                 prepared,
                 summary,
                 backtest,
                 fundamental_results,
             )
-        elif analysis_section == "Comparador sectorial":
+        elif analysis_detail == "Comparar empresas":
+            render_page_intro(
+                "MÁS ANÁLISIS",
+                "Comparar empresas",
+                "Compara negocios semejantes; el precio nominal de una acción no indica "
+                "si está más barata o es mejor que otra.",
+            )
             render_sector_comparison(
                 prepared,
                 fundamental_results,
@@ -7528,11 +7675,25 @@ def main() -> None:
                 private_favorites,
                 group_favorites,
             )
-        elif analysis_section == "Historial guardado":
+        elif analysis_detail == "Historial":
+            render_page_intro(
+                "MÁS ANÁLISIS",
+                "Historial",
+                "Consulta cómo cambiaron el precio y las notas entre revisiones; no es "
+                "un registro de compras y ventas.",
+            )
             render_saved_analysis_history(journal)
-        elif not prepared:
+        elif analysis_detail == "Plan de capital":
+            render_capital_projection_page(authenticated_user.username)
+        elif analysis_detail == "Prueba con el pasado" and not prepared:
             st.info("Actualiza empresas antes de ejecutar una prueba histórica.")
-        else:
+        elif analysis_detail == "Prueba con el pasado":
+            render_page_intro(
+                "MÁS ANÁLISIS",
+                "Prueba con el pasado",
+                "Simula las reglas sobre datos históricos. Sirve para detectar una "
+                "estrategia frágil; no predice la próxima subida.",
+            )
             preferred_backtest = str(
                 st.session_state.get("analysis_ticker", "") or ""
             )
@@ -7559,16 +7720,6 @@ def main() -> None:
             )
 
     elif selected_section == "Favoritos":
-        favorite_options = ["Mis listas", "Añadir empresa"]
-        if st.session_state.pop("_return_to_favorite_lists", False):
-            st.session_state["favorite_view"] = "Mis listas"
-        if st.session_state.get("favorite_view") not in favorite_options:
-            st.session_state["favorite_view"] = "Mis listas"
-        favorite_view = render_subnavigation(
-            "Favoritos",
-            favorite_options,
-            key="favorite_view",
-        )
         if not persistent_journal_enabled():
             st.warning(
                 "Los favoritos necesitan almacenamiento persistente. En local se "
@@ -7592,17 +7743,6 @@ def main() -> None:
             )
 
     elif selected_section == "Carteras":
-        portfolio_options = ["Privada", "Grupo"]
-        if st.session_state.get("portfolio_navigation") not in portfolio_options:
-            st.session_state["portfolio_navigation"] = "Privada"
-        portfolio_section = render_subnavigation(
-            "Cartera",
-            portfolio_options,
-            key="portfolio_navigation",
-            format_func=lambda value: (
-                "Mi cartera privada" if value == "Privada" else "Cartera del grupo"
-            ),
-        )
         if not persistent_journal_enabled():
             st.warning("Las carteras necesitan almacenamiento persistente.")
         else:
@@ -7638,17 +7778,6 @@ def main() -> None:
                 st.info("Comprueba la conexión con Supabase y vuelve a intentarlo.")
 
     elif selected_section == "Más":
-        more_options = ["Alertas por correo"]
-        if authenticated_user.is_admin:
-            more_options.append("Administración")
-        more_options.append("Guía y riesgos")
-        if st.session_state.get("more_navigation") not in more_options:
-            st.session_state["more_navigation"] = "Guía y riesgos"
-        more_section = render_subnavigation(
-            "Más secciones",
-            more_options,
-            key="more_navigation",
-        )
         if more_section == "Alertas por correo":
             if persistent_journal_enabled():
                 render_email_alert_settings(journal)
