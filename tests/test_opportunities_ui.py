@@ -41,7 +41,7 @@ class Journal:
         return pd.DataFrame()
 
 st.session_state.setdefault("main_navigation", "Analizar")
-st.session_state.setdefault("analysis_navigation", "Oportunidades")
+st.session_state.setdefault("analysis_navigation", "Empresa")
 st.segmented_control(
     "Navegación principal",
     ["Inicio", "Analizar"],
@@ -50,7 +50,7 @@ st.segmented_control(
 )
 st.segmented_control(
     "Tipo de análisis",
-    ["Oportunidades", "Historial"],
+    ["Radar", "Empresa"],
     key="analysis_navigation",
     required=True,
 )
@@ -62,15 +62,15 @@ render_analysis_company_picker(
 )
 '''
     app = AppTest.from_string(script, default_timeout=15).run()
-    app.selectbox[0].set_value("MA").run()
-    next(button for button in app.button if button.label == "Analizar favorita").click().run()
+    app.selectbox[0].set_value("Mastercard (MA)").run()
+    next(button for button in app.button if button.label == "Abrir").click().run()
 
     state = app.session_state.filtered_state
     assert not app.exception
     assert state.get("analysis_ticker") is None
     assert state["main_navigation"] == "Analizar"
-    assert state["analysis_navigation"] == "Oportunidades"
+    assert state["analysis_navigation"] == "Empresa"
     assert state["_requested_main_navigation"] == "Analizar"
-    assert state["_requested_analysis_navigation"] == "Oportunidades"
+    assert state["_requested_analysis_navigation"] == "Empresa"
     assert state["_requested_analysis_ticker"] == "MA"
     assert state["_pending_analysis_ticker"] == "MA"
