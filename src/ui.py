@@ -342,12 +342,19 @@ button[data-baseweb="tab"] {
     background: rgba(8, 127, 91, 0.08);
 }
 
-.ssl-page-intro span {
+.ssl-page-intro > span:first-child {
     display: block;
     color: var(--ssl-primary);
     font-size: 0.72rem;
     font-weight: 820;
     letter-spacing: 0.09em;
+}
+
+.ssl-page-intro h2 span {
+    color: inherit;
+    font-size: inherit;
+    font-weight: inherit;
+    letter-spacing: inherit;
 }
 
 .ssl-page-intro h2 {
@@ -468,12 +475,20 @@ button[data-baseweb="tab"] {
 [class*="st-key-section_subnavigation"] {
     min-height: 3.55rem;
     margin: 0.55rem 0 0.35rem;
-    display: flex;
-    align-items: flex-start;
 }
 
 [class*="st-key-section_subnavigation"] [data-testid="stSegmentedControl"] {
     width: 100%;
+}
+
+/* Streamlit conserva brevemente la versión anterior de un elemento durante un
+   rerun. No debemos convertirla de nuevo en un bloque visible: eso producía
+   varias barras de navegación fantasma mientras se descargaban los precios. */
+[data-stale="true"] [class*="st-key-section_subnavigation"],
+[class*="st-key-section_subnavigation"][data-stale="true"] {
+    display: none !important;
+    min-height: 0 !important;
+    margin: 0 !important;
 }
 
 .ssl-login-brand {
@@ -548,11 +563,19 @@ div[data-testid="stForm"]:has(input[autocomplete="username"]) {
     .ssl-score-row {
         gap: 0.35rem;
     }
-    [data-testid="stSegmentedControl"] {
+    [data-testid="stSegmentedControl"],
+    [data-testid="stButtonGroup"] {
         overflow-x: auto;
+        scrollbar-width: thin;
     }
-    [data-testid="stSegmentedControl"] > div {
+    [data-testid="stSegmentedControl"] > div,
+    [data-testid="stButtonGroup"] [role="radiogroup"] {
         min-width: max-content;
+        flex-wrap: nowrap !important;
+    }
+    [data-testid="stButtonGroup"] button {
+        flex: 0 0 auto;
+        white-space: nowrap;
     }
     div[data-testid="stMetric"] {
         min-height: auto;
