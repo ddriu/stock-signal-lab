@@ -79,6 +79,8 @@ from src.growth_momentum import (
     GrowthMomentumResult,
     calculate_growth_position_plan,
     evaluate_growth_momentum,
+    growth_fundamental_status,
+    next_growth_analysis_batch,
     quote_price_to_eur,
 )
 from src.email_sender import (
@@ -86,6 +88,14 @@ from src.email_sender import (
     EmailDeliveryError,
     load_email_config,
     send_test_email,
+)
+from src.entry_opportunity import (
+    EntryOpportunityResult,
+    STATUS_BUYABLE,
+    STATUS_EVENT,
+    evaluate_entry_opportunity,
+    non_linking_ticker_text,
+    sector_concentrations,
 )
 from src.favorite_tags import (
     FAVORITE_TAGS,
@@ -197,9 +207,10 @@ st.set_page_config(
 )
 
 MAIN_OPTIONS = ["Inicio", "Analizar", "Favoritos", "Carteras", "Más"]
-ANALYSIS_OPTIONS = ["Radar", "Empresa", "Estrategias", "Más análisis"]
+ANALYSIS_OPTIONS = ["Radar", "Oportunidades", "Empresa", "Estrategias", "Más análisis"]
 ANALYSIS_LABELS = {
     "Radar": "◎ Radar",
+    "Oportunidades": "🎯 Oportunidades",
     "Empresa": "↗ Empresa",
     "Estrategias": "◱ Estrategias",
     "Más análisis": "··· Más",
@@ -212,7 +223,6 @@ ANALYSIS_TOOL_OPTIONS = [
     "Plan de capital",
 ]
 LEGACY_ANALYSIS_ROUTES = {
-    "Oportunidades": ("Radar", None, None),
     "Crecimiento y momentum": ("Estrategias", "analysis_strategy_navigation", "Crecimiento"),
     "Objetivo 30+ días": (
         "Estrategias",
@@ -238,6 +248,7 @@ LEGACY_ANALYSIS_ROUTES = {
 }
 SIDEBAR_ANALYSIS_SECTIONS = {
     "Radar",
+    "Oportunidades",
     "Estrategias",
     "Comparar empresas",
     "Prueba con el pasado",
@@ -258,8 +269,11 @@ def cached_download(ticker: str, start: date, end: date, auto_adjust: bool) -> p
 
 
 @st.cache_data(ttl=21_600, max_entries=300, show_spinner=False)
-def cached_fundamentals(ticker: str) -> dict[str, object]:
-    """Caché más largo para datos empresariales, que cambian menos que el precio."""
+def cached_fundamentals(
+    ticker: str,
+    refresh_token: str = "",
+) -> dict[str, object]:
+    """Caché de fundamentales con una clave opcional para reintentos manuales."""
 
     return download_fundamental_snapshot(ticker)
 
@@ -807,6 +821,7 @@ def load_market_data(
     *,
     fundamental_tickers: set[str] | None = None,
     merge_existing: bool = False,
+    refresh_fundamentals: bool = False,
 ) -> None:
     if not tickers:
         st.sidebar.error("Elige al menos una favorita o registra una posición.")
@@ -838,6 +853,9 @@ def load_market_data(
         else {}
     )
     errors: list[str] = []
+    refresh_token = (
+        str(pd.Timestamp.utcnow().value) if refresh_fundamentals else ""
+    )
     progress = st.progress(0, text="Descargando precios…")
     for position, ticker in enumerate(tickers, start=1):
         ticker_start = (
@@ -856,7 +874,7 @@ def load_market_data(
             errors.append(str(exc))
         if ticker in deep_tickers:
             try:
-                fundamentals[ticker] = cached_fundamentals(ticker)
+                fundamentals[ticker] = cached_fundamentals(ticker, refresh_token)
             except (DataDownloadError, ValueError) as exc:
                 fundamentals[ticker] = {
                     "symbol": ticker,
@@ -924,6 +942,17 @@ def load_market_data(
     quick_mode_tickers.difference_update(deep_tickers)
     st.session_state["quick_mode_tickers"] = sorted(quick_mode_tickers)
     st.session_state["download_errors"] = errors
+    refreshed_statuses = {
+        ticker: growth_fundamental_status(fundamentals.get(ticker))
+        for ticker in deep_tickers
+    }
+    st.session_state["_last_fundamental_refresh"] = {
+        "requested": len(deep_tickers),
+        "complete": sum(status == "complete" for status in refreshed_statuses.values()),
+        "partial": sum(status == "partial" for status in refreshed_statuses.values()),
+        "error": sum(status == "error" for status in refreshed_statuses.values()),
+        "tickers": sorted(deep_tickers),
+    }
     # Los resultados dependen del histórico y de toda la configuración. Se
     # descartan sólo cuando se actualizan precios; cambiar de pestaña no obliga
     # a repetir la simulación.
@@ -5899,6 +5928,537 @@ def render_opportunities_page(
     )
 
 
+def _entry_opportunity_company_name(
+    ticker: str,
+    raw_fundamentals: dict[str, dict[str, object]],
+    favorite_labels: dict[str, str],
+) -> str:
+    info = raw_fundamentals.get(ticker, {})
+    name = str(info.get("longName") or info.get("shortName") or "").strip()
+    if name:
+        return name
+    label = str(favorite_labels.get(ticker, "") or "").strip()
+    marker = f" ({ticker})"
+    if marker in label:
+        candidate = label.split(marker, 1)[0].strip()
+        if candidate:
+            return candidate
+    return ticker
+
+
+def _build_entry_opportunities(
+    prepared: dict[str, pd.DataFrame],
+    fundamental_results: dict[str, FundamentalResult],
+    valuation_results: dict[str, ValuationResult],
+    relative_results: dict[str, RelativeStrengthResult],
+    risk_results: dict[str, RiskResult],
+    raw_fundamentals: dict[str, dict[str, object]],
+    favorite_labels: dict[str, str],
+    strategy: StrategyConfig,
+) -> tuple[list[EntryOpportunityResult], list[str]]:
+    results: list[EntryOpportunityResult] = []
+    errors: list[str] = []
+    for ticker, frame in prepared.items():
+        try:
+            signal = evaluate_latest_signal(frame, strategy, ticker=ticker)
+            fundamentals = fundamental_results[ticker]
+            valuation = valuation_results[ticker]
+            relative = relative_results[ticker]
+            risk = risk_results[ticker]
+            info = raw_fundamentals.get(ticker, {})
+            results.append(
+                evaluate_entry_opportunity(
+                    ticker=ticker,
+                    company_name=_entry_opportunity_company_name(
+                        ticker,
+                        raw_fundamentals,
+                        favorite_labels,
+                    ),
+                    frame=frame,
+                    signal=signal,
+                    fundamental_score=fundamentals.score,
+                    fundamental_coverage=fundamentals.coverage_pct,
+                    valuation_score=valuation.score,
+                    valuation_coverage=valuation.coverage_pct,
+                    relative_score=relative.score,
+                    relative_coverage=relative.coverage_pct,
+                    risk_score=risk.score,
+                    risk_coverage=risk.coverage_pct,
+                    info=info,
+                    sector=str(
+                        info.get("industry")
+                        or fundamentals.sector
+                        or info.get("sector")
+                        or ""
+                    ),
+                    market=fundamentals.country or str(info.get("country") or ""),
+                )
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(f"{ticker}: {exc}")
+    return results, errors
+
+
+def _opportunity_sort_value(
+    result: EntryOpportunityResult,
+    order: str,
+) -> float:
+    if order == "Score técnico":
+        return float(result.technical_score)
+    if order == "Timing":
+        return float(result.timing.score)
+    if order == "Beneficio/riesgo":
+        return float(result.zones.risk_reward or -1)
+    if order == "Momentum 20 sesiones":
+        return float(result.timing.return_20d_pct or -999)
+    if order == "Volumen":
+        return float(result.timing.volume_ratio or -1)
+    return float(result.opportunity_score)
+
+
+def _render_entry_opportunity_card(
+    result: EntryOpportunityResult,
+    *,
+    rank: int,
+) -> None:
+    safe_key = result.ticker.replace(".", "_").replace("^", "_")
+    with st.container(border=True):
+        st.caption(f"#{rank} · {result.status_label}")
+        st.markdown(
+            f"### {non_linking_ticker_text(result.ticker)} · "
+            f"{result.opportunity_score}/100"
+        )
+        if result.company_name != result.ticker:
+            st.caption(result.company_name)
+        st.write(f"Entrada preferida: **{result.zones.preferred_entry.label}**")
+        st.caption(
+            f"Técnico {result.technical_score} · Timing {result.timing.score} · "
+            f"Cobertura {result.confidence_pct}%"
+        )
+        st.button(
+            f"Abrir {non_linking_ticker_text(result.ticker)}",
+            key=f"entry_opportunity_card_{rank}_{safe_key}",
+            width="stretch",
+            on_click=_open_ticker_analysis,
+            args=(result.ticker,),
+        )
+
+
+def _render_entry_opportunity_detail(
+    result: EntryOpportunityResult,
+    journal: object,
+) -> None:
+    timing = result.timing
+    zones = result.zones
+    safe_key = result.ticker.replace(".", "_").replace("^", "_")
+    with st.expander(
+        f"{non_linking_ticker_text(result.ticker)} · {result.company_name} · "
+        f"{result.status_label}"
+    ):
+        st.write(result.explanation)
+        score_a, score_b, score_c, score_d = st.columns(4)
+        score_a.metric(
+            "Score técnico",
+            f"{result.technical_score}/100",
+            result.technical_label,
+            delta_color="off",
+        )
+        score_b.metric(
+            "Timing actual",
+            "BLOQUEADO" if result.event.blocked else f"{timing.score}/100",
+        )
+        score_c.metric(
+            "Empresa",
+            f"{result.fundamental_score}/100"
+            if result.fundamental_score is not None
+            else "N/D",
+        )
+        score_d.metric("Oportunidad", f"{result.opportunity_score}/100")
+
+        st.markdown("#### Precio y riesgo")
+        price_a, price_b, price_c, price_d = st.columns(4)
+        price_a.metric("Precio actual", f"{result.price:.2f}")
+        price_b.metric("Entrada preferida", zones.preferred_entry.label)
+        price_c.metric("Invalidación técnica", f"{zones.invalidation:.2f}")
+        price_d.metric(
+            "Beneficio / riesgo",
+            f"{zones.risk_reward:.2f}"
+            if zones.risk_reward is not None
+            else "N/D",
+        )
+        st.caption(
+            f"Agresiva {zones.aggressive_entry.label} · Excelente "
+            f"{zones.excellent_entry.label} · Riesgo hasta invalidación "
+            f"{zones.risk_to_stop_pct:.1f}%"
+            if zones.risk_to_stop_pct is not None
+            else (
+                f"Agresiva {zones.aggressive_entry.label} · Excelente "
+                f"{zones.excellent_entry.label} · Riesgo N/D"
+            )
+        )
+        st.caption(
+            f"Zonas construidas con {zones.basis}. Son referencias, no precios de "
+            "ejecución garantizados."
+        )
+        st.caption(
+            f"Ruptura: {zones.breakout:.2f}"
+            if zones.breakout is not None
+            else "Ruptura: N/D"
+        )
+        if zones.target is not None:
+            st.caption(
+                f"Objetivo técnico para calcular B/R: {zones.target:.2f}. No es una "
+                "previsión de precio ni una garantía de salida."
+            )
+
+        st.markdown("#### Indicadores utilizados")
+        indicator_rows = pd.DataFrame(
+            [
+                {
+                    "RSI": timing.rsi,
+                    "MACD": timing.macd,
+                    "Señal MACD": timing.macd_signal,
+                    "SMA20": timing.sma20,
+                    "SMA50": timing.sma50,
+                    "SMA200": timing.sma200,
+                    "Ruptura": timing.breakout_price,
+                    "ATR %": timing.atr_pct,
+                    "Volumen": timing.volume_ratio,
+                    "1 sesión %": timing.return_1d_pct,
+                    "5 sesiones %": timing.return_5d_pct,
+                    "20 sesiones %": timing.return_20d_pct,
+                    "60 sesiones %": timing.return_60d_pct,
+                    "Desde señal %": timing.gap_from_signal_pct,
+                    "Gap apertura %": timing.gap_from_previous_close_pct,
+                    "Desde SMA20 %": timing.distance_sma20_pct,
+                    "Desde SMA50 %": timing.distance_sma50_pct,
+                    "Desde máximo 20d %": timing.distance_high_20d_pct,
+                    "Desde máximo 52s %": timing.distance_high_52w_pct,
+                }
+            ]
+        )
+        st.dataframe(
+            indicator_rows,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Volumen": st.column_config.NumberColumn(format="%.2fx"),
+                **{
+                    column: st.column_config.NumberColumn(format="%.2f")
+                    for column in [
+                        "MACD",
+                        "Señal MACD",
+                        "SMA20",
+                        "SMA50",
+                        "SMA200",
+                        "Ruptura",
+                    ]
+                },
+                **{
+                    column: st.column_config.NumberColumn(format="%+.1f%%")
+                    for column in indicator_rows.columns
+                    if column
+                    not in {
+                        "RSI",
+                        "Volumen",
+                        "MACD",
+                        "Señal MACD",
+                        "SMA20",
+                        "SMA50",
+                        "SMA200",
+                        "Ruptura",
+                    }
+                },
+                "RSI": st.column_config.NumberColumn(format="%.1f"),
+            },
+        )
+        factor_a, factor_b = st.columns(2)
+        with factor_a:
+            st.markdown("**A favor**")
+            if result.positive_factors:
+                for factor in result.positive_factors:
+                    st.markdown(f"- ✓ {friendly_factor(factor)}")
+            else:
+                st.caption("No hay fortalezas suficientes con los datos disponibles.")
+        with factor_b:
+            st.markdown("**En contra**")
+            if result.risk_factors:
+                for factor in result.risk_factors:
+                    st.markdown(f"- ⚠ {friendly_factor(factor)}")
+            else:
+                st.caption("No aparecen advertencias adicionales.")
+        st.caption(
+            f"Señal originada el {timing.signal_date.date()} a "
+            f"{timing.signal_price:.2f} · datos de precio {timing.as_of.date()} · "
+            f"{result.event.label}."
+        )
+        action_a, action_b = st.columns(2)
+        action_a.button(
+            "Abrir análisis completo",
+            type="primary",
+            width="stretch",
+            key=f"entry_opportunity_detail_{safe_key}",
+            on_click=_open_ticker_analysis,
+            args=(result.ticker,),
+        )
+        save_clicked = action_b.button(
+            "Guardar oportunidad",
+            width="stretch",
+            key=f"save_entry_opportunity_{safe_key}",
+            help=(
+                "Guarda precio, score técnico y score de oportunidad. El timing y la "
+                "zona quedan anotados para poder contrastarlos más adelante."
+            ),
+        )
+        if save_clicked:
+            try:
+                journal.add_analysis_snapshot(
+                    ticker=result.ticker,
+                    analyzed_at=timing.as_of,
+                    price=result.price,
+                    opportunity_score=result.opportunity_score,
+                    company_score=result.fundamental_score,
+                    entry_score=result.technical_score,
+                    valuation_score=None,
+                    relative_score=None,
+                    risk_score=None,
+                    opportunity_label=result.status_label,
+                    entry_label=result.technical_label,
+                    position_label=result.position_action,
+                    sector=result.sector,
+                    explanation=result.explanation,
+                    note=(
+                        f"Timing {timing.score}/100; señal {timing.signal_price:.2f}; "
+                        f"entrada preferida {zones.preferred_entry.label}; "
+                        f"invalidación {zones.invalidation:.2f}; {result.event.label}"
+                    ),
+                )
+            except (JournalStorageError, AttributeError, TypeError, ValueError) as exc:
+                st.error(f"No se pudo guardar la oportunidad: {exc}")
+            else:
+                st.success("Oportunidad guardada en el historial privado.")
+
+
+def render_entry_opportunities_page(
+    prepared: dict[str, pd.DataFrame],
+    strategy: StrategyConfig,
+    fundamental_results: dict[str, FundamentalResult],
+    valuation_results: dict[str, ValuationResult],
+    relative_results: dict[str, RelativeStrengthResult],
+    risk_results: dict[str, RiskResult],
+    raw_fundamentals: dict[str, dict[str, object]],
+    journal: object,
+    favorite_tickers: list[str],
+    favorite_labels: dict[str, str],
+) -> None:
+    """Nueva capa: distingue una buena señal de un buen precio de entrada."""
+
+    render_page_intro(
+        "🎯 OPORTUNIDADES",
+        "¿Sigue siendo buena entrada hoy?",
+        "Conserva el score técnico y añade timing, zona de entrada, evento próximo "
+        "y riesgo. Las notas ordenan revisiones; no son probabilidades de ganar.",
+    )
+    if not prepared:
+        st.info(
+            "Todavía no hay precios actualizados para esta lectura. Elige favoritas en "
+            "«Actualizar datos» y pulsa actualizar; el Radar actual permanece intacto."
+        )
+        return
+
+    results, errors = _build_entry_opportunities(
+        prepared,
+        fundamental_results,
+        valuation_results,
+        relative_results,
+        risk_results,
+        raw_fundamentals,
+        favorite_labels,
+        strategy,
+    )
+    if errors:
+        with st.expander(f"{len(errors)} empresas sin lectura completa"):
+            for error in errors:
+                st.caption(error)
+    if not results:
+        st.warning("No hay ninguna empresa con datos suficientes para calcular oportunidades.")
+        return
+
+    held_tickers = set(_portfolio_tracking_tickers(journal))
+    favorite_set = set(favorite_tickers)
+    concentrations = sector_concentrations(results, minimum_count=2)
+    if concentrations:
+        descriptions = [
+            f"{sector}: {', '.join(non_linking_ticker_text(ticker) for ticker in tickers)}"
+            for sector, tickers in sorted(concentrations.items())
+        ]
+        st.warning(
+            "**Concentración sectorial:** varias señales pueden representar la misma "
+            "apuesta económica. " + " · ".join(descriptions)
+        )
+
+    st.markdown("### Mejores oportunidades revisadas")
+    top = sorted(
+        (result for result in results if result.status_code != STATUS_EVENT),
+        key=lambda result: (
+            result.status_code == STATUS_BUYABLE,
+            result.opportunity_score,
+            result.timing.score,
+        ),
+        reverse=True,
+    )[:5]
+    if top:
+        top_columns = st.columns(min(len(top), 3))
+        for index, result in enumerate(top, start=1):
+            with top_columns[(index - 1) % len(top_columns)]:
+                _render_entry_opportunity_card(result, rank=index)
+
+    with st.expander("Filtrar y ordenar", expanded=False):
+        filter_a, filter_b, filter_c = st.columns(3)
+        minimum_score = filter_a.slider(
+            "Score oportunidad mínimo",
+            0,
+            100,
+            50,
+            key="entry_opportunity_minimum_score",
+        )
+        scope = filter_b.selectbox(
+            "Conjunto",
+            ["Todas las actualizadas", "Sólo favoritas", "Sólo cartera"],
+            key="entry_opportunity_scope",
+        )
+        order = filter_c.selectbox(
+            "Ordenar por",
+            [
+                "Score oportunidad",
+                "Score técnico",
+                "Timing",
+                "Beneficio/riesgo",
+                "Momentum 20 sesiones",
+                "Volumen",
+            ],
+            key="entry_opportunity_order",
+        )
+        sectors = sorted({result.sector for result in results})
+        markets = sorted({result.market for result in results})
+        sector_filter = filter_a.multiselect(
+            "Sector",
+            sectors,
+            key="entry_opportunity_sector",
+        )
+        market_filter = filter_b.multiselect(
+            "Mercado",
+            markets,
+            key="entry_opportunity_market",
+        )
+        minimum_rr = filter_c.slider(
+            "Beneficio/riesgo mínimo",
+            0.0,
+            5.0,
+            0.0,
+            0.25,
+            key="entry_opportunity_minimum_rr",
+        )
+        option_a, option_b = st.columns(2)
+        only_buyable = option_a.checkbox(
+            "Sólo comprables",
+            key="entry_opportunity_only_buyable",
+        )
+        exclude_events = option_b.checkbox(
+            "Ocultar resultados próximos",
+            key="entry_opportunity_exclude_events",
+        )
+
+    visible = []
+    for result in results:
+        if result.opportunity_score < minimum_score:
+            continue
+        if scope == "Sólo favoritas" and result.ticker not in favorite_set:
+            continue
+        if scope == "Sólo cartera" and result.ticker not in held_tickers:
+            continue
+        if sector_filter and result.sector not in sector_filter:
+            continue
+        if market_filter and result.market not in market_filter:
+            continue
+        if only_buyable and result.status_code != STATUS_BUYABLE:
+            continue
+        if exclude_events and result.event.days_until is not None and result.event.days_until <= 3:
+            continue
+        if minimum_rr and (result.zones.risk_reward or 0) < minimum_rr:
+            continue
+        visible.append(result)
+    visible.sort(key=lambda result: _opportunity_sort_value(result, order), reverse=True)
+
+    st.markdown("### Tabla de decisión")
+    st.caption(
+        f"{len(visible)} de {len(results)} empresas. Selecciona una fila para abrirla; "
+        "selecciona varias para compararlas."
+    )
+    rows = []
+    for result in visible:
+        rows.append(
+            {
+                "Ticker": result.ticker,
+                "Empresa": result.company_name,
+                "Precio": result.price,
+                "Score técnico": result.technical_score,
+                "Timing": result.timing.score,
+                "Empresa /100": result.fundamental_score,
+                "Oportunidad": result.opportunity_score,
+                "Cobertura": result.confidence_pct,
+                "Evento próximo": result.event.label,
+                "Gap señal": result.timing.gap_from_signal_pct,
+                "Zona entrada": result.zones.preferred_entry.label,
+                "B/R": result.zones.risk_reward,
+                "Estado": result.status_label,
+                "Si la tienes": (
+                    result.position_action if result.ticker in held_tickers else "—"
+                ),
+                "Actualizado": result.timing.as_of.date(),
+            }
+        )
+    table = pd.DataFrame(rows)
+    if not table.empty:
+        render_ticker_dataframe(
+            table,
+            key="entry_opportunities_table",
+            height=min(720, 42 + 35 * len(table)),
+            column_config={
+                "Precio": st.column_config.NumberColumn(format="%.2f"),
+                "Gap señal": st.column_config.NumberColumn(format="%+.1f%%"),
+                "B/R": st.column_config.NumberColumn(format="%.2f"),
+                "Cobertura": st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d%%"
+                ),
+                **{
+                    column: st.column_config.ProgressColumn(
+                        min_value=0,
+                        max_value=100,
+                        format="%d",
+                    )
+                    for column in [
+                        "Score técnico",
+                        "Timing",
+                        "Empresa /100",
+                        "Oportunidad",
+                    ]
+                },
+            },
+        )
+    else:
+        st.info("Ninguna empresa cumple ahora los filtros elegidos.")
+        return
+
+    st.markdown("### Por qué comprar o esperar")
+    st.caption(
+        "Abre una ficha para ver el fundamento del rango. Los detalles se limitan a "
+        "las primeras 25 filas para que la página siga siendo ágil en móvil."
+    )
+    for result in visible[:25]:
+        _render_entry_opportunity_detail(result, journal)
+
+
 def render_company_analysis_page(
     prepared: dict[str, pd.DataFrame],
     strategy: StrategyConfig,
@@ -6381,33 +6941,46 @@ def render_growth_momentum_page(
     complete_fundamentals = [
         ticker
         for ticker in loaded_favorites
-        if raw_fundamentals.get(ticker)
-        and not raw_fundamentals.get(ticker, {}).get("_quick_mode")
-        and not raw_fundamentals.get(ticker, {}).get("_fundamental_error")
+        if growth_fundamental_status(raw_fundamentals.get(ticker)) == "complete"
     ]
-    scan_cols = st.columns(3)
+    partial_fundamentals = [
+        ticker
+        for ticker in loaded_favorites
+        if growth_fundamental_status(raw_fundamentals.get(ticker))
+        in {"partial", "error"}
+    ]
+    scan_cols = st.columns(4)
     scan_cols[0].metric("Favoritas en la lista", len(favorite_universe))
     scan_cols[1].metric("Precio y momentum cargados", len(loaded_favorites))
     scan_cols[2].metric("Análisis empresarial completo", len(complete_fundamentals))
-    completed_scan = int(st.session_state.pop("_growth_scan_completed", 0) or 0)
+    scan_cols[3].metric("Datos parciales o con error", len(partial_fundamentals))
+    completed_scan = st.session_state.pop("_growth_scan_completed", {}) or {}
+    if isinstance(completed_scan, int):
+        completed_scan = {"requested": completed_scan, "complete": completed_scan}
     if completed_scan:
+        reviewed_count = int(completed_scan.get("requested", 0) or 0)
+        complete_count = int(completed_scan.get("complete", 0) or 0)
+        partial_count = int(completed_scan.get("partial", 0) or 0)
+        error_count = int(completed_scan.get("error", 0) or 0)
         st.success(
-            f"Se han actualizado {completed_scan} empresas. El radar conserva también "
-            "los bloques revisados anteriormente."
+            f"Bloque revisado: {reviewed_count} empresas; {complete_count} con datos "
+            f"empresariales suficientes, {partial_count} parciales y {error_count} con error. "
+            "El radar conserva los bloques anteriores."
         )
     if favorite_universe:
-        missing_favorites = [
-            ticker for ticker in favorite_universe if ticker not in prepared
-        ]
-        scan_batch = (
-            missing_favorites[:200]
-            if missing_favorites
-            else favorite_universe[:200]
+        scan_batch = next_growth_analysis_batch(
+            favorite_universe,
+            set(prepared),
+            raw_fundamentals,
+            limit=25,
         )
+        all_complete = not scan_batch
+        if all_complete:
+            scan_batch = favorite_universe[:25]
         scan_label = (
-            f"Revisar favoritas pendientes ({len(scan_batch)})"
-            if missing_favorites
-            else f"Actualizar radar de favoritas ({len(scan_batch)})"
+            f"Analizar las siguientes {len(scan_batch)} con datos completos"
+            if not all_complete
+            else f"Actualizar las primeras {len(scan_batch)} empresas"
         )
         if st.button(
             scan_label,
@@ -6418,10 +6991,16 @@ def render_growth_momentum_page(
         ):
             st.session_state["_growth_scan_tickers"] = scan_batch
             st.rerun()
-        if len(missing_favorites) > len(scan_batch):
+        remaining_count = sum(
+            ticker not in prepared
+            or growth_fundamental_status(raw_fundamentals.get(ticker)) != "complete"
+            for ticker in favorite_universe
+        )
+        if remaining_count > len(scan_batch):
             st.caption(
-                f"Quedarán {len(missing_favorites) - len(scan_batch)} empresas para el "
-                "siguiente bloque. Se divide la descarga para no bloquear el alojamiento gratuito."
+                f"Después quedarán {remaining_count - len(scan_batch)} empresas por completar. "
+                "Los bloques de 25 evitan que el alojamiento gratuito se bloquee y, ahora, "
+                "cada empresa contabilizada recibe precio y fundamentales."
             )
     else:
         st.warning(
@@ -6807,14 +7386,19 @@ def render_growth_momentum_page(
     quick_tickers = [
         ticker
         for ticker in ordered_tickers
-        if raw_fundamentals.get(ticker, {}).get("_quick_mode")
-        or raw_fundamentals.get(ticker, {}).get("_fundamental_error")
+        if growth_fundamental_status(raw_fundamentals.get(ticker)) != "complete"
     ]
     if quick_tickers:
-        deep_batch = quick_tickers[:25]
+        deep_batch = next_growth_analysis_batch(
+            quick_tickers,
+            set(prepared),
+            raw_fundamentals,
+            limit=25,
+        )
         st.info(
-            f"{len(quick_tickers)} empresas tienen ya precio y momentum, pero les falta "
-            "la revisión empresarial. Mientras tanto no se mostrarán como entradas completas."
+            f"{len(quick_tickers)} empresas tienen precio y momentum, pero aún no reúnen "
+            "al menos dos métricas empresariales útiles. Se mantienen visibles, pero no "
+            "se presentarán como entradas completas."
         )
         if st.button(
             f"Completar las siguientes {len(deep_batch)} empresas",
@@ -6879,6 +7463,64 @@ def render_growth_momentum_page(
         st.info(message)
     else:
         st.warning(message)
+
+    selected_info = raw_fundamentals.get(selected, {})
+    selected_data_status = growth_fundamental_status(selected_info)
+    with st.expander(
+        "Datos empresariales utilizados",
+        expanded=selected_data_status != "complete",
+    ):
+        metric_specs = (
+            ("Crecimiento de ingresos", "revenueGrowth", "percent"),
+            ("Crecimiento del beneficio", "earningsGrowth", "percent"),
+            ("Margen operativo", "operatingMargins", "percent"),
+            ("Rentabilidad sobre recursos propios", "returnOnEquity", "percent"),
+            ("Flujo de caja libre", "freeCashflow", "money"),
+        )
+        company_metric_rows: list[dict[str, str]] = []
+        for metric_label, metric_key, metric_kind in metric_specs:
+            raw_value = selected_info.get(metric_key)
+            try:
+                numeric_value = float(raw_value)
+            except (TypeError, ValueError):
+                numeric_value = float("nan")
+            if pd.isna(numeric_value):
+                display_value = "N/D"
+            elif metric_kind == "percent":
+                display_value = f"{numeric_value * 100:+.1f}%"
+            else:
+                display_value = f"{numeric_value:,.0f} {str(selected_info.get('currency') or '').strip()}".strip()
+            company_metric_rows.append(
+                {"Dato": metric_label, "Valor disponible": display_value}
+            )
+        st.dataframe(
+            pd.DataFrame(company_metric_rows),
+            hide_index=True,
+            width="stretch",
+        )
+        providers = [
+            str(provider)
+            for provider in selected_info.get("_providers", [])
+            if provider
+        ]
+        period_end = str(selected_info.get("_official_period_end") or "").strip()
+        source_text = ", ".join(providers) if providers else "fuente gratuita sin confirmar"
+        period_text = f" · cierre contable {period_end}" if period_end else ""
+        st.caption(f"Fuentes: {source_text}{period_text}.")
+        if selected_data_status != "complete":
+            st.warning(
+                "La fuente gratuita no ha entregado todavía al menos dos métricas "
+                "empresariales. El precio y el momentum sí se calculan, pero esta "
+                "empresa no puede convertirse en entrada fuerte con esos datos incompletos."
+            )
+            if st.button(
+                f"Reintentar sólo {selected}",
+                icon=":material/refresh:",
+                width="stretch",
+                key=f"growth_retry_selected_{selected}",
+            ):
+                st.session_state["_growth_scan_tickers"] = [selected]
+                st.rerun()
 
     factor_a, factor_b = st.columns(2)
     with factor_a:
@@ -7314,7 +7956,10 @@ def render_sector_comparison(
         )
 
 
-def render_saved_analysis_history(journal: object) -> None:
+def render_saved_analysis_history(
+    journal: object,
+    prepared: dict[str, pd.DataFrame] | None = None,
+) -> None:
     st.subheader("Historial de análisis guardados")
     st.write(
         "Comprueba cómo han cambiado el precio y las notas desde cada revisión. "
@@ -7349,6 +7994,39 @@ def render_saved_analysis_history(journal: object) -> None:
         selected["analyzed_at"], errors="coerce"
     )
     selected = selected.sort_values("analyzed_at")
+    selected["timing_score"] = pd.to_numeric(
+        selected["note"].fillna("").astype(str).str.extract(
+            r"Timing\s+(\d{1,3})/100",
+            expand=False,
+        ),
+        errors="coerce",
+    )
+    frame = (prepared or {}).get(selected_ticker)
+    if frame is not None and not frame.empty and "close" in frame:
+        closes = pd.to_numeric(frame["close"], errors="coerce").dropna().copy()
+        closes.index = pd.to_datetime(closes.index).tz_localize(None)
+
+        def subsequent_return(row: pd.Series, sessions: int) -> float | None:
+            analyzed_at = pd.Timestamp(row["analyzed_at"])
+            if analyzed_at.tzinfo is not None:
+                analyzed_at = analyzed_at.tz_localize(None)
+            future = closes.loc[closes.index > analyzed_at]
+            if len(future) < sessions:
+                return None
+            initial = float(row["price"])
+            if initial <= 0:
+                return None
+            return (float(future.iloc[sessions - 1]) / initial - 1.0) * 100.0
+
+        for sessions in (1, 5, 20):
+            selected[f"subsequent_return_{sessions}d"] = selected.apply(
+                subsequent_return,
+                axis=1,
+                sessions=sessions,
+            )
+    else:
+        for sessions in (1, 5, 20):
+            selected[f"subsequent_return_{sessions}d"] = None
     action_col, count_col = st.columns([2, 3])
     action_col.button(
         f"Abrir análisis actualizado de {selected_ticker}",
@@ -7360,11 +8038,12 @@ def render_saved_analysis_history(journal: object) -> None:
     count_col.info(f"{len(selected)} revisiones guardadas de {selected_ticker}.")
 
     evolution = selected.set_index("analyzed_at")[
-        ["opportunity_score", "entry_score", "company_score"]
+        ["opportunity_score", "entry_score", "timing_score", "company_score"]
     ].rename(
         columns={
             "opportunity_score": "Oportunidad",
-            "entry_score": "Entrada",
+            "entry_score": "Técnico",
+            "timing_score": "Timing",
             "company_score": "Empresa",
         }
     )
@@ -7377,7 +8056,8 @@ def render_saved_analysis_history(journal: object) -> None:
             "price": "Precio",
             "opportunity_score": "Oportunidad",
             "company_score": "Empresa",
-            "entry_score": "Entrada",
+            "entry_score": "Técnico",
+            "timing_score": "Timing",
             "valuation_score": "Valoración",
             "risk_score": "Riesgo",
             "opportunity_label": "Lectura conjunta",
@@ -7387,6 +8067,9 @@ def render_saved_analysis_history(journal: object) -> None:
             "expected_price": "Precio estadístico",
             "horizon_days": "Sesiones",
             "note": "Nota personal",
+            "subsequent_return_1d": "Retorno posterior 1d",
+            "subsequent_return_5d": "Retorno posterior 5d",
+            "subsequent_return_20d": "Retorno posterior 20d",
         }
     )
     st.dataframe(
@@ -7398,7 +8081,8 @@ def render_saved_analysis_history(journal: object) -> None:
                 "Precio",
                 "Oportunidad",
                 "Empresa",
-                "Entrada",
+                "Técnico",
+                "Timing",
                 "Valoración",
                 "Riesgo",
                 "Lectura conjunta",
@@ -7407,6 +8091,9 @@ def render_saved_analysis_history(journal: object) -> None:
                 "Casos positivos",
                 "Precio estadístico",
                 "Sesiones",
+                "Retorno posterior 1d",
+                "Retorno posterior 5d",
+                "Retorno posterior 20d",
                 "Nota personal",
             ],
         ],
@@ -7417,6 +8104,9 @@ def render_saved_analysis_history(journal: object) -> None:
             "Precio estadístico": st.column_config.NumberColumn(format="%.2f"),
             "Retorno histórico": st.column_config.NumberColumn(format="%+.1f%%"),
             "Casos positivos": st.column_config.NumberColumn(format="%.1f%%"),
+            "Retorno posterior 1d": st.column_config.NumberColumn(format="%+.1f%%"),
+            "Retorno posterior 5d": st.column_config.NumberColumn(format="%+.1f%%"),
+            "Retorno posterior 20d": st.column_config.NumberColumn(format="%+.1f%%"),
             **{
                 column: st.column_config.ProgressColumn(
                     min_value=0, max_value=100, format="%d"
@@ -7424,7 +8114,8 @@ def render_saved_analysis_history(journal: object) -> None:
                 for column in [
                     "Oportunidad",
                     "Empresa",
-                    "Entrada",
+                    "Técnico",
+                    "Timing",
                     "Valoración",
                     "Riesgo",
                 ]
@@ -7437,7 +8128,7 @@ def render_saved_analysis_history(journal: object) -> None:
         labels = {
             int(row.id): (
                 f"{pd.Timestamp(row.analyzed_at).date()} · "
-                f"entrada {int(row.entry_score)}/100"
+                f"técnico {int(row.entry_score)}/100"
             )
             for row in selected.itertuples(index=False)
         }
@@ -7645,6 +8336,12 @@ def render_methodology() -> None:
         - **Peor caída temporal:** mayor pérdida sufrida desde un máximo anterior.
         - **Oportunidad conjunta:** combina calidad, valoración, momento, fortaleza
           frente al mercado y riesgo. No sustituye las cinco notas individuales.
+        - **Oportunidades (nueva pestaña):** conserva el score técnico y pregunta si
+          el precio actual todavía ofrece un timing razonable. Utiliza distancia desde
+          la señal, ATR, medias, ruptura, RSI, volumen, evento próximo y beneficio/riesgo.
+          Una empresa excelente puede aparecer como «esperar precio».
+        - **Zona de entrada:** rango técnico construido con soportes, medias, ATR y
+          ruptura. No es un precio exacto ni garantiza que una orden llegue a ejecutarse.
         - **Confianza de datos:** indica cuántas métricas están disponibles; no es
           la probabilidad de ganar dinero.
         - **Cambio de acción:** descuenta una comisión en euros al vender y otra al
@@ -7982,9 +8679,16 @@ def main() -> None:
                     or portfolio_refresh_requested
                     or portfolio_auto_refresh
                 ),
+                refresh_fundamentals=bool(growth_scan_tickers),
             )
         if growth_scan_tickers:
-            st.session_state["_growth_scan_completed"] = len(growth_scan_tickers)
+            refresh_summary = dict(
+                st.session_state.get("_last_fundamental_refresh", {}) or {}
+            )
+            # El mensaje debe reflejar lo descargado de verdad. Antes se
+            # anunciaban hasta 200 revisadas aunque el límite profundo era 25.
+            refresh_summary.setdefault("requested", len(growth_scan_tickers))
+            st.session_state["_growth_scan_completed"] = refresh_summary
         st.session_state.pop("_pending_analysis_ticker", None)
     for error in st.session_state.get("download_errors", []):
         st.warning(error)
@@ -8064,6 +8768,19 @@ def main() -> None:
                 favorite_tickers,
                 include_company_detail=False,
             )
+        elif analysis_section == "Oportunidades":
+            render_entry_opportunities_page(
+                prepared,
+                strategy,
+                fundamental_results,
+                valuation_results,
+                relative_results,
+                risk_results,
+                raw_fundamentals,
+                journal,
+                favorite_tickers,
+                favorite_labels,
+            )
         elif analysis_section == "Empresa":
             render_page_intro(
                 "ANÁLISIS DE EMPRESA",
@@ -8135,7 +8852,7 @@ def main() -> None:
                 "Consulta cómo cambiaron el precio y las notas entre revisiones; no es "
                 "un registro de compras y ventas.",
             )
-            render_saved_analysis_history(journal)
+            render_saved_analysis_history(journal, prepared)
         elif analysis_detail == "Plan de capital":
             render_capital_projection_page(authenticated_user.username)
         elif analysis_detail == "Prueba con el pasado" and not prepared:

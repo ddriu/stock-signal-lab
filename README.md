@@ -34,6 +34,7 @@ La instalación local solicita las credenciales guardadas en
 │   ├── signal_engine.py      # Momento de entrada y gestión de posición
 │   ├── fundamentals.py       # Calidad empresarial con cobertura de datos
 │   ├── opportunity.py        # Valoración, fortaleza relativa, riesgo y score conjunto
+│   ├── entry_opportunity.py  # Timing, eventos, zonas de entrada y concentración
 │   ├── growth_momentum.py    # Estrategia mensual dinámica y perfiles sectoriales
 │   ├── staircase_projection.py # Aportaciones, escalera y simulación a diez años
 │   ├── sector_comparison.py  # Comparación normalizada y liderazgo entre pares
@@ -93,6 +94,11 @@ plataforma y por activos. La navegación separa inicio, análisis,
 favoritos, carteras y guía para cargar únicamente la sección que se está consultando.
 Las oportunidades se presentan en tarjetas fáciles de leer y conservan el ranking
 completo y los gráficos técnicos como detalle desplegable.
+La pestaña independiente **Oportunidades** mantiene el Radar original para poder
+compararlos. Distingue score técnico de timing actual, detecta movimientos ya extendidos
+y resultados próximos, calcula zonas desde ATR, medias, soportes y ruptura, y muestra
+invalidación, beneficio/riesgo y concentración sectorial. La nota final redistribuye de
+forma explícita los pesos cuando faltan fundamentales y conserva la cobertura de datos.
 Dentro de **Analizar** hay además un desplegable de favoritas y un buscador con
 autocompletado sobre favoritas, análisis guardados y empresas abiertas recientemente.
 En **Favoritos**, la tabla permite analizar, editar etiquetas o quitar una empresa
@@ -189,6 +195,10 @@ Desde la ficha de una empresa se puede guardar una fotografía privada del anál
 precio, fecha, seis notas, lecturas, expectativa histórica y una nota personal. El
 historial permite ver la evolución, abrir de nuevo la empresa y borrar revisiones.
 No duplica las series de precios ni las gráficas en la base de datos.
+Una oportunidad también puede guardarse desde su ficha expandible. El timing y la zona
+quedan en la nota del historial; cuando el ticker está cargado, el historial calcula los
+retornos posteriores a 1, 5 y 20 sesiones para empezar a contrastar los distintos rangos
+de score sin llamarlos probabilidades.
 
 Cada cuenta mantiene una **cartera privada** separada. Además existe una **cartera del
 grupo**, visible únicamente después de iniciar sesión, en la que los cuatro miembros
@@ -241,6 +251,8 @@ Cada usuario puede guardar su propio correo, activar o desactivar avisos de entr
 reducción y posible salida, elegir una nota mínima de entrada e incluir el seguimiento
 del grupo. El correo contiene un solo resumen y, por defecto, sólo se envía cuando la
 categoría cambia para evitar mensajes repetidos.
+Cuando hay datos suficientes, el mensaje comienza con un bloque compacto de mejores
+oportunidades que añade nombre, ticker, timing, score conjunto, estado y zona preferida.
 
 La revisión automática incluye favoritas y posiciones abiertas. Las entradas se
 evalúan únicamente para empresas que no están ya en cartera; las alertas de reducir
