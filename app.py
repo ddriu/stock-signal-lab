@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 import html
+import importlib
 
 import pandas as pd
 import streamlit as st
@@ -106,10 +107,15 @@ from src.portfolio_snapshot_import import (
     import_portfolio_workbook_snapshot,
     parse_portfolio_snapshot_excel,
 )
-from src.portfolio_snapshot import (
-    group_portfolio_snapshot_for_home,
-    latest_portfolio_snapshot,
-    refresh_portfolio_snapshot_prices,
+from src import portfolio_snapshot as _portfolio_snapshot_module
+
+_portfolio_snapshot_module = importlib.reload(_portfolio_snapshot_module)
+group_portfolio_snapshot_for_home = (
+    _portfolio_snapshot_module.group_portfolio_snapshot_for_home
+)
+latest_portfolio_snapshot = _portfolio_snapshot_module.latest_portfolio_snapshot
+refresh_portfolio_snapshot_prices = (
+    _portfolio_snapshot_module.refresh_portfolio_snapshot_prices
 )
 from src.portfolio_decisions import (
     build_portfolio_decision_rows,
