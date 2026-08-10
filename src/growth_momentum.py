@@ -14,6 +14,71 @@ import numpy as np
 import pandas as pd
 
 from src.opportunity import RelativeStrengthResult, RiskResult
+
+
+GROWTH_FUNDAMENTAL_FIELDS = (
+    "revenueGrowth",
+    "earningsGrowth",
+    "operatingMargins",
+    "returnOnEquity",
+    "freeCashflow",
+)
+
+
+def growth_fundamental_metric_count(info: dict[str, Any] | None) -> int:
+    """Cuenta las métricas empresariales que realmente sirven al radar.
+
+    Que Yahoo devuelva un diccionario con el símbolo o el nombre no significa
+    que haya descargado ingresos, beneficios, márgenes o caja. Mantener esta
+    comprobación separada evita presentar una consulta vacía como completa.
+    """
+
+    snapshot = info or {}
+    return sum(_number(snapshot.get(key)) is not None for key in GROWTH_FUNDAMENTAL_FIELDS)
+
+
+def growth_fundamental_status(info: dict[str, Any] | None) -> str:
+    """Devuelve ``pending``, ``error``, ``partial`` o ``complete``."""
+
+    snapshot = info or {}
+    if not snapshot or snapshot.get("_quick_mode"):
+        return "pending"
+    if snapshot.get("_fundamental_error"):
+        return "error"
+    if growth_fundamental_metric_count(snapshot) < 2:
+        return "partial"
+    return "complete"
+
+
+def next_growth_analysis_batch(
+    tickers: list[str],
+    prepared_tickers: set[str],
+    fundamentals: dict[str, dict[str, Any]],
+    *,
+    limit: int = 25,
+) -> list[str]:
+    """Elige el siguiente bloque que todavía no tiene un análisis útil.
+
+    Se priorizan empresas sin histórico y después las que sólo tienen la carga
+    rápida. Los errores o respuestas parciales quedan al final para que una
+    incidencia temporal de un proveedor no bloquee el avance por toda la lista.
+    """
+
+    unique = list(dict.fromkeys(str(ticker).strip().upper() for ticker in tickers if ticker))
+    missing_prices = [ticker for ticker in unique if ticker not in prepared_tickers]
+    pending = [
+        ticker
+        for ticker in unique
+        if ticker in prepared_tickers
+        and growth_fundamental_status(fundamentals.get(ticker)) == "pending"
+    ]
+    incomplete = [
+        ticker
+        for ticker in unique
+        if ticker in prepared_tickers
+        and growth_fundamental_status(fundamentals.get(ticker)) in {"error", "partial"}
+    ]
+    return [*missing_prices, *pending, *incomplete][: max(int(limit), 1)]
 from src.data_sources import convert_currency
 
 
@@ -600,8 +665,13 @@ def evaluate_growth_momentum(
 
     market_broken = context_score < 35
     company_data_missing = profile.key != "etf" and growth_score is None
+    company_data_partial = (
+        profile.key != "etf" and growth_fundamental_metric_count(info) < 2
+    )
     if company_data_missing and bool(info.get("_quick_mode")):
         label = "Pendiente de fundamentales"
+    elif company_data_partial:
+        label = "Datos empresariales parciales"
     elif company_data_missing:
         label = "Datos empresariales insuficientes"
     elif confidence < 45:

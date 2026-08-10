@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from typing import Callable
 
@@ -17,9 +17,16 @@ from src.alerts import (
     build_digest_content,
     filter_changed_candidates,
 )
-from src.data_loader import DataDownloadError, download_prices
+from src.data_loader import (
+    DataDownloadError,
+    download_fundamental_snapshot,
+    download_prices,
+)
 from src.email_sender import send_email
+from src.entry_opportunity import evaluate_entry_opportunity
+from src.fundamentals import evaluate_fundamentals
 from src.indicators import add_indicators
+from src.opportunity import evaluate_risk, evaluate_valuation
 from src.signal_engine import evaluate_latest_signal
 from src.storage import GROUP_PORTFOLIO_OWNER, create_journal
 
@@ -88,6 +95,9 @@ def run_daily_alerts(
     *,
     journal_factory: Callable[[str], object] = create_journal,
     downloader: Callable[..., pd.DataFrame] = download_prices,
+    fundamental_downloader: Callable[[str], dict[str, object]] = (
+        download_fundamental_snapshot
+    ),
     sender: Callable[..., None] = send_email,
     today: date | None = None,
 ) -> AlertRunSummary:
@@ -180,6 +190,67 @@ def run_daily_alerts(
                         company_name=names.get(ticker, ""),
                     )
                     if candidate is not None:
+                        required_for_opportunity = {
+                            "open",
+                            "high",
+                            "low",
+                            "close",
+                            "atr_14",
+                        }
+                        if required_for_opportunity.issubset(frame.columns):
+                            try:
+                                info = fundamental_downloader(ticker)
+                            except Exception as exc:
+                                info = {"symbol": ticker}
+                                errors.append(
+                                    f"{owner} / {ticker}: fundamentales incompletos ({exc})."
+                                )
+                            try:
+                                fundamental = evaluate_fundamentals(info, ticker)
+                                valuation = evaluate_valuation(info, ticker)
+                                risk = evaluate_risk(ticker, frame)
+                                company_name = str(
+                                    info.get("longName")
+                                    or info.get("shortName")
+                                    or candidate.company_name
+                                    or ticker
+                                ).strip()
+                                enhanced = evaluate_entry_opportunity(
+                                    ticker=ticker,
+                                    company_name=company_name,
+                                    frame=frame,
+                                    signal=signal,
+                                    fundamental_score=fundamental.score,
+                                    fundamental_coverage=fundamental.coverage_pct,
+                                    valuation_score=valuation.score,
+                                    valuation_coverage=valuation.coverage_pct,
+                                    relative_score=None,
+                                    relative_coverage=0,
+                                    risk_score=risk.score,
+                                    risk_coverage=risk.coverage_pct,
+                                    info=info,
+                                    sector=str(
+                                        info.get("industry")
+                                        or fundamental.sector
+                                        or ""
+                                    ),
+                                    market=fundamental.country or "",
+                                )
+                                candidate = replace(
+                                    candidate,
+                                    company_name=company_name,
+                                    timing_score=enhanced.timing.score,
+                                    opportunity_score=enhanced.opportunity_score,
+                                    opportunity_status=enhanced.status_label,
+                                    preferred_entry=(
+                                        enhanced.zones.preferred_entry.label
+                                    ),
+                                    event_label=enhanced.event.label,
+                                )
+                            except (KeyError, TypeError, ValueError) as exc:
+                                errors.append(
+                                    f"{owner} / {ticker}: oportunidad parcial ({exc})."
+                                )
                         candidates.append(candidate)
                 except Exception as exc:
                     # Un ticker con poco histórico o datos incompletos no debe

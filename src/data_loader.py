@@ -544,6 +544,108 @@ def download_prices(
     return result
 
 
+def _statement_series(
+    frame: pd.DataFrame | None,
+    labels: tuple[str, ...],
+) -> list[float]:
+    """Extrae una serie anual de una tabla contable de yfinance."""
+
+    if frame is None or frame.empty:
+        return []
+    for label in labels:
+        if label not in frame.index:
+            continue
+        row = frame.loc[label]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+        values = pd.to_numeric(row, errors="coerce").dropna()
+        if values.empty:
+            return []
+        try:
+            values = values.sort_index(ascending=False)
+        except TypeError:
+            pass
+        return [float(value) for value in values.tolist()]
+    return []
+
+
+def _statement_growth(values: list[float]) -> float | None:
+    if len(values) < 2 or values[1] == 0:
+        return None
+    return values[0] / abs(values[1]) - 1.0
+
+
+def _yahoo_statement_snapshot(stock: object) -> dict[str, object]:
+    """Calcula un respaldo contable cuando ``get_info`` llega incompleto.
+
+    Yahoo mantiene endpoints separados para ficha e informes financieros. En
+    ocasiones la ficha falla en Streamlit Cloud mientras las tablas anuales sí
+    responden; aprovecharlas recupera crecimiento, márgenes, balance y caja sin
+    inventar datos.
+    """
+
+    income = stock.get_income_stmt(freq="yearly")
+    balance = stock.get_balance_sheet(freq="yearly")
+    cashflow = stock.get_cash_flow(freq="yearly")
+
+    revenue = _statement_series(income, ("TotalRevenue", "OperatingRevenue"))
+    net_income = _statement_series(
+        income,
+        ("NetIncome", "NetIncomeCommonStockholders"),
+    )
+    operating_income = _statement_series(income, ("OperatingIncome",))
+    equity = _statement_series(
+        balance,
+        ("StockholdersEquity", "CommonStockEquity", "TotalEquityGrossMinorityInterest"),
+    )
+    current_assets = _statement_series(balance, ("CurrentAssets", "TotalCurrentAssets"))
+    current_liabilities = _statement_series(
+        balance,
+        ("CurrentLiabilities", "TotalCurrentLiabilities"),
+    )
+    debt = _statement_series(balance, ("TotalDebt",))
+    free_cashflow = _statement_series(cashflow, ("FreeCashFlow",))
+    operating_cash = _statement_series(
+        cashflow,
+        ("OperatingCashFlow", "TotalCashFromOperatingActivities"),
+    )
+    capex = _statement_series(cashflow, ("CapitalExpenditure", "CapitalExpenditures"))
+
+    latest_revenue = revenue[0] if revenue else None
+    latest_income = net_income[0] if net_income else None
+    latest_operating = operating_income[0] if operating_income else None
+    average_equity = (
+        sum(equity[:2]) / len(equity[:2]) if equity else None
+    )
+    latest_fcf = free_cashflow[0] if free_cashflow else None
+    if latest_fcf is None and operating_cash:
+        latest_fcf = operating_cash[0] - abs(capex[0]) if capex else operating_cash[0]
+
+    def ratio(numerator: float | None, denominator: float | None) -> float | None:
+        if numerator is None or denominator in (None, 0):
+            return None
+        return numerator / denominator
+
+    metrics: dict[str, object | None] = {
+        "revenueGrowth": _statement_growth(revenue),
+        "earningsGrowth": _statement_growth(net_income),
+        "profitMargins": ratio(latest_income, latest_revenue),
+        "operatingMargins": ratio(latest_operating, latest_revenue),
+        "returnOnEquity": ratio(latest_income, average_equity),
+        "currentRatio": ratio(
+            current_assets[0] if current_assets else None,
+            current_liabilities[0] if current_liabilities else None,
+        ),
+        "debtToEquity": (
+            ratio(debt[0], equity[0]) * 100
+            if debt and equity and ratio(debt[0], equity[0]) is not None
+            else None
+        ),
+        "freeCashflow": latest_fcf,
+    }
+    return {key: value for key, value in metrics.items() if value is not None}
+
+
 def download_fundamental_snapshot(ticker: str) -> dict[str, object]:
     """Combina una fotografía de Yahoo con cuentas oficiales SEC disponibles.
 
@@ -577,10 +679,17 @@ def download_fundamental_snapshot(ticker: str) -> dict[str, object]:
         "enterpriseToEbitda",
         "pegRatio",
         "sharesOutstanding",
+        # Fechas orientativas del próximo evento. Yahoo puede no publicarlas o
+        # modificarlas; la capa de oportunidades conserva esa incertidumbre.
+        "earningsTimestamp",
+        "earningsTimestampStart",
+        "earningsTimestampEnd",
+        "earningsDate",
     }
     warnings: list[str] = []
+    stock = yf.Ticker(symbol)
     try:
-        info = yf.Ticker(symbol).get_info()
+        info = stock.get_info()
     except Exception as exc:
         info = {}
         warnings.append(f"Yahoo no pudo aportar fundamentales de {symbol}: {exc}")
@@ -588,6 +697,26 @@ def download_fundamental_snapshot(ticker: str) -> dict[str, object]:
         info = {}
     yahoo = {key: value for key, value in info.items() if key in fields}
     yahoo.setdefault("symbol", symbol)
+    accounting_fields = {
+        "returnOnEquity",
+        "profitMargins",
+        "operatingMargins",
+        "revenueGrowth",
+        "earningsGrowth",
+        "debtToEquity",
+        "currentRatio",
+        "freeCashflow",
+    }
+    if sum(yahoo.get(key) is not None for key in accounting_fields) < 2:
+        try:
+            statement_metrics = _yahoo_statement_snapshot(stock)
+        except Exception as exc:
+            statement_metrics = {}
+            warnings.append(
+                f"Yahoo no pudo aportar estados financieros de {symbol}: {exc}"
+            )
+        for key, value in statement_metrics.items():
+            yahoo.setdefault(key, value)
     try:
         official = download_sec_fundamental_snapshot(symbol)
     except (ExternalDataError, ValueError) as exc:

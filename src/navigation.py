@@ -11,7 +11,11 @@ GROWTH_RADAR_WATCH_LABELS = frozenset(
     {"Vigilancia activa", "Esperar mejor precio"}
 )
 GROWTH_RADAR_PENDING_LABELS = frozenset(
-    {"Pendiente de fundamentales", "Datos empresariales insuficientes"}
+    {
+        "Pendiente de fundamentales",
+        "Datos empresariales parciales",
+        "Datos empresariales insuficientes",
+    }
 )
 
 

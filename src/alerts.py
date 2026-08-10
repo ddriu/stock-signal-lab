@@ -20,6 +20,7 @@ from src.signal_engine import (
     LABEL_STRONG,
     SignalResult,
 )
+from src.entry_opportunity import non_linking_ticker_text
 
 
 ALERT_PREFERENCE_COLUMNS = [
@@ -80,6 +81,11 @@ class AlertCandidate:
     signature: str
     held: bool
     company_name: str = ""
+    timing_score: int | None = None
+    opportunity_score: int | None = None
+    opportunity_status: str = ""
+    preferred_entry: str = ""
+    event_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -187,6 +193,11 @@ def build_alert_candidate(
     held: bool,
     preferences: AlertPreferences,
     company_name: str = "",
+    timing_score: int | None = None,
+    opportunity_score: int | None = None,
+    opportunity_status: str = "",
+    preferred_entry: str = "",
+    event_label: str = "",
 ) -> AlertCandidate | None:
     """Aplica las preferencias a una señal ya calculada."""
 
@@ -234,6 +245,11 @@ def build_alert_candidate(
         signature=signature,
         held=held,
         company_name=company_name.strip(),
+        timing_score=timing_score,
+        opportunity_score=opportunity_score,
+        opportunity_status=opportunity_status.strip(),
+        preferred_entry=preferred_entry.strip(),
+        event_label=event_label.strip(),
     )
 
 
@@ -285,9 +301,10 @@ def build_digest_content(
     alert_word = f"{len(rows)} alerta{'s' if len(rows) != 1 else ''}"
 
     def display_label(candidate: AlertCandidate) -> str:
-        ticker = candidate.ticker.strip().upper()
+        raw_ticker = candidate.ticker.strip().upper()
+        ticker = non_linking_ticker_text(raw_ticker)
         name = candidate.company_name.strip()
-        if not name or name.casefold() == ticker.casefold():
+        if not name or name.casefold() == raw_ticker.casefold():
             return ticker
         return f"{name} ({ticker})"
 
@@ -301,9 +318,41 @@ def build_digest_content(
     plain_lines = [
         f"Hola {display_name},",
         "",
-        "Estas señales han cambiado y merecen revisión:",
-        "",
+        "TOP OPORTUNIDADES",
     ]
+    opportunity_rows = sorted(
+        (
+            candidate
+            for candidate in rows
+            if candidate.kind == "Compra" and candidate.opportunity_score is not None
+        ),
+        key=lambda candidate: int(candidate.opportunity_score or 0),
+        reverse=True,
+    )[:5]
+    for candidate in opportunity_rows:
+        timing_text = (
+            f" / Timing {candidate.timing_score}"
+            if candidate.timing_score is not None
+            else ""
+        )
+        zone_text = (
+            f" · Zona {candidate.preferred_entry}"
+            if candidate.preferred_entry
+            else ""
+        )
+        plain_lines.append(
+            f"{display_label(candidate)} · Oportunidad {candidate.opportunity_score}"
+            f"{timing_text} · {candidate.opportunity_status or candidate.title}{zone_text}"
+        )
+    if not opportunity_rows:
+        plain_lines.append("Sin nuevas entradas con score conjunto disponible.")
+    plain_lines.extend(
+        [
+            "",
+            "Estas señales han cambiado y merecen revisión:",
+            "",
+        ]
+    )
     html_rows: list[str] = []
     color_by_kind = {
         "Compra": "#16835b",
@@ -316,7 +365,7 @@ def build_digest_content(
             [
                 f"{label} · {candidate.kind} · {candidate.title}",
                 (
-                    f"Entrada {candidate.entry_score}/100 ({candidate.entry_label}); "
+                    f"Score técnico {candidate.entry_score}/100 ({candidate.entry_label}); "
                     f"posición: {candidate.position_label}; cierre: {candidate.price:.2f}."
                 ),
                 candidate.explanation,
@@ -335,11 +384,23 @@ def build_digest_content(
                 {html.escape(label)} · {html.escape(candidate.title)}
               </h3>
               <p style="margin:0 0 8px">
-                Entrada <strong>{candidate.entry_score}/100</strong>
+                Score técnico <strong>{candidate.entry_score}/100</strong>
                 ({html.escape(candidate.entry_label)}) · Posición:
                 <strong>{html.escape(candidate.position_label)}</strong> ·
                 cierre {candidate.price:.2f} · datos {html.escape(candidate.as_of)}
               </p>
+              {
+                  '<p style="margin:0 0 8px">Timing <strong>'
+                  + str(candidate.timing_score)
+                  + '/100</strong> · Oportunidad <strong>'
+                  + str(candidate.opportunity_score)
+                  + '/100</strong> · '
+                  + html.escape(candidate.opportunity_status)
+                  + (f' · Zona {html.escape(candidate.preferred_entry)}' if candidate.preferred_entry else '')
+                  + '</p>'
+                  if candidate.opportunity_score is not None
+                  else ''
+              }
               <p style="margin:0;color:#475569">{html.escape(candidate.explanation)}</p>
             </div>
             """
@@ -349,10 +410,41 @@ def build_digest_content(
         "asesoramiento financiero ni garantizan rentabilidad."
     )
     plain_lines.extend([disclaimer, "Puedes desactivar estos avisos desde la aplicación."])
+    html_opportunity_rows = "".join(
+        '<p style="margin:8px 0">'
+        + html.escape(display_label(candidate))
+        + " · Oportunidad <strong>"
+        + str(candidate.opportunity_score)
+        + "/100</strong>"
+        + (
+            " · Timing " + str(candidate.timing_score) + "/100"
+            if candidate.timing_score is not None
+            else ""
+        )
+        + '<br><span style="color:#475569">'
+        + html.escape(candidate.opportunity_status or candidate.title)
+        + (
+            " · Zona " + html.escape(candidate.preferred_entry)
+            if candidate.preferred_entry
+            else ""
+        )
+        + "</span></p>"
+        for candidate in opportunity_rows
+    )
+    if not html_opportunity_rows:
+        html_opportunity_rows = (
+            '<p style="margin:8px 0;color:#64748b">'
+            "Sin nuevas entradas con score conjunto disponible.</p>"
+        )
     html_body = f"""
     <div style="font-family:Arial,sans-serif;max-width:680px;margin:auto;color:#1e293b">
       <h2 style="color:#14213d">Stock Signal Lab</h2>
       <p>Hola {html.escape(display_name)},</p>
+      <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;
+                  padding:12px 16px;margin:12px 0">
+        <strong>🔥 TOP OPORTUNIDADES</strong>
+        {html_opportunity_rows}
+      </div>
       <p>Estas señales han cambiado y merecen revisión:</p>
       {''.join(html_rows)}
       <p style="font-size:12px;color:#64748b;margin-top:22px">{html.escape(disclaimer)}</p>
