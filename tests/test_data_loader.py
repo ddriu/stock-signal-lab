@@ -208,7 +208,11 @@ def test_fundamentals_fall_back_to_yahoo_financial_statements(monkeypatch) -> No
 
     class FakeTicker:
         def get_info(self):
-            return {"symbol": "TEST", "shortName": "Test Company"}
+            return {
+                "symbol": "TEST",
+                "shortName": "Test Company",
+                "revenueGrowth": None,
+            }
 
         def get_income_stmt(self, **kwargs):
             return pd.DataFrame(
