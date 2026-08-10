@@ -33,15 +33,23 @@ class AlertRunSummary:
     errors: tuple[str, ...]
 
 
-def _favorite_tickers(journal: object) -> set[str]:
+def _favorite_names(journal: object) -> dict[str, str]:
     favorites = journal.list_favorites()
     if favorites.empty:
-        return set()
-    return {
-        str(ticker).strip().upper()
-        for ticker in favorites["ticker"].dropna()
-        if str(ticker).strip()
-    }
+        return {}
+    names: dict[str, str] = {}
+    has_name = "name" in favorites.columns
+    for _, row in favorites.iterrows():
+        ticker = str(row.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        name = str(row.get("name") or "").strip() if has_name else ""
+        names[ticker] = name or ticker
+    return names
+
+
+def _favorite_tickers(journal: object) -> set[str]:
+    return set(_favorite_names(journal))
 
 
 def _position_costs(journal: object) -> dict[str, float]:
@@ -97,18 +105,25 @@ def run_daily_alerts(
     if not preferences:
         return AlertRunSummary(0, 0, 0, 0, ())
 
-    group_favorites = _favorite_tickers(group_journal)
+    group_names = _favorite_names(group_journal)
+    group_favorites = set(group_names)
     group_positions = _position_costs(group_journal)
-    scopes: dict[str, tuple[AlertPreferences, object, set[str], dict[str, float]]] = {}
+    scopes: dict[
+        str,
+        tuple[AlertPreferences, object, set[str], dict[str, float], dict[str, str]],
+    ] = {}
     all_tickers: set[str] = set()
     errors: list[str] = []
     for preference in preferences:
         try:
             user_journal = journal_factory(preference.owner)
-            favorites = _favorite_tickers(user_journal)
+            names = _favorite_names(user_journal)
+            favorites = set(names)
             positions = _position_costs(user_journal)
             if preference.include_group:
                 favorites |= group_favorites
+                for ticker, name in group_names.items():
+                    names.setdefault(ticker, name)
                 for ticker, average_cost in group_positions.items():
                     positions.setdefault(ticker, average_cost)
             scope = favorites | set(positions)
@@ -117,6 +132,7 @@ def run_daily_alerts(
                 user_journal,
                 scope,
                 positions,
+                names,
             )
             all_tickers |= scope
         except Exception as exc:
@@ -132,7 +148,7 @@ def run_daily_alerts(
     emails_sent = 0
     alerts_sent = 0
 
-    for owner, (preference, journal, scope, positions) in scopes.items():
+    for owner, (preference, journal, scope, positions, names) in scopes.items():
         try:
             previous = journal.list_alert_states()
             previous_signatures = (
@@ -161,6 +177,7 @@ def run_daily_alerts(
                         price=price,
                         held=held,
                         preferences=preference,
+                        company_name=names.get(ticker, ""),
                     )
                     if candidate is not None:
                         candidates.append(candidate)

@@ -79,6 +79,7 @@ class AlertCandidate:
     explanation: str
     signature: str
     held: bool
+    company_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -185,6 +186,7 @@ def build_alert_candidate(
     price: float,
     held: bool,
     preferences: AlertPreferences,
+    company_name: str = "",
 ) -> AlertCandidate | None:
     """Aplica las preferencias a una señal ya calculada."""
 
@@ -231,6 +233,7 @@ def build_alert_candidate(
         explanation=signal.explanation,
         signature=signature,
         held=held,
+        company_name=company_name.strip(),
     )
 
 
@@ -279,7 +282,22 @@ def build_digest_content(
     """Devuelve asunto, versión de texto y HTML del resumen."""
 
     rows = list(candidates)
-    subject = f"Stock Signal Lab · {len(rows)} alerta{'s' if len(rows) != 1 else ''}"
+    alert_word = f"{len(rows)} alerta{'s' if len(rows) != 1 else ''}"
+
+    def display_label(candidate: AlertCandidate) -> str:
+        ticker = candidate.ticker.strip().upper()
+        name = candidate.company_name.strip()
+        if not name or name.casefold() == ticker.casefold():
+            return ticker
+        return f"{name} ({ticker})"
+
+    # El asunto muestra una empresa para que la alerta sea reconocible incluso
+    # antes de abrir el mensaje. El cuerpo conserva todas las empresas.
+    subject = f"Stock Signal Lab · {alert_word}"
+    if rows:
+        subject += f" · {display_label(rows[0])}"
+        if len(rows) > 1:
+            subject += f" y {len(rows) - 1} más"
     plain_lines = [
         f"Hola {display_name},",
         "",
@@ -293,9 +311,10 @@ def build_digest_content(
         "Venta": "#c53030",
     }
     for candidate in rows:
+        label = display_label(candidate)
         plain_lines.extend(
             [
-                f"{candidate.ticker} · {candidate.kind} · {candidate.title}",
+                f"{label} · {candidate.kind} · {candidate.title}",
                 (
                     f"Entrada {candidate.entry_score}/100 ({candidate.entry_label}); "
                     f"posición: {candidate.position_label}; cierre: {candidate.price:.2f}."
@@ -313,7 +332,7 @@ def build_digest_content(
                 {html.escape(candidate.kind.upper())}
               </div>
               <h3 style="margin:4px 0 8px;color:#14213d">
-                {html.escape(candidate.ticker)} · {html.escape(candidate.title)}
+                {html.escape(label)} · {html.escape(candidate.title)}
               </h3>
               <p style="margin:0 0 8px">
                 Entrada <strong>{candidate.entry_score}/100</strong>
@@ -343,4 +362,3 @@ def build_digest_content(
     </div>
     """
     return subject, "\n".join(plain_lines), html_body
-
