@@ -96,6 +96,7 @@ def test_repeated_signature_is_filtered_and_digest_has_disclaimer() -> None:
         explanation="Explicación.",
         signature="entry:Entrada fuerte",
         held=False,
+        company_name="Taiwan Semiconductor Manufacturing",
     )
 
     assert filter_changed_candidates(
@@ -105,5 +106,36 @@ def test_repeated_signature_is_filtered_and_digest_has_disclaimer() -> None:
     ) == []
     subject, plain, html = build_digest_content("Luci", [candidate])
     assert "1 alerta" in subject
+    assert "Taiwan Semiconductor Manufacturing (TSM)" in subject
     assert "no constituyen asesoramiento financiero" in plain.lower()
-    assert "TSM" in html
+    assert "Taiwan Semiconductor Manufacturing (TSM)" in plain
+    assert "Taiwan Semiconductor Manufacturing (TSM)" in html
+
+
+def test_digest_adds_opportunity_summary_without_linking_dotted_ticker() -> None:
+    candidate = AlertCandidate(
+        ticker="BA.L",
+        kind="Compra",
+        title="Momento técnico fuerte",
+        entry_score=82,
+        entry_label="Entrada fuerte",
+        position_label="Mantener",
+        price=18.25,
+        as_of="2026-08-10",
+        explanation="Explicación.",
+        signature="entry:Entrada fuerte",
+        held=False,
+        company_name="BAE Systems plc",
+        timing_score=68,
+        opportunity_score=79,
+        opportunity_status="🟢 COMPRABLE",
+        preferred_entry="17.80–18.10",
+    )
+
+    _, plain, html = build_digest_content("David", [candidate])
+
+    assert "TOP OPORTUNIDADES" in plain
+    assert "BAE Systems plc" in plain
+    assert "Oportunidad 79" in plain
+    assert "href=" not in html
+    assert "http://ba.l" not in html.lower()

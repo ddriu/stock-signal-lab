@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import pandas as pd
+import pytest
 
 from src import data_loader
 
@@ -50,6 +51,14 @@ def test_stooq_symbol_translates_common_markets() -> None:
     assert data_loader._stooq_symbol("^GSPC") == "^SPX"
 
 
+def test_broker_aliases_resolve_to_analysis_tickers() -> None:
+    assert data_loader.resolve_analysis_ticker("6vo") == "RDDT"
+    assert data_loader.resolve_analysis_ticker("AMZ") == "AMZN"
+    assert data_loader.resolve_analysis_ticker("Netflix") == "NFLX"
+    assert data_loader.resolve_analysis_ticker("ServiceNow") == "NOW"
+    assert data_loader.resolve_analysis_ticker("SONY") == "SONY"
+
+
 def test_download_prices_uses_direct_yahoo_chart_before_stooq(monkeypatch) -> None:
     monkeypatch.setattr(data_loader.yf, "download", lambda *args, **kwargs: pd.DataFrame())
     payload = {
@@ -86,6 +95,24 @@ def test_download_prices_uses_direct_yahoo_chart_before_stooq(monkeypatch) -> No
     assert frame.attrs["ticker"] == "7974.T"
     assert frame.attrs["provider"] == "Yahoo Finance (conexión directa)"
     assert frame["close"].tolist() == [101.0, 104.0]
+
+
+def test_download_error_is_short_and_does_not_expose_provider_url(monkeypatch) -> None:
+    monkeypatch.setattr(data_loader.yf, "download", lambda *args, **kwargs: pd.DataFrame())
+
+    def fail_request(*args, **kwargs):
+        raise data_loader.requests.HTTPError(
+            "404 Client Error: Not Found for url: https://provider.example/very/long/url"
+        )
+
+    monkeypatch.setattr(data_loader.requests, "get", fail_request)
+
+    with pytest.raises(data_loader.DataDownloadError) as error:
+        data_loader.download_prices("empresa inexistente", "2025-01-01", "2025-02-01")
+
+    message = str(error.value)
+    assert "http" not in message
+    assert "Busca la empresa por nombre" in message
 
 
 def test_search_instruments_returns_only_stocks_and_etfs(monkeypatch) -> None:
@@ -174,3 +201,57 @@ def test_curated_bae_systems_search_survives_yahoo_failure(monkeypatch) -> None:
     assert [result.ticker for result in results] == ["BA.L", "BAESY"]
     assert results[0].country == "Reino Unido"
     assert results[1].listing_type == "ADR / OTC"
+
+
+def test_fundamentals_fall_back_to_yahoo_financial_statements(monkeypatch) -> None:
+    columns = pd.to_datetime(["2025-12-31", "2024-12-31"])
+
+    class FakeTicker:
+        def get_info(self):
+            return {"symbol": "TEST", "shortName": "Test Company"}
+
+        def get_income_stmt(self, **kwargs):
+            return pd.DataFrame(
+                {
+                    columns[0]: [120.0, 24.0, 30.0],
+                    columns[1]: [100.0, 20.0, 25.0],
+                },
+                index=["TotalRevenue", "NetIncome", "OperatingIncome"],
+            )
+
+        def get_balance_sheet(self, **kwargs):
+            return pd.DataFrame(
+                {
+                    columns[0]: [110.0, 80.0, 40.0, 30.0],
+                    columns[1]: [90.0, 70.0, 35.0, 28.0],
+                },
+                index=[
+                    "StockholdersEquity",
+                    "CurrentAssets",
+                    "CurrentLiabilities",
+                    "TotalDebt",
+                ],
+            )
+
+        def get_cash_flow(self, **kwargs):
+            return pd.DataFrame(
+                {
+                    columns[0]: [18.0],
+                    columns[1]: [14.0],
+                },
+                index=["FreeCashFlow"],
+            )
+
+    monkeypatch.setattr(data_loader.yf, "Ticker", lambda symbol: FakeTicker())
+    monkeypatch.setattr(
+        data_loader,
+        "download_sec_fundamental_snapshot",
+        lambda symbol: {},
+    )
+
+    result = data_loader.download_fundamental_snapshot("TEST")
+
+    assert result["revenueGrowth"] == pytest.approx(0.20)
+    assert result["earningsGrowth"] == pytest.approx(0.20)
+    assert result["operatingMargins"] == pytest.approx(0.25)
+    assert result["freeCashflow"] == pytest.approx(18.0)

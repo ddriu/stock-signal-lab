@@ -37,13 +37,15 @@ def test_growth_radar_groups_keep_order_and_classify_readings() -> None:
             ("RTX", "Vigilancia activa"),
             ("halo", "Pendiente de fundamentales"),
             ("MA", "Entrada candidata"),
+            ("ANET", "Entrada candidata"),
             ("NKE", "Sin entrada"),
         ]
     )
 
     assert groups == {
-        "all": ["MA", "RTX", "HALO", "NKE"],
-        "entries": ["MA"],
+        "all": ["MA", "RTX", "HALO", "ANET", "NKE"],
+        "strong": ["MA"],
+        "candidates": ["ANET"],
         "watch": ["RTX"],
         "pending": ["HALO"],
     }

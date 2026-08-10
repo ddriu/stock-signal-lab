@@ -8,6 +8,8 @@ from src.growth_momentum import (
     calculate_growth_position_plan,
     classify_sector_profile,
     evaluate_growth_momentum,
+    growth_fundamental_status,
+    next_growth_analysis_batch,
     quote_price_to_eur,
 )
 from src.indicators import add_indicators
@@ -94,6 +96,51 @@ def test_quick_scan_cannot_be_presented_as_a_complete_entry() -> None:
     assert result.growth_score is None
     assert result.label == "Pendiente de fundamentales"
     assert result.score <= 60
+
+
+def test_growth_fundamentals_require_two_useful_company_metrics() -> None:
+    assert growth_fundamental_status({"symbol": "EMPTY"}) == "partial"
+    assert growth_fundamental_status(
+        {"symbol": "ONE", "revenueGrowth": 0.20}
+    ) == "partial"
+    assert growth_fundamental_status(
+        {
+            "symbol": "READY",
+            "revenueGrowth": 0.20,
+            "operatingMargins": 0.15,
+        }
+    ) == "complete"
+
+
+def test_growth_batch_advances_from_missing_prices_to_quick_fundamentals() -> None:
+    batch = next_growth_analysis_batch(
+        ["NEW", "QUICK", "READY", "PARTIAL"],
+        {"QUICK", "READY", "PARTIAL"},
+        {
+            "QUICK": {"symbol": "QUICK", "_quick_mode": True},
+            "READY": {"revenueGrowth": 0.2, "operatingMargins": 0.2},
+            "PARTIAL": {"revenueGrowth": 0.2},
+        },
+        limit=3,
+    )
+    assert batch == ["NEW", "QUICK", "PARTIAL"]
+
+
+def test_partial_growth_data_never_becomes_an_entry() -> None:
+    stock = _frame(100, 190)
+    market = _frame(100, 135)
+    result = evaluate_growth_momentum(
+        ticker="PARTIAL",
+        frame=stock,
+        info={"symbol": "PARTIAL", "revenueGrowth": 0.30},
+        relative=evaluate_relative_strength(
+            "PARTIAL", stock, market, broad_name="SPY"
+        ),
+        risk=evaluate_risk("PARTIAL", stock),
+        broad_market=market,
+        config=GrowthMomentumConfig(),
+    )
+    assert result.label == "Datos empresariales parciales"
 
 
 def test_small_cap_reduces_risk_and_position_limit() -> None:
