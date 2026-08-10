@@ -15,6 +15,8 @@ import os
 
 import streamlit as st
 
+from src.brand import brand_mark_html
+
 
 HASH_ALGORITHM = "pbkdf2_sha256"
 
@@ -225,7 +227,9 @@ def require_login() -> AuthConfig:
     st.markdown(
         """
         <div class="ssl-login-brand">
-            <div class="ssl-logo" aria-hidden="true">↗</div>
+            """
+        + brand_mark_html()
+        + """
             <h1>Stock Signal Lab</h1>
             <p>Decisiones de inversión explicadas con datos, riesgo y contexto.</p>
         </div>
