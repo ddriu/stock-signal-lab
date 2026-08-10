@@ -18,10 +18,12 @@ import streamlit as st
 # que un cambio de marca no requiera suspender o reiniciar manualmente la app.
 from src import brand as _brand_module
 from src import auth as _auth_module
+from src import navigation as _navigation_module
 from src import ui as _ui_module
 
 _brand_module = importlib.reload(_brand_module)
 _auth_module = importlib.reload(_auth_module)
+_navigation_module = importlib.reload(_navigation_module)
 _ui_module = importlib.reload(_ui_module)
 
 from config import BacktestConfig, StrategyConfig
@@ -6687,7 +6689,7 @@ def render_growth_momentum_page(
         )
     ]
     radar_frame = pd.DataFrame(radar_rows)
-    radar_groups = growth_radar_ticker_groups(
+    calculated_radar_groups = growth_radar_ticker_groups(
         zip(radar_frame["Ticker"], radar_frame["Lectura"])
     )
     radar_group_specs = [
@@ -6697,6 +6699,13 @@ def render_growth_momentum_page(
         ("watch", "En vigilancia", ":material/visibility:"),
         ("pending", "Pendientes de datos", ":material/pending_actions:"),
     ]
+    # Una versión anterior del agrupador sólo devolvía las categorías con
+    # resultados. Streamlit Cloud puede conservar ese módulo durante un
+    # despliegue en caliente, por lo que completamos siempre el contrato aquí.
+    radar_groups = {
+        group_key: list(calculated_radar_groups.get(group_key, []))
+        for group_key, _, _ in radar_group_specs
+    }
     valid_group_keys = {group_key for group_key, _, _ in radar_group_specs}
     if st.session_state.get("growth_radar_group") not in valid_group_keys:
         st.session_state["growth_radar_group"] = "all"
