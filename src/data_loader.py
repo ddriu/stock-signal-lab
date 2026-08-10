@@ -716,7 +716,8 @@ def download_fundamental_snapshot(ticker: str) -> dict[str, object]:
                 f"Yahoo no pudo aportar estados financieros de {symbol}: {exc}"
             )
         for key, value in statement_metrics.items():
-            yahoo.setdefault(key, value)
+            if yahoo.get(key) is None:
+                yahoo[key] = value
     try:
         official = download_sec_fundamental_snapshot(symbol)
     except (ExternalDataError, ValueError) as exc:
