@@ -23,6 +23,12 @@ from src.auth import (
     require_login,
 )
 from src.backtesting import BacktestResult, run_backtest
+from src.brand import (
+    BRAND_FAVICON_SVG,
+    brand_mark_html,
+    contextual_icon,
+    icon_html,
+)
 from src.current_positions import (
     REFERENCE_COST,
     REFERENCE_ENTRY,
@@ -171,15 +177,19 @@ from src.visualization import (
 )
 
 
-st.set_page_config(page_title="Stock Signal Lab", page_icon="📈", layout="wide")
+st.set_page_config(
+    page_title="Stock Signal Lab",
+    page_icon=BRAND_FAVICON_SVG,
+    layout="wide",
+)
 
 MAIN_OPTIONS = ["Inicio", "Analizar", "Favoritos", "Carteras", "Más"]
 ANALYSIS_OPTIONS = ["Radar", "Empresa", "Estrategias", "Más análisis"]
 ANALYSIS_LABELS = {
-    "Radar": "Radar",
-    "Empresa": "Empresa",
-    "Estrategias": "Estrategias",
-    "Más análisis": "Más",
+    "Radar": "◎ Radar",
+    "Empresa": "↗ Empresa",
+    "Estrategias": "◱ Estrategias",
+    "Más análisis": "··· Más",
 }
 STRATEGY_OPTIONS = ["Crecimiento", "Resultado tras 30+ días"]
 ANALYSIS_TOOL_OPTIONS = [
@@ -4557,7 +4567,7 @@ def render_app_header(user: AuthConfig) -> None:
         st.markdown(
             f"""
             <div class="ssl-app-header">
-                <div class="ssl-logo" aria-hidden="true">↗</div>
+                {brand_mark_html()}
                 <div>
                     <h1 class="ssl-app-title">Stock Signal Lab</h1>
                     <p class="ssl-app-subtitle">
@@ -4590,9 +4600,12 @@ def render_page_intro(eyebrow: str, title: str, description: str) -> None:
     st.markdown(
         f"""
         <section class="ssl-page-intro">
-            <span>{html.escape(eyebrow)}</span>
-            <h2>{html.escape(title)}</h2>
-            <p>{html.escape(description)}</p>
+            <div class="ssl-page-intro-copy">
+                <span>{html.escape(eyebrow)}</span>
+                <h2>{html.escape(title)}</h2>
+                <p>{html.escape(description)}</p>
+            </div>
+            {icon_html(contextual_icon(eyebrow, title), 'ssl-page-intro-icon')}
         </section>
         """,
         unsafe_allow_html=True,
@@ -5489,6 +5502,7 @@ def render_home(
         action_a, action_b, action_c = st.columns(3)
         action_a.button(
             "Analizar empresas",
+            icon=":material/monitoring:",
             width="stretch",
             type="primary",
             on_click=_set_navigation,
@@ -5496,12 +5510,14 @@ def render_home(
         )
         action_b.button(
             "Buscar y guardar",
+            icon=":material/favorite:",
             width="stretch",
             on_click=_set_navigation,
             args=("Favoritos",),
         )
         action_c.button(
             "Abrir mi cartera",
+            icon=":material/account_balance_wallet:",
             width="stretch",
             on_click=_set_navigation,
             args=("Carteras", "portfolio_navigation", "Privada"),
@@ -7721,11 +7737,11 @@ def main() -> None:
         required=True,
         label_visibility="collapsed",
         format_func=lambda value: {
-            "Inicio": "Inicio",
-            "Analizar": "Analizar",
-            "Favoritos": "Favoritos",
-            "Carteras": "Cartera",
-            "Más": "Más",
+            "Inicio": "⌂  Inicio",
+            "Analizar": "↗  Analizar",
+            "Favoritos": "♡  Favoritos",
+            "Carteras": "▱  Cartera",
+            "Más": "···  Más",
         }[value],
     )
     analysis_section = ""
@@ -7763,6 +7779,9 @@ def main() -> None:
             "Favoritos",
             favorite_options,
             key="favorite_view",
+            format_func=lambda value: (
+                "♡ Mis listas" if value == "Mis listas" else "+ Añadir empresa"
+            ),
         )
     elif selected_section == "Carteras":
         portfolio_options = ["Privada", "Grupo"]
@@ -7773,7 +7792,7 @@ def main() -> None:
             portfolio_options,
             key="portfolio_navigation",
             format_func=lambda value: (
-                "Mi cartera" if value == "Privada" else "Cartera del grupo"
+                "▱ Mi cartera" if value == "Privada" else "◎ Cartera del grupo"
             ),
         )
     elif selected_section == "Más":
@@ -7787,6 +7806,11 @@ def main() -> None:
             "Más secciones",
             more_options,
             key="more_navigation",
+            format_func=lambda value: {
+                "Alertas por correo": "◌ Alertas",
+                "Administración": "⚙ Administración",
+                "Guía y riesgos": "? Guía y riesgos",
+            }.get(value, value),
         )
 
     layout_analysis_section = (
