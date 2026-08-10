@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 
-GROWTH_RADAR_ENTRY_LABELS = frozenset({"Entrada fuerte", "Entrada candidata"})
+GROWTH_RADAR_STRONG_LABELS = frozenset({"Entrada fuerte"})
+GROWTH_RADAR_CANDIDATE_LABELS = frozenset({"Entrada candidata"})
 GROWTH_RADAR_WATCH_LABELS = frozenset(
     {"Vigilancia activa", "Esperar mejor precio"}
 )
@@ -73,7 +74,8 @@ def growth_radar_ticker_groups(
 
     groups: dict[str, list[str]] = {
         "all": [],
-        "entries": [],
+        "strong": [],
+        "candidates": [],
         "watch": [],
         "pending": [],
     }
@@ -83,8 +85,10 @@ def growth_radar_ticker_groups(
         if not ticker or ticker in groups["all"]:
             continue
         groups["all"].append(ticker)
-        if label in GROWTH_RADAR_ENTRY_LABELS:
-            groups["entries"].append(ticker)
+        if label in GROWTH_RADAR_STRONG_LABELS:
+            groups["strong"].append(ticker)
+        if label in GROWTH_RADAR_CANDIDATE_LABELS:
+            groups["candidates"].append(ticker)
         if label in GROWTH_RADAR_WATCH_LABELS:
             groups["watch"].append(ticker)
         if label in GROWTH_RADAR_PENDING_LABELS:

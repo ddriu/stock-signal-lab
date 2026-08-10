@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from src.data_sources import convert_currency
+
 
 HOME_GROUPED_PLATFORMS = ("Civislend", "Segofactoring")
 
@@ -23,6 +25,109 @@ class PortfolioSnapshotSummary:
     cost_estimate_eur: float | None
     gain_loss_eur: float | None
     return_pct: float | None
+
+
+@dataclass(frozen=True)
+class PortfolioRefreshSummary:
+    """Procedencia de los valores mostrados para una fotografía de cartera."""
+
+    market_priced_count: int
+    manual_count: int
+    pending_count: int
+    market_as_of: str | None
+
+
+def refresh_portfolio_snapshot_prices(
+    positions: pd.DataFrame,
+    latest_prices: dict[str, float],
+    rates_per_eur: dict[str, float],
+    *,
+    price_dates: dict[str, object] | None = None,
+) -> tuple[pd.DataFrame, PortfolioRefreshSummary]:
+    """Revaloriza sólo las partidas con ticker y cantidad comprobables.
+
+    La fotografía sigue siendo la fuente de cantidades y costes. Los activos sin
+    ticker (efectivo, Civislend, Segofactoring...) conservan su último valor manual
+    para no inventar una cotización. El resultado es sólo de presentación y no
+    modifica la fotografía persistida.
+    """
+
+    if positions.empty:
+        return positions.copy(), PortfolioRefreshSummary(0, 0, 0, None)
+
+    refreshed = positions.copy()
+    if "valuation_status" not in refreshed.columns:
+        refreshed["valuation_status"] = ""
+    if "market_as_of" not in refreshed.columns:
+        refreshed["market_as_of"] = ""
+
+    market_priced = 0
+    manual = 0
+    pending = 0
+    observed_dates: list[pd.Timestamp] = []
+    price_dates = price_dates or {}
+
+    for index, row in refreshed.iterrows():
+        ticker = str(row.get("analysis_ticker") or "").strip().upper()
+        quantity = pd.to_numeric(row.get("quantity"), errors="coerce")
+        currency = str(row.get("currency") or "EUR").strip().upper()
+        current_price = latest_prices.get(ticker)
+
+        if not ticker:
+            refreshed.at[index, "valuation_status"] = "Dato manual"
+            manual += 1
+            continue
+        if (
+            pd.isna(quantity)
+            or float(quantity) <= 0
+            or current_price is None
+            or float(current_price) <= 0
+        ):
+            refreshed.at[index, "valuation_status"] = "Precio pendiente"
+            pending += 1
+            continue
+
+        try:
+            value_eur = float(
+                convert_currency(
+                    float(quantity) * float(current_price),
+                    currency,
+                    "EUR",
+                    rates_per_eur,
+                )
+            )
+        except (TypeError, ValueError):
+            refreshed.at[index, "valuation_status"] = "Cambio de moneda pendiente"
+            pending += 1
+            continue
+
+        refreshed.at[index, "current_price"] = float(current_price)
+        refreshed.at[index, "value_eur"] = value_eur
+        cost = pd.to_numeric(row.get("cost_estimate_eur"), errors="coerce")
+        if pd.notna(cost):
+            gain = value_eur - float(cost)
+            refreshed.at[index, "gain_loss_eur"] = gain
+            refreshed.at[index, "return_pct"] = (
+                gain / float(cost) * 100.0 if float(cost) > 0 else None
+            )
+        refreshed.at[index, "valuation_status"] = "Precio actualizado"
+        raw_date = price_dates.get(ticker)
+        parsed_date = pd.to_datetime(raw_date, errors="coerce")
+        if pd.notna(parsed_date):
+            normalized_date = pd.Timestamp(parsed_date).date().isoformat()
+            refreshed.at[index, "market_as_of"] = normalized_date
+            observed_dates.append(pd.Timestamp(parsed_date))
+        market_priced += 1
+
+    market_as_of = (
+        max(observed_dates).date().isoformat() if observed_dates else None
+    )
+    return refreshed, PortfolioRefreshSummary(
+        market_priced_count=market_priced,
+        manual_count=manual,
+        pending_count=pending,
+        market_as_of=market_as_of,
+    )
 
 
 def group_portfolio_snapshot_for_home(positions: pd.DataFrame) -> pd.DataFrame:
