@@ -109,6 +109,9 @@ def build_position_dashboard(
                 "quantity": float(position.quantity),
                 "average_cost": float(position.average_cost),
                 "cost_basis": cost_basis,
+                "cost_basis_eur": (
+                    cost_eur if cost_eur is not None else float("nan")
+                ),
                 "current_price": (
                     float(current_price) if current_price is not None else float("nan")
                 ),

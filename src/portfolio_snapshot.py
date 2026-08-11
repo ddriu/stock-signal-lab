@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 
 import pandas as pd
 
@@ -79,12 +80,14 @@ def refresh_portfolio_snapshot_prices(
             refreshed.at[index, "valuation_status"] = "Dato manual"
             manual += 1
             continue
-        if (
-            pd.isna(quantity)
-            or float(quantity) <= 0
-            or current_price is None
-            or float(current_price) <= 0
-        ):
+        if pd.isna(quantity) or float(quantity) <= 0:
+            # Una valoración introducida por importe sigue siendo válida aunque no
+            # permita recalcularla con una cotización. No debe presentarse como un
+            # error ni desaparecer de los totales.
+            refreshed.at[index, "valuation_status"] = "Dato manual (sin cantidad)"
+            manual += 1
+            continue
+        if current_price is None or float(current_price) <= 0:
             refreshed.at[index, "valuation_status"] = "Precio pendiente"
             pending += 1
             continue
@@ -130,6 +133,136 @@ def refresh_portfolio_snapshot_prices(
         pending_count=pending,
         market_as_of=market_as_of,
     )
+
+
+def reconcile_current_portfolio(
+    snapshot: pd.DataFrame,
+    operations: pd.DataFrame,
+    positions_dashboard: pd.DataFrame,
+) -> pd.DataFrame:
+    """Construye una sola vista actual a partir de fotografía y diario.
+
+    La fotografía conserva fondos, efectivo e inversiones alternativas. Cuando un
+    ticker tiene movimientos en el diario, su posición abierta reconstruida pasa a
+    ser la fuente prioritaria. Así una venta no deja una segunda cantidad obsoleta
+    visible en Inicio. La función es sólo de presentación: no borra el histórico.
+    """
+
+    if operations.empty or "ticker" not in operations.columns:
+        return snapshot.copy()
+
+    frame = snapshot.copy()
+    operated_tickers = {
+        resolve_analysis_ticker(str(value).strip().upper())
+        for value in operations["ticker"].dropna().tolist()
+        if str(value).strip()
+    }
+    if not operated_tickers:
+        return frame
+
+    if frame.empty:
+        frame = pd.DataFrame(
+            columns=[
+                "snapshot_date", "platform", "asset_name", "raw_identifier",
+                "analysis_ticker", "asset_type", "portfolio_block", "quantity",
+                "current_price", "currency", "value_eur", "return_pct",
+                "cost_estimate_eur", "gain_loss_eur", "comments", "source",
+                "notes", "valuation_status", "market_as_of",
+            ]
+        )
+
+    resolved_snapshot = frame.get(
+        "analysis_ticker", pd.Series("", index=frame.index)
+    ).fillna("").astype(str).map(
+        lambda value: resolve_analysis_ticker(value.strip().upper()) if value.strip() else ""
+    )
+    templates = frame.loc[resolved_snapshot.isin(operated_tickers)].copy()
+    reconciled = frame.loc[~resolved_snapshot.isin(operated_tickers)].copy()
+
+    replacement_rows: list[dict[str, object]] = []
+    if not positions_dashboard.empty:
+        for position in positions_dashboard.to_dict("records"):
+            raw_ticker = str(position.get("ticker") or "").strip().upper()
+            ticker = resolve_analysis_ticker(raw_ticker) if raw_ticker else ""
+            if not ticker or ticker not in operated_tickers:
+                continue
+
+            matching = templates.loc[
+                templates.get(
+                    "analysis_ticker", pd.Series("", index=templates.index)
+                ).fillna("").astype(str).map(
+                    lambda value: (
+                        resolve_analysis_ticker(value.strip().upper())
+                        if value.strip()
+                        else ""
+                    )
+                )
+                == ticker
+            ]
+            row = matching.iloc[0].to_dict() if not matching.empty else {}
+            if len(matching) > 1:
+                row["platform"] = "Varias cuentas"
+            row.setdefault("platform", "Diario de operaciones")
+            row.setdefault("asset_name", raw_ticker or ticker)
+            row.setdefault("asset_type", "Acción / ETF")
+            row.setdefault("portfolio_block", "Cartera actual")
+            row["snapshot_date"] = date.today().isoformat()
+            row["raw_identifier"] = raw_ticker or ticker
+            row["analysis_ticker"] = ticker
+            row["quantity"] = position.get("quantity")
+            row["current_price"] = position.get("current_price")
+            row["currency"] = str(position.get("currency") or "EUR").upper()
+
+            cost = pd.to_numeric(position.get("cost_basis_eur"), errors="coerce")
+            value = pd.to_numeric(position.get("net_value_eur"), errors="coerce")
+            gain = pd.to_numeric(position.get("net_pnl_eur"), errors="coerce")
+            return_pct = pd.to_numeric(position.get("net_return_pct"), errors="coerce")
+            if pd.notna(cost):
+                row["cost_estimate_eur"] = float(cost)
+            if pd.notna(value):
+                row["value_eur"] = float(value)
+                row["gain_loss_eur"] = float(gain) if pd.notna(gain) else None
+                row["return_pct"] = (
+                    float(return_pct) if pd.notna(return_pct) else None
+                )
+                row["valuation_status"] = "Precio actualizado desde el diario"
+                row["source"] = "Diario de operaciones + último precio"
+            else:
+                # Si hoy no hay precio, mantenemos el último valor manual visible,
+                # pero la cantidad y el coste proceden ya del diario.
+                fallback_values = pd.to_numeric(
+                    matching.get("value_eur", pd.Series(dtype=float)), errors="coerce"
+                )
+                fallback_value = (
+                    float(fallback_values.sum()) if fallback_values.notna().any() else None
+                )
+                row["value_eur"] = fallback_value
+                if fallback_value is not None and pd.notna(cost):
+                    row["gain_loss_eur"] = fallback_value - float(cost)
+                    row["return_pct"] = (
+                        (fallback_value - float(cost)) / float(cost) * 100.0
+                        if float(cost) > 0
+                        else None
+                    )
+                row["valuation_status"] = "Último valor manual; precio pendiente"
+                row["source"] = "Diario de operaciones + último valor manual"
+            row["notes"] = (
+                "Vista reconciliada: cantidades y coste del diario; la fotografía "
+                "histórica original no se ha modificado."
+            )
+            replacement_rows.append(row)
+
+    if replacement_rows:
+        replacements = pd.DataFrame(replacement_rows)
+        all_columns = list(dict.fromkeys([*frame.columns, *replacements.columns]))
+        reconciled = reconciled.reindex(columns=all_columns)
+        replacements = replacements.reindex(columns=all_columns)
+        reconciled = (
+            replacements.copy()
+            if reconciled.empty
+            else pd.concat([reconciled, replacements], ignore_index=True)
+        )
+    return reconciled.reset_index(drop=True)
 
 
 def group_portfolio_snapshot_for_home(positions: pd.DataFrame) -> pd.DataFrame:

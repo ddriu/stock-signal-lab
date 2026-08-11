@@ -611,6 +611,17 @@ div[data-testid="stForm"]:has(input[autocomplete="username"]) {
     .ssl-status-pill {
         display: none;
     }
+    [class*="st-key-app_header_container"] [data-testid="stHorizontalBlock"] {
+        flex-wrap: nowrap !important;
+        align-items: center;
+    }
+    [class*="st-key-app_header_container"] [data-testid="stColumn"] {
+        min-width: 0 !important;
+    }
+    [class*="st-key-app_header_container"] [data-testid="stColumn"]:last-child {
+        flex: 0 0 8.5rem !important;
+        width: 8.5rem !important;
+    }
 }
 
 @media (max-width: 700px) {
@@ -655,17 +666,42 @@ div[data-testid="stForm"]:has(input[autocomplete="username"]) {
     }
     [data-testid="stSegmentedControl"],
     [data-testid="stButtonGroup"] {
-        overflow-x: auto;
-        scrollbar-width: thin;
+        overflow: visible;
     }
     [data-testid="stSegmentedControl"] > div,
     [data-testid="stButtonGroup"] [role="radiogroup"] {
-        min-width: max-content;
-        flex-wrap: nowrap !important;
+        min-width: 0 !important;
+        width: 100% !important;
+        flex-wrap: wrap !important;
     }
     [data-testid="stButtonGroup"] button {
-        flex: 0 0 auto;
+        flex: 1 1 calc(33.333% - 0.5rem) !important;
+        min-width: 6.2rem;
         white-space: nowrap;
+    }
+    [data-testid="stTabs"] [data-baseweb="tab-list"] {
+        flex-wrap: wrap;
+        overflow: visible;
+    }
+    [data-testid="stTabs"] button[data-baseweb="tab"] {
+        flex: 1 1 8.5rem;
+        padding-left: 0.65rem;
+        padding-right: 0.65rem;
+        white-space: normal;
+    }
+    [class*="st-key-app_header_container"] [data-testid="stColumn"]:last-child {
+        flex-basis: 4.5rem !important;
+        width: 4.5rem !important;
+    }
+    [class*="st-key-app_header_container"] [data-testid="stPopover"] p {
+        display: none;
+    }
+    .ssl-app-title {
+        font-size: 1.35rem !important;
+        white-space: nowrap;
+    }
+    .ssl-app-subtitle {
+        display: none;
     }
     div[data-testid="stMetric"] {
         min-height: auto;
