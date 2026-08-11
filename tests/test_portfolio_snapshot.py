@@ -4,6 +4,7 @@ import pytest
 from src.portfolio_snapshot import (
     group_portfolio_snapshot_for_home,
     latest_portfolio_snapshot,
+    reconcile_current_portfolio,
     refresh_portfolio_snapshot_prices,
 )
 
@@ -220,3 +221,123 @@ def test_snapshot_refresh_resolves_broker_market_aliases() -> None:
     assert refreshed.iloc[0]["valuation_status"] == "Precio actualizado"
     assert status.market_priced_count == 1
     assert status.pending_count == 0
+
+
+def test_snapshot_without_quantity_remains_a_manual_value() -> None:
+    positions = pd.DataFrame(
+        [
+            {
+                "snapshot_date": "2026-08-11",
+                "platform": "Trade Republic",
+                "asset_name": "Nintendo",
+                "asset_type": "Acción",
+                "analysis_ticker": "NTDOY",
+                "quantity": None,
+                "currency": "EUR",
+                "value_eur": 489.56,
+                "cost_estimate_eur": 430.0,
+            }
+        ]
+    )
+
+    refreshed, status = refresh_portfolio_snapshot_prices(
+        positions,
+        {"NTDOY": 25.0},
+        {"EUR": 1.0},
+    )
+
+    assert refreshed.iloc[0]["value_eur"] == pytest.approx(489.56)
+    assert refreshed.iloc[0]["valuation_status"] == "Dato manual (sin cantidad)"
+    assert status.manual_count == 1
+    assert status.pending_count == 0
+
+
+def test_diary_position_replaces_stale_snapshot_without_touching_other_assets() -> None:
+    snapshot = pd.DataFrame(
+        [
+            {
+                "snapshot_date": "2026-08-01",
+                "platform": "Revolut",
+                "asset_name": "Arista Networks",
+                "raw_identifier": "ANET",
+                "analysis_ticker": "ANET",
+                "asset_type": "Acción",
+                "portfolio_block": "Cartera actual",
+                "quantity": 2.0,
+                "current_price": 165.0,
+                "currency": "USD",
+                "value_eur": 330.0,
+                "cost_estimate_eur": 300.0,
+                "gain_loss_eur": 30.0,
+                "return_pct": 10.0,
+            },
+            {
+                "snapshot_date": "2026-08-01",
+                "platform": "Civislend",
+                "asset_name": "Proyecto 1",
+                "raw_identifier": "",
+                "analysis_ticker": "",
+                "asset_type": "Crowdlending",
+                "portfolio_block": "Alternativas",
+                "quantity": None,
+                "currency": "EUR",
+                "value_eur": 500.0,
+                "cost_estimate_eur": 500.0,
+                "gain_loss_eur": 0.0,
+                "return_pct": 0.0,
+            },
+        ]
+    )
+    operations = pd.DataFrame([{"ticker": "ANET", "side": "Compra"}])
+    dashboard = pd.DataFrame(
+        [
+            {
+                "ticker": "ANET",
+                "currency": "USD",
+                "quantity": 0.75,
+                "current_price": 190.0,
+                "cost_basis_eur": 120.0,
+                "net_value_eur": 129.26,
+                "net_pnl_eur": 9.26,
+                "net_return_pct": 7.7167,
+            }
+        ]
+    )
+
+    reconciled = reconcile_current_portfolio(snapshot, operations, dashboard)
+
+    assert len(reconciled) == 2
+    anet = reconciled.loc[reconciled["analysis_ticker"] == "ANET"].iloc[0]
+    assert anet["quantity"] == pytest.approx(0.75)
+    assert anet["value_eur"] == pytest.approx(129.26)
+    assert anet["source"] == "Diario de operaciones + último precio"
+    assert reconciled.loc[reconciled["platform"] == "Civislend", "value_eur"].iloc[0] == 500.0
+
+
+def test_closed_diary_position_removes_stale_snapshot_from_current_view() -> None:
+    snapshot = pd.DataFrame(
+        [
+            {
+                "snapshot_date": "2026-08-01",
+                "platform": "Revolut",
+                "asset_name": "Arista Networks",
+                "analysis_ticker": "ANET",
+                "asset_type": "Acción",
+                "value_eur": 330.0,
+            }
+        ]
+    )
+    operations = pd.DataFrame(
+        [
+            {"ticker": "ANET", "side": "Compra"},
+            {"ticker": "ANET", "side": "Venta"},
+        ]
+    )
+
+    reconciled = reconcile_current_portfolio(
+        snapshot,
+        operations,
+        pd.DataFrame(),
+    )
+
+    assert reconciled.empty
