@@ -71,6 +71,8 @@ from src.data_loader import (
     search_result_market_group,
     search_instruments,
 )
+from src.price_units import format_quote_price, normalize_price_frame_units, resolve_quote_unit
+from src.market_analysis import InstrumentReport, build_instrument_report
 from src.data_sources import (
     ExternalDataError,
     FxSnapshot,
@@ -161,6 +163,7 @@ latest_portfolio_snapshot = _portfolio_snapshot_module.latest_portfolio_snapshot
 refresh_portfolio_snapshot_prices = (
     _portfolio_snapshot_module.refresh_portfolio_snapshot_prices
 )
+reconcile_current_portfolio = _portfolio_snapshot_module.reconcile_current_portfolio
 from src.portfolio_decisions import (
     build_portfolio_decision_rows,
     entry_opportunity_rows,
@@ -225,8 +228,8 @@ MAIN_OPTIONS = ["Inicio", "Analizar", "Favoritos", "Carteras", "Más"]
 ANALYSIS_OPTIONS = ["Radar", "Oportunidades", "Empresa", "Estrategias", "Más análisis"]
 ANALYSIS_LABELS = {
     "Radar": "◎ Mi radar",
-    "Oportunidades": "🎯 Entradas hoy",
-    "Empresa": "↗ Buscar empresa",
+    "Oportunidades": "🎯 Entradas",
+    "Empresa": "↗ Empresa",
     "Estrategias": "◱ Estrategias",
     "Más análisis": "··· Herramientas",
 }
@@ -502,8 +505,9 @@ def build_sidebar(
     with st.sidebar.expander("Modo avanzado: ticker exacto"):
         manual_value = st.text_area(
             "Símbolos bursátiles",
-            "" if favorite_tickers else "AAPL, MSFT, SAN.MC",
+            "",
             height=78,
+            placeholder="AAPL, SAN.MC, 7974.T…",
             help=(
                 "Sólo es necesario si el buscador no encuentra la empresa. Ejemplos: "
                 "SAN.MC (Madrid), 7974.T (Tokio) o KAP.IL (Londres internacional)."
@@ -1018,7 +1022,10 @@ def prepare_data(
     opportunity_results: dict[str, OpportunityResult] = {}
     for ticker, raw_frame in raw_data.items():
         try:
-            frame = add_signal_columns(add_indicators(raw_frame, config), config)
+            raw_info = raw_fundamentals.get(ticker, {})
+            quote_currency = raw_info.get("currency") or raw_frame.attrs.get("quote_currency")
+            normalized_frame = normalize_price_frame_units(raw_frame, quote_currency)
+            frame = add_signal_columns(add_indicators(normalized_frame, config), config)
             signal = evaluate_latest_signal(frame, config, ticker=ticker)
         except ValueError as exc:
             summary.append({"Ticker": ticker, "Estado": f"Sin señal: {exc}"})
@@ -1092,6 +1099,310 @@ def prepare_data(
     )
 
 
+def _report_price(report: InstrumentReport, value: float | None) -> str:
+    if value is None:
+        return "N/D"
+    return format_quote_price(value, report.currency)
+
+
+def render_extended_market_report(
+    report: InstrumentReport,
+    *,
+    peer_opportunities: dict[str, OpportunityResult] | None = None,
+    peer_fundamentals: dict[str, FundamentalResult] | None = None,
+) -> None:
+    """Muestra la ficha ampliada sin repetir el radar completo."""
+
+    with st.expander(
+        "Mapa técnico, niveles, entradas y eventos",
+        expanded=False,
+        icon=":material/route:",
+    ):
+        st.caption(
+            f"Datos hasta {report.as_of.date():%d/%m/%Y} · precios en "
+            f"{report.currency or 'moneda de cotización'}. Los niveles se recalculan "
+            "con el histórico disponible; no son órdenes ni garantías."
+        )
+        if report.classification == "QUALITY_TURNAROUND":
+            st.success(
+                f"**{report.classification}:** {report.classification_reason}"
+            )
+        elif "TURNAROUND" in report.classification:
+            st.info(f"**{report.classification}:** {report.classification_reason}")
+        else:
+            st.caption(f"**{report.classification}:** {report.classification_reason}")
+
+        score_specs = (
+            ("Entrada", report.entry_score),
+            ("Posición", report.position_score),
+            ("Momentum", report.momentum_score),
+            ("Tendencia", report.trend_score),
+            ("Riesgo", report.risk_score),
+            ("Calidad", report.quality_score),
+        )
+        score_columns = st.columns(3)
+        for index, (label, detail) in enumerate(score_specs):
+            score_columns[index % 3].metric(
+                label,
+                f"{detail.score}/100" if detail.score is not None else "N/D",
+                help=(
+                    f"Cobertura {detail.coverage_pct}%. "
+                    "Es una nota explicable, no una probabilidad de ganar."
+                ),
+            )
+        st.info(f"**Si ya la tienes:** {report.position_action}.")
+
+        overview_tab, plan_tab, event_tab = st.tabs(
+            ["Precio e indicadores", "Niveles y plan", "Eventos y comparación"]
+        )
+        with overview_tab:
+            return_rows = [
+                {
+                    "Periodo": period,
+                    "Rentabilidad": value,
+                }
+                for period, value in report.returns_pct.items()
+            ]
+            st.dataframe(
+                pd.DataFrame(return_rows),
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "Rentabilidad": st.column_config.NumberColumn(format="%+.1f%%")
+                },
+            )
+            range_a, range_b, range_c = st.columns(3)
+            range_a.metric("Precio", _report_price(report, report.price))
+            range_b.metric(
+                "Máximo 52 semanas",
+                _report_price(report, report.high_52w),
+                (
+                    f"{report.distance_high_52w_pct:+.1f}%"
+                    if report.distance_high_52w_pct is not None
+                    else None
+                ),
+            )
+            range_c.metric(
+                "Mínimo 52 semanas",
+                _report_price(report, report.low_52w),
+                (
+                    f"{report.distance_low_52w_pct:+.1f}%"
+                    if report.distance_low_52w_pct is not None
+                    else None
+                ),
+            )
+            indicator_labels = {
+                "sma_20": "SMA20",
+                "sma_50": "SMA50",
+                "sma_100": "SMA100",
+                "sma_200": "SMA200",
+                "ema_20": "EMA20",
+                "ema_50": "EMA50",
+                "rsi": "RSI(14)",
+                "macd": "MACD",
+                "macd_signal": "Señal MACD",
+                "macd_hist": "Histograma MACD",
+                "atr_14": "ATR(14)",
+                "adx_14": "ADX(14)",
+                "plus_di_14": "+DI",
+                "minus_di_14": "-DI",
+                "volume_ratio": "Volumen / media 20d",
+            }
+            price_indicators = {
+                "sma_20",
+                "sma_50",
+                "sma_100",
+                "sma_200",
+                "ema_20",
+                "ema_50",
+                "macd",
+                "macd_signal",
+                "macd_hist",
+                "atr_14",
+            }
+            indicator_rows = []
+            for key, value in report.indicators.items():
+                if value is None:
+                    visible_value = "N/D"
+                elif key in price_indicators:
+                    visible_value = _report_price(report, value)
+                elif key == "volume_ratio":
+                    visible_value = f"{value:.2f}x"
+                else:
+                    visible_value = f"{value:.2f}"
+                indicator_rows.append(
+                    {"Indicador": indicator_labels.get(key, key), "Valor": visible_value}
+                )
+            st.dataframe(pd.DataFrame(indicator_rows), hide_index=True, width="stretch")
+
+        with plan_tab:
+            level_rows = [
+                {
+                    "Nivel": level.label,
+                    "Precio": level.price,
+                    "Por qué": level.reason,
+                    "Detectado": level.as_of.date() if level.as_of is not None else None,
+                }
+                for level in (*report.supports, *report.resistances)
+            ]
+            if level_rows:
+                st.markdown("**Soportes y resistencias automáticos**")
+                st.dataframe(
+                    pd.DataFrame(level_rows),
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "Precio": st.column_config.NumberColumn(format="%.2f"),
+                        "Detectado": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                    },
+                )
+            entry_rows = [
+                {
+                    "Entrada": option.label,
+                    "Zona": f"{_report_price(report, option.lower)} – {_report_price(report, option.upper)}",
+                    "Base": option.basis,
+                    "Confirmación": option.condition,
+                }
+                for option in report.entries
+            ]
+            st.markdown("**Tres formas de esperar el precio**")
+            st.dataframe(pd.DataFrame(entry_rows), hide_index=True, width="stretch")
+            st.markdown("**Stop inicial: comparación, no cambio automático**")
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Método": "FIXED · producción",
+                            "Stop": report.fixed_stop.recommended_stop,
+                            "Distancia": report.fixed_stop.stop_distance_pct,
+                            "Motivo": report.fixed_stop.reason,
+                        },
+                        {
+                            "Método": "STRUCTURAL · experimental",
+                            "Stop": report.structural_stop.recommended_stop,
+                            "Distancia": report.structural_stop.stop_distance_pct,
+                            "Motivo": report.structural_stop.reason,
+                        },
+                    ]
+                ),
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "Stop": st.column_config.NumberColumn(format="%.2f"),
+                    "Distancia": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
+            if report.targets:
+                st.markdown("**Objetivos por resistencias observadas**")
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Horizonte": target.horizon,
+                                "Objetivo": target.price,
+                                "Base": target.basis,
+                            }
+                            for target in report.targets
+                        ]
+                    ),
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "Objetivo": st.column_config.NumberColumn(format="%.2f")
+                    },
+                )
+            else:
+                st.caption(
+                    "No hay resistencias superiores suficientes para publicar objetivos sin inventarlos."
+                )
+
+        with event_tab:
+            if report.recent_events:
+                st.markdown("**Cambios técnicos recientes**")
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Fecha": event.event_date.date(),
+                                "Evento": event.label,
+                                "Lectura": "Favorable" if event.direction == "positive" else "Riesgo",
+                            }
+                            for event in report.recent_events
+                        ]
+                    ),
+                    hide_index=True,
+                    width="stretch",
+                    column_config={"Fecha": st.column_config.DateColumn(format="DD/MM/YYYY")},
+                )
+            if report.events:
+                st.markdown("**Calendario recibido de la fuente**")
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Fecha": event.event_date,
+                                "Evento": event.label,
+                                "Estado": event.status,
+                            }
+                            for event in report.events
+                        ]
+                    ),
+                    hide_index=True,
+                    width="stretch",
+                    column_config={"Fecha": st.column_config.DateColumn(format="DD/MM/YYYY")},
+                )
+            else:
+                st.caption("La fuente gratuita no entregó fechas empresariales verificables.")
+
+            comparison_universe = {
+                report.ticker,
+                "NKE",
+                "NFLX",
+                "HALO",
+                "YPF",
+                "DHR",
+                "7974.T",
+                "NTDOY",
+                "ORCL",
+                "XE",
+            }
+            opportunities = peer_opportunities or {}
+            fundamentals = peer_fundamentals or {}
+            comparison_rows = [
+                {
+                    "Ticker": ticker,
+                    "Oportunidad": opportunities[ticker].score,
+                    "Lectura": opportunities[ticker].label,
+                    "Calidad": (
+                        fundamentals[ticker].score
+                        if ticker in fundamentals
+                        else None
+                    ),
+                }
+                for ticker in comparison_universe
+                if ticker in opportunities
+            ]
+            if comparison_rows:
+                comparison_rows.sort(key=lambda row: row["Oportunidad"], reverse=True)
+                for rank, row in enumerate(comparison_rows, start=1):
+                    row["Puesto"] = rank
+                st.markdown("**Ranking entre comparables cargadas en esta sesión**")
+                st.dataframe(
+                    pd.DataFrame(comparison_rows),
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "Oportunidad": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
+                        "Calidad": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
+                    },
+                )
+                missing = sorted(comparison_universe.difference(opportunities))
+                if missing:
+                    st.caption(
+                        "Sin datos actuales en esta sesión: " + ", ".join(missing) + "."
+                    )
+
+
 def render_analysis(
     ticker: str,
     frame: pd.DataFrame,
@@ -1105,6 +1416,8 @@ def render_analysis(
     raw_fundamentals: dict[str, object],
     verification: PriceVerification | None = None,
     journal: object | None = None,
+    peer_opportunities: dict[str, OpportunityResult] | None = None,
+    peer_fundamentals: dict[str, FundamentalResult] | None = None,
 ) -> None:
     with st.expander("Si ya tienes esta acción"):
         entry_price = st.number_input(
@@ -1122,6 +1435,17 @@ def render_analysis(
         entry_price=float(entry_price) if entry_price > 0 else None,
     )
     latest = frame.dropna(subset=["sma_long", "rsi"]).iloc[-1]
+    extended_report = build_instrument_report(
+        ticker=ticker,
+        frame=frame,
+        info=raw_fundamentals,
+        signal=signal,
+        fundamentals=fundamentals,
+        valuation=valuation,
+        relative=relative,
+        risk=risk,
+        fixed_stop_pct=strategy.stop_loss_pct,
+    )
     study = historical_forward_return_study(
         frame,
         current_score=signal.score,
@@ -1223,7 +1547,19 @@ def render_analysis(
         f"{risk.score}/100" if risk.score is not None else "N/D",
         help="Una nota alta indica menor volatilidad, menor caída y mejor liquidez; no elimina el riesgo.",
     )
-    col8.metric("Último cierre", f"{latest['close']:.2f}", format_pct(daily_change))
+    display_currency = str(
+        frame.attrs.get("display_currency") or raw_fundamentals.get("currency") or ""
+    )
+    col8.metric(
+        "Último cierre",
+        format_quote_price(float(latest["close"]), display_currency),
+        format_pct(daily_change),
+    )
+    render_extended_market_report(
+        extended_report,
+        peer_opportunities=peer_opportunities,
+        peer_fundamentals=peer_fundamentals,
+    )
     if auto_snapshot_saved:
         st.caption(
             "✓ Seguimiento de hoy guardado automáticamente en «Historial guardado»."
@@ -2264,7 +2600,10 @@ def render_operation_form(
         else "Registrar operación"
     )
     st.subheader(heading)
-    with st.form(form_key, clear_on_submit=True):
+    # Conserva lo escrito cuando falla una validación (por ejemplo, una venta
+    # superior a la cantidad disponible). Así el usuario puede corregir un solo
+    # campo sin tener que volver a introducir toda la operación.
+    with st.form(form_key, clear_on_submit=False):
         ticker = st.text_input("Ticker")
         side = st.selectbox("Tipo", ["Compra", "Venta"])
         quantity = st.number_input(
@@ -2296,8 +2635,8 @@ def render_operation_form(
     if not submitted:
         return
     if not ticker.strip():
-        st.error("El ticker es obligatorio.")
-        return
+        st.session_state[f"{flash_key}_error"] = "El ticker es obligatorio."
+        st.rerun()
     try:
         journal.add_operation(
             ticker,
@@ -2311,8 +2650,8 @@ def render_operation_form(
             recorded_by=recorded_by,
         )
     except (ValueError, JournalStorageError) as exc:
-        st.error(str(exc))
-        return
+        st.session_state[f"{flash_key}_error"] = str(exc)
+        st.rerun()
     st.session_state[flash_key] = (
         f"Operación guardada para {owner_label}."
         if owner_label
@@ -2660,7 +2999,9 @@ def render_current_position_form(
             except (AssertionError, ValueError, JournalStorageError) as exc:
                 st.error(str(exc))
             else:
-                st.success(f"{display_name} se ha guardado en tu cartera.")
+                st.session_state[f"_{view_key}_current_position_flash"] = (
+                    f"{display_name} se ha guardado en tu cartera."
+                )
                 st.rerun()
 
 
@@ -2669,6 +3010,8 @@ def render_private_investments(
     *,
     actor_username: str,
     view_key: str,
+    operations: pd.DataFrame,
+    positions_dashboard: pd.DataFrame,
     include_alternative_investments: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Gestiona la cartera actual y, sólo para ddriu, proyectos alternativos."""
@@ -2678,6 +3021,11 @@ def render_private_investments(
         "Añade lo que tienes en cada bróker y consulta el valor, la ganancia o pérdida "
         "y la distribución de tu cartera. Cada usuario ve únicamente sus propios datos."
     )
+    position_flash = st.session_state.pop(
+        f"_{view_key}_current_position_flash", None
+    )
+    if position_flash:
+        st.success(str(position_flash))
     if include_alternative_investments:
         try:
             investments = journal.list_private_investments()
@@ -2962,15 +3310,20 @@ def render_private_investments(
     else:
         st.info("Todavía no hay cuentas agregadas para mostrar.")
 
-    if not portfolio_snapshots.empty:
+    if not portfolio_snapshots.empty or not positions_dashboard.empty:
         snapshot_view = portfolio_snapshots.copy()
-        snapshot_view["snapshot_date"] = pd.to_datetime(
-            snapshot_view["snapshot_date"], errors="coerce"
+        if snapshot_view.empty:
+            latest_positions = pd.DataFrame()
+            latest_date = pd.Timestamp(date.today())
+        else:
+            latest_positions, latest_summary = latest_portfolio_snapshot(snapshot_view)
+            assert latest_summary is not None
+            latest_date = pd.Timestamp(latest_summary.snapshot_date)
+        latest_positions = reconcile_current_portfolio(
+            latest_positions,
+            operations,
+            positions_dashboard,
         )
-        latest_date = snapshot_view["snapshot_date"].max()
-        latest_positions = snapshot_view.loc[
-            snapshot_view["snapshot_date"] == latest_date
-        ].copy()
         for column in [
             "value_eur", "cost_estimate_eur", "gain_loss_eur", "return_pct"
         ]:
@@ -2981,10 +3334,17 @@ def render_private_investments(
         latest_cost = float(latest_positions["cost_estimate_eur"].sum())
         latest_pnl = float(latest_positions["gain_loss_eur"].sum())
         st.subheader("Fotografía de posiciones")
-        st.caption(
-            f"Última fotografía guardada: {latest_date:%d/%m/%Y}. "
-            "Es una valoración histórica; no sustituye el diario de compras y ventas."
-        )
+        if snapshot_view.empty:
+            st.caption(
+                "Vista actual calculada desde el diario de compras y ventas. "
+                "Guarda una fotografía si también quieres construir un histórico."
+            )
+        else:
+            st.caption(
+                f"Base guardada: {latest_date:%d/%m/%Y}. Vista actual reconciliada: "
+                "si una empresa tiene compras o ventas en el diario, su cantidad y coste "
+                "proceden del diario. El histórico original se conserva."
+            )
         snapshot_cols = st.columns(4)
         snapshot_cols[0].metric("Valor declarado", f"{latest_value:,.2f} €")
         snapshot_cols[1].metric("Coste estimado", f"{latest_cost:,.2f} €")
@@ -2998,11 +3358,16 @@ def render_private_investments(
                 config=PLOTLY_CONFIG,
             )
         with chart_cols[1]:
-            st.plotly_chart(
-                portfolio_snapshot_history_chart(snapshot_view),
-                width="stretch",
-                config=PLOTLY_CONFIG,
-            )
+            if snapshot_view.empty:
+                st.info(
+                    "El histórico empezará cuando guardes una fotografía de cartera."
+                )
+            else:
+                st.plotly_chart(
+                    portfolio_snapshot_history_chart(snapshot_view),
+                    width="stretch",
+                    config=PLOTLY_CONFIG,
+                )
 
         snapshot_display = latest_positions.rename(
             columns={
@@ -3523,6 +3888,9 @@ def render_journal(
     flash_message = st.session_state.pop(flash_key, None)
     if flash_message:
         st.success(str(flash_message))
+    form_error = st.session_state.pop(f"{flash_key}_error", None)
+    if form_error:
+        st.error(str(form_error))
     fixed_fee = st.number_input(
         "Comisión fija por cada compra o venta",
         min_value=0.0,
@@ -3534,6 +3902,20 @@ def render_journal(
             "a la moneda de la acción."
         ),
         key=f"{view_key}_fixed_fee",
+    )
+    operations = journal.list_operations()
+    positions = journal.open_positions()
+    latest_prices = {
+        ticker: float(frame["close"].iloc[-1])
+        for ticker, frame in prepared.items()
+        if not frame.empty
+    }
+    positions_dashboard, portfolio_kpis = build_position_dashboard(
+        operations,
+        positions,
+        latest_prices,
+        fx_snapshot.rates_per_eur,
+        sell_fee_eur=float(fixed_fee),
     )
     current_portfolio_enabled = not shared
     alternative_investments_enabled = (
@@ -3571,12 +3953,13 @@ def render_journal(
                 journal,
                 actor_username=actor_username,
                 view_key=view_key,
+                operations=operations,
+                positions_dashboard=positions_dashboard,
                 include_alternative_investments=alternative_investments_enabled,
             )
 
     with history_tab:
         st.subheader("Histórico")
-        operations = journal.list_operations()
         if operations.empty:
             st.info("El diario todavía está vacío.")
         else:
@@ -3612,31 +3995,65 @@ def render_journal(
                         "Puedes eliminar únicamente los movimientos que registraste tú."
                     )
             else:
+                delete_pending_key = f"_{view_key}_pending_operation_delete"
+                pending_operation_id = st.session_state.get(delete_pending_key)
+                if pending_operation_id is not None:
+                    pending_rows = deletable.loc[
+                        pd.to_numeric(deletable["id"], errors="coerce")
+                        == int(pending_operation_id)
+                    ]
+                    if pending_rows.empty:
+                        st.session_state.pop(delete_pending_key, None)
+                    else:
+                        pending_row = pending_rows.iloc[0]
+                        with st.container(border=True):
+                            st.warning(
+                                "¿Eliminar la operación "
+                                f"{pending_row.get('side', '')} de "
+                                f"{pending_row.get('ticker', '')} del "
+                                f"{str(pending_row.get('executed_at', ''))[:10]}? "
+                                "La cartera se recalculará."
+                            )
+                            confirm_col, cancel_col = st.columns(2)
+                            if confirm_col.button(
+                                "Sí, eliminar",
+                                type="primary",
+                                width="stretch",
+                                key=f"{view_key}_confirm_delete_operation",
+                            ):
+                                journal.delete_operation(int(pending_operation_id))
+                                st.session_state.pop(delete_pending_key, None)
+                                st.session_state[flash_key] = (
+                                    "Operación eliminada; la cartera se ha recalculado."
+                                )
+                                st.rerun()
+                            if cancel_col.button(
+                                "Cancelar",
+                                width="stretch",
+                                key=f"{view_key}_cancel_delete_operation",
+                            ):
+                                st.session_state.pop(delete_pending_key, None)
+                                st.rerun()
+                operation_labels = {
+                    int(row.id): (
+                        f"{row.id} · {row.side} {row.ticker} · "
+                        f"{str(row.executed_at)[:10]} · {float(row.quantity):g} uds."
+                    )
+                    for row in deletable.itertuples(index=False)
+                }
                 operation_id = st.selectbox(
-                    "ID para eliminar",
-                    deletable["id"].tolist(),
+                    "Operación que quieres eliminar",
+                    list(operation_labels),
+                    format_func=lambda value: operation_labels[int(value)],
                     key=f"{view_key}_delete_operation_id",
                 )
                 if st.button(
-                    "Eliminar operación seleccionada",
+                    "Revisar antes de eliminar",
                     key=f"{view_key}_delete_operation",
                 ):
-                    journal.delete_operation(int(operation_id))
+                    st.session_state[delete_pending_key] = int(operation_id)
                     st.rerun()
 
-    positions = journal.open_positions()
-    latest_prices = {
-        ticker: float(frame["close"].iloc[-1])
-        for ticker, frame in prepared.items()
-        if not frame.empty
-    }
-    positions_dashboard, portfolio_kpis = build_position_dashboard(
-        operations,
-        positions,
-        latest_prices,
-        fx_snapshot.rates_per_eur,
-        sell_fee_eur=float(fixed_fee),
-    )
     with evolution_tab:
         render_portfolio_evolution(
             operations=operations,
@@ -3738,13 +4155,25 @@ def render_journal(
             )
             portfolio_cols[1].metric(
                 "Valor neto actual",
-                f"{portfolio_kpis.current_net_value_eur:,.2f} EUR",
+                (
+                    f"{portfolio_kpis.current_net_value_eur:,.2f} EUR"
+                    if portfolio_kpis.priced_positions_count
+                    else "N/D"
+                ),
                 help="Valor de las posiciones con precio disponible, descontando una comisión de salida.",
             )
             portfolio_cols[2].metric(
                 "Resultado latente",
-                f"{portfolio_kpis.unrealized_pnl_eur:+,.2f} EUR",
-                delta=f"{portfolio_kpis.unrealized_return_pct:+.2f}%",
+                (
+                    f"{portfolio_kpis.unrealized_pnl_eur:+,.2f} EUR"
+                    if portfolio_kpis.priced_positions_count
+                    else "N/D"
+                ),
+                delta=(
+                    f"{portfolio_kpis.unrealized_return_pct:+.2f}%"
+                    if portfolio_kpis.priced_positions_count
+                    else None
+                ),
                 help="Beneficio o pérdida si se cerrasen ahora las posiciones valoradas.",
             )
             portfolio_cols[3].metric(
@@ -4386,6 +4815,8 @@ def render_favorite_list(
     if "tags" not in favorites.columns:
         favorites["tags"] = ""
     scope_key = "group" if shared else "private"
+    revision_key = f"favorite_editor_revision_{scope_key}"
+    pending_key = f"_favorite_pending_removal_{scope_key}"
     title_col, add_col = st.columns([4, 1])
     title_col.markdown(f"#### {title}")
     add_col.button(
@@ -4398,6 +4829,43 @@ def render_favorite_list(
         args=("Lista del grupo" if shared else "Mi lista privada",),
     )
     st.caption(f"{len(favorites)} de {MAX_FAVORITES} empresas guardadas")
+    pending_removal = str(st.session_state.get(pending_key) or "").strip().upper()
+    if pending_removal:
+        with st.container(border=True):
+            st.warning(
+                f"¿Quitar {pending_removal} de esta lista? La cartera y el diario "
+                "no se modificarán."
+            )
+            confirm_col, cancel_col = st.columns(2)
+            if confirm_col.button(
+                "Sí, quitar",
+                type="primary",
+                width="stretch",
+                key=f"confirm_favorite_removal_{scope_key}",
+            ):
+                try:
+                    journal.delete_favorite(pending_removal)
+                except (JournalStorageError, ValueError) as exc:
+                    st.error(str(exc))
+                else:
+                    st.session_state["_favorites_flash"] = (
+                        f"{pending_removal} se ha quitado de la lista."
+                    )
+                    st.session_state.pop(pending_key, None)
+                    st.session_state[revision_key] = (
+                        int(st.session_state.get(revision_key, 0) or 0) + 1
+                    )
+                    st.rerun()
+            if cancel_col.button(
+                "Cancelar",
+                width="stretch",
+                key=f"cancel_favorite_removal_{scope_key}",
+            ):
+                st.session_state.pop(pending_key, None)
+                st.session_state[revision_key] = (
+                    int(st.session_state.get(revision_key, 0) or 0) + 1
+                )
+                st.rerun()
     if favorites.empty:
         st.info("Todavía no hay empresas en esta lista.")
         return
@@ -4451,8 +4919,11 @@ def render_favorite_list(
         visible["Quitar"] = False
         if not shared:
             visible = visible.drop(columns=["Añadida por"])
+        action_first = ["Ticker", "Analizar", "Quitar", "Empresa", "Mercado", "Etiquetas"]
+        if shared:
+            action_first.append("Añadida por")
+        visible = visible.loc[:, action_first]
 
-        revision_key = f"favorite_editor_revision_{scope_key}"
         editor_revision = int(st.session_state.get(revision_key, 0) or 0)
         edited = st.data_editor(
             visible,
@@ -4507,16 +4978,11 @@ def render_favorite_list(
 
             if wants_remove:
                 if not can_edit_selected:
-                    st.warning(
+                    st.session_state["_favorites_warning"] = (
                         "En la lista del grupo sólo puedes quitar las empresas que tú añadiste."
                     )
                 else:
-                    try:
-                        journal.delete_favorite(selected_ticker)
-                    except (JournalStorageError, ValueError) as exc:
-                        st.error(str(exc))
-                    else:
-                        st.success(f"{selected_ticker} ya no está en esta lista.")
+                    st.session_state[pending_key] = selected_ticker
                 st.session_state[revision_key] = editor_revision + 1
                 st.rerun()
 
@@ -4531,7 +4997,9 @@ def render_favorite_list(
                     except (JournalStorageError, ValueError) as exc:
                         st.error(str(exc))
                     else:
-                        st.success(f"Etiquetas de {selected_ticker} actualizadas.")
+                        st.session_state["_favorites_flash"] = (
+                            f"Etiquetas de {selected_ticker} actualizadas."
+                        )
                 st.session_state[revision_key] = editor_revision + 1
                 st.rerun()
 
@@ -4596,6 +5064,12 @@ def render_favorites_manager(
     is_admin: bool,
     favorite_view: str,
 ) -> None:
+    favorite_flash = st.session_state.pop("_favorites_flash", None)
+    if favorite_flash:
+        st.success(str(favorite_flash))
+    favorite_warning = st.session_state.pop("_favorites_warning", None)
+    if favorite_warning:
+        st.warning(str(favorite_warning))
     if favorite_view == "Mis listas":
         render_page_intro(
             "FAVORITOS",
@@ -4703,7 +5177,9 @@ def render_favorites_manager(
                     except (JournalStorageError, ValueError) as exc:
                         st.error(str(exc))
                     else:
-                        st.success(f"{direct_ticker} se ha guardado.")
+                        st.session_state["_favorites_flash"] = (
+                            f"{direct_ticker} se ha guardado en {destination.lower()}."
+                        )
                         st.session_state.pop("favorite_search_results", None)
                         st.session_state.pop("favorite_search_last_query", None)
                         st.session_state["_return_to_favorite_lists"] = True
@@ -4783,7 +5259,7 @@ def render_favorites_manager(
             except (JournalStorageError, ValueError) as exc:
                 st.error(str(exc))
             else:
-                st.success(
+                st.session_state["_favorites_flash"] = (
                     f"{selected.name} se ha guardado en "
                     f"{destination.lower()}."
                 )
@@ -4819,36 +5295,37 @@ def _logout_current_user() -> None:
 
 def render_app_header(user: AuthConfig) -> None:
     role = "Administrador" if user.is_admin else f"Hola, {user.display_name}"
-    header_col, account_col = st.columns([7, 1], vertical_alignment="center")
-    with header_col:
-        st.markdown(
-            f"""
-            <div class="ssl-app-header">
-                {brand_mark_html()}
-                <div>
-                    <h1 class="ssl-app-title">Stock Signal Lab</h1>
-                    <p class="ssl-app-subtitle">
-                        {html.escape(role)} · señales explicadas, cartera y riesgo
-                    </p>
+    with st.container(key="app_header_container"):
+        header_col, account_col = st.columns([7, 1], vertical_alignment="center")
+        with header_col:
+            st.markdown(
+                f"""
+                <div class="ssl-app-header">
+                    {brand_mark_html()}
+                    <div>
+                        <h1 class="ssl-app-title">Stock Signal Lab</h1>
+                        <p class="ssl-app-subtitle">
+                            {html.escape(role)} · señales explicadas, cartera y riesgo
+                        </p>
+                    </div>
+                    <span class="ssl-status-pill">Sólo análisis</span>
                 </div>
-                <span class="ssl-status-pill">Sólo análisis</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with account_col:
-        with st.popover(
-            "Mi cuenta",
-            icon=":material/account_circle:",
-            width="stretch",
-        ):
-            st.caption(f"Sesión iniciada como {user.display_name}.")
-            st.button(
-                "Cerrar sesión",
-                width="stretch",
-                key="header_logout",
-                on_click=_logout_current_user,
+                """,
+                unsafe_allow_html=True,
             )
+        with account_col:
+            with st.popover(
+                "Cuenta",
+                icon=":material/account_circle:",
+                width="stretch",
+            ):
+                st.caption(f"Sesión iniciada como {user.display_name}.")
+                st.button(
+                    "Cerrar sesión",
+                    width="stretch",
+                    key="header_logout",
+                    on_click=_logout_current_user,
+                )
 
 
 def render_analysis_view_guide() -> None:
@@ -5681,6 +6158,7 @@ def render_home(
         private_dashboard, private_kpis = _portfolio_snapshot(
             journal, prepared, fx_snapshot
         )
+        private_operations = journal.list_operations()
         group_dashboard, group_kpis = _portfolio_snapshot(
             group_journal, prepared, fx_snapshot
         )
@@ -5688,8 +6166,17 @@ def render_home(
         st.warning(f"No se pudo construir el resumen de carteras: {exc}")
         private_dashboard = pd.DataFrame()
         group_dashboard = pd.DataFrame()
+        private_operations = pd.DataFrame()
         private_kpis = None
         group_kpis = None
+
+    latest_snapshot = reconcile_current_portfolio(
+        latest_snapshot,
+        private_operations,
+        private_dashboard,
+    )
+    if not latest_snapshot.empty:
+        latest_snapshot, snapshot_summary = latest_portfolio_snapshot(latest_snapshot)
 
     if section in {"Resumen", "Hoy"} and (
         snapshot_summary is not None or private_kpis is not None
@@ -5784,7 +6271,8 @@ def render_home(
     if section == "Mi cartera" and snapshot_summary is not None:
         st.markdown("### Mi cartera")
         st.caption(
-            "Distribución basada en los últimos valores guardados, no en cotizaciones en tiempo real. "
+            "Vista única: el diario manda en las acciones con compras o ventas; "
+            "el resto conserva su último valor guardado. "
             f"{snapshot_summary.analyzable_count} partidas tienen ticker reconocible para análisis. "
             "Civislend y Segofactoring aparecen agrupados para mostrar el capital total invertido."
         )
@@ -6257,6 +6745,8 @@ def render_opportunities_page(
         raw_fundamentals.get(selected, {}),
         price_verifications.get(selected),
         journal,
+        opportunity_results,
+        fundamental_results,
     )
 
 
@@ -6891,6 +7381,8 @@ def render_company_analysis_page(
         raw_fundamentals.get(selected, {}),
         price_verifications.get(selected),
         journal,
+        opportunity_results,
+        fundamental_results,
     )
 
 
@@ -8879,7 +9371,7 @@ def main() -> None:
             favorite_options,
             key="favorite_view",
             format_func=lambda value: (
-                "♡ Mis listas" if value == "Mis listas" else "+ Añadir empresa"
+                "♡ Mis listas" if value == "Mis listas" else "+ Añadir"
             ),
         )
     elif selected_section == "Carteras":
@@ -8891,7 +9383,7 @@ def main() -> None:
             portfolio_options,
             key="portfolio_navigation",
             format_func=lambda value: (
-                "▱ Mi cartera" if value == "Privada" else "◎ Cartera del grupo"
+                "▱ Mi cartera" if value == "Privada" else "◎ Grupo"
             ),
         )
     elif selected_section == "Más":
