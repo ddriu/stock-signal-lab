@@ -112,6 +112,7 @@ from src.journal import (
 from src.msn_research import build_msn_research_links
 from src.navigation import (
     analysis_refresh_tickers,
+    direct_ticker_from_query,
     growth_radar_ticker_groups,
     merge_analysis_ticker_sources,
     sanitize_favorite_selection,
@@ -4155,6 +4156,14 @@ def _favorites_matching_tags(
     return favorites.loc[mask].copy()
 
 
+def _open_favorite_add(destination: str) -> None:
+    """Abre el alta de favoritas con la lista de destino ya elegida."""
+
+    st.session_state["main_navigation"] = "Favoritos"
+    st.session_state["favorite_view"] = "Añadir empresa"
+    st.session_state["_requested_favorite_destination"] = destination
+
+
 def render_favorite_list(
     favorites: pd.DataFrame,
     *,
@@ -4168,13 +4177,23 @@ def render_favorite_list(
     favorites = favorites.copy()
     if "tags" not in favorites.columns:
         favorites["tags"] = ""
-    st.markdown(f"#### {title}")
+    scope_key = "group" if shared else "private"
+    title_col, add_col = st.columns([4, 1])
+    title_col.markdown(f"#### {title}")
+    add_col.button(
+        "Añadir empresa",
+        icon=":material/add:",
+        type="primary",
+        width="stretch",
+        key=f"favorite_add_{scope_key}",
+        on_click=_open_favorite_add,
+        args=("Lista del grupo" if shared else "Mi lista privada",),
+    )
     st.caption(f"{len(favorites)} de {MAX_FAVORITES} empresas guardadas")
     if favorites.empty:
         st.info("Todavía no hay empresas en esta lista.")
         return
 
-    scope_key = "group" if shared else "private"
     search_value = st.text_input(
         "Buscar dentro de esta lista",
         placeholder="Nombre o ticker",
@@ -4390,6 +4409,20 @@ def render_favorites_manager(
         "Añadir empresa",
         "Busca por nombre y elige la cotización y el mercado correctos.",
     )
+    destinations = ["Mi lista privada", "Lista del grupo"]
+    requested_destination = st.session_state.pop(
+        "_requested_favorite_destination", None
+    )
+    if requested_destination in destinations:
+        st.session_state["favorite_destination"] = requested_destination
+        st.session_state["manual_favorite_destination"] = requested_destination
+    destination = st.radio(
+        "Dónde guardarla",
+        destinations,
+        horizontal=True,
+        key="favorite_destination",
+        help="Guardar una empresa no es una recomendación de compra.",
+    )
     with st.form("company_search_form"):
         search_col, button_col = st.columns([4, 1])
         query = search_col.text_input(
@@ -4407,6 +4440,7 @@ def render_favorites_manager(
             width="stretch",
         )
     if submitted:
+        st.session_state["favorite_search_last_query"] = query.strip()
         st.session_state.pop("favorite_search_result", None)
         st.session_state.pop("favorite_market_filter", None)
         try:
@@ -4421,9 +4455,51 @@ def render_favorites_manager(
     )
     if submitted and not results:
         st.warning(
-            "No se encontraron acciones o ETF. Prueba con el nombre en inglés o abre "
-            "el modo avanzado de ticker exacto."
+            "No se encontraron acciones o ETF con ese texto. Si has escrito un "
+            "ticker válido, puedes guardarlo directamente debajo."
         )
+    direct_query = str(
+        st.session_state.get("favorite_search_last_query", "") or ""
+    ).strip()
+    if not results and direct_query:
+        direct_ticker = direct_ticker_from_query(direct_query)
+        if direct_ticker:
+            with st.container(border=True):
+                st.markdown(f"#### Añadir `{direct_ticker}` directamente")
+                st.caption(
+                    "Utiliza esta opción cuando conoces el ticker pero el buscador "
+                    "por nombre no devuelve su mercado."
+                )
+                direct_name = st.text_input(
+                    "Nombre de la empresa (opcional)",
+                    placeholder="Si lo dejas vacío se mostrará el ticker",
+                    key="favorite_direct_name",
+                )
+                if st.button(
+                    f"Guardar {direct_ticker}",
+                    type="primary",
+                    width="stretch",
+                    key="save_direct_favorite",
+                ):
+                    target = (
+                        private_journal
+                        if destination == "Mi lista privada"
+                        else group_journal
+                    )
+                    try:
+                        target.add_favorite(
+                            direct_ticker,
+                            direct_name,
+                            recorded_by=actor_username,
+                        )
+                    except (JournalStorageError, ValueError) as exc:
+                        st.error(str(exc))
+                    else:
+                        st.success(f"{direct_ticker} se ha guardado.")
+                        st.session_state.pop("favorite_search_results", None)
+                        st.session_state.pop("favorite_search_last_query", None)
+                        st.session_state["_return_to_favorite_lists"] = True
+                        st.rerun()
     if results:
         market = st.selectbox(
             "Filtrar por mercado o país",
@@ -4439,12 +4515,6 @@ def render_favorites_manager(
             options=result_indices,
             format_func=lambda index: _search_result_label(results[index]),
             key="favorite_search_result",
-        )
-        destination = st.radio(
-            "Dónde guardarla",
-            ["Mi lista privada", "Lista del grupo"],
-            horizontal=True,
-            help="Guardar una empresa no es una recomendación de compra.",
         )
         selected = results[result_index]
         st.caption(
@@ -4510,72 +4580,9 @@ def render_favorites_manager(
                     f"{destination.lower()}."
                 )
                 st.session_state.pop("favorite_search_results", None)
+                st.session_state.pop("favorite_search_last_query", None)
                 st.session_state["_return_to_favorite_lists"] = True
                 st.rerun()
-
-    with st.expander("Modo avanzado: añadir un ticker exacto"):
-        st.caption(
-            "Úsalo sólo si la búsqueda por nombre no funciona. Los sufijos identifican "
-            "el mercado: .MC España, .T Japón, .L Londres y .IL Londres internacional."
-        )
-        with st.form("manual_favorite_form", clear_on_submit=True):
-            manual_ticker = st.text_input(
-                "Ticker",
-                placeholder="Ejemplo: SAN.MC, 7974.T o KAP.IL",
-            )
-            manual_name = st.text_input(
-                "Nombre opcional",
-                placeholder="Si lo dejas vacío se mostrará el ticker",
-            )
-            manual_tags = st.multiselect(
-                "Etiquetas",
-                FAVORITE_TAGS,
-                max_selections=5,
-                key="manual_favorite_tags",
-            )
-            manual_destination = st.radio(
-                "Lista",
-                ["Mi lista privada", "Lista del grupo"],
-                horizontal=True,
-                key="manual_favorite_destination",
-            )
-            manual_submitted = st.form_submit_button(
-                "Guardar ticker",
-                type="primary",
-                width="stretch",
-            )
-        if manual_submitted:
-            normalized_ticker = manual_ticker.strip().upper()
-            target = (
-                private_journal
-                if manual_destination == "Mi lista privada"
-                else group_journal
-            )
-            resolved_tags = manual_tags
-            if normalized_ticker and not resolved_tags:
-                try:
-                    manual_fundamentals = cached_fundamentals(normalized_ticker)
-                except (DataDownloadError, ValueError):
-                    manual_fundamentals = {}
-                resolved_tags = suggest_favorite_tags(
-                    normalized_ticker,
-                    manual_name,
-                    fundamentals=manual_fundamentals,
-                )
-            try:
-                target.add_favorite(
-                    normalized_ticker,
-                    manual_name,
-                    tags=resolved_tags,
-                    recorded_by=actor_username,
-                )
-            except (JournalStorageError, ValueError) as exc:
-                st.error(str(exc))
-            else:
-                st.success(f"{normalized_ticker} se ha guardado.")
-                st.session_state["_return_to_favorite_lists"] = True
-                st.rerun()
-
 
 PLOTLY_CONFIG = {
     "displayModeBar": False,
@@ -4887,6 +4894,7 @@ def _reset_analysis_company_picker() -> None:
         st.session_state.get("analysis_picker_revision", 0) or 0
     ) + 1
     st.session_state.pop("analysis_picker_results", None)
+    st.session_state.pop("analysis_picker_last_query", None)
     st.session_state.pop("analysis_picker_market", None)
     st.session_state.pop("analysis_picker_result", None)
 
@@ -4898,6 +4906,7 @@ def _continue_search_in_favorites(
     """Lleva una búsqueda rápida a la pantalla donde puede guardarse."""
 
     st.session_state["main_navigation"] = "Favoritos"
+    st.session_state["favorite_view"] = "Añadir empresa"
     st.session_state["favorite_search_query"] = query
     st.session_state["favorite_search_results"] = results
     st.session_state.pop("favorite_market_filter", None)
@@ -5054,6 +5063,7 @@ def _close_quick_company_search() -> None:
     revision = int(st.session_state.get("quick_company_search_revision", 0) or 0)
     st.session_state["quick_company_search_revision"] = revision + 1
     st.session_state.pop("quick_company_search_results", None)
+    st.session_state.pop("quick_company_search_last_query", None)
     st.session_state.pop("quick_company_market_filter", None)
     st.session_state.pop("quick_company_search_result", None)
 
@@ -5096,6 +5106,7 @@ def render_quick_company_search() -> None:
                 width="stretch",
             )
         if submitted:
+            st.session_state["quick_company_search_last_query"] = query.strip()
             st.session_state.pop("quick_company_market_filter", None)
             st.session_state.pop("quick_company_search_result", None)
             try:
@@ -5111,8 +5122,21 @@ def render_quick_company_search() -> None:
             [],
         )
         if submitted and not results:
-            st.warning("No se encontraron acciones o ETF con ese nombre.")
+            st.warning("No se encontraron acciones o ETF con ese nombre o ticker.")
         if not results:
+            direct_ticker = direct_ticker_from_query(
+                st.session_state.get("quick_company_search_last_query", "")
+            )
+            if direct_ticker:
+                st.button(
+                    f"Abrir {direct_ticker} directamente",
+                    icon=":material/open_in_new:",
+                    type="primary",
+                    width="stretch",
+                    key=f"quick_open_direct_{revision}",
+                    on_click=_open_quick_company_analysis,
+                    args=(direct_ticker,),
+                )
             return
 
         market = st.selectbox(
@@ -5159,7 +5183,7 @@ def render_analysis_company_picker(
     journal: object,
     raw_fundamentals: dict[str, dict[str, object]],
 ) -> None:
-    """Un único selector para favoritas, recientes, guardadas y búsquedas nuevas."""
+    """Separa empresas conocidas de la búsqueda de una cotización nueva."""
 
     try:
         snapshots = journal.list_analysis_snapshots()
@@ -5197,55 +5221,66 @@ def render_analysis_company_picker(
         labels[ticker] = (
             f"{name} ({ticker}) · {source}" if name != ticker else f"{ticker} · {source}"
         )
-    label_to_ticker = {label: ticker for ticker, label in labels.items()}
-    ticker_lookup = {ticker.casefold(): ticker for ticker in suggestion_tickers}
-
     revision = int(st.session_state.get("analysis_picker_revision", 0) or 0)
-    picker_key = f"analysis_company_query_{revision}"
+    # Use a new widget namespace so sessions created by the previous combined
+    # selector cannot restore an obsolete label as the selected ticker.
+    picker_key = f"analysis_known_company_{revision}"
     active_ticker = str(st.session_state.get("analysis_ticker", "") or "").strip()
 
     with st.container(border=True):
         st.markdown("#### Elige una empresa")
         st.caption(
-            "Empieza a escribir un nombre o ticker. En la misma lista aparecen tus "
-            "favoritas, las recientes y los análisis guardados."
+            "Abre una empresa conocida o busca una nueva por su nombre o ticker."
         )
         if active_ticker:
             st.caption(f"Empresa abierta ahora: **{active_ticker}**")
-        selector_col, action_col = st.columns([4, 1])
-        with selector_col:
-            search_choice = st.selectbox(
-                "Buscar empresa",
-                [labels[ticker] for ticker in suggestion_tickers],
-                index=None,
-                placeholder="Escribe un nombre o ticker…",
-                accept_new_options=True,
-                filter_mode="fuzzy",
-                key=picker_key,
-                help=(
-                    "Si la empresa no está en tu historial, buscaremos su cotización "
-                    "correcta en los mercados disponibles."
-                ),
+        if suggestion_tickers:
+            st.markdown("##### Favoritas, recientes y guardadas")
+            selector_col, action_col = st.columns([4, 1])
+            with selector_col:
+                known_ticker = st.selectbox(
+                    "Empresa conocida",
+                    suggestion_tickers,
+                    index=None,
+                    placeholder="Elige o filtra una empresa…",
+                    format_func=lambda ticker: labels.get(ticker, ticker),
+                    filter_mode="fuzzy",
+                    key=picker_key,
+                    label_visibility="collapsed",
+                )
+            with action_col:
+                open_known = st.button(
+                    "Abrir",
+                    icon=":material/open_in_new:",
+                    type="primary",
+                    width="stretch",
+                    disabled=not known_ticker,
+                    key=f"analysis_company_open_known_{revision}",
+                )
+            if open_known and known_ticker:
+                _open_ticker_analysis(known_ticker)
+                st.rerun()
+
+        st.divider()
+        st.markdown("##### Buscar una empresa nueva")
+        with st.form(f"analysis_manual_search_form_{revision}"):
+            query_col, search_col = st.columns([4, 1])
+            query = query_col.text_input(
+                "Nombre o ticker nuevo",
+                placeholder="BAE Systems, Nintendo, ANET, 7974.T…",
+                key=f"analysis_manual_query_{revision}",
+                label_visibility="collapsed",
             )
-        known_ticker = label_to_ticker.get(str(search_choice or ""))
-        if known_ticker is None and search_choice:
-            known_ticker = ticker_lookup.get(str(search_choice).strip().casefold())
-        with action_col:
-            st.markdown("<div style='height: 1.75rem'></div>", unsafe_allow_html=True)
-            search_action = st.button(
-                "Abrir" if known_ticker else "Buscar",
+            search_action = search_col.form_submit_button(
+                "Buscar",
                 icon=":material/search:",
                 type="primary",
                 width="stretch",
-                disabled=not search_choice,
-                key=f"analysis_company_action_{revision}",
             )
 
-        if search_action and search_choice:
-            if known_ticker:
-                _open_ticker_analysis(known_ticker)
-                st.rerun()
-            query = str(search_choice).strip()
+        if search_action:
+            query = str(query or "").strip()
+            st.session_state["analysis_picker_last_query"] = query
             st.session_state.pop("analysis_picker_market", None)
             st.session_state.pop("analysis_picker_result", None)
             try:
@@ -5258,8 +5293,21 @@ def render_analysis_company_picker(
             "analysis_picker_results",
             [],
         )
-        if search_action and search_choice and not known_ticker and not results:
+        if search_action and query and not results:
             st.warning("No se encontraron cotizaciones con ese nombre o ticker.")
+        last_query = str(
+            st.session_state.get("analysis_picker_last_query", "") or ""
+        ).strip()
+        direct_ticker = direct_ticker_from_query(last_query)
+        if not results and direct_ticker:
+            st.button(
+                f"Analizar {direct_ticker} como ticker exacto",
+                icon=":material/open_in_new:",
+                width="stretch",
+                key=f"analysis_picker_direct_{revision}",
+                on_click=_open_ticker_analysis,
+                args=(direct_ticker,),
+            )
         if results:
             market = st.selectbox(
                 "Mercado de cotización",
@@ -8486,6 +8534,8 @@ def main() -> None:
                 ANALYSIS_TOOL_OPTIONS,
                 key="analysis_tool_navigation",
             )
+        if analysis_section != "Empresa":
+            render_quick_company_search()
     elif selected_section == "Favoritos":
         favorite_options = ["Mis listas", "Añadir empresa"]
         if st.session_state.pop("_return_to_favorite_lists", False):
