@@ -89,6 +89,32 @@ def merge_analysis_ticker_sources(*sources: Iterable[object]) -> list[str]:
     return merged
 
 
+def next_daily_review_batch(
+    tickers: Iterable[object],
+    attempted_tickers: Iterable[object],
+    *,
+    limit: int = 25,
+) -> list[str]:
+    """Devuelve el siguiente lote diario sin repetir empresas ya intentadas.
+
+    La revisión completa se reparte en lotes pequeños para no agotar los recursos
+    del alojamiento gratuito. Una empresa con datos parciales también cuenta como
+    intentada: así un proveedor externo que falle no provoca un bucle infinito.
+    """
+
+    attempted = {
+        ticker
+        for value in attempted_tickers
+        if (ticker := normalize_ticker(value))
+    }
+    pending: list[str] = []
+    for value in tickers:
+        ticker = normalize_ticker(value)
+        if ticker and ticker not in attempted and ticker not in pending:
+            pending.append(ticker)
+    return pending[: max(int(limit), 1)]
+
+
 def growth_radar_ticker_groups(
     readings: Iterable[tuple[object, object]],
 ) -> dict[str, list[str]]:
