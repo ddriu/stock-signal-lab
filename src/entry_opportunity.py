@@ -777,3 +777,42 @@ def sector_concentrations(
         for sector, tickers in grouped.items()
         if len(dict.fromkeys(tickers)) >= minimum_count
     }
+
+
+def actionable_sector_concentrations(
+    opportunities: Iterable[EntryOpportunityResult],
+    *,
+    minimum_count: int = 2,
+) -> dict[str, tuple[str, ...]]:
+    """Agrupa sólo entradas comprables para que el aviso sea accionable.
+
+    Tener muchas empresas del mismo sector bajo seguimiento no equivale a
+    proponer su compra simultánea. La diversificación importa aquí cuando dos o
+    más pasan todos los filtros de entrada el mismo día.
+    """
+
+    return sector_concentrations(
+        (
+            result
+            for result in opportunities
+            if result.status_code == STATUS_BUYABLE
+        ),
+        minimum_count=minimum_count,
+    )
+
+
+def opportunity_status_counts(
+    opportunities: Iterable[EntryOpportunityResult],
+) -> dict[str, int]:
+    """Resume los estados sin convertir un score alto en una orden de compra."""
+
+    counts = {
+        STATUS_BUYABLE: 0,
+        STATUS_WAIT_PRICE: 0,
+        STATUS_EXTENDED: 0,
+        STATUS_EVENT: 0,
+    }
+    for result in opportunities:
+        if result.status_code in counts:
+            counts[result.status_code] += 1
+    return counts

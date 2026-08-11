@@ -6,9 +6,12 @@ from collections.abc import Iterable
 
 import pandas as pd
 
+from src.data_loader import resolve_analysis_ticker
+
 
 def _ticker(value: object) -> str:
-    return str(value or "").strip().upper()
+    ticker = str(value or "").strip().upper()
+    return resolve_analysis_ticker(ticker) if ticker else ""
 
 
 def _optional_number(value: object) -> float | None:
