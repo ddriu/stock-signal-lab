@@ -83,3 +83,34 @@ def test_dashboard_keeps_unpriced_position_visible() -> None:
     assert pd.isna(dashboard.iloc[0]["current_price"])
     assert kpis.invested_eur == pytest.approx(10.0)
     assert kpis.priced_positions_count == 0
+
+
+def test_dashboard_uses_analysis_alias_for_broker_ticker() -> None:
+    operations = pd.DataFrame(
+        [
+            {
+                "id": 1,
+                "ticker": "CEBS",
+                "side": "Compra",
+                "quantity": 7.0,
+                "price": 9.0,
+                "fees": 0.0,
+                "executed_at": "2026-08-01",
+                "notes": "",
+                "currency": "EUR",
+                "created_at": "2026-08-01",
+            }
+        ]
+    )
+    positions = calculate_open_positions(operations)
+
+    dashboard, kpis = build_position_dashboard(
+        operations,
+        positions,
+        {"CEBS.DE": 10.0},
+        {"EUR": 1.0},
+    )
+
+    assert dashboard.iloc[0]["ticker"] == "CEBS"
+    assert dashboard.iloc[0]["current_price"] == pytest.approx(10.0)
+    assert kpis.priced_positions_count == 1

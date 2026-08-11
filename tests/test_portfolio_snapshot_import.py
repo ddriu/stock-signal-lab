@@ -121,6 +121,40 @@ def test_snapshot_import_is_idempotent_and_creates_civislend_detail(tmp_path) ->
     assert len(journal.list_private_investments()) == 1
 
 
+def test_snapshot_import_does_not_duplicate_manual_civislend_project(tmp_path) -> None:
+    positions = normalize_portfolio_snapshot_frame(sample_snapshot_source())
+    snapshot = PortfolioWorkbookSnapshot(
+        positions=positions,
+        accounts=account_summaries_from_positions(positions),
+        snapshot_date="2026-07-17",
+    )
+    journal = TradingJournal(tmp_path / "journal.db", owner="ddriu")
+    journal.add_private_investment(
+        platform="Civislend",
+        project_name="Proyecto 1",
+        invested_amount=1_000,
+        current_value=1_000,
+        expected_return_pct=10,
+        start_date="2026-07-01",
+        maturity_date=None,
+        status="Activa",
+        notes="Alta manual",
+        recorded_by="ddriu",
+    )
+
+    result = import_portfolio_workbook_snapshot(
+        journal,
+        snapshot,
+        recorded_by="ddriu",
+    )
+
+    assert result.civislend_created == 0
+    assert result.civislend_updated == 0
+    investments = journal.list_private_investments()
+    assert investments["project_name"].tolist() == ["Proyecto 1"]
+    assert investments.iloc[0]["notes"] == "Alta manual"
+
+
 def test_snapshot_rejects_multiple_valuation_dates() -> None:
     source = sample_snapshot_source()
     source.loc[1, "Fecha"] = "18/07/2026"
@@ -128,3 +162,17 @@ def test_snapshot_rejects_multiple_valuation_dates() -> None:
     with pytest.raises(ValueError, match="una sola fecha"):
         normalize_portfolio_snapshot_frame(source)
 
+
+def test_snapshot_keeps_broker_symbol_but_uses_analysis_alias() -> None:
+    source = sample_snapshot_source().iloc[:4].copy()
+    source["Ticker / ISIN"] = ["6VO", "AMZ", "NETFLIX", "CEBS"]
+
+    positions = normalize_portfolio_snapshot_frame(source)
+
+    assert positions["raw_identifier"].tolist() == ["6VO", "AMZ", "NETFLIX", "CEBS"]
+    assert positions["analysis_ticker"].tolist() == [
+        "RDDT",
+        "AMZN",
+        "NFLX",
+        "CEBS.DE",
+    ]

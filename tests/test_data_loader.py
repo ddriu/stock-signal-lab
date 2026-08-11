@@ -54,6 +54,7 @@ def test_stooq_symbol_translates_common_markets() -> None:
 def test_broker_aliases_resolve_to_analysis_tickers() -> None:
     assert data_loader.resolve_analysis_ticker("6vo") == "RDDT"
     assert data_loader.resolve_analysis_ticker("AMZ") == "AMZN"
+    assert data_loader.resolve_analysis_ticker("CEBS") == "CEBS.DE"
     assert data_loader.resolve_analysis_ticker("Netflix") == "NFLX"
     assert data_loader.resolve_analysis_ticker("ServiceNow") == "NOW"
     assert data_loader.resolve_analysis_ticker("SONY") == "SONY"
