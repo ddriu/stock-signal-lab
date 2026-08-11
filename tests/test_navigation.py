@@ -1,9 +1,23 @@
 from src.navigation import (
     analysis_refresh_tickers,
+    direct_ticker_from_query,
     growth_radar_ticker_groups,
     merge_analysis_ticker_sources,
     sanitize_favorite_selection,
 )
+
+
+def test_direct_ticker_query_accepts_international_symbols() -> None:
+    assert direct_ticker_from_query(" anet ") == "ANET"
+    assert direct_ticker_from_query("san.mc") == "SAN.MC"
+    assert direct_ticker_from_query("025560.ks") == "025560.KS"
+    assert direct_ticker_from_query("BRK-B") == "BRK-B"
+
+
+def test_direct_ticker_query_does_not_treat_company_name_as_symbol() -> None:
+    assert direct_ticker_from_query("BAE Systems") is None
+    assert direct_ticker_from_query("") is None
+    assert direct_ticker_from_query("AAPL / MSFT") is None
 
 
 def test_temporary_ticker_cannot_break_favorite_multiselect() -> None:
