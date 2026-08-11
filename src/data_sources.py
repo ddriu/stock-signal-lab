@@ -524,9 +524,18 @@ def benchmark_for_ticker(ticker: str) -> str:
 
 
 def sector_benchmark(sector: str | None, ticker: str) -> str | None:
-    """Devuelve un ETF sectorial para títulos estadounidenses."""
+    """Devuelve una referencia sectorial compatible con la plaza de cotización."""
 
-    if "." in ticker:
+    symbol = ticker.upper()
+    # Referencias UCITS negociadas en Londres. Comparar en la misma plaza reduce
+    # el ruido de divisa que introduciría enfrentar directamente una acción en
+    # GBP con un ETF estadounidense en USD.
+    london_mapping = {
+        "Consumer Defensive": "ESIS.L",
+    }
+    if symbol.endswith(".L"):
+        return london_mapping.get(sector or "")
+    if "." in symbol:
         return None
     mapping = {
         "Technology": "XLK",

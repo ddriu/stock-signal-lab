@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Callable
 
 
@@ -28,7 +29,7 @@ def _number(value: Any) -> float | None:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    return number if number == number else None
+    return number if math.isfinite(number) else None
 
 
 def _tier_score(value: float, tiers: tuple[tuple[Callable[[float], bool], float], ...]) -> float:

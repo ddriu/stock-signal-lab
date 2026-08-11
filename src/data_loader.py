@@ -175,6 +175,18 @@ def _market_metadata(
 
 _CURATED_INTERNATIONAL_LISTINGS: tuple[tuple[tuple[str, ...], TickerSearchResult], ...] = (
     (
+        ("diageo", "diageo plc", "dge", "dge.l"),
+        TickerSearchResult(
+            ticker="DGE.L",
+            name="Diageo plc",
+            exchange="London Stock Exchange",
+            instrument_type="Acción",
+            country="Reino Unido",
+            currency="GBP",
+            listing_type="Acción local",
+        ),
+    ),
+    (
         ("kazatomprom", "national atomic company", "kap.il"),
         TickerSearchResult(
             ticker="KAP.IL",
@@ -438,6 +450,7 @@ def _download_yahoo_chart_prices(
             description = ((chart or {}).get("error") or {}).get("description")
             raise ValueError(description or "respuesta sin series de precios")
         series = result[0]
+        metadata = series.get("meta") if isinstance(series.get("meta"), dict) else {}
         timestamps = series.get("timestamp") or []
         indicators = series.get("indicators") or {}
         quotes = indicators.get("quote") or []
@@ -464,6 +477,7 @@ def _download_yahoo_chart_prices(
             for column in ("Open", "High", "Low", "Close"):
                 frame[column] = pd.to_numeric(frame[column], errors="coerce") * ratio
         frame.attrs["provider"] = "Yahoo Finance (conexión directa)"
+        frame.attrs["quote_currency"] = str(metadata.get("currency") or "").strip()
         return frame
     except (requests.RequestException, AttributeError, KeyError, TypeError, ValueError) as exc:
         # No se expone la URL completa ni la respuesta interna del proveedor en
@@ -544,6 +558,8 @@ def download_prices(
     result["volume"] = result["volume"].fillna(0.0)
     result.attrs["ticker"] = symbol
     result.attrs["provider"] = frame.attrs.get("provider", "Yahoo Finance")
+    if frame.attrs.get("quote_currency"):
+        result.attrs["quote_currency"] = frame.attrs["quote_currency"]
     return result
 
 
@@ -667,6 +683,8 @@ def download_fundamental_snapshot(ticker: str) -> dict[str, object]:
         "industry",
         "quoteType",
         "currency",
+        "exchange",
+        "fullExchangeName",
         "returnOnEquity",
         "profitMargins",
         "operatingMargins",
@@ -688,6 +706,8 @@ def download_fundamental_snapshot(ticker: str) -> dict[str, object]:
         "earningsTimestampStart",
         "earningsTimestampEnd",
         "earningsDate",
+        "exDividendDate",
+        "dividendDate",
     }
     warnings: list[str] = []
     stock = yf.Ticker(symbol)

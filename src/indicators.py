@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from config import StrategyConfig
+from src.stop_engine import AtrMethod, calculate_atr
 
 
 def calculate_rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -21,6 +22,47 @@ def calculate_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     rsi = rsi.mask((average_loss == 0) & (average_gain > 0), 100.0)
     rsi = rsi.mask((average_loss == 0) & (average_gain == 0), 50.0)
     return rsi.rename("rsi")
+
+
+def calculate_adx(frame: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    """Calcula ADX y sus dos direcciones con el suavizado de Wilder.
+
+    ADX mide fuerza, no dirección: por eso se conservan también ``+DI`` y
+    ``-DI``. Los valores iniciales permanecen como N/D hasta reunir historial
+    suficiente en lugar de rellenarse con ceros.
+    """
+
+    if period < 2:
+        raise ValueError("El periodo ADX debe ser al menos 2.")
+    required = {"high", "low", "close"}
+    missing = required.difference(frame.columns)
+    if missing:
+        raise ValueError(f"Faltan columnas OHLC: {', '.join(sorted(missing))}")
+
+    high = pd.to_numeric(frame["high"], errors="coerce")
+    low = pd.to_numeric(frame["low"], errors="coerce")
+    upward = high.diff()
+    downward = -low.diff()
+    plus_dm = upward.where((upward > downward) & (upward > 0), 0.0)
+    minus_dm = downward.where((downward > upward) & (downward > 0), 0.0)
+    atr = calculate_atr(frame, period=period, method=AtrMethod.WILDER)
+    plus_smoothed = plus_dm.ewm(
+        alpha=1 / period, adjust=False, min_periods=period
+    ).mean()
+    minus_smoothed = minus_dm.ewm(
+        alpha=1 / period, adjust=False, min_periods=period
+    ).mean()
+    plus_di = 100.0 * plus_smoothed / atr.replace(0.0, np.nan)
+    minus_di = 100.0 * minus_smoothed / atr.replace(0.0, np.nan)
+    denominator = (plus_di + minus_di).replace(0.0, np.nan)
+    directional_index = 100.0 * (plus_di - minus_di).abs() / denominator
+    adx = directional_index.ewm(
+        alpha=1 / period, adjust=False, min_periods=period
+    ).mean()
+    return pd.DataFrame(
+        {"plus_di_14": plus_di, "minus_di_14": minus_di, "adx_14": adx},
+        index=frame.index,
+    )
 
 
 def add_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
@@ -39,6 +81,14 @@ def add_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
     data["sma_short"] = close.rolling(config.sma_short, min_periods=config.sma_short).mean()
     data["sma_medium"] = close.rolling(config.sma_medium, min_periods=config.sma_medium).mean()
     data["sma_long"] = close.rolling(config.sma_long, min_periods=config.sma_long).mean()
+    # Referencias estables para la ficha ampliada. No sustituyen las medias
+    # configurables usadas por el score de producción.
+    data["sma_20"] = close.rolling(20, min_periods=20).mean()
+    data["sma_50"] = close.rolling(50, min_periods=50).mean()
+    data["sma_100"] = close.rolling(100, min_periods=100).mean()
+    data["sma_200"] = close.rolling(200, min_periods=200).mean()
+    data["ema_20"] = close.ewm(span=20, adjust=False, min_periods=20).mean()
+    data["ema_50"] = close.ewm(span=50, adjust=False, min_periods=50).mean()
     data["sma_medium_slope"] = data["sma_medium"].diff(5)
     data["rsi"] = calculate_rsi(close, config.rsi_period)
 
@@ -77,14 +127,10 @@ def add_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
     ).max()
     data["distance_high_pct"] = (close / observed_high - 1.0) * 100.0
 
-    previous_close = close.shift(1)
-    true_range = pd.concat(
-        [
-            data["high"] - data["low"],
-            (data["high"] - previous_close).abs(),
-            (data["low"] - previous_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    data["atr_14"] = true_range.rolling(14, min_periods=14).mean()
+    # Se conserva expresamente el ATR simple que ya utilizaba la aplicación.
+    # Wilder queda disponible en el motor de stops para la comparación, pero
+    # no cambia todavía ningún score o señal de producción.
+    data["atr_14"] = calculate_atr(data, period=14, method=AtrMethod.SMA)
+    adx = calculate_adx(data, period=14)
+    data = data.join(adx)
     return data
