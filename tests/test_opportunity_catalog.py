@@ -65,3 +65,19 @@ def test_latest_saved_snapshot_is_used_even_if_input_is_unsorted() -> None:
     assert len(rows) == 1
     assert rows[0]["Momento entrada"] == 68
     assert rows[0]["Fecha"] == "2026-08-03"
+
+
+def test_broker_alias_and_market_ticker_share_one_radar_row() -> None:
+    live = [
+        {
+            "Ticker": "CEBS.DE",
+            "Oportunidad": 67,
+            "Lectura conjunta": "Vigilancia",
+        }
+    ]
+
+    rows = build_opportunity_catalog(["CEBS"], pd.DataFrame(), live)
+
+    assert len(rows) == 1
+    assert rows[0]["Ticker"] == "CEBS.DE"
+    assert rows[0]["Comprobación"] == "Actualizado en esta sesión"

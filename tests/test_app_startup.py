@@ -77,3 +77,22 @@ def test_favorite_add_page_searches_by_name_or_symbol(
     assert not app.exception
     assert any(widget.label == "Nombre o símbolo" for widget in app.text_input)
     assert any(widget.label == "Dónde guardarla" for widget in app.radio)
+
+
+@pytest.mark.parametrize("analysis_page", ["Radar", "Oportunidades"])
+def test_analysis_overview_pages_open_without_market_data(
+    analysis_page: str,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("STOCK_SIGNAL_LAB_DATA_DIR", str(tmp_path))
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    app = AppTest.from_file(str(app_path), default_timeout=30)
+    app.session_state["_authenticated_user"] = "ddriu"
+    app.session_state["main_navigation"] = "Analizar"
+    app.session_state["analysis_navigation"] = analysis_page
+
+    app.run()
+
+    assert not app.exception
+    assert app.session_state["analysis_navigation"] == analysis_page

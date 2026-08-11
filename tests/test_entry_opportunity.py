@@ -6,13 +6,18 @@ import pandas as pd
 
 from config import StrategyConfig
 from src.entry_opportunity import (
+    STATUS_BUYABLE,
     STATUS_EVENT,
+    STATUS_EXTENDED,
+    STATUS_WAIT_PRICE,
+    actionable_sector_concentrations,
     calculate_entry_zones,
     combine_entry_opportunity_score,
     evaluate_entry_opportunity,
     evaluate_entry_timing,
     evaluate_event_risk,
     non_linking_ticker_text,
+    opportunity_status_counts,
     sector_concentrations,
     ticker_display_html,
 )
@@ -163,3 +168,36 @@ def test_sector_concentration_keeps_related_signals_together() -> None:
     grouped = sector_concentrations([first, second, unrelated])
 
     assert grouped == {"Aerospace & Defense": ("BA.L", "RTX")}
+
+
+def test_actionable_concentration_ignores_companies_that_must_wait() -> None:
+    base = _opportunity("BA.L", "Aerospace & Defense")
+    buyable = replace(base, status_code=STATUS_BUYABLE)
+    waiting = replace(base, ticker="RTX", status_code=STATUS_WAIT_PRICE)
+    second_buyable = replace(base, ticker="GD", status_code=STATUS_BUYABLE)
+
+    grouped = actionable_sector_concentrations(
+        [buyable, waiting, second_buyable]
+    )
+
+    assert grouped == {"Aerospace & Defense": ("BA.L", "GD")}
+
+
+def test_opportunity_status_counts_separates_buy_wait_extension_and_event() -> None:
+    base = _opportunity()
+    results = [
+        replace(base, ticker="BUY", status_code=STATUS_BUYABLE),
+        replace(base, ticker="WAIT", status_code=STATUS_WAIT_PRICE),
+        replace(base, ticker="EXT", status_code=STATUS_EXTENDED),
+        replace(base, ticker="EVENT", status_code=STATUS_EVENT),
+        replace(base, ticker="WAIT2", status_code=STATUS_WAIT_PRICE),
+    ]
+
+    counts = opportunity_status_counts(results)
+
+    assert counts == {
+        STATUS_BUYABLE: 1,
+        STATUS_WAIT_PRICE: 2,
+        STATUS_EXTENDED: 1,
+        STATUS_EVENT: 1,
+    }
