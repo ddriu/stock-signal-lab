@@ -33,6 +33,7 @@ CIVISLEND_IMPORT_NOTE_PREFIX = "Importado desde fotografía de cartera de Civisl
 ANALYSIS_TICKER_OVERRIDES = {
     "6VO": "RDDT",
     "AMZ": "AMZN",
+    "CEBS": "CEBS.DE",
     "NETFLIX": "NFLX",
     "7974 / NTDOY": "NTDOY",
     "KAP": "KAP.IL",
@@ -220,8 +221,13 @@ def import_civislend_snapshot_rows(
                 CIVISLEND_IMPORT_NOTE_PREFIX
             )
         ]
-    existing_by_name = {
+    imported_by_name = {
         str(row.project_name): int(row.id) for row in imported.itertuples(index=False)
+    }
+    existing_civislend_names = {
+        str(row.project_name)
+        for row in existing.itertuples(index=False)
+        if str(row.platform) == "Civislend"
     }
     created = 0
     updated = 0
@@ -231,7 +237,8 @@ def import_civislend_snapshot_rows(
             "la fecha real de inversión, el vencimiento y el rendimiento esperado "
             "no aparecen en el archivo."
         )
-        investment_id = existing_by_name.get(str(row.asset_name))
+        asset_name = str(row.asset_name)
+        investment_id = imported_by_name.get(asset_name)
         if investment_id is not None:
             journal.update_private_investment(
                 investment_id,
@@ -240,10 +247,16 @@ def import_civislend_snapshot_rows(
                 notes=notes,
             )
             updated += 1
+        elif asset_name in existing_civislend_names:
+            # La misma posición puede haberse registrado manualmente antes de
+            # existir la importación por fotografías. Se conserva intacta y no
+            # se crea una segunda copia sólo porque sus notas no lleven el
+            # prefijo automático.
+            continue
         else:
             journal.add_private_investment(
                 platform="Civislend",
-                project_name=str(row.asset_name),
+                project_name=asset_name,
                 invested_amount=float(
                     row.cost_estimate_eur
                     if pd.notna(row.cost_estimate_eur)

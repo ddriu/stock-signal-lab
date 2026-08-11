@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from src.data_sources import convert_currency
+from src.data_loader import resolve_analysis_ticker
 
 
 HOME_GROUPED_PLATFORMS = ("Civislend", "Segofactoring")
@@ -68,7 +69,8 @@ def refresh_portfolio_snapshot_prices(
     price_dates = price_dates or {}
 
     for index, row in refreshed.iterrows():
-        ticker = str(row.get("analysis_ticker") or "").strip().upper()
+        stored_ticker = str(row.get("analysis_ticker") or "").strip().upper()
+        ticker = resolve_analysis_ticker(stored_ticker) if stored_ticker else ""
         quantity = pd.to_numeric(row.get("quantity"), errors="coerce")
         currency = str(row.get("currency") or "EUR").strip().upper()
         current_price = latest_prices.get(ticker)

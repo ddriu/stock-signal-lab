@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from src.data_sources import convert_currency
+from src.data_loader import resolve_analysis_ticker
 from src.journal import calculate_position_states
 from src.portfolio import value_holding
 
@@ -62,7 +63,8 @@ def build_position_dashboard(
         if cost_eur is not None:
             invested_eur += cost_eur
 
-        current_price = latest_prices.get(ticker)
+        analysis_ticker = resolve_analysis_ticker(ticker)
+        current_price = latest_prices.get(analysis_ticker)
         net_value_eur: float | None = None
         net_pnl_eur: float | None = None
         net_return_pct: float | None = None

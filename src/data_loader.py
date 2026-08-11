@@ -45,6 +45,9 @@ ANALYSIS_TICKER_ALIASES = {
     "AMAZON": "AMZN",
     "AMAZON.COM": "AMZN",
     "AMZ": "AMZN",
+    # Trade Republic/Revolut pueden mostrar sólo el símbolo de Xetra. Yahoo
+    # necesita el sufijo de mercado para distinguir esta cotización en euros.
+    "CEBS": "CEBS.DE",
     "NETFLIX": "NFLX",
     "ORACLE": "ORCL",
     "REDDIT": "RDDT",
