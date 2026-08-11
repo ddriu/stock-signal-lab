@@ -93,9 +93,12 @@ from src.entry_opportunity import (
     EntryOpportunityResult,
     STATUS_BUYABLE,
     STATUS_EVENT,
+    STATUS_EXTENDED,
+    STATUS_WAIT_PRICE,
+    actionable_sector_concentrations,
     evaluate_entry_opportunity,
     non_linking_ticker_text,
-    sector_concentrations,
+    opportunity_status_counts,
 )
 from src.favorite_tags import (
     FAVORITE_TAGS,
@@ -210,11 +213,11 @@ st.set_page_config(
 MAIN_OPTIONS = ["Inicio", "Analizar", "Favoritos", "Carteras", "Más"]
 ANALYSIS_OPTIONS = ["Radar", "Oportunidades", "Empresa", "Estrategias", "Más análisis"]
 ANALYSIS_LABELS = {
-    "Radar": "◎ Radar",
-    "Oportunidades": "🎯 Oportunidades",
-    "Empresa": "↗ Empresa",
+    "Radar": "◎ Mi radar",
+    "Oportunidades": "🎯 Entradas hoy",
+    "Empresa": "↗ Buscar empresa",
     "Estrategias": "◱ Estrategias",
-    "Más análisis": "··· Más",
+    "Más análisis": "··· Herramientas",
 }
 STRATEGY_OPTIONS = ["Crecimiento", "Resultado tras 30+ días"]
 ANALYSIS_TOOL_OPTIONS = [
@@ -5769,9 +5772,9 @@ def render_opportunities_page(
 ) -> None:
     render_page_intro(
         "RADAR",
-        "Qué merece atención",
-        "Ordena tus favoritas para decidir cuáles revisar primero. Una nota alta abre "
-        "una investigación; no es una orden de compra.",
+        "Todas mis empresas",
+        "Aquí aparecen todas tus favoritas: entradas, empresas en espera y pendientes. "
+        "La pestaña «Entradas hoy» aplica después el filtro de precio actual.",
     )
     try:
         saved_snapshots = journal.list_analysis_snapshots()
@@ -5790,37 +5793,95 @@ def render_opportunities_page(
         )
         return
 
-    updated_count = sum(
-        row.get("Comprobación") == "Actualizado en esta sesión"
+    current_rows = [
+        row
         for row in catalog_summary
-    )
+        if row.get("Comprobación") == "Actualizado en esta sesión"
+    ]
+    updated_count = len(current_rows)
     pending_count = len(catalog_summary) - updated_count
-    st.caption(
-        f"{len(catalog_summary)} empresas en el radar · {updated_count} comprobadas "
-        f"en esta sesión · {pending_count} pendientes de actualizar."
+    strong_count = sum(
+        row.get("Lectura entrada") == "Entrada fuerte" for row in current_rows
     )
+    candidate_count = sum(
+        row.get("Lectura entrada") in {"Entrada interesante", "Entrada candidata"}
+        for row in current_rows
+    )
+    waiting_count = max(updated_count - strong_count - candidate_count, 0)
+    radar_metrics = st.columns(4)
+    radar_metrics[0].metric("Revisadas hoy", updated_count, f"de {len(catalog_summary)}")
+    radar_metrics[1].metric("Entradas fuertes", strong_count)
+    radar_metrics[2].metric("Candidatas", candidate_count)
+    radar_metrics[3].metric("En espera / pendientes", waiting_count + pending_count)
+    st.caption(
+        "Una empresa en espera sigue formando parte del radar. «Entrada fuerte» describe "
+        "el momento técnico; «Entradas hoy» comprueba además precio, evento y beneficio/riesgo."
+    )
+
+    analysis_favorites = list(
+        dict.fromkeys(resolve_analysis_ticker(ticker) for ticker in favorite_tickers)
+    )
+    scan_batch = next_growth_analysis_batch(
+        analysis_favorites,
+        set(prepared),
+        raw_fundamentals,
+        limit=25,
+    )
+    if scan_batch:
+        incomplete_count = sum(
+            ticker not in prepared
+            or growth_fundamental_status(raw_fundamentals.get(ticker)) != "complete"
+            for ticker in analysis_favorites
+        )
+        refresh_a, refresh_b = st.columns([1, 2])
+        if refresh_a.button(
+            f"Actualizar siguientes {len(scan_batch)}",
+            type="primary",
+            icon=":material/refresh:",
+            width="stretch",
+            key="radar_refresh_next_batch",
+        ):
+            st.session_state["_growth_scan_tickers"] = scan_batch
+            st.rerun()
+        refresh_b.caption(
+            f"Quedan {incomplete_count} sin precio o datos empresariales completos. "
+            "Se procesan en bloques de 25 para no bloquear el alojamiento gratuito."
+        )
+
     held_tickers = set(_portfolio_tracking_tickers(journal))
     radar_views = ["Todas", "Entradas fuertes", "Candidatas", "Mi cartera", "Reducir / vender"]
+    view_counts = {
+        "Todas": len(catalog_summary),
+        "Entradas fuertes": strong_count,
+        "Candidatas": candidate_count,
+        "Mi cartera": sum(row.get("Ticker") in held_tickers for row in catalog_summary),
+        "Reducir / vender": sum(
+            row.get("Ticker") in held_tickers
+            and row.get("Si ya la tienes") in {"Reducir", "Vender"}
+            for row in catalog_summary
+        ),
+    }
     radar_view = st.segmented_control(
         "Qué quieres revisar",
         radar_views,
         default="Todas",
         key="opportunity_radar_view",
         label_visibility="collapsed",
+        format_func=lambda value: f"{value} · {view_counts[value]}",
     )
     if radar_view == "Entradas fuertes":
         visible_catalog = [
             row
             for row in catalog_summary
             if row.get("Lectura entrada") == "Entrada fuerte"
-            and row.get("Ticker") not in held_tickers
+            and row.get("Comprobación") == "Actualizado en esta sesión"
         ]
     elif radar_view == "Candidatas":
         visible_catalog = [
             row
             for row in catalog_summary
             if row.get("Lectura entrada") in {"Entrada interesante", "Entrada candidata"}
-            and row.get("Ticker") not in held_tickers
+            and row.get("Comprobación") == "Actualizado en esta sesión"
         ]
     elif radar_view == "Mi cartera":
         visible_catalog = [
@@ -5989,6 +6050,17 @@ def _entry_opportunity_company_name(
     if name:
         return name
     label = str(favorite_labels.get(ticker, "") or "").strip()
+    if not label:
+        # Las listas antiguas pueden conservar el símbolo corto del bróker
+        # (por ejemplo CEBS) mientras el análisis usa CEBS.DE.
+        label = next(
+            (
+                str(candidate_label or "").strip()
+                for candidate_ticker, candidate_label in favorite_labels.items()
+                if resolve_analysis_ticker(str(candidate_ticker)) == ticker
+            ),
+            "",
+        )
     marker = f" ({ticker})"
     if marker in label:
         candidate = label.split(marker, 1)[0].strip()
@@ -6306,9 +6378,9 @@ def render_entry_opportunities_page(
 
     render_page_intro(
         "🎯 OPORTUNIDADES",
-        "¿Sigue siendo buena entrada hoy?",
-        "Conserva el score técnico y añade timing, zona de entrada, evento próximo "
-        "y riesgo. Las notas ordenan revisiones; no son probabilidades de ganar.",
+        "Entradas de hoy",
+        "Parte del Radar y separa lo comprable ahora de lo que debe esperar por precio, "
+        "exceso de subida o un evento próximo.",
     )
     if not prepared:
         st.info(
@@ -6335,33 +6407,71 @@ def render_entry_opportunities_page(
         st.warning("No hay ninguna empresa con datos suficientes para calcular oportunidades.")
         return
 
+    counts = opportunity_status_counts(results)
+    status_metrics = st.columns(4)
+    status_metrics[0].metric("Comprables ahora", counts[STATUS_BUYABLE])
+    status_metrics[1].metric("Esperar precio", counts[STATUS_WAIT_PRICE])
+    status_metrics[2].metric("Demasiado extendidas", counts[STATUS_EXTENDED])
+    status_metrics[3].metric("Evento próximo", counts[STATUS_EVENT])
+    st.caption(
+        f"{len(results)} empresas con lectura actual. Sólo las verdes pasan a la vez "
+        "los filtros de tendencia, timing, score conjunto y beneficio/riesgo."
+    )
+
     held_tickers = set(_portfolio_tracking_tickers(journal))
-    favorite_set = set(favorite_tickers)
-    concentrations = sector_concentrations(results, minimum_count=2)
+    favorite_set = {
+        resolve_analysis_ticker(ticker) for ticker in favorite_tickers
+    }
+    concentrations = actionable_sector_concentrations(results, minimum_count=2)
     if concentrations:
         descriptions = [
             f"{sector}: {', '.join(non_linking_ticker_text(ticker) for ticker in tickers)}"
             for sector, tickers in sorted(concentrations.items())
         ]
-        st.warning(
-            "**Concentración sectorial:** varias señales pueden representar la misma "
-            "apuesta económica. " + " · ".join(descriptions)
-        )
+        with st.expander(
+            f"Diversificación: {len(concentrations)} sectores concentran entradas válidas"
+        ):
+            st.warning(
+                "Varias entradas verdes representan una apuesta económica semejante. "
+                "No conviene sumar todas como si fueran independientes."
+            )
+            for description in descriptions:
+                st.caption(description)
 
-    st.markdown("### Mejores oportunidades revisadas")
-    top = sorted(
-        (result for result in results if result.status_code != STATUS_EVENT),
+    st.markdown("### Entradas que pasan todos los filtros")
+    buyable = sorted(
+        (result for result in results if result.status_code == STATUS_BUYABLE),
         key=lambda result: (
-            result.status_code == STATUS_BUYABLE,
             result.opportunity_score,
             result.timing.score,
         ),
         reverse=True,
     )[:5]
-    if top:
-        top_columns = st.columns(min(len(top), 3))
-        for index, result in enumerate(top, start=1):
+    if buyable:
+        top_columns = st.columns(min(len(buyable), 3))
+        for index, result in enumerate(buyable, start=1):
             with top_columns[(index - 1) % len(top_columns)]:
+                _render_entry_opportunity_card(result, rank=index)
+    else:
+        st.info(
+            "Hoy ninguna empresa supera todos los filtros. Esto es un resultado válido: "
+            "el sistema no rellena la pantalla con compras por obligación."
+        )
+
+    near_entries = sorted(
+        (
+            result
+            for result in results
+            if result.status_code in {STATUS_WAIT_PRICE, STATUS_EXTENDED}
+        ),
+        key=lambda result: (result.opportunity_score, result.timing.score),
+        reverse=True,
+    )[:3]
+    if near_entries:
+        st.markdown("### Más cercanas, pero todavía conviene esperar")
+        near_columns = st.columns(min(len(near_entries), 3))
+        for index, result in enumerate(near_entries, start=1):
+            with near_columns[(index - 1) % len(near_columns)]:
                 _render_entry_opportunity_card(result, rank=index)
 
     with st.expander("Filtrar y ordenar", expanded=False):
@@ -6370,7 +6480,7 @@ def render_entry_opportunities_page(
             "Score oportunidad mínimo",
             0,
             100,
-            50,
+            0,
             key="entry_opportunity_minimum_score",
         )
         scope = filter_b.selectbox(
@@ -6411,9 +6521,10 @@ def render_entry_opportunities_page(
             key="entry_opportunity_minimum_rr",
         )
         option_a, option_b = st.columns(2)
-        only_buyable = option_a.checkbox(
-            "Sólo comprables",
-            key="entry_opportunity_only_buyable",
+        status_filter = option_a.selectbox(
+            "Estado de entrada",
+            ["Todos", "Comprables", "Esperar precio", "Extendidas", "Evento próximo"],
+            key="entry_opportunity_status_filter",
         )
         exclude_events = option_b.checkbox(
             "Ocultar resultados próximos",
@@ -6432,7 +6543,13 @@ def render_entry_opportunities_page(
             continue
         if market_filter and result.market not in market_filter:
             continue
-        if only_buyable and result.status_code != STATUS_BUYABLE:
+        status_codes = {
+            "Comprables": {STATUS_BUYABLE},
+            "Esperar precio": {STATUS_WAIT_PRICE},
+            "Extendidas": {STATUS_EXTENDED},
+            "Evento próximo": {STATUS_EVENT},
+        }
+        if status_filter != "Todos" and result.status_code not in status_codes[status_filter]:
             continue
         if exclude_events and result.event.days_until is not None and result.event.days_until <= 3:
             continue
