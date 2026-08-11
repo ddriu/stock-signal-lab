@@ -4810,6 +4810,9 @@ def _portfolio_allocations(
         listed["analysis_ticker"] = (
             listed["analysis_ticker"].fillna("").astype(str).str.strip().str.upper()
         )
+        listed["analysis_ticker"] = listed["analysis_ticker"].map(
+            lambda ticker: resolve_analysis_ticker(ticker) if ticker else ""
+        )
         listed["value_eur"] = pd.to_numeric(listed["value_eur"], errors="coerce")
         total = float(listed["value_eur"].fillna(0.0).sum())
         if total > 0:
