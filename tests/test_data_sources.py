@@ -5,9 +5,11 @@ import pytest
 
 from src.data_sources import (
     PriceVerification,
+    benchmark_for_ticker,
     compare_verified_price,
     convert_currency,
     merge_fundamental_sources,
+    sector_benchmark,
 )
 
 
@@ -53,3 +55,8 @@ def test_price_verification_compares_same_date() -> None:
     )
     assert checked.difference_pct == pytest.approx(0.5)
     assert checked.status == "Coincide"
+
+
+def test_london_consumer_company_uses_local_market_and_sector_references() -> None:
+    assert benchmark_for_ticker("DGE.L") == "^FTSE"
+    assert sector_benchmark("Consumer Defensive", "DGE.L") == "ESIS.L"

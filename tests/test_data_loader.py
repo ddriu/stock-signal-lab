@@ -204,6 +204,19 @@ def test_curated_bae_systems_search_survives_yahoo_failure(monkeypatch) -> None:
     assert results[1].listing_type == "ADR / OTC"
 
 
+def test_curated_diageo_search_survives_yahoo_failure(monkeypatch) -> None:
+    class FailingSearch:
+        def __init__(self, *args, **kwargs) -> None:
+            raise RuntimeError("Yahoo temporalmente no disponible")
+
+    monkeypatch.setattr(data_loader.yf, "Search", FailingSearch)
+
+    results = data_loader.search_instruments("Diageo plc")
+
+    assert [result.ticker for result in results] == ["DGE.L"]
+    assert results[0].country == "Reino Unido"
+
+
 def test_fundamentals_fall_back_to_yahoo_financial_statements(monkeypatch) -> None:
     columns = pd.to_datetime(["2025-12-31", "2024-12-31"])
 

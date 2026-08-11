@@ -33,5 +33,11 @@ def test_add_indicators_preserves_input_and_adds_columns() -> None:
         "breakout",
         "distance_high_pct",
         "volume_ratio",
+        "sma_100",
+        "ema_20",
+        "ema_50",
+        "adx_14",
+        "plus_di_14",
+        "minus_di_14",
     }.issubset(result.columns)
     assert result["sma_long"].notna().sum() == 41
