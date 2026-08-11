@@ -93,7 +93,7 @@ class StrategyConfig:
 class BacktestConfig:
     """Hipótesis operativas del backtest."""
 
-    initial_capital: float = 10_000.0
+    initial_capital: float = 1_000.0
     commission_pct: float = 0.10
     slippage_pct: float = 0.05
 

@@ -19,16 +19,20 @@ import streamlit as st
 from src import brand as _brand_module
 from src import auth as _auth_module
 from src import entry_opportunity as _entry_opportunity_module
+from src import growth_momentum as _growth_momentum_module
 from src import navigation as _navigation_module
 from src import opportunity_catalog as _opportunity_catalog_module
 from src import ui as _ui_module
+from src import visualization as _visualization_module
 
 _brand_module = importlib.reload(_brand_module)
 _auth_module = importlib.reload(_auth_module)
 _entry_opportunity_module = importlib.reload(_entry_opportunity_module)
+_growth_momentum_module = importlib.reload(_growth_momentum_module)
 _navigation_module = importlib.reload(_navigation_module)
 _opportunity_catalog_module = importlib.reload(_opportunity_catalog_module)
 _ui_module = importlib.reload(_ui_module)
+_visualization_module = importlib.reload(_visualization_module)
 
 from config import BacktestConfig, StrategyConfig
 from src.alerts import normalize_alert_preferences
@@ -122,6 +126,7 @@ from src.navigation import (
     direct_ticker_from_query,
     growth_radar_ticker_groups,
     merge_analysis_ticker_sources,
+    next_daily_review_batch,
     sanitize_favorite_selection,
 )
 from src.opportunity_catalog import build_opportunity_catalog
@@ -168,7 +173,7 @@ from src.return_calibration import (
     calibrate_score_returns,
     calibration_for_score,
 )
-from src.risk import calculate_position_plan
+from src.risk import calculate_manual_order_plan, calculate_position_plan
 from src.sector_comparison import HORIZON_SESSIONS, compare_sector
 from src.segofactoring_import import (
     import_segofactoring_rows,
@@ -224,6 +229,24 @@ ANALYSIS_LABELS = {
     "Más análisis": "··· Herramientas",
 }
 STRATEGY_OPTIONS = ["Crecimiento", "Resultado tras 30+ días"]
+ANALYSIS_VIEW_DESCRIPTIONS = {
+    "Radar": (
+        "Ordena todas tus favoritas y te dice cuáles merecen atención, cuáles están "
+        "en espera y cuáles necesitan datos."
+    ),
+    "Oportunidades": (
+        "Filtra el radar por precio actual: distingue una entrada posible hoy de una "
+        "buena empresa que llega tarde, está cara o tiene un evento próximo."
+    ),
+    "Crecimiento": (
+        "Busca futuros líderes combinando crecimiento del negocio, fortaleza del precio, "
+        "sector y riesgo para dimensionar una entrada."
+    ),
+    "Resultado tras 30+ días": (
+        "Comprueba qué ocurrió después de señales pasadas. Sirve para validar el método; "
+        "no es una cuarta recomendación actual."
+    ),
+}
 ANALYSIS_TOOL_OPTIONS = [
     "Comparar empresas",
     "Historial",
@@ -565,10 +588,13 @@ def build_sidebar(
         initial_capital = st.number_input(
             "Capital para el backtest (€)",
             min_value=100.0,
-            value=10_000.0,
-            step=1_000.0,
+            value=1_000.0,
+            step=100.0,
             key="cfg_initial_capital",
-            help="Es capital ficticio; no modifica tu cartera real.",
+            help=(
+                "Capital líquido de referencia para backtest y tamaño de las nuevas "
+                "operaciones. No modifica tu cartera real."
+            ),
         )
 
     st.sidebar.divider()
@@ -1572,22 +1598,195 @@ def render_analysis(
         max_risk_pct=strategy.max_risk_per_trade_pct,
     )
     with st.expander(
-        "¿Cuánto arriesgaría si decidiera entrar?",
+        "Plan de compra, stop y límite de beneficio",
         expanded=signal.label in {"Entrada fuerte", "Entrada interesante"},
     ):
         st.caption(
-            "Ejemplo matemático usando el último cierre como entrada. Asume que el capital y "
-            "la acción están en la misma moneda; no incluye impuestos ni gaps."
+            "Introduce la orden que realmente estudiarías. La app admite una o varias "
+            "acciones completas y compras por importe con fracciones. Asume que capital y "
+            "cotización están en la misma moneda; no incluye impuestos, cambio de divisa ni gaps."
         )
-        risk_cols = st.columns(5)
-        risk_cols[0].metric("Importe de la posición", f"{plan.position_value:,.2f}")
-        risk_cols[1].metric("Unidades aproximadas", f"{plan.quantity:,.2f}")
-        risk_cols[2].metric("Salida si falla", f"{plan.stop_price:,.2f}")
-        risk_cols[3].metric("Pérdida prevista", f"{plan.loss_at_stop:,.2f}")
-        risk_cols[4].metric("Referencia 2 a 1", f"{plan.reference_target_2r:,.2f}")
+        order_a, order_b, order_c = st.columns(3)
+        broker = order_a.selectbox(
+            "Plataforma",
+            ["Trade Republic", "Revolut"],
+            key=f"order_broker_{ticker}",
+        )
+        order_mode = order_b.radio(
+            "Calcular compra por",
+            ["Importe", "Número de acciones"],
+            horizontal=True,
+            key=f"order_mode_{ticker}",
+        )
+        order_price = order_c.number_input(
+            "Precio límite de compra",
+            min_value=0.01,
+            value=float(round(float(latest["close"]), 2)),
+            step=0.01,
+            key=f"order_price_{ticker}",
+            help="Puede ser distinto del último cierre si quieres esperar un retroceso.",
+        )
+        size_a, size_b = st.columns(2)
+        if order_mode == "Número de acciones":
+            order_quantity = size_a.number_input(
+                "Acciones que comprarías",
+                min_value=0.000001,
+                value=1.0,
+                step=1.0,
+                format="%.6f",
+                key=f"order_quantity_{ticker}",
+                help="Admite enteros y fracciones para poder comparar ambos casos.",
+            )
+            order_amount = None
+        else:
+            default_amount = min(
+                float(settings.initial_capital),
+                max(10.0, float(plan.position_value)),
+            )
+            order_amount = size_a.number_input(
+                "Importe que invertirías",
+                min_value=1.0,
+                value=float(round(default_amount, 2)),
+                step=10.0,
+                key=f"order_amount_{ticker}",
+            )
+            order_quantity = None
+        order_fee = size_b.number_input(
+            "Comisión estimada por orden",
+            min_value=0.0,
+            value=1.0,
+            step=0.25,
+            key=f"order_fee_{ticker}",
+            help=(
+                "Pon 0 si esa operación entra en tu cupo gratuito de Revolut. "
+                "Se aplica una vez al comprar y otra al vender."
+            ),
+        )
+        manual_plan = calculate_manual_order_plan(
+            capital=float(settings.initial_capital),
+            entry_price=float(order_price),
+            stop_loss_pct=float(strategy.stop_loss_pct),
+            max_risk_pct=float(strategy.max_risk_per_trade_pct),
+            quantity=(float(order_quantity) if order_quantity is not None else None),
+            investment_amount=(float(order_amount) if order_amount is not None else None),
+            trailing_stop_pct=float(strategy.trailing_stop_pct),
+            fee_per_order=float(order_fee),
+        )
+        risk_cols = st.columns(6)
+        risk_cols[0].metric("Capital de referencia", f"{settings.initial_capital:,.2f}")
+        risk_cols[1].metric("Importe de compra", f"{manual_plan.position_value:,.2f}")
+        risk_cols[2].metric("Acciones", f"{manual_plan.quantity:,.6f}")
+        risk_cols[3].metric("Stop inicial", f"{manual_plan.stop_price:,.2f}")
+        risk_cols[4].metric(
+            "Pérdida con comisiones", f"{manual_plan.estimated_loss_with_fees:,.2f}"
+        )
+        risk_cols[5].metric("Capital restante", f"{manual_plan.capital_remaining:,.2f}")
+        if not manual_plan.within_capital:
+            st.error("La orden supera el capital de referencia, incluida la compra.")
+        elif not manual_plan.within_risk_budget:
+            st.warning(
+                f"La pérdida estimada supera tu presupuesto de riesgo de "
+                f"{manual_plan.risk_budget:,.2f}. Con estos parámetros, el máximo sería "
+                f"{manual_plan.maximum_quantity_by_risk:,.6f} acciones "
+                f"({manual_plan.maximum_position_value_by_risk:,.2f})."
+            )
+        else:
+            st.success(
+                f"La orden cabe en el capital y respeta el riesgo máximo de "
+                f"{manual_plan.risk_budget:,.2f}."
+            )
+
+        st.markdown("**Límites de venta por beneficio**")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Nivel": f"{target.multiple_r}R",
+                        "Precio límite": target.price,
+                        "Beneficio bruto": target.gross_profit,
+                        "Beneficio tras comisiones": target.net_profit_after_exit_fee,
+                    }
+                    for target in manual_plan.targets
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Precio límite": st.column_config.NumberColumn(format="%.2f"),
+                "Beneficio bruto": st.column_config.NumberColumn(format="%+.2f"),
+                "Beneficio tras comisiones": st.column_config.NumberColumn(format="%+.2f"),
+            },
+        )
         st.caption(
-            "«Referencia 2 a 1» significa que la ganancia potencial sería dos veces el riesgo. "
-            "No es un precio objetivo ni una predicción."
+            "1R, 2R y 3R son referencias calculadas desde el riesgo hasta el stop. "
+            "Puedes usar una venta limitada parcial; no son precios previstos."
+        )
+
+        with st.expander("Ver cómo subiría el stop"):
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Máximo desde la compra": level.peak_gain_pct,
+                            "Precio máximo": level.peak_price,
+                            "Nuevo stop": level.stop_price,
+                            "Rentabilidad protegida": level.locked_return_pct,
+                        }
+                        for level in manual_plan.stop_ladder
+                    ]
+                ),
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Máximo desde la compra": st.column_config.NumberColumn(format="%+.0f%%"),
+                    "Precio máximo": st.column_config.NumberColumn(format="%.2f"),
+                    "Nuevo stop": st.column_config.NumberColumn(format="%.2f"),
+                    "Rentabilidad protegida": st.column_config.NumberColumn(format="%+.1f%%"),
+                },
+            )
+            st.caption(
+                "Regla desplegada: el stop nunca baja y es el mayor entre el stop inicial "
+                "y el máximo alcanzado menos la protección dinámica configurada. Se actualiza "
+                "con una sesión terminada y se aplica desde la siguiente para evitar usar el "
+                "máximo del día de forma retroactiva."
+            )
+
+        if broker == "Trade Republic":
+            if manual_plan.fractional:
+                st.warning(
+                    "Trade Republic permite negociar fracciones sólo mediante órdenes de "
+                    "mercado. Para la parte fraccionaria no podrás dejar una orden stop o "
+                    "limitada automática; usa alertas y vende manualmente."
+                )
+            else:
+                st.info(
+                    "Con acciones completas, Trade Republic ofrece órdenes de mercado, "
+                    "límite y stop. Comprueba antes de confirmar si admite simultáneamente "
+                    "el stop y la venta limitada sobre las mismas unidades."
+                )
+            st.markdown(
+                "[Ayuda oficial de Trade Republic sobre fracciones]"
+                "(https://support.traderepublic.com/es-es/1420-How-do-I-trade-fractions)"
+            )
+        else:
+            st.info(
+                "Revolut permite introducir una compra por importe o por unidades y ofrece "
+                "órdenes stop y límite para acciones. Una orden stop se convierte en orden "
+                "de mercado y puede ejecutarse a un precio distinto. Si la app rechaza el "
+                "stop de una fracción, conserva la alerta de Stock Signal Lab y vende por "
+                "cantidad manualmente."
+            )
+            st.markdown(
+                "[Cómo colocar una orden en Revolut]"
+                "(https://help.revolut.com/es-ES/help/wealth/stocks/trading-stocks/"
+                "order-execution/place-a-stock-order/) · "
+                "[Cómo funciona una orden stop]"
+                "(https://help.revolut.com/es-ES/help/wealth/stocks/trading-stocks/"
+                "order-types/what-is-a-stop-order/)"
+            )
+        st.caption(
+            "Los stops no garantizan la pérdida máxima: un gap, falta de liquidez o retraso "
+            "puede producir una ejecución peor que el nivel indicado."
         )
 
     entry_guide = build_entry_guide(
@@ -4650,6 +4849,51 @@ def render_app_header(user: AuthConfig) -> None:
             )
 
 
+def render_analysis_view_guide() -> None:
+    """Explica las tres lecturas actuales sin añadir otra pantalla de configuración."""
+
+    with st.popover(
+        "Qué hace cada lectura",
+        icon=":material/help_outline:",
+        width="stretch",
+    ):
+        st.markdown(
+            f"**Mi radar**  \n{ANALYSIS_VIEW_DESCRIPTIONS['Radar']}"
+        )
+        st.markdown(
+            f"**Entradas hoy**  \n{ANALYSIS_VIEW_DESCRIPTIONS['Oportunidades']}"
+        )
+        st.markdown(
+            f"**Crecimiento**  \n{ANALYSIS_VIEW_DESCRIPTIONS['Crecimiento']}"
+        )
+        st.caption(
+            "Resultado tras 30+ días no busca una compra nueva: mide cómo se comportaron "
+            "las señales anteriores para detectar si el método está siendo útil."
+        )
+
+
+def render_automatic_review_status(username: str) -> None:
+    """Muestra el estado compartido por Radar, Entradas hoy y Crecimiento."""
+
+    suffix = username.strip().lower() or "usuario"
+    total = int(st.session_state.get(f"_automatic_review_total_{suffix}", 0) or 0)
+    attempted = st.session_state.get(f"_automatic_review_attempted_{suffix}", [])
+    reviewed = len({str(ticker).strip().upper() for ticker in attempted if ticker})
+    if total <= 0:
+        return
+    if reviewed >= total:
+        st.caption(
+            f"✓ Revisión automática de hoy terminada: {total} empresas recorridas en "
+            "bloques internos de 25. Mi radar, Entradas hoy y Crecimiento comparten "
+            "estos datos."
+        )
+    else:
+        st.caption(
+            f"Revisión automática de hoy: {reviewed} de {total} empresas recorridas. "
+            "La aplicación continúa en bloques internos de 25."
+        )
+
+
 def render_page_intro(eyebrow: str, title: str, description: str) -> None:
     """Cabecera breve y consistente para distinguir cada herramienta."""
 
@@ -5821,36 +6065,6 @@ def render_opportunities_page(
         "Una empresa en espera sigue formando parte del radar. «Entrada fuerte» describe "
         "el momento técnico; «Entradas hoy» comprueba además precio, evento y beneficio/riesgo."
     )
-
-    analysis_favorites = list(
-        dict.fromkeys(resolve_analysis_ticker(ticker) for ticker in favorite_tickers)
-    )
-    scan_batch = next_growth_analysis_batch(
-        analysis_favorites,
-        set(prepared),
-        raw_fundamentals,
-        limit=25,
-    )
-    if scan_batch:
-        incomplete_count = sum(
-            ticker not in prepared
-            or growth_fundamental_status(raw_fundamentals.get(ticker)) != "complete"
-            for ticker in analysis_favorites
-        )
-        refresh_a, refresh_b = st.columns([1, 2])
-        if refresh_a.button(
-            f"Actualizar siguientes {len(scan_batch)}",
-            type="primary",
-            icon=":material/refresh:",
-            width="stretch",
-            key="radar_refresh_next_batch",
-        ):
-            st.session_state["_growth_scan_tickers"] = scan_batch
-            st.rerun()
-        refresh_b.caption(
-            f"Quedan {incomplete_count} sin precio o datos empresariales completos. "
-            "Se procesan en bloques de 25 para no bloquear el alojamiento gratuito."
-        )
 
     held_tickers = set(_portfolio_tracking_tickers(journal))
     radar_views = ["Todas", "Entradas fuertes", "Candidatas", "Mi cartera", "Reducir / vender"]
@@ -7140,39 +7354,16 @@ def render_growth_momentum_page(
             "El radar conserva los bloques anteriores."
         )
     if favorite_universe:
-        scan_batch = next_growth_analysis_batch(
-            favorite_universe,
-            set(prepared),
-            raw_fundamentals,
-            limit=25,
-        )
-        all_complete = not scan_batch
-        if all_complete:
-            scan_batch = favorite_universe[:25]
-        scan_label = (
-            f"Analizar las siguientes {len(scan_batch)} con datos completos"
-            if not all_complete
-            else f"Actualizar las primeras {len(scan_batch)} empresas"
-        )
-        if st.button(
-            scan_label,
-            type="primary",
-            width="stretch",
-            icon=":material/travel_explore:",
-            key="growth_scan_favorites",
-        ):
-            st.session_state["_growth_scan_tickers"] = scan_batch
-            st.rerun()
         remaining_count = sum(
             ticker not in prepared
             or growth_fundamental_status(raw_fundamentals.get(ticker)) != "complete"
             for ticker in favorite_universe
         )
-        if remaining_count > len(scan_batch):
+        if remaining_count:
             st.caption(
-                f"Después quedarán {remaining_count - len(scan_batch)} empresas por completar. "
-                "Los bloques de 25 evitan que el alojamiento gratuito se bloquee y, ahora, "
-                "cada empresa contabilizada recibe precio y fundamentales."
+                f"{remaining_count} empresas no reúnen todavía precio o fundamentales "
+                "completos. Ya se han intentado automáticamente; permanecen visibles como "
+                "datos parciales y se volverán a comprobar en la próxima revisión diaria."
             )
     else:
         st.warning(
@@ -7567,19 +7758,20 @@ def render_growth_momentum_page(
             raw_fundamentals,
             limit=25,
         )
-        st.info(
-            f"{len(quick_tickers)} empresas tienen precio y momentum, pero aún no reúnen "
-            "al menos dos métricas empresariales útiles. Se mantienen visibles, pero no "
-            "se presentarán como entradas completas."
-        )
-        if st.button(
-            f"Completar las siguientes {len(deep_batch)} empresas",
-            width="stretch",
-            icon=":material/fact_check:",
-            key="growth_complete_fundamentals",
-        ):
-            st.session_state["_growth_scan_tickers"] = deep_batch
-            st.rerun()
+        with st.expander(f"Datos parciales · {len(quick_tickers)} empresas"):
+            st.info(
+                "Tienen precio y momentum, pero aún no reúnen al menos dos métricas "
+                "empresariales útiles. Se mantienen visibles, aunque no se presentan "
+                "como entradas completas."
+            )
+            if deep_batch and st.button(
+                f"Reintentar ahora las primeras {len(deep_batch)}",
+                width="stretch",
+                icon=":material/fact_check:",
+                key="growth_complete_fundamentals",
+            ):
+                st.session_state["_growth_scan_tickers"] = deep_batch
+                st.rerun()
     if st.session_state.get("growth_selected_ticker") not in ordered_tickers:
         st.session_state.pop("growth_selected_ticker", None)
     selected = st.selectbox(
@@ -8658,8 +8850,22 @@ def main() -> None:
                 ANALYSIS_TOOL_OPTIONS,
                 key="analysis_tool_navigation",
             )
+        current_reading = (
+            analysis_detail
+            if analysis_section == "Estrategias" and analysis_detail
+            else analysis_section
+        )
+        current_description = ANALYSIS_VIEW_DESCRIPTIONS.get(current_reading)
+        if current_description:
+            st.caption(current_description)
         if analysis_section != "Empresa":
-            render_quick_company_search()
+            guide_col, search_col = st.columns([1, 2])
+            with guide_col:
+                render_analysis_view_guide()
+            with search_col:
+                render_quick_company_search()
+        else:
+            render_analysis_view_guide()
     elif selected_section == "Favoritos":
         favorite_options = ["Mis listas", "Añadir empresa"]
         if st.session_state.pop("_return_to_favorite_lists", False):
@@ -8758,12 +8964,60 @@ def main() -> None:
         if requested_active_ticker
         else ""
     )
-    growth_scan_tickers = [
+    requested_growth_scan_tickers = [
         resolve_analysis_ticker(str(ticker))
         for ticker in st.session_state.pop("_growth_scan_tickers", [])
         if str(ticker).strip()
     ]
-    growth_scan_tickers = list(dict.fromkeys(growth_scan_tickers))[:200]
+    requested_growth_scan_tickers = list(
+        dict.fromkeys(requested_growth_scan_tickers)
+    )[:25]
+    automatic_review_page = selected_section == "Analizar" and (
+        analysis_section in {"Radar", "Oportunidades"}
+        or (
+            analysis_section == "Estrategias"
+            and analysis_detail == "Crecimiento"
+        )
+    )
+    review_universe = list(
+        dict.fromkeys(
+            resolve_analysis_ticker(str(ticker))
+            for ticker in favorite_tickers
+            if str(ticker).strip()
+        )
+    )
+    review_suffix = authenticated_user.username.strip().lower() or "usuario"
+    review_date_key = f"_automatic_review_date_{review_suffix}"
+    review_attempted_key = f"_automatic_review_attempted_{review_suffix}"
+    review_total_key = f"_automatic_review_total_{review_suffix}"
+    today_key = date.today().isoformat()
+    automatic_review_batch: list[str] = []
+    if automatic_review_page:
+        if st.session_state.get(review_date_key) != today_key:
+            st.session_state[review_date_key] = today_key
+            st.session_state[review_attempted_key] = []
+        st.session_state[review_total_key] = len(review_universe)
+        attempted_review = list(st.session_state.get(review_attempted_key, []))
+        automatic_review_batch = next_daily_review_batch(
+            review_universe,
+            attempted_review,
+            limit=25,
+        )
+        batch_being_attempted = (
+            requested_growth_scan_tickers
+            if requested_growth_scan_tickers
+            else automatic_review_batch
+        )
+        attempted_review = merge_analysis_ticker_sources(
+            attempted_review,
+            [ticker for ticker in batch_being_attempted if ticker in review_universe],
+        )
+        st.session_state[review_attempted_key] = attempted_review
+    growth_scan_tickers = (
+        requested_growth_scan_tickers
+        if requested_growth_scan_tickers
+        else automatic_review_batch
+    )
     if requested_pending_ticker and requested_pending_ticker != pending_analysis_ticker:
         st.info(
             f"{requested_pending_ticker} es el símbolo mostrado por el bróker; "
@@ -8864,6 +9118,20 @@ def main() -> None:
             refresh_summary.setdefault("requested", len(growth_scan_tickers))
             st.session_state["_growth_scan_completed"] = refresh_summary
         st.session_state.pop("_pending_analysis_ticker", None)
+        if automatic_review_page and growth_scan_tickers:
+            attempted_review = list(
+                st.session_state.get(review_attempted_key, [])
+            )
+            remaining_review = next_daily_review_batch(
+                review_universe,
+                attempted_review,
+                limit=25,
+            )
+            if remaining_review:
+                # Cada rerun constituye una petición pequeña e independiente. Así
+                # se recorren todas las favoritas sin un proceso único demasiado
+                # pesado para Streamlit Community Cloud.
+                st.rerun()
     for error in st.session_state.get("download_errors", []):
         st.warning(error)
 
@@ -8924,6 +9192,8 @@ def main() -> None:
         )
 
     elif selected_section == "Analizar":
+        if automatic_review_page:
+            render_automatic_review_status(authenticated_user.username)
         if analysis_section == "Radar":
             render_opportunities_page(
                 raw_data,

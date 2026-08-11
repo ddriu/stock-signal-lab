@@ -314,6 +314,15 @@ fracción invertida = min(100%, riesgo máximo por operación / distancia del st
 Por ejemplo, riesgo del 1% y stop del 8% implica una asignación inicial del 12,5% del
 capital. Esta simplificación no tiene en cuenta correlaciones entre posiciones.
 
+El capital líquido inicial de referencia es 1.000 €. En cada empresa, el plan de
+orden permite introducir un precio límite y calcular la compra por importe —incluidas
+fracciones— o por número de acciones. Muestra stop inicial, pérdida monetaria con
+comisiones, referencias 1R/2R/3R y la escalera del trailing. Trade Republic restringe
+las órdenes stop y límite sobre fracciones; Revolut puede permitir compras por importe,
+pero la disponibilidad de órdenes condicionadas sobre fracciones debe comprobarse en
+la cuenta concreta. Si el bróker no admite la orden, la aplicación sólo genera una
+alerta y la salida sigue siendo manual.
+
 ## Hipótesis del backtest
 
 - La señal se calcula al cierre y se ejecuta en la apertura siguiente.
