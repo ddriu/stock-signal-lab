@@ -22,6 +22,7 @@ from src import entry_opportunity as _entry_opportunity_module
 from src import growth_momentum as _growth_momentum_module
 from src import navigation as _navigation_module
 from src import opportunity_catalog as _opportunity_catalog_module
+from src import risk as _risk_module
 from src import ui as _ui_module
 from src import visualization as _visualization_module
 
@@ -31,6 +32,7 @@ _entry_opportunity_module = importlib.reload(_entry_opportunity_module)
 _growth_momentum_module = importlib.reload(_growth_momentum_module)
 _navigation_module = importlib.reload(_navigation_module)
 _opportunity_catalog_module = importlib.reload(_opportunity_catalog_module)
+_risk_module = importlib.reload(_risk_module)
 _ui_module = importlib.reload(_ui_module)
 _visualization_module = importlib.reload(_visualization_module)
 
