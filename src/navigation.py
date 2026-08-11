@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import re
 
 
 GROWTH_RADAR_STRONG_LABELS = frozenset({"Entrada fuerte"})
@@ -23,6 +24,23 @@ def normalize_ticker(value: object) -> str:
     """Devuelve un símbolo uniforme sin aceptar valores vacíos."""
 
     return str(value or "").strip().upper()
+
+
+_DIRECT_TICKER_PATTERN = re.compile(r"^[A-Z0-9^][A-Z0-9.\-^=]{0,19}$")
+
+
+def direct_ticker_from_query(value: object) -> str | None:
+    """Reconoce un ticker escrito directamente sin confundirlo con un nombre.
+
+    Admite símbolos internacionales habituales como ``SAN.MC``, ``7974.T`` o
+    ``BRK-B``. Una búsqueda con espacios se considera un nombre de empresa y
+    debe pasar por el buscador de instrumentos.
+    """
+
+    ticker = normalize_ticker(value)
+    if not ticker or not _DIRECT_TICKER_PATTERN.fullmatch(ticker):
+        return None
+    return ticker
 
 
 def sanitize_favorite_selection(
