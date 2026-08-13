@@ -18,21 +18,33 @@ import streamlit as st
 # que un cambio de marca no requiera suspender o reiniciar manualmente la app.
 from src import brand as _brand_module
 from src import auth as _auth_module
+from src import current_positions as _current_positions_module
 from src import entry_opportunity as _entry_opportunity_module
 from src import growth_momentum as _growth_momentum_module
+from src import journal as _journal_module
 from src import navigation as _navigation_module
 from src import opportunity_catalog as _opportunity_catalog_module
+from src import portfolio_snapshot_import as _portfolio_snapshot_import_module
 from src import risk as _risk_module
+from src import supabase_journal as _supabase_journal_module
+from src import storage as _storage_module
 from src import ui as _ui_module
 from src import visualization as _visualization_module
 
 _brand_module = importlib.reload(_brand_module)
 _auth_module = importlib.reload(_auth_module)
+_current_positions_module = importlib.reload(_current_positions_module)
 _entry_opportunity_module = importlib.reload(_entry_opportunity_module)
 _growth_momentum_module = importlib.reload(_growth_momentum_module)
+_journal_module = importlib.reload(_journal_module)
 _navigation_module = importlib.reload(_navigation_module)
 _opportunity_catalog_module = importlib.reload(_opportunity_catalog_module)
+_portfolio_snapshot_import_module = importlib.reload(
+    _portfolio_snapshot_import_module
+)
 _risk_module = importlib.reload(_risk_module)
+_supabase_journal_module = importlib.reload(_supabase_journal_module)
+_storage_module = importlib.reload(_storage_module)
 _ui_module = importlib.reload(_ui_module)
 _visualization_module = importlib.reload(_visualization_module)
 
@@ -60,6 +72,7 @@ from src.current_positions import (
     REFERENCE_RETURN,
     estimate_current_position,
     snapshot_with_current_position,
+    snapshot_without_positions,
 )
 from src.dashboard import build_position_dashboard
 from src.data_loader import (
@@ -150,6 +163,7 @@ from src.portfolio import compare_switch, value_holding
 from src.portfolio_export import build_portfolio_excel
 from src.portfolio_history import build_portfolio_history
 from src.portfolio_snapshot_import import (
+    account_summaries_from_positions,
     import_portfolio_workbook_snapshot,
     parse_portfolio_snapshot_excel,
 )
@@ -2680,6 +2694,144 @@ def operation_history_for_display(operations: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _sync_accounts_from_complete_snapshot(
+    journal: object,
+    positions: pd.DataFrame,
+    accounts: pd.DataFrame,
+    *,
+    snapshot_date: date | str,
+) -> None:
+    """Alinea los totales de cuenta con una composición declarada como completa."""
+
+    summaries = account_summaries_from_positions(positions)
+    summary_by_name = {
+        str(row.account_name): row for row in summaries.itertuples(index=False)
+    }
+    existing_by_name = {
+        str(row.account_name): row for row in accounts.itertuples(index=False)
+    } if not accounts.empty else {}
+    account_names = list(dict.fromkeys([*existing_by_name, *summary_by_name]))
+    target = pd.Timestamp(snapshot_date).date().isoformat()
+    for account_name in account_names:
+        summary = summary_by_name.get(account_name)
+        existing = existing_by_name.get(account_name)
+        account_type = (
+            str(summary.account_type)
+            if summary is not None
+            else str(getattr(existing, "account_type", "Bróker"))
+        )
+        journal.upsert_portfolio_account(
+            account_name=account_name,
+            account_type=account_type,
+            investments_value=(
+                float(summary.investments_value) if summary is not None else 0.0
+            ),
+            cash_balance=float(summary.cash_balance) if summary is not None else 0.0,
+            currency="EUR",
+            status="Actualizada",
+            notes=f"Calculada desde la composición completa del {target}.",
+        )
+
+
+def render_portfolio_composition_editor(
+    journal: object,
+    *,
+    portfolio_snapshots: pd.DataFrame,
+    accounts: pd.DataFrame,
+    actor_username: str,
+    view_key: str,
+) -> None:
+    """Permite declarar ventas sin inventar precios ni operaciones históricas."""
+
+    if portfolio_snapshots.empty or not hasattr(
+        journal, "replace_portfolio_snapshot_positions"
+    ):
+        return
+    latest, summary = latest_portfolio_snapshot(portfolio_snapshots)
+    if summary is None or latest.empty:
+        return
+
+    with st.expander("He vendido o cerrado posiciones"):
+        st.caption(
+            "Actualizar precios no detecta ventas en Trade Republic, Revolut o "
+            "MyInvestor. Marca aquí lo que ya no tienes: se guardará una nueva foto "
+            "de hoy y la foto anterior seguirá en el historial."
+        )
+        editor = latest.loc[
+            :, ["platform", "asset_name", "analysis_ticker", "value_eur"]
+        ].copy()
+        editor.insert(0, "Quitar", False)
+        editor = editor.rename(
+            columns={
+                "platform": "Plataforma",
+                "asset_name": "Activo",
+                "analysis_ticker": "Ticker",
+                "value_eur": "Valor actual",
+            }
+        )
+        edited = st.data_editor(
+            editor,
+            width="stretch",
+            height=min(680, 40 + 35 * len(editor)),
+            hide_index=True,
+            disabled=["Plataforma", "Activo", "Ticker", "Valor actual"],
+            key=f"{view_key}_portfolio_composition_editor_{summary.snapshot_date}",
+            column_config={
+                "Quitar": st.column_config.CheckboxColumn(
+                    "Ya no la tengo",
+                    width="small",
+                    help="Puedes marcar varias ventas y guardarlas juntas.",
+                ),
+                "Ticker": st.column_config.TextColumn(width="small"),
+                "Activo": st.column_config.TextColumn(width="large"),
+                "Valor actual": st.column_config.NumberColumn(format="%.2f €"),
+            },
+        )
+        selected = edited.loc[edited["Quitar"].fillna(False).astype(bool)]
+        if not selected.empty:
+            names = ", ".join(selected["Activo"].astype(str).tolist())
+            st.warning(f"Se retirarán de la cartera actual: {names}.")
+        if st.button(
+            "Guardar posiciones cerradas",
+            type="primary",
+            icon=":material/check:",
+            width="stretch",
+            disabled=selected.empty,
+            key=f"{view_key}_save_closed_positions",
+        ):
+            try:
+                removed = [
+                    (str(row.Plataforma), str(row.Activo))
+                    for row in selected.itertuples(index=False)
+                ]
+                updated = snapshot_without_positions(
+                    portfolio_snapshots,
+                    snapshot_date=date.today(),
+                    removed=removed,
+                )
+                journal.replace_portfolio_snapshot_positions(
+                    updated,
+                    snapshot_date=date.today(),
+                    recorded_by=actor_username,
+                )
+                _sync_accounts_from_complete_snapshot(
+                    journal,
+                    updated,
+                    accounts,
+                    snapshot_date=date.today(),
+                )
+            except (ValueError, JournalStorageError) as exc:
+                st.error(str(exc))
+            else:
+                count = len(selected)
+                st.session_state[f"_{view_key}_current_position_flash"] = (
+                    f"Cartera actualizada: {count} posición"
+                    f"{'es' if count != 1 else ''} cerrada"
+                    f"{'s' if count != 1 else ''}."
+                )
+                st.rerun()
+
+
 def render_current_position_form(
     journal: object,
     *,
@@ -3075,6 +3227,13 @@ def render_private_investments(
             accounts = pd.DataFrame()
 
     if snapshot_storage_ready:
+        render_portfolio_composition_editor(
+            journal,
+            portfolio_snapshots=portfolio_snapshots,
+            accounts=accounts,
+            actor_username=actor_username,
+            view_key=view_key,
+        )
         render_current_position_form(
             journal,
             portfolio_snapshots=portfolio_snapshots,
@@ -6146,8 +6305,12 @@ def render_home(
                 f"{snapshot_refresh.manual_count} valores manuales · "
                 f"{snapshot_refresh.pending_count} pendientes."
             )
+        st.caption(
+            "Este botón actualiza cotizaciones; para añadir una compra o quitar una "
+            "venta usa Inicio → Mi cartera."
+        )
     refresh_b.button(
-        "Actualizar cartera ahora",
+        "Actualizar precios",
         icon=":material/refresh:",
         width="stretch",
         key="home_refresh_portfolio",
