@@ -121,6 +121,31 @@ def test_snapshot_import_is_idempotent_and_creates_civislend_detail(tmp_path) ->
     assert len(journal.list_private_investments()) == 1
 
 
+def test_same_day_complete_import_removes_a_position_missing_from_new_file(
+    tmp_path,
+) -> None:
+    positions = normalize_portfolio_snapshot_frame(sample_snapshot_source())
+    journal = TradingJournal(tmp_path / "journal.db", owner="ddriu")
+    first = PortfolioWorkbookSnapshot(
+        positions=positions,
+        accounts=account_summaries_from_positions(positions),
+        snapshot_date="2026-07-17",
+    )
+    import_portfolio_workbook_snapshot(journal, first, recorded_by="ddriu")
+
+    reduced_positions = positions.iloc[:-1].copy()
+    second = PortfolioWorkbookSnapshot(
+        positions=reduced_positions,
+        accounts=account_summaries_from_positions(reduced_positions),
+        snapshot_date="2026-07-17",
+    )
+    import_portfolio_workbook_snapshot(journal, second, recorded_by="ddriu")
+
+    saved = journal.list_portfolio_snapshot_positions()
+    assert len(saved) == len(reduced_positions)
+    assert set(saved["asset_name"]) == set(reduced_positions["asset_name"])
+
+
 def test_snapshot_import_does_not_duplicate_manual_civislend_project(tmp_path) -> None:
     positions = normalize_portfolio_snapshot_frame(sample_snapshot_source())
     snapshot = PortfolioWorkbookSnapshot(

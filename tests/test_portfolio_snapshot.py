@@ -341,3 +341,34 @@ def test_closed_diary_position_removes_stale_snapshot_from_current_view() -> Non
     )
 
     assert reconciled.empty
+
+
+def test_recent_complete_snapshot_wins_over_older_diary_purchase() -> None:
+    snapshot = pd.DataFrame(
+        [
+            {
+                "snapshot_date": "2026-08-13",
+                "platform": "Revolut",
+                "asset_name": "Oracle",
+                "analysis_ticker": "ORCL",
+                "asset_type": "Acción",
+                "value_eur": 270.0,
+            }
+        ]
+    )
+    operations = pd.DataFrame(
+        [
+            {
+                "ticker": "MRNA",
+                "side": "Compra",
+                "executed_at": "2026-08-01T16:00:00",
+            }
+        ]
+    )
+    dashboard = pd.DataFrame(
+        [{"ticker": "MRNA", "quantity": 1.0, "net_value_eur": 52.0}]
+    )
+
+    reconciled = reconcile_current_portfolio(snapshot, operations, dashboard)
+
+    assert reconciled["analysis_ticker"].tolist() == ["ORCL"]

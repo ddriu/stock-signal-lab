@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import pandas as pd
 import pytest
 
 from src.supabase_journal import SupabaseTradingJournal
@@ -288,6 +289,47 @@ def test_supabase_portfolio_accounts_are_upserted_and_filtered_by_owner(monkeypa
     assert calls[0]["params"] == {"on_conflict": "owner,account_name"}
     assert calls[0]["json"]["owner"] == "ddriu"
     assert calls[1]["params"]["owner"] == "eq.ddriu"
+
+
+def test_supabase_complete_snapshot_replacement_deletes_same_date_first(
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        return FakeResponse(None, status_code=204)
+
+    monkeypatch.setattr("src.supabase_journal.requests.request", fake_request)
+    journal = SupabaseTradingJournal(
+        "https://example.supabase.co",
+        "sb_secret_test",
+        "ddriu",
+    )
+
+    count = journal.replace_portfolio_snapshot_positions(
+        pd.DataFrame(
+            [
+                {
+                    "snapshot_date": "2026-08-13",
+                    "platform": "Revolut",
+                    "asset_name": "Oracle",
+                    "value_eur": 270.0,
+                }
+            ]
+        ),
+        snapshot_date="2026-08-13",
+        recorded_by="ddriu",
+    )
+
+    assert count == 1
+    assert calls[0]["method"] == "DELETE"
+    assert calls[0]["params"] == {
+        "owner": "eq.ddriu",
+        "snapshot_date": "eq.2026-08-13",
+    }
+    assert calls[1]["method"] == "POST"
+    assert calls[1]["json"][0]["asset_name"] == "Oracle"
 
 
 def test_supabase_analysis_history_uses_owner_and_separate_table(monkeypatch) -> None:

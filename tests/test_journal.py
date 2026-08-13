@@ -1,3 +1,4 @@
+import pandas as pd
 import pytest
 
 from src.alerts import AlertState, normalize_alert_preferences
@@ -164,6 +165,36 @@ def test_portfolio_account_rejects_negative_values(tmp_path) -> None:
             account_type="Bróker",
             investments_value=-1,
         )
+
+
+def test_complete_snapshot_replacement_removes_omitted_positions(tmp_path) -> None:
+    journal = TradingJournal(tmp_path / "journal.db", owner="ddriu")
+    original = pd.DataFrame(
+        [
+            {
+                "snapshot_date": "2026-08-13",
+                "platform": "Revolut",
+                "asset_name": "Moderna",
+                "value_eur": 50.0,
+            },
+            {
+                "snapshot_date": "2026-08-13",
+                "platform": "Revolut",
+                "asset_name": "Oracle",
+                "value_eur": 270.0,
+            },
+        ]
+    )
+    journal.upsert_portfolio_snapshot_positions(original, recorded_by="ddriu")
+
+    journal.replace_portfolio_snapshot_positions(
+        original.loc[original["asset_name"] == "Oracle"],
+        snapshot_date="2026-08-13",
+        recorded_by="ddriu",
+    )
+
+    saved = journal.list_portfolio_snapshot_positions()
+    assert saved["asset_name"].tolist() == ["Oracle"]
 
 
 def test_analysis_snapshots_are_private_lightweight_history(tmp_path) -> None:
