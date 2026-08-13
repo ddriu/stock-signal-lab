@@ -175,3 +175,63 @@ def snapshot_with_current_position(
         base = base.loc[~(same_platform & (same_name | same_ticker))].copy()
 
     return pd.concat([base, pd.DataFrame([new_row])], ignore_index=True, sort=False)
+
+
+def snapshot_without_positions(
+    existing: pd.DataFrame,
+    *,
+    snapshot_date: date | str,
+    removed: list[tuple[str, str]],
+) -> pd.DataFrame:
+    """Crea una foto nueva omitiendo las posiciones que el usuario ya no tiene.
+
+    Las claves son ``(plataforma, activo)`` porque una misma empresa puede estar en
+    dos brókeres. No se altera la fotografía histórica de origen.
+    """
+
+    if existing.empty:
+        raise ValueError("No hay una cartera guardada que se pueda revisar.")
+
+    target_date = pd.Timestamp(snapshot_date).normalize()
+    if pd.isna(target_date):
+        raise ValueError("La fecha de valoración no es válida.")
+
+    frame = existing.copy()
+    parsed = pd.to_datetime(frame["snapshot_date"], errors="coerce").dt.normalize()
+    if parsed.isna().all():
+        raise ValueError("Las posiciones guardadas no tienen una fecha válida.")
+    latest_date = parsed.max()
+    if target_date < latest_date:
+        raise ValueError(
+            "La fecha no puede ser anterior a la última valoración guardada."
+        )
+
+    base = frame.loc[parsed == latest_date].copy()
+    base["snapshot_date"] = target_date.date().isoformat()
+    removed_keys = {
+        (str(platform).strip().casefold(), str(asset).strip().casefold())
+        for platform, asset in removed
+        if str(platform).strip() and str(asset).strip()
+    }
+    if not removed_keys:
+        raise ValueError("Marca al menos una posición que ya no tengas.")
+
+    row_keys = pd.Series(
+        [
+            (
+                str(row.platform).strip().casefold(),
+                str(row.asset_name).strip().casefold(),
+            )
+            for row in base.itertuples(index=False)
+        ],
+        index=base.index,
+    )
+    updated = base.loc[~row_keys.isin(removed_keys)].copy()
+    removed_count = len(base) - len(updated)
+    if removed_count == 0:
+        raise ValueError("Las posiciones marcadas ya no aparecen en la cartera actual.")
+    if updated.empty:
+        raise ValueError(
+            "No se puede dejar la fotografía completamente vacía desde esta pantalla."
+        )
+    return updated.reset_index(drop=True)

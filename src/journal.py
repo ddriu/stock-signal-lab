@@ -948,13 +948,14 @@ class TradingJournal:
         payloads = [
             normalize_portfolio_snapshot_position(
                 **{
-                    column: getattr(row, column)
+                    column: row[column]
                     for column in PORTFOLIO_SNAPSHOT_COLUMNS
-                    if column
+                    if column in row
+                    and column
                     not in {"id", "recorded_by", "created_at", "updated_at"}
                 }
             )
-            for row in positions.itertuples(index=False)
+            for row in positions.to_dict("records")
         ]
         columns = [column for column in PORTFOLIO_SNAPSHOT_COLUMNS if column != "id"]
         with self._connect() as connection:
@@ -981,6 +982,49 @@ class TradingJournal:
                         notes = excluded.notes,
                         recorded_by = excluded.recorded_by,
                         updated_at = excluded.updated_at
+                    """,
+                    tuple(values[column] for column in columns),
+                )
+        return len(payloads)
+
+    def replace_portfolio_snapshot_positions(
+        self,
+        positions: pd.DataFrame,
+        *,
+        snapshot_date: date | datetime | str,
+        recorded_by: str = "",
+    ) -> int:
+        """Sustituye atómicamente una foto completa, incluidas las bajas."""
+
+        target = pd.Timestamp(snapshot_date).date().isoformat()
+        replacement = positions.copy()
+        if replacement.empty:
+            raise ValueError("La fotografía de cartera no puede quedar vacía.")
+        replacement["snapshot_date"] = target
+        payloads = [
+            normalize_portfolio_snapshot_position(
+                **{
+                    column: row[column]
+                    for column in PORTFOLIO_SNAPSHOT_COLUMNS
+                    if column in row
+                    and column
+                    not in {"id", "recorded_by", "created_at", "updated_at"}
+                }
+            )
+            for row in replacement.to_dict("records")
+        ]
+        columns = [column for column in PORTFOLIO_SNAPSHOT_COLUMNS if column != "id"]
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM portfolio_snapshots WHERE snapshot_date = ?",
+                (target,),
+            )
+            for position in payloads:
+                values = {**position, "recorded_by": recorded_by.strip().lower()}
+                connection.execute(
+                    f"""
+                    INSERT INTO portfolio_snapshots ({', '.join(columns)})
+                    VALUES ({', '.join('?' for _ in columns)})
                     """,
                     tuple(values[column] for column in columns),
                 )

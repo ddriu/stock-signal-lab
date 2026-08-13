@@ -143,18 +143,31 @@ def reconcile_current_portfolio(
     """Construye una sola vista actual a partir de fotografía y diario.
 
     La fotografía conserva fondos, efectivo e inversiones alternativas. Cuando un
-    ticker tiene movimientos en el diario, su posición abierta reconstruida pasa a
-    ser la fuente prioritaria. Así una venta no deja una segunda cantidad obsoleta
-    visible en Inicio. La función es sólo de presentación: no borra el histórico.
+    ticker tiene movimientos posteriores a la foto, su posición abierta reconstruida
+    pasa a ser la fuente prioritaria. Una foto completa reciente prevalece sobre
+    compras antiguas del diario: así una venta declarada desde el bróker no reaparece.
+    La función es sólo de presentación: no borra el histórico.
     """
 
     if operations.empty or "ticker" not in operations.columns:
         return snapshot.copy()
 
     frame = snapshot.copy()
+    relevant_operations = operations
+    if not frame.empty and "executed_at" in operations.columns:
+        snapshot_dates = pd.to_datetime(
+            frame.get("snapshot_date", pd.Series(dtype=object)), errors="coerce"
+        )
+        operation_dates = pd.to_datetime(operations["executed_at"], errors="coerce")
+        if snapshot_dates.notna().any() and operation_dates.notna().any():
+            latest_snapshot_date = snapshot_dates.max().normalize()
+            relevant_operations = operations.loc[
+                operation_dates.dt.normalize() > latest_snapshot_date
+            ]
+
     operated_tickers = {
         resolve_analysis_ticker(str(value).strip().upper())
-        for value in operations["ticker"].dropna().tolist()
+        for value in relevant_operations["ticker"].dropna().tolist()
         if str(value).strip()
     }
     if not operated_tickers:

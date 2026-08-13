@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from io import BytesIO
 from typing import BinaryIO
 
@@ -282,11 +283,20 @@ def import_portfolio_workbook_snapshot(
 ) -> PortfolioWorkbookImportResult:
     """Guarda fotografía, cuentas agregadas y detalle genérico de Civislend."""
 
-    positions_saved = journal.upsert_portfolio_snapshot_positions(
-        snapshot.positions,
-        recorded_by=recorded_by,
-    )
+    replace_snapshot = getattr(journal, "replace_portfolio_snapshot_positions", None)
+    if callable(replace_snapshot):
+        positions_saved = replace_snapshot(
+            snapshot.positions,
+            snapshot_date=snapshot.snapshot_date,
+            recorded_by=recorded_by,
+        )
+    else:
+        positions_saved = journal.upsert_portfolio_snapshot_positions(
+            snapshot.positions,
+            recorded_by=recorded_by,
+        )
     accounts_saved = 0
+    is_current = pd.Timestamp(snapshot.snapshot_date).date() == date.today()
     for account in snapshot.accounts.itertuples(index=False):
         journal.upsert_portfolio_account(
             account_name=str(account.account_name),
@@ -294,10 +304,14 @@ def import_portfolio_workbook_snapshot(
             investments_value=float(account.investments_value),
             cash_balance=float(account.cash_balance),
             currency=str(account.currency),
-            status="Pendiente de actualizar",
+            status="Actualizada" if is_current else "Pendiente de actualizar",
             notes=(
-                f"Fotografía de cartera del {snapshot.snapshot_date}; "
-                "pendiente de actualizar con datos actuales."
+                f"Fotografía completa de cartera del {snapshot.snapshot_date}."
+                + (
+                    " Composición declarada como actual."
+                    if is_current
+                    else " Pendiente de actualizar con datos actuales."
+                )
             ),
         )
         accounts_saved += 1

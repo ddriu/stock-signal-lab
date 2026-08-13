@@ -415,12 +415,13 @@ class SupabaseTradingJournal:
         recorded_by: str = "",
     ) -> int:
         payload: list[dict[str, object]] = []
-        for row in positions.itertuples(index=False):
+        for row in positions.to_dict("records"):
             normalized = normalize_portfolio_snapshot_position(
                 **{
-                    column: getattr(row, column)
+                    column: row[column]
                     for column in PORTFOLIO_SNAPSHOT_COLUMNS
-                    if column
+                    if column in row
+                    and column
                     not in {"id", "recorded_by", "created_at", "updated_at"}
                 }
             )
@@ -444,6 +445,33 @@ class SupabaseTradingJournal:
             },
         )
         return len(payload)
+
+    def replace_portfolio_snapshot_positions(
+        self,
+        positions: pd.DataFrame,
+        *,
+        snapshot_date: date | datetime | str,
+        recorded_by: str = "",
+    ) -> int:
+        """Sustituye una foto remota para que también desaparezcan las ventas."""
+
+        target = pd.Timestamp(snapshot_date).date().isoformat()
+        replacement = positions.copy()
+        if replacement.empty:
+            raise ValueError("La fotografía de cartera no puede quedar vacía.")
+        replacement["snapshot_date"] = target
+        self._request(
+            "DELETE",
+            endpoint=self.portfolio_snapshots_endpoint,
+            params={
+                "owner": f"eq.{self.owner}",
+                "snapshot_date": f"eq.{target}",
+            },
+        )
+        return self.upsert_portfolio_snapshot_positions(
+            replacement,
+            recorded_by=recorded_by,
+        )
 
     def list_portfolio_snapshot_positions(self) -> pd.DataFrame:
         response = self._request(
