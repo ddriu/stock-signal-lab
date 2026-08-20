@@ -142,6 +142,7 @@ from src.navigation import (
     analysis_refresh_tickers,
     direct_ticker_from_query,
     growth_radar_ticker_groups,
+    market_data_freshness_rows,
     merge_analysis_ticker_sources,
     next_daily_review_batch,
     sanitize_favorite_selection,
@@ -216,6 +217,7 @@ from src.ui import (
 from src.visualization import (
     annual_portfolio_chart,
     backtest_chart,
+    chart_period_frame,
     correlation_heatmap,
     momentum_chart,
     normalized_comparison_chart,
@@ -312,8 +314,14 @@ def apply_visual_theme() -> None:
 
 
 @st.cache_data(ttl=3_600, max_entries=350, show_spinner=False)
-def cached_download(ticker: str, start: date, end: date, auto_adjust: bool) -> pd.DataFrame:
-    """Caché de red; los indicadores se recalculan fuera con la configuración actual."""
+def cached_download(
+    ticker: str,
+    start: date,
+    end: date,
+    auto_adjust: bool,
+    refresh_token: str = "",
+) -> pd.DataFrame:
+    """Caché de red con una clave que permite forzar una consulta nueva."""
 
     return download_prices(ticker, start, end, auto_adjust=auto_adjust)
 
@@ -815,13 +823,14 @@ def build_sidebar(
     )
     load_clicked = st.sidebar.button(
         (
-            f"Actualizar {selected_count} empresas"
+            f"Actualizar ahora {selected_count} empresas"
             if selected_count
-            else "Actualizar posiciones abiertas"
+            else "Actualizar ahora las posiciones"
         ),
         type="primary",
         width="stretch",
         icon=":material/refresh:",
+        help="Fuerza una consulta nueva de precios; no reutiliza la caché anterior.",
     )
     start = end - timedelta(days=365 * int(years))
     strategy = StrategyConfig(
@@ -876,16 +885,17 @@ def load_market_data(
     fundamental_tickers: set[str] | None = None,
     merge_existing: bool = False,
     refresh_fundamentals: bool = False,
-) -> None:
+    price_refresh_token: str = "",
+) -> set[str]:
     if not tickers:
         st.sidebar.error("Elige al menos una favorita o registra una posición.")
-        return
+        return set()
     if len(tickers) > 200:
         st.sidebar.error(
             "La actualización admite hasta 200 empresas simultáneas. "
             "Reduce temporalmente la selección de favoritos."
         )
-        return
+        return set()
     deep_tickers = set(tickers if fundamental_tickers is None else fundamental_tickers)
     if len(deep_tickers) > 25:
         deep_tickers = set(
@@ -907,6 +917,7 @@ def load_market_data(
         else {}
     )
     errors: list[str] = []
+    refreshed_tickers: set[str] = set()
     refresh_token = (
         str(pd.Timestamp.utcnow().value) if refresh_fundamentals else ""
     )
@@ -923,7 +934,9 @@ def load_market_data(
                 ticker_start,
                 end,
                 auto_adjust,
+                price_refresh_token,
             )
+            refreshed_tickers.add(ticker)
         except (DataDownloadError, ValueError) as exc:
             errors.append(str(exc))
         if ticker in deep_tickers:
@@ -969,7 +982,9 @@ def load_market_data(
     missing_references = reference_symbols.difference(downloaded).difference(references)
     for symbol in sorted(missing_references):
         try:
-            references[symbol] = cached_download(symbol, start, end, auto_adjust)
+            references[symbol] = cached_download(
+                symbol, start, end, auto_adjust, price_refresh_token
+            )
         except (DataDownloadError, ValueError) as exc:
             errors.append(f"No se pudo calcular la comparación con {symbol}: {exc}")
     try:
@@ -996,6 +1011,13 @@ def load_market_data(
     quick_mode_tickers.difference_update(deep_tickers)
     st.session_state["quick_mode_tickers"] = sorted(quick_mode_tickers)
     st.session_state["download_errors"] = errors
+    st.session_state["_last_price_refresh"] = {
+        "requested": list(tickers),
+        "succeeded": sorted(refreshed_tickers),
+        "failed": sorted(set(tickers).difference(refreshed_tickers)),
+        "requested_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+        "forced": bool(price_refresh_token),
+    }
     refreshed_statuses = {
         ticker: growth_fundamental_status(fundamentals.get(ticker))
         for ticker in deep_tickers
@@ -1011,6 +1033,7 @@ def load_market_data(
     # descartan sólo cuando se actualizan precios; cambiar de pestaña no obliga
     # a repetir la simulación.
     st.session_state.pop("backtest_results", None)
+    return refreshed_tickers
 
 
 def prepare_data(
@@ -2189,13 +2212,26 @@ def render_analysis(
 
     with st.expander("Ver explicación técnica completa"):
         st.write(signal.explanation)
+    chart_period = st.segmented_control(
+        "Periodo de las gráficas",
+        ["1 mes", "3 meses", "1 año", "5 años", "Máximo"],
+        default="3 meses",
+        key=f"chart_period_{ticker}",
+        required=True,
+    )
+    visible_chart_frame = chart_period_frame(frame, str(chart_period or "3 meses"))
+    st.caption(
+        f"Gráficas desde {visible_chart_frame.index[0]:%d/%m/%Y} hasta "
+        f"{visible_chart_frame.index[-1]:%d/%m/%Y}. La última vela visible es la "
+        "utilizada por los indicadores."
+    )
     st.plotly_chart(
-        price_chart(frame, ticker),
+        price_chart(visible_chart_frame, ticker),
         width="stretch",
         config=PLOTLY_CONFIG,
     )
     st.plotly_chart(
-        momentum_chart(frame, strategy.rsi_overbought),
+        momentum_chart(visible_chart_frame, strategy.rsi_overbought),
         width="stretch",
         config=PLOTLY_CONFIG,
     )
@@ -5517,19 +5553,107 @@ def render_automatic_review_status(username: str) -> None:
     total = int(st.session_state.get(f"_automatic_review_total_{suffix}", 0) or 0)
     attempted = st.session_state.get(f"_automatic_review_attempted_{suffix}", [])
     reviewed = len({str(ticker).strip().upper() for ticker in attempted if ticker})
+    failed_values = st.session_state.get(f"_automatic_review_failed_{suffix}", [])
+    failed = sorted(
+        {str(ticker).strip().upper() for ticker in failed_values if ticker}
+    )
     if total <= 0:
         return
     if reviewed >= total:
-        st.caption(
-            f"✓ Revisión automática de hoy terminada: {total} empresas recorridas en "
-            "bloques internos de 25. Mi radar, Entradas hoy y Crecimiento comparten "
-            "estos datos."
-        )
+        if failed:
+            st.warning(
+                f"Revisión terminada: {total - len(failed)} con precio y "
+                f"{len(failed)} sin completar ({', '.join(failed)}). Puedes reintentarlas "
+                "con «Actualizar ahora todas mis favoritas»."
+            )
+        else:
+            st.caption(
+                f"✓ Revisión automática de hoy terminada: {total} empresas con "
+                "precio. Mi radar, Entradas hoy y Crecimiento comparten estos datos."
+            )
     else:
         st.caption(
-            f"Revisión automática de hoy: {reviewed} de {total} empresas recorridas. "
+            f"Revisión automática de hoy: {reviewed} de {total} empresas consultadas. "
             "La aplicación continúa en bloques internos de 25."
         )
+
+
+def render_market_data_status(
+    raw_data: dict[str, pd.DataFrame],
+    favorite_tickers: list[str],
+) -> None:
+    """Hace visible la frescura del mercado en todas las vistas de análisis."""
+
+    rows = market_data_freshness_rows(raw_data)
+    if not rows:
+        st.warning(
+            "Precios sin cargar. El Radar conserva tus favoritas, pero ninguna lectura "
+            "es actual hasta pulsar «Actualizar ahora»."
+        )
+        if favorite_tickers:
+            st.button(
+                "Actualizar ahora todas mis favoritas",
+                icon=":material/refresh:",
+                width="stretch",
+                key="force_all_favorite_refresh_empty",
+                on_click=_request_all_favorite_refresh,
+            )
+        return
+
+    market_dates = [row["Última vela"] for row in rows]
+    loaded = {str(row["Ticker"]) for row in rows}
+    favorite_set = {
+        resolve_analysis_ticker(ticker)
+        for ticker in favorite_tickers
+        if str(ticker).strip()
+    }
+    favorite_loaded = len(loaded.intersection(favorite_set))
+    latest_market_date = max(market_dates)
+    oldest_market_date = min(market_dates)
+    current_refresh = dict(st.session_state.get("_last_price_refresh", {}) or {})
+    failed = list(current_refresh.get("failed", []) or [])
+
+    with st.container(border=True):
+        status_a, status_b, status_c = st.columns(3)
+        status_a.metric("Precios cargados", len(rows))
+        status_b.metric("Última vela disponible", latest_market_date.strftime("%d/%m/%Y"))
+        status_c.metric(
+            "Favoritas con precio",
+            f"{favorite_loaded}/{len(favorite_set)}" if favorite_set else "0/0",
+        )
+        if oldest_market_date != latest_market_date:
+            st.warning(
+                "No todas las empresas tienen la misma fecha de mercado: "
+                f"desde {oldest_market_date:%d/%m/%Y} hasta "
+                f"{latest_market_date:%d/%m/%Y}."
+            )
+        elif failed:
+            st.warning(
+                "La última actualización no pudo completar: " + ", ".join(failed)
+            )
+        else:
+            st.caption(
+                "La fecha de la vela indica el dato utilizado. La hora de descarga y "
+                "el proveedor se pueden comprobar empresa por empresa."
+            )
+        with st.popover("Comprobar fecha y proveedor", icon=":material/schedule:"):
+            st.dataframe(
+                pd.DataFrame(rows),
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "Última vela": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                },
+            )
+        if favorite_set:
+            st.button(
+                "Actualizar ahora todas mis favoritas",
+                icon=":material/refresh:",
+                width="stretch",
+                key="force_all_favorite_refresh",
+                on_click=_request_all_favorite_refresh,
+                help="Vuelve a consultar precios y recorre la lista en bloques de 25.",
+            )
 
 
 def render_page_intro(eyebrow: str, title: str, description: str) -> None:
@@ -5769,6 +5893,21 @@ def _set_analysis_tool(tool: str) -> None:
     st.session_state["main_navigation"] = "Analizar"
     st.session_state["analysis_navigation"] = "Más análisis"
     st.session_state["analysis_tool_navigation"] = tool
+
+
+def _request_analysis_page(page: str) -> None:
+    """Cambia entre Radar y Entradas sin tocar directamente el widget visible."""
+
+    st.session_state["_requested_main_navigation"] = "Analizar"
+    st.session_state["_requested_analysis_navigation"] = page
+
+
+def _request_all_favorite_refresh() -> None:
+    """Solicita una revisión completa sin reutilizar la caché de precios."""
+
+    st.session_state["_force_all_favorite_refresh"] = True
+    st.session_state["_requested_main_navigation"] = "Analizar"
+    st.session_state["_requested_analysis_navigation"] = "Radar"
 
 
 def _sync_analysis_ticker(source_key: str) -> None:
@@ -6677,6 +6816,13 @@ def render_opportunities_page(
         "Aquí aparecen todas tus favoritas: entradas, empresas en espera y pendientes. "
         "La pestaña «Entradas hoy» aplica después el filtro de precio actual.",
     )
+    st.button(
+        "Ver sólo las entradas que pasan el filtro de hoy",
+        icon=":material/target:",
+        key="radar_open_entries",
+        on_click=_request_analysis_page,
+        args=("Oportunidades",),
+    )
     try:
         saved_snapshots = journal.list_analysis_snapshots()
     except JournalStorageError as exc:
@@ -7254,6 +7400,13 @@ def render_entry_opportunities_page(
         "Entradas de hoy",
         "Parte del Radar y separa lo comprable ahora de lo que debe esperar por precio, "
         "exceso de subida o un evento próximo.",
+    )
+    st.button(
+        "Volver a todas mis empresas",
+        icon=":material/arrow_back:",
+        key="entries_back_to_radar",
+        on_click=_request_analysis_page,
+        args=("Radar",),
     )
     if not prepared:
         st.info(
@@ -9646,13 +9799,21 @@ def main() -> None:
     review_suffix = authenticated_user.username.strip().lower() or "usuario"
     review_date_key = f"_automatic_review_date_{review_suffix}"
     review_attempted_key = f"_automatic_review_attempted_{review_suffix}"
+    review_failed_key = f"_automatic_review_failed_{review_suffix}"
     review_total_key = f"_automatic_review_total_{review_suffix}"
     today_key = date.today().isoformat()
+    force_all_favorite_refresh = bool(
+        st.session_state.pop("_force_all_favorite_refresh", False)
+    )
     automatic_review_batch: list[str] = []
     if automatic_review_page:
-        if st.session_state.get(review_date_key) != today_key:
+        if (
+            st.session_state.get(review_date_key) != today_key
+            or force_all_favorite_refresh
+        ):
             st.session_state[review_date_key] = today_key
             st.session_state[review_attempted_key] = []
+            st.session_state[review_failed_key] = []
         st.session_state[review_total_key] = len(review_universe)
         attempted_review = list(st.session_state.get(review_attempted_key, []))
         automatic_review_batch = next_daily_review_batch(
@@ -9660,16 +9821,6 @@ def main() -> None:
             attempted_review,
             limit=25,
         )
-        batch_being_attempted = (
-            requested_growth_scan_tickers
-            if requested_growth_scan_tickers
-            else automatic_review_batch
-        )
-        attempted_review = merge_analysis_ticker_sources(
-            attempted_review,
-            [ticker for ticker in batch_being_attempted if ticker in review_universe],
-        )
-        st.session_state[review_attempted_key] = attempted_review
     growth_scan_tickers = (
         requested_growth_scan_tickers
         if requested_growth_scan_tickers
@@ -9734,6 +9885,7 @@ def main() -> None:
                 active_ticker=active_analysis_ticker,
             )
         )
+        refreshed_tickers: set[str] = set()
         if tickers_to_load:
             deep_tickers = (
                 {
@@ -9752,7 +9904,20 @@ def main() -> None:
                 if load_clicked or pending_analysis_ticker or growth_scan_tickers
                 else set()
             )
-            load_market_data(
+            force_new_prices = bool(
+                load_clicked
+                or pending_analysis_ticker
+                or portfolio_refresh_requested
+                or force_all_favorite_refresh
+            )
+            price_refresh_token = (
+                str(pd.Timestamp.now(tz="UTC").value)
+                if force_new_prices
+                else today_key
+                if growth_scan_tickers or portfolio_auto_refresh
+                else ""
+            )
+            refreshed_tickers = load_market_data(
                 tickers_to_load,
                 start,
                 end,
@@ -9765,8 +9930,27 @@ def main() -> None:
                     or portfolio_auto_refresh
                 ),
                 refresh_fundamentals=bool(growth_scan_tickers),
+                price_refresh_token=price_refresh_token,
             )
         if growth_scan_tickers:
+            attempted_review = list(
+                st.session_state.get(review_attempted_key, [])
+            )
+            attempted_review = merge_analysis_ticker_sources(
+                attempted_review,
+                [ticker for ticker in growth_scan_tickers if ticker in review_universe],
+            )
+            st.session_state[review_attempted_key] = attempted_review
+            failed_review = list(st.session_state.get(review_failed_key, []))
+            failed_review = merge_analysis_ticker_sources(
+                failed_review,
+                [
+                    ticker
+                    for ticker in growth_scan_tickers
+                    if ticker not in refreshed_tickers and ticker in review_universe
+                ],
+            )
+            st.session_state[review_failed_key] = failed_review
             refresh_summary = dict(
                 st.session_state.get("_last_fundamental_refresh", {}) or {}
             )
@@ -9849,6 +10033,7 @@ def main() -> None:
         )
 
     elif selected_section == "Analizar":
+        render_market_data_status(raw_data, favorite_tickers)
         if automatic_review_page:
             render_automatic_review_status(authenticated_user.username)
         if analysis_section == "Radar":
