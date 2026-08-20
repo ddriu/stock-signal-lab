@@ -26,6 +26,7 @@ from src import navigation as _navigation_module
 from src import opportunity_catalog as _opportunity_catalog_module
 from src import portfolio_snapshot_import as _portfolio_snapshot_import_module
 from src import risk as _risk_module
+from src import speculative as _speculative_module
 from src import supabase_journal as _supabase_journal_module
 from src import storage as _storage_module
 from src import ui as _ui_module
@@ -43,6 +44,7 @@ _portfolio_snapshot_import_module = importlib.reload(
     _portfolio_snapshot_import_module
 )
 _risk_module = importlib.reload(_risk_module)
+_speculative_module = importlib.reload(_speculative_module)
 _supabase_journal_module = importlib.reload(_supabase_journal_module)
 _storage_module = importlib.reload(_storage_module)
 _ui_module = importlib.reload(_ui_module)
@@ -163,6 +165,12 @@ from src.opportunity import (
 from src.portfolio import compare_switch, value_holding
 from src.portfolio_export import build_portfolio_excel
 from src.portfolio_history import build_portfolio_history
+from src.speculative import (
+    SpeculativeCandidate,
+    assess_speculative_candidate,
+    discover_speculative_candidates,
+    rank_speculative_assessments,
+)
 from src.portfolio_snapshot_import import (
     account_summaries_from_positions,
     import_portfolio_workbook_snapshot,
@@ -355,6 +363,13 @@ def cached_company_search(query: str) -> list[TickerSearchResult]:
     """Evita repetir búsquedas iguales durante el día."""
 
     return search_instruments(query, max_results=25)
+
+
+@st.cache_data(ttl=1_800, max_entries=2, show_spinner=False)
+def cached_speculative_candidates() -> list[SpeculativeCandidate]:
+    """Universo externo pequeño; la evaluación completa se realiza después."""
+
+    return discover_speculative_candidates(limit=12)
 
 
 def apply_section_layout(section: str, analysis_section: str = "") -> None:
@@ -5910,6 +5925,26 @@ def _request_all_favorite_refresh() -> None:
     st.session_state["_requested_analysis_navigation"] = "Radar"
 
 
+def _request_complete_review() -> None:
+    """Revisa favoritas y posiciones antes de explorar small caps líquidas."""
+
+    st.session_state["_force_all_favorite_refresh"] = True
+    st.session_state["_pending_speculative_discovery"] = True
+    st.session_state["_complete_review_started_at"] = pd.Timestamp.now(
+        tz="UTC"
+    ).isoformat()
+    st.session_state["_requested_main_navigation"] = "Analizar"
+    st.session_state["_requested_analysis_navigation"] = "Radar"
+
+
+def _request_speculative_search() -> None:
+    """Inicia el screener; si falta revisar favoritas, las completa primero."""
+
+    st.session_state["_pending_speculative_discovery"] = True
+    st.session_state["_requested_main_navigation"] = "Analizar"
+    st.session_state["_requested_analysis_navigation"] = "Oportunidades"
+
+
 def _sync_analysis_ticker(source_key: str) -> None:
     """Mantiene la misma empresa activa entre las herramientas de Analizar."""
 
@@ -6635,9 +6670,25 @@ def render_home(
         )
 
     if section in {"Resumen", "Hoy"}:
+        st.button(
+            "Revisar toda mi cartera y buscar oportunidades",
+            icon=":material/radar:",
+            width="stretch",
+            type="primary",
+            key="home_complete_review",
+            on_click=_request_complete_review,
+            help=(
+                "Actualiza posiciones y favoritas, aplica los filtros completos y "
+                "después explora un universo separado de small caps líquidas."
+            ),
+        )
+        st.caption(
+            "Primero protege lo que ya tienes; después busca entradas normales y "
+            "candidatas especulativas. No se envían órdenes al bróker."
+        )
         action_a, action_b, action_c = st.columns(3)
         action_a.button(
-            "Analizar empresas",
+            "Abrir análisis",
             icon=":material/monitoring:",
             width="stretch",
             type="primary",
@@ -7141,6 +7192,104 @@ def _build_entry_opportunities(
     return results, errors
 
 
+def render_speculative_opportunities(
+    results: list[EntryOpportunityResult],
+    risk_results: dict[str, RiskResult],
+    raw_fundamentals: dict[str, dict[str, object]],
+    discoveries: list[SpeculativeCandidate],
+) -> None:
+    """Muestra sólo el universo externo y deja visibles todos sus descartes."""
+
+    st.markdown("### Oportunidades especulativas controladas")
+    st.caption(
+        "Small caps líquidas de Nasdaq/NYSE. El screener sólo descubre nombres: "
+        "para ser candidata deben superar después Entradas, liquidez, cobertura, "
+        "beneficio/riesgo 2:1 y el filtro de no perseguir una subida explosiva."
+    )
+    if not discoveries:
+        st.info(
+            "Todavía no se ha ejecutado el screener externo. No se mezclan small caps "
+            "nuevas con tus favoritas hasta que lo solicites."
+        )
+        return
+    result_by_ticker = {result.ticker: result for result in results}
+    discovery_by_ticker = {item.ticker: item for item in discoveries}
+    assessments = []
+    for ticker, discovery in discovery_by_ticker.items():
+        opportunity = result_by_ticker.get(ticker)
+        risk = risk_results.get(ticker)
+        if opportunity is None or risk is None:
+            continue
+        assessments.append(
+            assess_speculative_candidate(
+                opportunity,
+                risk,
+                raw_fundamentals.get(ticker, {}),
+                discovery,
+            )
+        )
+    assessments = rank_speculative_assessments(assessments)
+    pending = len(discoveries) - len(assessments)
+    eligible = [assessment for assessment in assessments if assessment.eligible]
+    metrics = st.columns(3)
+    metrics[0].metric("Universo revisado", len(discoveries))
+    metrics[1].metric("Superan todos los controles", len(eligible))
+    metrics[2].metric("Sin lectura completa", pending)
+    if eligible:
+        st.success(
+            f"{len(eligible)} candidata{'s' if len(eligible) != 1 else ''} merece"
+            " revisión manual. No equivale a una orden ni a una rentabilidad esperada."
+        )
+    else:
+        st.info(
+            "Ninguna small cap supera hoy todos los controles. No operar también es "
+            "un resultado válido."
+        )
+    rows: list[dict[str, object]] = []
+    for assessment in assessments:
+        opportunity = result_by_ticker[assessment.ticker]
+        rows.append(
+            {
+                "Ticker": assessment.ticker,
+                "Estado": assessment.label,
+                "Score especulativo": assessment.score,
+                "Oportunidad": opportunity.opportunity_score,
+                "Timing": opportunity.timing.score,
+                "Capitalización": assessment.market_cap,
+                "Negociación diaria": assessment.daily_turnover,
+                "B/R": opportunity.zones.risk_reward,
+                "Cambio 1 sesión": opportunity.timing.return_1d_pct,
+                "Motivo": " · ".join(assessment.reasons),
+            }
+        )
+    if rows:
+        render_ticker_dataframe(
+            pd.DataFrame(rows),
+            key="speculative_opportunities_table",
+            column_config={
+                "Score especulativo": st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d"
+                ),
+                "Oportunidad": st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d"
+                ),
+                "Timing": st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d"
+                ),
+                "Capitalización": st.column_config.NumberColumn(format="%.0f USD"),
+                "Negociación diaria": st.column_config.NumberColumn(format="%.0f USD"),
+                "B/R": st.column_config.NumberColumn(format="%.2f"),
+                "Cambio 1 sesión": st.column_config.NumberColumn(format="%+.1f%%"),
+            },
+        )
+    with st.expander("Riesgos que el proveedor no puede verificar por completo"):
+        st.warning(
+            "Antes de operar hay que comprobar noticias, promociones, suspensiones, "
+            "dilución, ampliaciones y consumo de caja en fuentes oficiales. El tamaño "
+            "máximo debe calcularse desde la pérdida aceptable, no desde el potencial."
+        )
+
+
 def _opportunity_sort_value(
     result: EntryOpportunityResult,
     order: str,
@@ -7392,6 +7541,7 @@ def render_entry_opportunities_page(
     journal: object,
     favorite_tickers: list[str],
     favorite_labels: dict[str, str],
+    speculative_discoveries: list[SpeculativeCandidate] | None = None,
 ) -> None:
     """Nueva capa: distingue una buena señal de un buen precio de entrada."""
 
@@ -7408,6 +7558,22 @@ def render_entry_opportunities_page(
         on_click=_request_analysis_page,
         args=("Radar",),
     )
+    st.button(
+        "Buscar small caps líquidas fuera de mis favoritas",
+        icon=":material/travel_explore:",
+        key="start_speculative_search",
+        width="stretch",
+        on_click=_request_speculative_search,
+        help=(
+            "Consulta un universo externo de Nasdaq/NYSE y después descarga el "
+            "histórico y los fundamentales de un máximo de 12 candidatas."
+        ),
+    )
+    speculative_error = str(
+        st.session_state.get("_speculative_discovery_error", "") or ""
+    )
+    if speculative_error:
+        st.warning(f"El screener especulativo no pudo completarse: {speculative_error}")
     if not prepared:
         st.info(
             "Todavía no hay precios actualizados para esta lectura. Elige favoritas en "
@@ -7442,6 +7608,13 @@ def render_entry_opportunities_page(
     st.caption(
         f"{len(results)} empresas con lectura actual. Sólo las verdes pasan a la vez "
         "los filtros de tendencia, timing, score conjunto y beneficio/riesgo."
+    )
+
+    render_speculative_opportunities(
+        results,
+        risk_results,
+        raw_fundamentals,
+        speculative_discoveries or [],
     )
 
     held_tickers = set(_portfolio_tracking_tickers(journal))
@@ -9327,8 +9500,8 @@ def render_email_alert_settings(journal: object) -> None:
 
     st.subheader("Alertas por correo")
     st.write(
-        "Recibe un único resumen cuando una favorita pase a entrada interesante o "
-        "cuando una posición registrada cambie a reducir o vender."
+        "Recibe un único resumen cuando una favorita supera todos los filtros de "
+        "«Entradas» o cuando una posición registrada cambia a reducir o vender."
     )
     st.info(
         "Una alerta invita a revisar los datos; no compra, vende ni envía órdenes a "
@@ -9360,8 +9533,8 @@ def render_email_alert_settings(journal: object) -> None:
                 "Entradas interesantes",
                 value=preferences.alert_buy,
                 help=(
-                    "Avisa sobre favoritas que no están en tu cartera cuando su momento "
-                    "técnico alcanza el mínimo elegido."
+                    "Avisa sobre favoritas que no están en tu cartera sólo cuando "
+                    "también superan timing, precio, evento y beneficio/riesgo."
                 ),
             )
         with type_b:
@@ -9448,10 +9621,14 @@ def render_email_alert_settings(journal: object) -> None:
             """
             - Tus favoritas privadas y todas tus posiciones abiertas.
             - Opcionalmente, las favoritas y posiciones de la cartera del grupo.
-            - **Compra:** sólo para empresas que todavía no figuran en tu cartera.
+            - **Compra:** sólo para empresas que todavía no figuran en tu cartera y
+              aparecen como **Comprable** tras el filtro completo de Entradas.
             - **Reducir o vender:** sólo para posiciones registradas, utilizando su
               coste medio para comprobar también el stop loss.
             - Un mismo estado no vuelve a enviarse hasta que la señal cambie.
+
+            La revisión programada utiliza el perfil Equilibrado. Si cambias el perfil
+            sólo durante una sesión, la pantalla puede mostrar notas distintas.
 
             Los precios diarios gratuitos pueden contener retrasos, huecos o ajustes.
             Comprueba siempre la cotización y las noticias antes de actuar.
@@ -9462,7 +9639,26 @@ def render_email_alert_settings(journal: object) -> None:
     except (JournalStorageError, AttributeError):
         states = pd.DataFrame()
     if not states.empty:
-        st.caption("Últimas empresas revisadas automáticamente")
+        evaluated_times = pd.to_datetime(states["evaluated_at"], errors="coerce")
+        notified_values = states.get(
+            "notified_at", pd.Series(index=states.index, dtype=object)
+        )
+        notified_times = pd.to_datetime(notified_values, errors="coerce")
+        audit_metrics = st.columns(3)
+        audit_metrics[0].metric("Empresas revisadas", len(states))
+        audit_metrics[1].metric("Con correo registrado", int(notified_times.notna().sum()))
+        audit_metrics[2].metric(
+            "Última revisión",
+            (
+                evaluated_times.max().strftime("%d/%m %H:%M")
+                if evaluated_times.notna().any()
+                else "N/D"
+            ),
+        )
+        st.caption(
+            "Trazabilidad automática: «Último correo» sólo cambia después de que el "
+            "servidor SMTP acepte el resumen; una revisión sin novedades no lo borra."
+        )
         visible = states.rename(
             columns={
                 "ticker": "Ticker",
@@ -9471,6 +9667,7 @@ def render_email_alert_settings(journal: object) -> None:
                 "position_label": "Si ya la tienes",
                 "price": "Último cierre",
                 "evaluated_at": "Revisada",
+                "notified_at": "Último correo",
             }
         )
         render_ticker_dataframe(
@@ -9483,6 +9680,7 @@ def render_email_alert_settings(journal: object) -> None:
                     "Si ya la tienes",
                     "Último cierre",
                     "Revisada",
+                    "Último correo",
                 ],
             ],
             key="alert_states_companies",
@@ -9789,10 +9987,17 @@ def main() -> None:
             and analysis_detail == "Crecimiento"
         )
     )
+    try:
+        review_position_tickers = [
+            *_portfolio_tracking_tickers(journal),
+            *_portfolio_tracking_tickers(group_journal),
+        ]
+    except JournalStorageError:
+        review_position_tickers = []
     review_universe = list(
         dict.fromkeys(
             resolve_analysis_ticker(str(ticker))
-            for ticker in favorite_tickers
+            for ticker in [*favorite_tickers, *review_position_tickers]
             if str(ticker).strip()
         )
     )
@@ -9973,6 +10178,36 @@ def main() -> None:
                 # se recorren todas las favoritas sin un proceso único demasiado
                 # pesado para Streamlit Community Cloud.
                 st.rerun()
+    attempted_after_refresh = {
+        str(ticker).strip().upper()
+        for ticker in st.session_state.get(review_attempted_key, [])
+        if str(ticker).strip()
+    }
+    favorites_reviewed = set(review_universe).issubset(attempted_after_refresh)
+    if (
+        automatic_review_page
+        and st.session_state.get("_pending_speculative_discovery")
+        and not requested_growth_scan_tickers
+        and favorites_reviewed
+    ):
+        st.session_state.pop("_pending_speculative_discovery", None)
+        try:
+            discoveries = cached_speculative_candidates()
+        except Exception as exc:
+            st.session_state["_speculative_candidates"] = []
+            st.session_state["_speculative_discovery_error"] = str(exc)
+        else:
+            st.session_state["_speculative_candidates"] = discoveries
+            st.session_state.pop("_speculative_discovery_error", None)
+            st.session_state["_growth_scan_tickers"] = [
+                candidate.ticker for candidate in discoveries
+            ]
+            st.session_state["_speculative_discovery_at"] = pd.Timestamp.now(
+                tz="UTC"
+            ).isoformat()
+        st.session_state["_requested_main_navigation"] = "Analizar"
+        st.session_state["_requested_analysis_navigation"] = "Oportunidades"
+        st.rerun()
     for error in st.session_state.get("download_errors", []):
         st.warning(error)
 
@@ -10066,6 +10301,9 @@ def main() -> None:
                 journal,
                 favorite_tickers,
                 favorite_labels,
+                speculative_discoveries=list(
+                    st.session_state.get("_speculative_candidates", []) or []
+                ),
             )
         elif analysis_section == "Empresa":
             render_page_intro(

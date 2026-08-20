@@ -245,6 +245,14 @@ tiene una entrada atractiva, mejora al menos 10 puntos técnicos y 5 puntos de o
 Para monedas distintas convierte el importe con el último tipo de referencia del BCE.
 No incluye fiscalidad, spread ni el margen de cambio aplicado por el broker.
 
+Desde Inicio, **Revisar toda mi cartera y buscar oportunidades** ejecuta un recorrido
+único: actualiza posiciones y favoritas, abre el Radar y después consulta un universo
+externo máximo de 12 small caps líquidas de Nasdaq/NYSE. El screener sólo descubre
+nombres; una small cap se descarta si es OTC, cotiza por debajo de 1 USD, negocia menos
+de 2 millones USD diarios, tiene cobertura insuficiente, beneficio/riesgo inferior a
+2:1, una subida diaria superior al 15% o no supera todos los filtros de Entradas. La
+tabla conserva los descartes y sus motivos para evitar seleccionar únicamente ganadoras.
+
 ## Alertas por correo
 
 Cada usuario puede guardar su propio correo, activar o desactivar avisos de entrada,
@@ -255,10 +263,13 @@ Cuando hay datos suficientes, el mensaje comienza con un bloque compacto de mejo
 oportunidades que añade nombre, ticker, timing, score conjunto, estado y zona preferida.
 
 La revisión automática incluye favoritas y posiciones abiertas. Las entradas se
-evalúan únicamente para empresas que no están ya en cartera; las alertas de reducir
+evalúan únicamente para empresas que no están ya en cartera y sólo generan correo
+cuando el análisis conjunto las marca como **Comprable**; las alertas de reducir
 o vender se limitan a posiciones registradas y utilizan su coste medio para comprobar
 el stop loss. El proceso usa el perfil equilibrado predeterminado y precios diarios:
 no vigila el mercado en tiempo real ni garantiza que el precio continúe disponible.
+La interfaz conserva la fecha del último correo aceptado por SMTP aunque las revisiones
+posteriores no tengan novedades, permitiendo distinguir revisión de entrega.
 
 El workflow `.github/workflows/daily-alerts.yml` se ejecuta por la mañana de lunes
 a viernes y también puede iniciarse manualmente. Necesita cuatro secretos de GitHub:
