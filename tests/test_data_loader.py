@@ -42,6 +42,7 @@ def test_download_prices_uses_stooq_when_yahoo_is_empty(monkeypatch) -> None:
     assert frame.index.is_monotonic_increasing
     assert frame.attrs["ticker"] == "AAPL"
     assert frame.attrs["provider"] == "Stooq"
+    assert pd.notna(pd.to_datetime(frame.attrs["fetched_at_utc"], utc=True))
 
 
 def test_stooq_symbol_translates_common_markets() -> None:

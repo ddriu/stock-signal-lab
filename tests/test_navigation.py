@@ -1,10 +1,36 @@
+from datetime import date
+
+import pandas as pd
+
 from src.navigation import (
     analysis_refresh_tickers,
     direct_ticker_from_query,
     growth_radar_ticker_groups,
+    market_data_freshness_rows,
     merge_analysis_ticker_sources,
     sanitize_favorite_selection,
 )
+
+
+def test_market_data_freshness_separates_market_date_from_download_time() -> None:
+    frame = pd.DataFrame(
+        {"close": [62.96, 174.38]},
+        index=pd.to_datetime(["2026-08-18", "2026-08-19"]),
+    )
+    frame.attrs["provider"] = "Yahoo Finance"
+    frame.attrs["fetched_at_utc"] = "2026-08-20T00:15:00+00:00"
+
+    rows = market_data_freshness_rows({"mrna": frame}, today=date(2026, 8, 20))
+
+    assert rows == [
+        {
+            "Ticker": "MRNA",
+            "Última vela": date(2026, 8, 19),
+            "Descargado": "20/08/2026 00:15 UTC",
+            "Proveedor": "Yahoo Finance",
+            "Estado": "Reciente",
+        }
+    ]
 
 
 def test_direct_ticker_query_accepts_international_symbols() -> None:

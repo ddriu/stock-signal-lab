@@ -1,12 +1,27 @@
 import pandas as pd
 
 from src.visualization import (
+    chart_period_frame,
     portfolio_snapshot_allocation_chart,
     portfolio_snapshot_assets_chart,
     private_investments_chart,
     staircase_projection_chart,
     staircase_range_chart,
 )
+
+
+def test_chart_period_frame_keeps_the_latest_session_visible() -> None:
+    index = pd.date_range("2024-01-01", "2026-08-19", freq="B")
+    frame = pd.DataFrame({"close": range(len(index))}, index=index)
+
+    month = chart_period_frame(frame, "1 mes")
+    quarter = chart_period_frame(frame, "3 meses")
+    maximum = chart_period_frame(frame, "Máximo")
+
+    assert month.index[-1] == pd.Timestamp("2026-08-19")
+    assert month.index[0] >= pd.Timestamp("2026-07-19")
+    assert quarter.index[0] >= pd.Timestamp("2026-05-19")
+    assert len(maximum) == len(frame)
 
 
 def test_long_chart_titles_wrap_and_axes_use_automatic_margins() -> None:
