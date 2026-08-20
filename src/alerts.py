@@ -261,18 +261,22 @@ def build_alert_state(
     held: bool,
     notified: bool,
     evaluated_at: str | None = None,
+    signature: str | None = None,
+    previous_notified_at: str | None = None,
 ) -> AlertState:
     now = evaluated_at or datetime.now().astimezone().isoformat(timespec="seconds")
     return AlertState(
         owner=owner.strip().lower(),
         ticker=signal.ticker.strip().upper(),
-        signature=signal_signature(signal, held=held),
+        signature=signature or signal_signature(signal, held=held),
         entry_score=int(signal.score),
         entry_label=signal.label,
         position_label=signal.position_label,
         price=float(price),
         evaluated_at=now,
-        notified_at=now if notified else None,
+        # Conserva la última entrega real. De lo contrario, una revisión sin
+        # novedades borraría al día siguiente la única evidencia del correo.
+        notified_at=now if notified else previous_notified_at,
     )
 
 

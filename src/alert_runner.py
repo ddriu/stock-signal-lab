@@ -16,6 +16,7 @@ from src.alerts import (
     build_alert_state,
     build_digest_content,
     filter_changed_candidates,
+    signal_signature,
 )
 from src.data_loader import (
     DataDownloadError,
@@ -23,7 +24,7 @@ from src.data_loader import (
     download_prices,
 )
 from src.email_sender import send_email
-from src.entry_opportunity import evaluate_entry_opportunity
+from src.entry_opportunity import STATUS_BUYABLE, evaluate_entry_opportunity
 from src.fundamentals import evaluate_fundamentals
 from src.indicators import add_indicators
 from src.opportunity import evaluate_risk, evaluate_valuation
@@ -166,7 +167,12 @@ def run_daily_alerts(
                 if not previous.empty
                 else {}
             )
-            evaluated: list[tuple[object, float, bool]] = []
+            previous_notified = (
+                dict(zip(previous["ticker"], previous["notified_at"]))
+                if not previous.empty and "notified_at" in previous.columns
+                else {}
+            )
+            evaluated: list[tuple[object, float, bool, str]] = []
             candidates: list[AlertCandidate] = []
             for ticker in sorted(scope):
                 frame = frames.get(ticker)
@@ -181,7 +187,7 @@ def run_daily_alerts(
                         entry_price=positions.get(ticker),
                     )
                     price = float(frame["close"].iloc[-1])
-                    evaluated.append((signal, price, held))
+                    state_signature = signal_signature(signal, held=held)
                     candidate = build_alert_candidate(
                         signal,
                         price=price,
@@ -189,7 +195,7 @@ def run_daily_alerts(
                         preferences=preference,
                         company_name=names.get(ticker, ""),
                     )
-                    if candidate is not None:
+                    if candidate is not None and candidate.kind == "Compra":
                         required_for_opportunity = {
                             "open",
                             "high",
@@ -246,12 +252,29 @@ def run_daily_alerts(
                                         enhanced.zones.preferred_entry.label
                                     ),
                                     event_label=enhanced.event.label,
+                                    signature=(
+                                        f"entry:{signal.label}:{enhanced.status_code}"
+                                    ),
                                 )
+                                state_signature = candidate.signature
+                                if enhanced.status_code != STATUS_BUYABLE:
+                                    candidate = None
                             except (KeyError, TypeError, ValueError) as exc:
                                 errors.append(
                                     f"{owner} / {ticker}: oportunidad parcial ({exc})."
                                 )
+                                state_signature = (
+                                    f"entry:{signal.label}:OPORTUNIDAD_INCOMPLETA"
+                                )
+                                candidate = None
+                        else:
+                            state_signature = (
+                                f"entry:{signal.label}:OPORTUNIDAD_INCOMPLETA"
+                            )
+                            candidate = None
+                    if candidate is not None:
                         candidates.append(candidate)
+                    evaluated.append((signal, price, held, state_signature))
                 except Exception as exc:
                     # Un ticker con poco histórico o datos incompletos no debe
                     # cancelar el resumen de las demás empresas del usuario.
@@ -285,8 +308,14 @@ def run_daily_alerts(
                     price=price,
                     held=held,
                     notified=signal.ticker in notified_tickers,
+                    signature=signature,
+                    previous_notified_at=(
+                        None
+                        if pd.isna(previous_notified.get(signal.ticker))
+                        else str(previous_notified.get(signal.ticker))
+                    ),
                 )
-                for signal, price, held in evaluated
+                for signal, price, held, signature in evaluated
             ]
             journal.upsert_alert_states(states)
         except Exception as exc:
