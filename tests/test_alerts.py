@@ -7,6 +7,7 @@ from src.alerts import (
     AlertCandidate,
     build_alert_candidate,
     build_digest_content,
+    build_alert_state,
     filter_changed_candidates,
     normalize_alert_preferences,
 )
@@ -139,3 +140,19 @@ def test_digest_adds_opportunity_summary_without_linking_dotted_ticker() -> None
     assert "Oportunidad 79" in plain
     assert "href=" not in html
     assert "http://ba.l" not in html.lower()
+
+
+def test_alert_state_preserves_the_last_real_notification() -> None:
+    state = build_alert_state(
+        owner="luci",
+        signal=make_signal(),
+        price=160,
+        held=False,
+        notified=False,
+        signature="entry:Entrada fuerte:ESPERAR_PRECIO",
+        previous_notified_at="2026-08-19T08:00:00+02:00",
+        evaluated_at="2026-08-20T08:00:00+02:00",
+    )
+
+    assert state.signature.endswith("ESPERAR_PRECIO")
+    assert state.notified_at == "2026-08-19T08:00:00+02:00"

@@ -23,6 +23,23 @@ render_entry_opportunities_page(
     assert not app.exception
     assert not app.error
     assert "no hay precios actualizados" in app.info[0].value.lower()
+    assert any("small caps" in button.label.lower() for button in app.button)
+
+
+def test_complete_review_requests_favorites_and_external_discovery() -> None:
+    script = '''
+import streamlit as st
+from app import _request_complete_review
+
+st.button("Revisar", on_click=_request_complete_review)
+st.write(str(bool(st.session_state.get("_force_all_favorite_refresh"))))
+st.write(str(bool(st.session_state.get("_pending_speculative_discovery"))))
+'''
+    app = AppTest.from_string(script, default_timeout=15).run()
+    app.button[0].click().run()
+
+    assert not app.exception
+    assert [item.value for item in app.markdown[-2:]] == ["True", "True"]
 
 
 def test_entry_opportunities_renders_scores_zones_and_table() -> None:
