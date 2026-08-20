@@ -558,6 +558,10 @@ def download_prices(
     result["volume"] = result["volume"].fillna(0.0)
     result.attrs["ticker"] = symbol
     result.attrs["provider"] = frame.attrs.get("provider", "Yahoo Finance")
+    # Se conserva el instante real de la consulta dentro del propio DataFrame.
+    # Así la interfaz puede distinguir una descarga nueva de un objeto devuelto
+    # por la caché de Streamlit.
+    result.attrs["fetched_at_utc"] = pd.Timestamp.now(tz="UTC").isoformat()
     if frame.attrs.get("quote_currency"):
         result.attrs["quote_currency"] = frame.attrs["quote_currency"]
     return result

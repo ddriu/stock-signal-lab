@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from datetime import date, timedelta
 import re
+
+import pandas as pd
 
 
 GROWTH_RADAR_STRONG_LABELS = frozenset({"Entrada fuerte"})
@@ -113,6 +116,40 @@ def next_daily_review_batch(
         if ticker and ticker not in attempted and ticker not in pending:
             pending.append(ticker)
     return pending[: max(int(limit), 1)]
+
+
+def market_data_freshness_rows(
+    frames: dict[str, pd.DataFrame],
+    *,
+    today: date | None = None,
+) -> list[dict[str, object]]:
+    """Resume fecha de mercado, consulta y proveedor sin inventar frescura."""
+
+    reference_day = today or date.today()
+    recent_limit = reference_day - timedelta(days=3)
+    rows: list[dict[str, object]] = []
+    for raw_ticker, frame in frames.items():
+        ticker = normalize_ticker(raw_ticker)
+        if not ticker or frame is None or frame.empty:
+            continue
+        market_date = pd.Timestamp(frame.index[-1]).date()
+        fetched_value = str(frame.attrs.get("fetched_at_utc") or "").strip()
+        fetched_at = pd.to_datetime(fetched_value, utc=True, errors="coerce")
+        fetched_text = (
+            fetched_at.strftime("%d/%m/%Y %H:%M UTC")
+            if pd.notna(fetched_at)
+            else "Hora no disponible"
+        )
+        rows.append(
+            {
+                "Ticker": ticker,
+                "Última vela": market_date,
+                "Descargado": fetched_text,
+                "Proveedor": str(frame.attrs.get("provider") or "No indicado"),
+                "Estado": "Reciente" if market_date >= recent_limit else "Revisar",
+            }
+        )
+    return sorted(rows, key=lambda row: str(row["Ticker"]))
 
 
 def growth_radar_ticker_groups(

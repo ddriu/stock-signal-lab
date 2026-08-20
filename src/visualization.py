@@ -19,6 +19,25 @@ COLORS = {
     "muted": "#73849A",
 }
 
+CHART_PERIODS = ("1 mes", "3 meses", "1 año", "5 años", "Máximo")
+
+
+def chart_period_frame(frame: pd.DataFrame, period: str) -> pd.DataFrame:
+    """Recorta un histórico ya calculado para una vista legible del gráfico."""
+
+    if period not in CHART_PERIODS:
+        raise ValueError(f"Periodo de gráfico no reconocido: {period}")
+    if frame.empty or period == "Máximo":
+        return frame.copy()
+    offsets = {
+        "1 mes": pd.DateOffset(months=1),
+        "3 meses": pd.DateOffset(months=3),
+        "1 año": pd.DateOffset(years=1),
+        "5 años": pd.DateOffset(years=5),
+    }
+    cutoff = pd.Timestamp(frame.index[-1]) - offsets[period]
+    return frame.loc[pd.to_datetime(frame.index) >= cutoff].copy()
+
 
 def _wrapped_title(value: object, *, width: int = 38) -> str:
     """Divide títulos largos para que no desaparezcan en móvil o media columna."""
