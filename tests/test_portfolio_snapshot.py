@@ -2,8 +2,10 @@ import pandas as pd
 import pytest
 
 from src.portfolio_snapshot import (
+    compare_portfolio_valuations,
     group_portfolio_snapshot_for_home,
     latest_portfolio_snapshot,
+    portfolio_platform_reconciliation,
     reconcile_current_portfolio,
     refresh_portfolio_snapshot_prices,
 )
@@ -188,6 +190,48 @@ def test_snapshot_refreshes_listed_assets_and_keeps_manual_investments() -> None
     assert status.manual_count == 1
     assert status.pending_count == 0
     assert status.market_as_of == "2026-08-07"
+
+
+def test_declared_and_market_values_remain_separate() -> None:
+    declared = pd.DataFrame(
+        [
+            {"platform": "Broker", "asset_name": "Acción", "analysis_ticker": "AAA", "value_eur": 100.0, "gain_loss_eur": 10.0},
+            {"platform": "Banco", "asset_name": "Fondo", "analysis_ticker": "", "value_eur": 200.0, "gain_loss_eur": -5.0},
+        ]
+    )
+    market = declared.copy()
+    market.loc[0, "value_eur"] = 108.0
+    market.loc[0, "gain_loss_eur"] = 18.0
+    market["valuation_status"] = ["Precio actualizado", "Dato manual"]
+    market["market_as_of"] = ["2026-08-14", ""]
+
+    comparison = compare_portfolio_valuations(declared, market)
+
+    assert comparison["declared_value_eur"].tolist() == [100.0, 200.0]
+    assert comparison["market_value_eur"].tolist() == [108.0, 200.0]
+    assert comparison["difference_eur"].tolist() == [8.0, 0.0]
+    assert comparison["market_gain_loss_eur"].tolist() == [18.0, -5.0]
+
+
+def test_platform_reconciliation_reports_real_market_coverage() -> None:
+    declared = pd.DataFrame(
+        [
+            {"platform": "Broker", "asset_name": "A", "value_eur": 100.0, "gain_loss_eur": 5.0},
+            {"platform": "Broker", "asset_name": "B", "value_eur": 50.0, "gain_loss_eur": -2.0},
+        ]
+    )
+    market = declared.copy()
+    market["value_eur"] = [110.0, 50.0]
+    market["gain_loss_eur"] = [15.0, -2.0]
+    market["valuation_status"] = ["Precio actualizado", "Dato manual"]
+
+    summary = portfolio_platform_reconciliation(declared, market).iloc[0]
+
+    assert summary["declared_value_eur"] == pytest.approx(150.0)
+    assert summary["market_value_eur"] == pytest.approx(160.0)
+    assert summary["difference_eur"] == pytest.approx(10.0)
+    assert summary["market_priced_count"] == 1
+    assert summary["line_count"] == 2
 
 
 def test_snapshot_refresh_resolves_broker_market_aliases() -> None:

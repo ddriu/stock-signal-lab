@@ -2,11 +2,12 @@ from streamlit.testing.v1 import AppTest
 
 
 def test_entry_opportunities_is_independent_from_existing_radar() -> None:
-    from app import ANALYSIS_OPTIONS, LEGACY_ANALYSIS_ROUTES
+    from app import ANALYSIS_OPTIONS, LEGACY_ANALYSIS_ROUTES, STRATEGY_OPTIONS
 
     assert "Radar" in ANALYSIS_OPTIONS
     assert "Oportunidades" in ANALYSIS_OPTIONS
     assert "Oportunidades" not in LEGACY_ANALYSIS_ROUTES
+    assert "Calidad fundamental" in STRATEGY_OPTIONS
 
 
 def test_entry_opportunities_explains_when_prices_are_not_loaded() -> None:

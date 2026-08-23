@@ -131,6 +131,8 @@ def test_digest_adds_opportunity_summary_without_linking_dotted_ticker() -> None
         opportunity_score=79,
         opportunity_status="🟢 COMPRABLE",
         preferred_entry="17.80–18.10",
+        fundamental_filter_score=74,
+        fundamental_filter_label="Interesante para estudiar",
     )
 
     _, plain, html = build_digest_content("David", [candidate])
@@ -138,6 +140,8 @@ def test_digest_adds_opportunity_summary_without_linking_dotted_ticker() -> None
     assert "TOP OPORTUNIDADES" in plain
     assert "BAE Systems plc" in plain
     assert "Oportunidad 79" in plain
+    assert "Filtro fundamental 74/100" in plain
+    assert "Calidad fundamental" in html
     assert "href=" not in html
     assert "http://ba.l" not in html.lower()
 
