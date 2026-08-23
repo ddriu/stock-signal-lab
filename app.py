@@ -100,6 +100,10 @@ from src.data_sources import (
     sector_benchmark,
 )
 from src.fundamentals import FundamentalResult, evaluate_fundamentals
+from src.fundamental_filter import (
+    FundamentalFilterResult,
+    evaluate_fundamental_filter,
+)
 from src.growth_momentum import (
     SECTOR_PROFILES,
     GrowthMomentumConfig,
@@ -182,7 +186,13 @@ _portfolio_snapshot_module = importlib.reload(_portfolio_snapshot_module)
 group_portfolio_snapshot_for_home = (
     _portfolio_snapshot_module.group_portfolio_snapshot_for_home
 )
+compare_portfolio_valuations = (
+    _portfolio_snapshot_module.compare_portfolio_valuations
+)
 latest_portfolio_snapshot = _portfolio_snapshot_module.latest_portfolio_snapshot
+portfolio_platform_reconciliation = (
+    _portfolio_snapshot_module.portfolio_platform_reconciliation
+)
 refresh_portfolio_snapshot_prices = (
     _portfolio_snapshot_module.refresh_portfolio_snapshot_prices
 )
@@ -257,7 +267,11 @@ ANALYSIS_LABELS = {
     "Estrategias": "◱ Estrategias",
     "Más análisis": "··· Herramientas",
 }
-STRATEGY_OPTIONS = ["Crecimiento", "Resultado tras 30+ días"]
+STRATEGY_OPTIONS = [
+    "Crecimiento",
+    "Calidad fundamental",
+    "Resultado tras 30+ días",
+]
 ANALYSIS_VIEW_DESCRIPTIONS = {
     "Radar": (
         "Ordena todas tus favoritas y te dice cuáles merecen atención, cuáles están "
@@ -270,6 +284,10 @@ ANALYSIS_VIEW_DESCRIPTIONS = {
     "Crecimiento": (
         "Busca futuros líderes combinando crecimiento del negocio, fortaleza del precio, "
         "sector y riesgo para dimensionar una entrada."
+    ),
+    "Calidad fundamental": (
+        "Comprueba valoración, rentabilidad, crecimiento, deuda y márgenes. Sirve para "
+        "estudiar el negocio; el momento de compra se mantiene separado."
     ),
     "Resultado tras 30+ días": (
         "Comprueba qué ocurrió después de señales pasadas. Sirve para validar el método; "
@@ -3215,6 +3233,8 @@ def render_private_investments(
     view_key: str,
     operations: pd.DataFrame,
     positions_dashboard: pd.DataFrame,
+    prepared: dict[str, pd.DataFrame],
+    fx_snapshot: FxSnapshot,
     include_alternative_investments: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Gestiona la cartera actual y, sólo para ddriu, proyectos alternativos."""
@@ -3543,6 +3563,33 @@ def render_private_investments(
         latest_value = float(latest_positions["value_eur"].sum())
         latest_cost = float(latest_positions["cost_estimate_eur"].sum())
         latest_pnl = float(latest_positions["gain_loss_eur"].sum())
+        latest_prices = {
+            ticker: float(frame["close"].iloc[-1])
+            for ticker, frame in prepared.items()
+            if not frame.empty
+        }
+        price_dates = {
+            ticker: pd.Timestamp(frame.index[-1])
+            for ticker, frame in prepared.items()
+            if not frame.empty
+        }
+        market_positions, market_refresh = refresh_portfolio_snapshot_prices(
+            latest_positions,
+            latest_prices,
+            fx_snapshot.rates_per_eur,
+            price_dates=price_dates,
+        )
+        market_value = float(
+            pd.to_numeric(market_positions["value_eur"], errors="coerce")
+            .fillna(0.0)
+            .sum()
+        )
+        market_pnl = float(
+            pd.to_numeric(market_positions["gain_loss_eur"], errors="coerce")
+            .fillna(0.0)
+            .sum()
+        )
+        valuation_difference = market_value - latest_value
         st.subheader("Fotografía de posiciones")
         if snapshot_view.empty:
             st.caption(
@@ -3555,15 +3602,70 @@ def render_private_investments(
                 "si una empresa tiene compras o ventas en el diario, su cantidad y coste "
                 "proceden del diario. El histórico original se conserva."
             )
+        st.caption(
+            "Las cifras declaradas son las que copiaste del bróker. La estimación de "
+            "mercado usa el último cierre disponible, cantidades guardadas y cambio BCE; "
+            "no sustituye el extracto del bróker."
+        )
         snapshot_cols = st.columns(4)
         snapshot_cols[0].metric("Valor declarado", f"{latest_value:,.2f} €")
         snapshot_cols[1].metric("Coste estimado", f"{latest_cost:,.2f} €")
-        snapshot_cols[2].metric("Resultado estimado", f"{latest_pnl:+,.2f} €")
+        snapshot_cols[2].metric("Resultado según foto", f"{latest_pnl:+,.2f} €")
         snapshot_cols[3].metric("Líneas de cartera", len(latest_positions))
+        market_cols = st.columns(4)
+        market_cols[0].metric(
+            "Estimación de mercado",
+            f"{market_value:,.2f} €",
+            delta=f"{valuation_difference:+,.2f} € vs foto",
+        )
+        market_cols[1].metric("Resultado con mercado", f"{market_pnl:+,.2f} €")
+        market_cols[2].metric(
+            "Actualizadas con cotización",
+            f"{market_refresh.market_priced_count}/{len(latest_positions)}",
+        )
+        market_cols[3].metric(
+            "Fecha de mercado",
+            market_refresh.market_as_of or "Sin cierres nuevos",
+        )
+        if market_refresh.manual_count or market_refresh.pending_count:
+            st.info(
+                f"{market_refresh.manual_count} líneas conservan el valor del bróker y "
+                f"{market_refresh.pending_count} no tienen precio disponible. Para que una "
+                "posición se recalcule hacen falta ticker y cantidad exacta."
+            )
+
+        platform_reconciliation = portfolio_platform_reconciliation(
+            latest_positions,
+            market_positions,
+        ).rename(
+            columns={
+                "platform": "Plataforma",
+                "declared_value_eur": "Valor declarado",
+                "declared_gain_loss_eur": "Resultado foto",
+                "market_value_eur": "Estimación mercado",
+                "market_gain_loss_eur": "Resultado mercado",
+                "difference_eur": "Diferencia",
+                "market_priced_count": "Con cotización",
+                "line_count": "Líneas",
+            }
+        )
+        st.markdown("#### Cuadre por plataforma")
+        st.dataframe(
+            platform_reconciliation,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Valor declarado": st.column_config.NumberColumn(format="%.2f €"),
+                "Resultado foto": st.column_config.NumberColumn(format="%+.2f €"),
+                "Estimación mercado": st.column_config.NumberColumn(format="%.2f €"),
+                "Resultado mercado": st.column_config.NumberColumn(format="%+.2f €"),
+                "Diferencia": st.column_config.NumberColumn(format="%+.2f €"),
+            },
+        )
         chart_cols = st.columns(2)
         with chart_cols[0]:
             st.plotly_chart(
-                portfolio_snapshot_allocation_chart(latest_positions),
+                portfolio_snapshot_allocation_chart(market_positions),
                 width="stretch",
                 config=PLOTLY_CONFIG,
             )
@@ -3579,7 +3681,16 @@ def render_private_investments(
                     config=PLOTLY_CONFIG,
                 )
 
-        snapshot_display = latest_positions.rename(
+        comparison = compare_portfolio_valuations(
+            latest_positions,
+            market_positions,
+        )
+        snapshot_display = latest_positions.reset_index(drop=True).copy()
+        snapshot_display["market_value_eur"] = comparison["market_value_eur"]
+        snapshot_display["market_difference_eur"] = comparison["difference_eur"]
+        snapshot_display["market_gain_loss_eur"] = comparison["market_gain_loss_eur"]
+        snapshot_display["valuation_status"] = comparison["valuation_status"]
+        snapshot_display = snapshot_display.rename(
             columns={
                 "platform": "Plataforma",
                 "asset_name": "Activo",
@@ -3588,10 +3699,14 @@ def render_private_investments(
                 "portfolio_block": "Bloque",
                 "quantity": "Cantidad",
                 "currency": "Moneda",
-                "value_eur": "Valor €",
-                "return_pct": "Rentabilidad estimada %",
+                "value_eur": "Valor declarado €",
+                "market_value_eur": "Estimación mercado €",
+                "market_difference_eur": "Diferencia €",
+                "return_pct": "Rentabilidad foto %",
                 "cost_estimate_eur": "Coste estimado €",
-                "gain_loss_eur": "Resultado estimado €",
+                "gain_loss_eur": "Resultado foto €",
+                "market_gain_loss_eur": "Resultado mercado €",
+                "valuation_status": "Origen valoración",
                 "comments": "Comentarios",
             }
         )
@@ -3601,18 +3716,23 @@ def render_private_investments(
                 :,
                 [
                     "Plataforma", "Activo", "Ticker para analizar", "Tipo", "Bloque",
-                    "Cantidad", "Moneda", "Valor €", "Coste estimado €",
-                    "Resultado estimado €", "Rentabilidad estimada %", "Comentarios",
+                    "Cantidad", "Moneda", "Valor declarado €", "Estimación mercado €",
+                    "Diferencia €", "Coste estimado €", "Resultado foto €",
+                    "Resultado mercado €", "Rentabilidad foto %", "Origen valoración",
+                    "Comentarios",
                 ],
             ],
             key=f"{view_key}_portfolio_snapshot_positions",
             ticker_column="Ticker para analizar",
             column_config={
                 "Cantidad": st.column_config.NumberColumn(format="%.4f"),
-                "Valor €": st.column_config.NumberColumn(format="%.2f €"),
+                "Valor declarado €": st.column_config.NumberColumn(format="%.2f €"),
+                "Estimación mercado €": st.column_config.NumberColumn(format="%.2f €"),
+                "Diferencia €": st.column_config.NumberColumn(format="%+.2f €"),
                 "Coste estimado €": st.column_config.NumberColumn(format="%.2f €"),
-                "Resultado estimado €": st.column_config.NumberColumn(format="%+.2f €"),
-                "Rentabilidad estimada %": st.column_config.NumberColumn(format="%+.2f%%"),
+                "Resultado foto €": st.column_config.NumberColumn(format="%+.2f €"),
+                "Resultado mercado €": st.column_config.NumberColumn(format="%+.2f €"),
+                "Rentabilidad foto %": st.column_config.NumberColumn(format="%+.2f%%"),
             },
         )
         analyzable = latest_positions.loc[
@@ -4079,7 +4199,7 @@ def render_journal(
     header_a.subheader(title)
     header_a.caption(description)
     header_b.button(
-        "Actualizar precios",
+        "Estimar con mercado",
         icon=":material/refresh:",
         width="stretch",
         key=f"{view_key}_refresh_portfolio_prices",
@@ -4093,6 +4213,10 @@ def render_journal(
     st.caption(
         f"Precios hasta {max(market_dates) if market_dates else 'pendientes'} · "
         f"Almacenamiento: {getattr(journal, 'backend_name', 'diario')}"
+    )
+    st.caption(
+        "La estimación usa últimos cierres y cambio BCE. No sustituye el saldo del "
+        "bróker ni puede cuadrar exactamente si faltan cantidades precisas."
     )
     flash_key = f"_{view_key}_journal_flash"
     flash_message = st.session_state.pop(flash_key, None)
@@ -4165,6 +4289,8 @@ def render_journal(
                 view_key=view_key,
                 operations=operations,
                 positions_dashboard=positions_dashboard,
+                prepared=prepared,
+                fx_snapshot=fx_snapshot,
                 include_alternative_investments=alternative_investments_enabled,
             )
 
@@ -6414,7 +6540,9 @@ def render_home(
     section: str = "Hoy",
 ) -> None:
     latest_snapshot = pd.DataFrame()
+    market_snapshot = pd.DataFrame()
     snapshot_summary = None
+    market_summary = None
     snapshot_refresh = None
     if hasattr(journal, "list_portfolio_snapshot_positions"):
         try:
@@ -6435,15 +6563,16 @@ def render_home(
         for ticker, frame in prepared.items()
         if not frame.empty
     }
-    if not latest_snapshot.empty:
-        latest_snapshot, snapshot_refresh = refresh_portfolio_snapshot_prices(
-            latest_snapshot,
+    market_snapshot = latest_snapshot.copy()
+    market_summary = snapshot_summary
+    if not market_snapshot.empty:
+        market_snapshot, snapshot_refresh = refresh_portfolio_snapshot_prices(
+            market_snapshot,
             latest_prices,
             fx_snapshot.rates_per_eur,
             price_dates=price_dates,
         )
-        # Recalcula total, resultado y rentabilidad con las filas revalorizadas.
-        latest_snapshot, snapshot_summary = latest_portfolio_snapshot(latest_snapshot)
+        market_snapshot, market_summary = latest_portfolio_snapshot(market_snapshot)
 
     update_dates = list(price_dates.values())
     if update_dates:
@@ -6480,11 +6609,12 @@ def render_home(
                 f"{snapshot_refresh.pending_count} pendientes."
             )
         st.caption(
-            "Este botón actualiza cotizaciones; para añadir una compra o quitar una "
-            "venta usa Inicio → Mi cartera."
+            "La fotografía del bróker no cambia. El botón calcula aparte una estimación "
+            "con últimos cierres y cambio BCE; para añadir una compra o quitar una venta "
+            "usa Inicio → Mi cartera."
         )
     refresh_b.button(
-        "Actualizar precios",
+        "Estimar con mercado",
         icon=":material/refresh:",
         width="stretch",
         key="home_refresh_portfolio",
@@ -6512,14 +6642,21 @@ def render_home(
         private_operations,
         private_dashboard,
     )
+    market_snapshot = reconcile_current_portfolio(
+        market_snapshot,
+        private_operations,
+        private_dashboard,
+    )
     if not latest_snapshot.empty:
         latest_snapshot, snapshot_summary = latest_portfolio_snapshot(latest_snapshot)
+    if not market_snapshot.empty:
+        market_snapshot, market_summary = latest_portfolio_snapshot(market_snapshot)
 
     if section in {"Resumen", "Hoy"} and (
         snapshot_summary is not None or private_kpis is not None
     ):
         if snapshot_summary is not None:
-            result_label = "Resultado estimado"
+            result_label = "Resultado según foto"
             value_text = f"{snapshot_summary.value_eur:,.2f} €"
             result_text = (
                 f"{snapshot_summary.gain_loss_eur:+,.2f} €"
@@ -6527,7 +6664,7 @@ def render_home(
                 else "N/D"
             )
             result_detail = (
-                f"{snapshot_summary.return_pct:+.2f}% estimado sobre el coste"
+                f"{snapshot_summary.return_pct:+.2f}% calculado con los datos importados"
                 if snapshot_summary.return_pct is not None
                 else "El archivo no incluye un coste completo"
             )
@@ -6536,13 +6673,7 @@ def render_home(
                 f"{snapshot_summary.line_count} partidas · "
                 f"{snapshot_summary.platform_count} plataformas"
             )
-            if snapshot_refresh is not None and snapshot_refresh.market_priced_count:
-                value_detail = (
-                    f"{snapshot_refresh.market_priced_count} cotizaciones hasta "
-                    f"{snapshot_refresh.market_as_of or 'el último cierre'}; resto manual"
-                )
-            else:
-                value_detail = f"Fotografía del {snapshot_summary.snapshot_date}"
+            value_detail = f"Fotografía declarada del {snapshot_summary.snapshot_date}"
         else:
             result_label = "Resultado latente"
             value_text = (
@@ -6599,6 +6730,21 @@ def render_home(
             """,
             unsafe_allow_html=True,
         )
+        if (
+            snapshot_summary is not None
+            and market_summary is not None
+            and snapshot_refresh is not None
+            and snapshot_refresh.market_priced_count
+        ):
+            market_difference = market_summary.value_eur - snapshot_summary.value_eur
+            st.info(
+                f"Estimación con mercado: {market_summary.value_eur:,.2f} € "
+                f"({market_difference:+,.2f} € frente a la fotografía). "
+                f"Se han recalculado {snapshot_refresh.market_priced_count} de "
+                f"{snapshot_summary.line_count} líneas hasta "
+                f"{snapshot_refresh.market_as_of or 'el último cierre'}. No es el saldo "
+                "en tiempo real del bróker."
+            )
         if group_kpis is not None and group_kpis.open_positions_count:
             st.caption(
                 f"Cartera del grupo: {group_kpis.open_positions_count} posiciones · "
@@ -6613,7 +6759,8 @@ def render_home(
             f"{snapshot_summary.analyzable_count} partidas tienen ticker reconocible para análisis. "
             "Civislend y Segofactoring aparecen agrupados para mostrar el capital total invertido."
         )
-        home_snapshot = group_portfolio_snapshot_for_home(latest_snapshot)
+        home_declared_snapshot = group_portfolio_snapshot_for_home(latest_snapshot)
+        home_snapshot = group_portfolio_snapshot_for_home(market_snapshot)
         chart_a, chart_b = st.columns(2)
         with chart_a:
             st.plotly_chart(
@@ -6627,8 +6774,18 @@ def render_home(
                 width="stretch",
                 config=PLOTLY_CONFIG,
             )
-        position_summary = home_snapshot.copy()
-        for column in ["value_eur", "gain_loss_eur", "return_pct"]:
+        home_comparison = compare_portfolio_valuations(
+            home_declared_snapshot,
+            home_snapshot,
+        )
+        position_summary = home_declared_snapshot.reset_index(drop=True).copy()
+        position_summary["market_value_eur"] = home_comparison["market_value_eur"]
+        position_summary["market_difference_eur"] = home_comparison["difference_eur"]
+        position_summary["valuation_status"] = home_comparison["valuation_status"]
+        for column in [
+            "value_eur", "market_value_eur", "market_difference_eur",
+            "gain_loss_eur", "return_pct",
+        ]:
             position_summary[column] = pd.to_numeric(
                 position_summary[column], errors="coerce"
             )
@@ -6637,9 +6794,12 @@ def render_home(
                 "asset_name": "Empresa",
                 "analysis_ticker": "Ticker",
                 "platform": "Cuenta",
-                "value_eur": "Valor actual",
-                "gain_loss_eur": "Ganancia / pérdida",
-                "return_pct": "Rentabilidad",
+                "value_eur": "Valor declarado",
+                "market_value_eur": "Estimación mercado",
+                "market_difference_eur": "Diferencia",
+                "gain_loss_eur": "Resultado foto",
+                "return_pct": "Rentabilidad foto",
+                "valuation_status": "Origen valoración",
             }
         )
         st.caption("Pulsa una posición con ticker para abrir su análisis.")
@@ -6650,16 +6810,21 @@ def render_home(
                     "Empresa",
                     "Ticker",
                     "Cuenta",
-                    "Valor actual",
-                    "Ganancia / pérdida",
-                    "Rentabilidad",
+                    "Valor declarado",
+                    "Estimación mercado",
+                    "Diferencia",
+                    "Resultado foto",
+                    "Rentabilidad foto",
+                    "Origen valoración",
                 ],
             ],
             key="home_portfolio_positions",
             column_config={
-                "Valor actual": st.column_config.NumberColumn(format="%.2f €"),
-                "Ganancia / pérdida": st.column_config.NumberColumn(format="%+.2f €"),
-                "Rentabilidad": st.column_config.NumberColumn(format="%+.2f%%"),
+                "Valor declarado": st.column_config.NumberColumn(format="%.2f €"),
+                "Estimación mercado": st.column_config.NumberColumn(format="%.2f €"),
+                "Diferencia": st.column_config.NumberColumn(format="%+.2f €"),
+                "Resultado foto": st.column_config.NumberColumn(format="%+.2f €"),
+                "Rentabilidad foto": st.column_config.NumberColumn(format="%+.2f%%"),
             },
         )
 
@@ -8260,6 +8425,184 @@ def render_capital_projection_page(username: str) -> None:
     )
 
 
+def _fundamental_technical_reading(
+    fundamental_score: int | None,
+    entry_score: int | None,
+) -> str:
+    """Mantiene negocio y momento separados, pero ofrece una lectura conjunta."""
+
+    if fundamental_score is None:
+        return "Completar datos empresariales"
+    if entry_score is None:
+        return "Falta momento técnico"
+    if fundamental_score >= 65 and entry_score >= 65:
+        return "Estudiar entrada"
+    if fundamental_score >= 65:
+        return "Buena empresa; esperar precio"
+    if entry_score >= 65:
+        return "Momentum con fundamentos débiles"
+    return "No prioritaria ahora"
+
+
+def render_fundamental_filter_page(
+    prepared: dict[str, pd.DataFrame],
+    raw_fundamentals: dict[str, dict[str, object]],
+    strategy: StrategyConfig,
+    private_favorites: pd.DataFrame,
+    group_favorites: pd.DataFrame,
+    favorite_labels: dict[str, str],
+) -> None:
+    """Pestaña independiente para el filtro fundamental de siete métricas."""
+
+    render_page_intro(
+        "FILTRO DE NEGOCIO",
+        "Calidad fundamental rápida",
+        "Comprueba siete fundamentos antes de estudiar la entrada. La nota no indica "
+        "que la acción vaya a subir ni sustituye el análisis técnico.",
+    )
+    st.info(
+        "La regla de la captura es un buen primer control, pero los límites cambian "
+        "según el sector. La aplicación ajusta el PER y el margen bruto, excluye ratios "
+        "no comparables y enseña la cobertura para no convertir datos ausentes en ceros."
+    )
+
+    scope = st.radio(
+        "Empresas que quieres filtrar",
+        ["Mi lista privada", "Mi lista privada y la del grupo"],
+        horizontal=True,
+        key="fundamental_filter_scope",
+    )
+    included_group = (
+        group_favorites
+        if scope == "Mi lista privada y la del grupo"
+        else pd.DataFrame()
+    )
+    universe, scoped_labels = build_favorite_catalog(
+        private_favorites,
+        included_group,
+    )
+    if not universe:
+        universe = sorted(raw_fundamentals)
+    labels = {**favorite_labels, **scoped_labels}
+
+    rows: list[dict[str, object]] = []
+    results: dict[str, FundamentalFilterResult] = {}
+    for ticker in universe:
+        info = raw_fundamentals.get(ticker, {})
+        result = evaluate_fundamental_filter(info, ticker)
+        results[ticker] = result
+        entry_score: int | None = None
+        if ticker in prepared:
+            try:
+                entry_score = evaluate_latest_signal(
+                    prepared[ticker], strategy, ticker=ticker
+                ).score
+            except (KeyError, TypeError, ValueError):
+                entry_score = None
+        values = {check.key: check.formatted_value for check in result.checks}
+        name = str(
+            info.get("longName")
+            or info.get("shortName")
+            or labels.get(ticker, ticker).split(" (")[0]
+            or ticker
+        ).strip()
+        rows.append(
+            {
+                "Ticker": ticker,
+                "Empresa": name,
+                "Fundamental": result.score,
+                "Cobertura": result.coverage_pct,
+                "Cumple": f"{result.passed}/{result.evaluated}",
+                "Momento": entry_score,
+                "Lectura": _fundamental_technical_reading(result.score, entry_score),
+                "PER": values.get("pe", "N/D"),
+                "ROIC": values.get("roic", "N/D"),
+                "Crecimiento": values.get("eps_growth", "N/D"),
+                "ROE": values.get("roe", "N/D"),
+                "Margen operativo": values.get("ebit_margin", "N/D"),
+            }
+        )
+
+    if not rows:
+        st.warning("Añade favoritas o abre una empresa para poder aplicar el filtro.")
+        return
+
+    table = pd.DataFrame(rows)
+    table["_orden"] = pd.to_numeric(table["Fundamental"], errors="coerce").fillna(-1)
+    table = table.sort_values(
+        ["_orden", "Cobertura", "Ticker"], ascending=[False, False, True]
+    ).drop(columns="_orden")
+    complete_count = sum(result.score is not None for result in results.values())
+    strong_count = sum(
+        result.score is not None and result.score >= 65 for result in results.values()
+    )
+    metric_a, metric_b, metric_c = st.columns(3)
+    metric_a.metric("Empresas del filtro", len(universe))
+    metric_b.metric("Con nota suficiente", complete_count)
+    metric_c.metric("Fundamentos ≥ 65", strong_count)
+
+    st.markdown("### Resultado")
+    st.caption(
+        "Selecciona una o varias filas para abrir su análisis o compararlas. Una nota "
+        "alta con momento bajo significa esperar, no comprar automáticamente."
+    )
+    selected = render_ticker_dataframe(
+        table,
+        key="fundamental_filter_table",
+        height=520,
+        column_config={
+            "Fundamental": st.column_config.ProgressColumn(
+                min_value=0, max_value=100, format="%d"
+            ),
+            "Cobertura": st.column_config.ProgressColumn(
+                min_value=0, max_value=100, format="%d%%"
+            ),
+            "Momento": st.column_config.ProgressColumn(
+                min_value=0, max_value=100, format="%d"
+            ),
+        },
+    )
+
+    detail_ticker = selected[0] if selected else str(table.iloc[0]["Ticker"])
+    detail_result = results[detail_ticker]
+    with st.expander(
+        f"Detalle de {detail_ticker}: {detail_result.label}",
+        expanded=bool(selected),
+    ):
+        st.caption(
+            f"Sector: {detail_result.sector} · cobertura "
+            f"{detail_result.coverage_pct}% · {detail_result.passed} reglas cumplidas."
+        )
+        if detail_result.warning:
+            st.warning(detail_result.warning)
+        check_rows = pd.DataFrame(
+            [
+                {
+                    "Métrica": check.label,
+                    "Dato": check.formatted_value,
+                    "Regla": check.rule,
+                    "Resultado": check.status,
+                    "Cómo leerla": check.explanation,
+                }
+                for check in detail_result.checks
+            ]
+        )
+        st.dataframe(check_rows, hide_index=True, width="stretch")
+
+    with st.expander("Cómo se combinan las distintas maneras de análisis"):
+        st.markdown(
+            """
+            - **Calidad fundamental:** decide si el negocio merece estudio y qué datos faltan.
+            - **Crecimiento:** busca aceleración del negocio y liderazgo de precio.
+            - **Entrada técnica:** decide si el precio actual ofrece una configuración razonable.
+            - **Cartera:** utiliza tu coste, tamaño y riesgo para mantener, ampliar, reducir o salir.
+
+            Las alertas pueden reunir las cuatro lecturas en un solo correo por empresa. Así
+            no recibes cuatro mensajes contradictorios ni confundes calidad con timing.
+            """
+        )
+
+
 def render_growth_momentum_page(
     prepared: dict[str, pd.DataFrame],
     raw_fundamentals: dict[str, dict[str, object]],
@@ -9501,7 +9844,8 @@ def render_email_alert_settings(journal: object) -> None:
     st.subheader("Alertas por correo")
     st.write(
         "Recibe un único resumen cuando una favorita supera todos los filtros de "
-        "«Entradas» o cuando una posición registrada cambia a reducir o vender."
+        "«Entradas» o cuando una posición registrada cambia a reducir o vender. "
+        "Cada empresa reúne momento, oportunidad y calidad fundamental."
     )
     st.info(
         "Una alerta invita a revisar los datos; no compra, vende ni envía órdenes a "
@@ -9625,6 +9969,9 @@ def render_email_alert_settings(journal: object) -> None:
               aparecen como **Comprable** tras el filtro completo de Entradas.
             - **Reducir o vender:** sólo para posiciones registradas, utilizando su
               coste medio para comprobar también el stop loss.
+            - **Varias lecturas, un aviso:** el correo presenta score técnico,
+              oportunidad y filtro fundamental en la misma ficha. Así dos métodos
+              coincidentes no generan correos duplicados.
             - Un mismo estado no vuelve a enviarse hasta que la señal cambie.
 
             La revisión programada utiliza el perfil Equilibrado. Si cambias el perfil
@@ -9984,7 +10331,7 @@ def main() -> None:
         analysis_section in {"Radar", "Oportunidades"}
         or (
             analysis_section == "Estrategias"
-            and analysis_detail == "Crecimiento"
+            and analysis_detail in {"Crecimiento", "Calidad fundamental"}
         )
     )
     try:
@@ -10343,6 +10690,18 @@ def main() -> None:
                 private_favorites,
                 group_favorites,
                 authenticated_user.username,
+            )
+        elif (
+            analysis_section == "Estrategias"
+            and analysis_detail == "Calidad fundamental"
+        ):
+            render_fundamental_filter_page(
+                prepared,
+                raw_fundamentals,
+                strategy,
+                private_favorites,
+                group_favorites,
+                favorite_labels,
             )
         elif (
             analysis_section == "Estrategias"
