@@ -86,6 +86,8 @@ class AlertCandidate:
     opportunity_status: str = ""
     preferred_entry: str = ""
     event_label: str = ""
+    fundamental_filter_score: int | None = None
+    fundamental_filter_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -198,6 +200,8 @@ def build_alert_candidate(
     opportunity_status: str = "",
     preferred_entry: str = "",
     event_label: str = "",
+    fundamental_filter_score: int | None = None,
+    fundamental_filter_label: str = "",
 ) -> AlertCandidate | None:
     """Aplica las preferencias a una señal ya calculada."""
 
@@ -250,6 +254,8 @@ def build_alert_candidate(
         opportunity_status=opportunity_status.strip(),
         preferred_entry=preferred_entry.strip(),
         event_label=event_label.strip(),
+        fundamental_filter_score=fundamental_filter_score,
+        fundamental_filter_label=fundamental_filter_label.strip(),
     )
 
 
@@ -372,6 +378,16 @@ def build_digest_content(
                     f"Score técnico {candidate.entry_score}/100 ({candidate.entry_label}); "
                     f"posición: {candidate.position_label}; cierre: {candidate.price:.2f}."
                 ),
+                (
+                    f"Filtro fundamental {candidate.fundamental_filter_score}/100 "
+                    f"({candidate.fundamental_filter_label})."
+                    if candidate.fundamental_filter_score is not None
+                    else (
+                        "Filtro fundamental: datos insuficientes."
+                        if candidate.kind == "Compra"
+                        else ""
+                    )
+                ),
                 candidate.explanation,
                 "",
             ]
@@ -404,6 +420,19 @@ def build_digest_content(
                   + '</p>'
                   if candidate.opportunity_score is not None
                   else ''
+              }
+              {
+                  '<p style="margin:0 0 8px">Calidad fundamental <strong>'
+                  + str(candidate.fundamental_filter_score)
+                  + '/100</strong> · '
+                  + html.escape(candidate.fundamental_filter_label)
+                  + '</p>'
+                  if candidate.fundamental_filter_score is not None
+                  else (
+                      '<p style="margin:0 0 8px;color:#64748b">Calidad fundamental: datos insuficientes</p>'
+                      if candidate.kind == 'Compra'
+                      else ''
+                  )
               }
               <p style="margin:0;color:#475569">{html.escape(candidate.explanation)}</p>
             </div>

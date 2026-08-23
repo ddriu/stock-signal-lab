@@ -39,6 +39,85 @@ class PortfolioRefreshSummary:
     market_as_of: str | None
 
 
+def compare_portfolio_valuations(
+    declared: pd.DataFrame,
+    market_estimate: pd.DataFrame,
+) -> pd.DataFrame:
+    """Compara el valor declarado por el bróker con una estimación de mercado."""
+
+    columns = [
+        "platform", "asset_name", "analysis_ticker", "declared_value_eur",
+        "market_value_eur", "difference_eur", "declared_gain_loss_eur",
+        "market_gain_loss_eur", "valuation_status", "market_as_of",
+    ]
+    if declared.empty:
+        return pd.DataFrame(columns=columns)
+    if len(declared) != len(market_estimate):
+        raise ValueError(
+            "La estimación de mercado debe contener las mismas posiciones que la fotografía."
+        )
+    source = declared.reset_index(drop=True)
+    estimate = market_estimate.reset_index(drop=True)
+    result = pd.DataFrame(index=source.index)
+    for column in ("platform", "asset_name", "analysis_ticker"):
+        result[column] = source.get(column, pd.Series("", index=source.index))
+    result["declared_value_eur"] = pd.to_numeric(
+        source.get("value_eur", pd.Series(0.0, index=source.index)), errors="coerce"
+    ).fillna(0.0)
+    result["market_value_eur"] = pd.to_numeric(
+        estimate.get("value_eur", result["declared_value_eur"]), errors="coerce"
+    ).fillna(result["declared_value_eur"])
+    result["difference_eur"] = result["market_value_eur"] - result["declared_value_eur"]
+    result["declared_gain_loss_eur"] = pd.to_numeric(
+        source.get("gain_loss_eur", pd.Series(index=source.index, dtype=float)),
+        errors="coerce",
+    )
+    result["market_gain_loss_eur"] = pd.to_numeric(
+        estimate.get("gain_loss_eur", result["declared_gain_loss_eur"]),
+        errors="coerce",
+    )
+    result["valuation_status"] = estimate.get(
+        "valuation_status", pd.Series("Dato manual", index=source.index)
+    ).fillna("Dato manual")
+    result["market_as_of"] = estimate.get(
+        "market_as_of", pd.Series("", index=source.index)
+    ).fillna("")
+    return result.loc[:, columns]
+
+
+def portfolio_platform_reconciliation(
+    declared: pd.DataFrame,
+    market_estimate: pd.DataFrame,
+) -> pd.DataFrame:
+    """Resume por plataforma el valor declarado y la estimación actualizable."""
+
+    comparison = compare_portfolio_valuations(declared, market_estimate)
+    columns = [
+        "platform", "declared_value_eur", "declared_gain_loss_eur",
+        "market_value_eur", "market_gain_loss_eur", "difference_eur",
+        "market_priced_count", "line_count",
+    ]
+    if comparison.empty:
+        return pd.DataFrame(columns=columns)
+    comparison["market_priced"] = (
+        comparison["valuation_status"].astype(str) == "Precio actualizado"
+    ).astype(int)
+    grouped = (
+        comparison.groupby("platform", dropna=False)
+        .agg(
+            declared_value_eur=("declared_value_eur", "sum"),
+            declared_gain_loss_eur=("declared_gain_loss_eur", "sum"),
+            market_value_eur=("market_value_eur", "sum"),
+            market_gain_loss_eur=("market_gain_loss_eur", "sum"),
+            difference_eur=("difference_eur", "sum"),
+            market_priced_count=("market_priced", "sum"),
+            line_count=("asset_name", "size"),
+        )
+        .reset_index()
+    )
+    return grouped.loc[:, columns]
+
+
 def refresh_portfolio_snapshot_prices(
     positions: pd.DataFrame,
     latest_prices: dict[str, float],

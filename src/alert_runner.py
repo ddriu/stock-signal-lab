@@ -26,6 +26,7 @@ from src.data_loader import (
 from src.email_sender import send_email
 from src.entry_opportunity import STATUS_BUYABLE, evaluate_entry_opportunity
 from src.fundamentals import evaluate_fundamentals
+from src.fundamental_filter import evaluate_fundamental_filter
 from src.indicators import add_indicators
 from src.opportunity import evaluate_risk, evaluate_valuation
 from src.signal_engine import evaluate_latest_signal
@@ -213,6 +214,9 @@ def run_daily_alerts(
                                 )
                             try:
                                 fundamental = evaluate_fundamentals(info, ticker)
+                                quick_fundamental = evaluate_fundamental_filter(
+                                    info, ticker
+                                )
                                 valuation = evaluate_valuation(info, ticker)
                                 risk = evaluate_risk(ticker, frame)
                                 company_name = str(
@@ -252,6 +256,12 @@ def run_daily_alerts(
                                         enhanced.zones.preferred_entry.label
                                     ),
                                     event_label=enhanced.event.label,
+                                    fundamental_filter_score=(
+                                        quick_fundamental.score
+                                    ),
+                                    fundamental_filter_label=(
+                                        quick_fundamental.label
+                                    ),
                                     signature=(
                                         f"entry:{signal.label}:{enhanced.status_code}"
                                     ),
