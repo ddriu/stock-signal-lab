@@ -257,9 +257,12 @@ tabla conserva los descartes y sus motivos para evitar seleccionar únicamente g
 
 Cada usuario puede guardar su propio correo, activar o desactivar avisos de entrada,
 reducción y posible salida, elegir una nota mínima de entrada e incluir el seguimiento
-del grupo. El correo contiene un solo resumen y, por defecto, sólo se envía cuando la
-categoría cambia para evitar mensajes repetidos.
-Cuando hay datos suficientes, el mensaje comienza con un bloque compacto de mejores
+del grupo. El proceso genera dos formatos complementarios. El **resumen diario** reúne
+todas las favoritas y posiciones en una tabla con técnica, crecimiento, calidad
+fundamental y oportunidad; una fuente ausente se marca como N/D y la empresa no
+desaparece. La **alerta accionable** sólo se envía cuando existe una entrada comprable
+o una posición cambia a reducir/vender y, por defecto, no repite el mismo estado.
+Cuando hay datos suficientes, esta alerta comienza con un bloque compacto de mejores
 oportunidades que añade nombre, ticker, timing, score conjunto, estado y zona preferida.
 
 La revisión automática incluye favoritas y posiciones abiertas. Las entradas se

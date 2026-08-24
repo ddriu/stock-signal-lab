@@ -9843,9 +9843,9 @@ def render_email_alert_settings(journal: object) -> None:
 
     st.subheader("Alertas por correo")
     st.write(
-        "Recibe un único resumen cuando una favorita supera todos los filtros de "
-        "«Entradas» o cuando una posición registrada cambia a reducir o vender. "
-        "Cada empresa reúne momento, oportunidad y calidad fundamental."
+        "Recibe dos formatos complementarios: un resumen diario de todas tus "
+        "favoritas y posiciones, y una alerta accionable cuando una empresa supera "
+        "todos los filtros de «Entradas» o una posición cambia a reducir o vender."
     )
     st.info(
         "Una alerta invita a revisar los datos; no compra, vende ni envía órdenes a "
@@ -9969,10 +9969,12 @@ def render_email_alert_settings(journal: object) -> None:
               aparecen como **Comprable** tras el filtro completo de Entradas.
             - **Reducir o vender:** sólo para posiciones registradas, utilizando su
               coste medio para comprobar también el stop loss.
-            - **Varias lecturas, un aviso:** el correo presenta score técnico,
-              oportunidad y filtro fundamental en la misma ficha. Así dos métodos
-              coincidentes no generan correos duplicados.
-            - Un mismo estado no vuelve a enviarse hasta que la señal cambie.
+            - **Resumen diario:** una sola fila por empresa con lectura técnica,
+              crecimiento, calidad fundamental y oportunidad. Incluye N/D cuando
+              falta una fuente, sin convertir esa ausencia en una nota negativa.
+            - **Alerta accionable:** destaca únicamente entradas comprables o cambios
+              de una posición a reducir/vender. Un mismo estado no vuelve a enviarse
+              hasta que la señal cambie.
 
             La revisión programada utiliza el perfil Equilibrado. Si cambias el perfil
             sólo durante una sesión, la pantalla puede mostrar notas distintas.
