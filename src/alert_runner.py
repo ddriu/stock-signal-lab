@@ -12,8 +12,10 @@ from config import StrategyConfig
 from src.alerts import (
     AlertCandidate,
     AlertPreferences,
+    DailyOverviewRow,
     build_alert_candidate,
     build_alert_state,
+    build_daily_overview_content,
     build_digest_content,
     filter_changed_candidates,
     signal_signature,
@@ -27,6 +29,7 @@ from src.email_sender import send_email
 from src.entry_opportunity import STATUS_BUYABLE, evaluate_entry_opportunity
 from src.fundamentals import evaluate_fundamentals
 from src.fundamental_filter import evaluate_fundamental_filter
+from src.growth_momentum import GrowthMomentumConfig, evaluate_growth_momentum
 from src.indicators import add_indicators
 from src.opportunity import evaluate_risk, evaluate_valuation
 from src.signal_engine import evaluate_latest_signal
@@ -157,6 +160,9 @@ def run_daily_alerts(
     )
     errors.extend(download_errors)
     config = StrategyConfig()
+    growth_config = GrowthMomentumConfig()
+    fundamental_cache: dict[str, dict[str, object]] = {}
+    fundamental_failures: dict[str, str] = {}
     emails_sent = 0
     alerts_sent = 0
 
@@ -175,9 +181,23 @@ def run_daily_alerts(
             )
             evaluated: list[tuple[object, float, bool, str]] = []
             candidates: list[AlertCandidate] = []
+            overview_rows: list[DailyOverviewRow] = []
             for ticker in sorted(scope):
                 frame = frames.get(ticker)
                 if frame is None or frame.empty:
+                    overview_rows.append(
+                        DailyOverviewRow(
+                            ticker=ticker,
+                            company_name=names.get(ticker, ticker),
+                            held=ticker in positions,
+                            price=0.0,
+                            as_of="",
+                            technical_score=None,
+                            technical_label="Sin datos",
+                            position_label="Sin datos",
+                            data_note="precios no disponibles",
+                        )
+                    )
                     continue
                 try:
                     held = ticker in positions
@@ -196,92 +216,164 @@ def run_daily_alerts(
                         preferences=preference,
                         company_name=names.get(ticker, ""),
                     )
-                    if candidate is not None and candidate.kind == "Compra":
-                        required_for_opportunity = {
-                            "open",
-                            "high",
-                            "low",
-                            "close",
-                            "atr_14",
-                        }
-                        if required_for_opportunity.issubset(frame.columns):
-                            try:
-                                info = fundamental_downloader(ticker)
-                            except Exception as exc:
-                                info = {"symbol": ticker}
-                                errors.append(
-                                    f"{owner} / {ticker}: fundamentales incompletos ({exc})."
-                                )
-                            try:
-                                fundamental = evaluate_fundamentals(info, ticker)
-                                quick_fundamental = evaluate_fundamental_filter(
-                                    info, ticker
-                                )
-                                valuation = evaluate_valuation(info, ticker)
+                    if ticker not in fundamental_cache:
+                        try:
+                            fundamental_cache[ticker] = fundamental_downloader(ticker)
+                        except Exception as exc:
+                            fundamental_cache[ticker] = {
+                                "symbol": ticker,
+                                "_quick_mode": True,
+                            }
+                            fundamental_failures[ticker] = str(exc)
+                    info = fundamental_cache[ticker]
+                    company_name = str(
+                        info.get("longName")
+                        or info.get("shortName")
+                        or names.get(ticker)
+                        or (candidate.company_name if candidate is not None else "")
+                        or ticker
+                    ).strip()
+                    data_notes: list[str] = []
+                    if ticker in fundamental_failures:
+                        data_notes.append("fundamentales no disponibles")
+
+                    quick_fundamental = None
+                    try:
+                        quick_fundamental = evaluate_fundamental_filter(info, ticker)
+                        if quick_fundamental.score is None:
+                            data_notes.append("calidad fundamental parcial")
+                    except (KeyError, TypeError, ValueError):
+                        data_notes.append("calidad fundamental incompleta")
+
+                    risk = None
+                    try:
+                        risk = evaluate_risk(ticker, frame)
+                    except (KeyError, TypeError, ValueError):
+                        data_notes.append("riesgo parcial")
+
+                    growth = None
+                    try:
+                        growth = evaluate_growth_momentum(
+                            ticker=ticker,
+                            frame=frame,
+                            info=info,
+                            relative=None,
+                            risk=risk,
+                            broad_market=None,
+                            config=growth_config,
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        data_notes.append("crecimiento parcial")
+
+                    enhanced = None
+                    required_for_opportunity = {
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "atr_14",
+                    }
+                    if required_for_opportunity.issubset(frame.columns):
+                        try:
+                            fundamental = evaluate_fundamentals(info, ticker)
+                            valuation = evaluate_valuation(info, ticker)
+                            if risk is None:
                                 risk = evaluate_risk(ticker, frame)
-                                company_name = str(
-                                    info.get("longName")
-                                    or info.get("shortName")
-                                    or candidate.company_name
-                                    or ticker
-                                ).strip()
-                                enhanced = evaluate_entry_opportunity(
-                                    ticker=ticker,
-                                    company_name=company_name,
-                                    frame=frame,
-                                    signal=signal,
-                                    fundamental_score=fundamental.score,
-                                    fundamental_coverage=fundamental.coverage_pct,
-                                    valuation_score=valuation.score,
-                                    valuation_coverage=valuation.coverage_pct,
-                                    relative_score=None,
-                                    relative_coverage=0,
-                                    risk_score=risk.score,
-                                    risk_coverage=risk.coverage_pct,
-                                    info=info,
-                                    sector=str(
-                                        info.get("industry")
-                                        or fundamental.sector
-                                        or ""
-                                    ),
-                                    market=fundamental.country or "",
-                                )
-                                candidate = replace(
-                                    candidate,
-                                    company_name=company_name,
-                                    timing_score=enhanced.timing.score,
-                                    opportunity_score=enhanced.opportunity_score,
-                                    opportunity_status=enhanced.status_label,
-                                    preferred_entry=(
-                                        enhanced.zones.preferred_entry.label
-                                    ),
-                                    event_label=enhanced.event.label,
-                                    fundamental_filter_score=(
-                                        quick_fundamental.score
-                                    ),
-                                    fundamental_filter_label=(
-                                        quick_fundamental.label
-                                    ),
-                                    signature=(
-                                        f"entry:{signal.label}:{enhanced.status_code}"
-                                    ),
-                                )
-                                state_signature = candidate.signature
-                                if enhanced.status_code != STATUS_BUYABLE:
-                                    candidate = None
-                            except (KeyError, TypeError, ValueError) as exc:
-                                errors.append(
-                                    f"{owner} / {ticker}: oportunidad parcial ({exc})."
-                                )
-                                state_signature = (
-                                    f"entry:{signal.label}:OPORTUNIDAD_INCOMPLETA"
-                                )
-                                candidate = None
-                        else:
+                            enhanced = evaluate_entry_opportunity(
+                                ticker=ticker,
+                                company_name=company_name,
+                                frame=frame,
+                                signal=signal,
+                                fundamental_score=fundamental.score,
+                                fundamental_coverage=fundamental.coverage_pct,
+                                valuation_score=valuation.score,
+                                valuation_coverage=valuation.coverage_pct,
+                                relative_score=None,
+                                relative_coverage=0,
+                                risk_score=risk.score,
+                                risk_coverage=risk.coverage_pct,
+                                info=info,
+                                sector=str(
+                                    info.get("industry")
+                                    or fundamental.sector
+                                    or ""
+                                ),
+                                market=fundamental.country or "",
+                            )
+                        except (KeyError, TypeError, ValueError):
+                            data_notes.append("oportunidad parcial")
+                    else:
+                        data_notes.append("oportunidad sin histórico suficiente")
+
+                    if candidate is not None:
+                        candidate = replace(candidate, company_name=company_name)
+                    if candidate is not None and candidate.kind == "Compra":
+                        if enhanced is None:
                             state_signature = (
                                 f"entry:{signal.label}:OPORTUNIDAD_INCOMPLETA"
                             )
                             candidate = None
+                        else:
+                            candidate = replace(
+                                candidate,
+                                timing_score=enhanced.timing.score,
+                                opportunity_score=enhanced.opportunity_score,
+                                opportunity_status=enhanced.status_label,
+                                preferred_entry=enhanced.zones.preferred_entry.label,
+                                event_label=enhanced.event.label,
+                                fundamental_filter_score=(
+                                    quick_fundamental.score
+                                    if quick_fundamental is not None
+                                    else None
+                                ),
+                                fundamental_filter_label=(
+                                    quick_fundamental.label
+                                    if quick_fundamental is not None
+                                    else ""
+                                ),
+                                signature=(
+                                    f"entry:{signal.label}:{enhanced.status_code}"
+                                ),
+                            )
+                            state_signature = candidate.signature
+                            if enhanced.status_code != STATUS_BUYABLE:
+                                candidate = None
+                    overview_rows.append(
+                        DailyOverviewRow(
+                            ticker=ticker,
+                            company_name=company_name,
+                            held=held,
+                            price=price,
+                            as_of=str(signal.as_of.date()),
+                            technical_score=signal.score,
+                            technical_label=signal.label,
+                            position_label=signal.position_label,
+                            growth_score=(growth.score if growth is not None else None),
+                            growth_label=(growth.label if growth is not None else ""),
+                            fundamental_score=(
+                                quick_fundamental.score
+                                if quick_fundamental is not None
+                                else None
+                            ),
+                            fundamental_label=(
+                                quick_fundamental.label
+                                if quick_fundamental is not None
+                                else ""
+                            ),
+                            opportunity_score=(
+                                enhanced.opportunity_score
+                                if enhanced is not None
+                                else None
+                            ),
+                            opportunity_status=(
+                                enhanced.status_label if enhanced is not None else ""
+                            ),
+                            changed=(
+                                previous_signatures.get(ticker) != state_signature
+                            ),
+                            data_note=", ".join(dict.fromkeys(data_notes)),
+                        )
+                    )
                     if candidate is not None:
                         candidates.append(candidate)
                     evaluated.append((signal, price, held, state_signature))
@@ -291,26 +383,75 @@ def run_daily_alerts(
                     errors.append(
                         f"{owner} / {ticker}: no se pudo calcular la señal ({exc})."
                     )
+                    overview_rows.append(
+                        DailyOverviewRow(
+                            ticker=ticker,
+                            company_name=names.get(ticker, ticker),
+                            held=ticker in positions,
+                            price=(
+                                float(frame["close"].iloc[-1])
+                                if "close" in frame.columns and not frame.empty
+                                else 0.0
+                            ),
+                            as_of="",
+                            technical_score=None,
+                            technical_label="Sin datos",
+                            position_label="Sin datos",
+                            data_note="no se pudo completar el análisis",
+                        )
+                    )
 
             selected = filter_changed_candidates(
                 candidates,
                 previous_signatures,
                 only_changes=preference.only_changes,
             )
+            actionable_delivered = False
             if selected:
                 subject, plain_body, html_body = build_digest_content(
                     owner.capitalize(),
                     selected,
                 )
-                sender(
-                    preference.email,
-                    subject,
-                    plain_body,
-                    html_body,
+                try:
+                    sender(
+                        preference.email,
+                        subject,
+                        plain_body,
+                        html_body,
+                    )
+                except Exception as exc:
+                    errors.append(
+                        f"{owner}: no se pudo enviar el correo de alertas ({exc})."
+                    )
+                else:
+                    actionable_delivered = True
+                    emails_sent += 1
+                    alerts_sent += len(selected)
+
+            if overview_rows:
+                subject, plain_body, html_body = build_daily_overview_content(
+                    owner.capitalize(),
+                    overview_rows,
                 )
-                emails_sent += 1
-                alerts_sent += len(selected)
-            notified_tickers = {candidate.ticker for candidate in selected}
+                try:
+                    sender(
+                        preference.email,
+                        subject,
+                        plain_body,
+                        html_body,
+                    )
+                except Exception as exc:
+                    errors.append(
+                        f"{owner}: no se pudo enviar el resumen diario ({exc})."
+                    )
+                else:
+                    emails_sent += 1
+
+            notified_tickers = (
+                {candidate.ticker for candidate in selected}
+                if actionable_delivered
+                else set()
+            )
             states = [
                 build_alert_state(
                     owner=owner,

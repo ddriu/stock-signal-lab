@@ -91,6 +91,28 @@ class AlertCandidate:
 
 
 @dataclass(frozen=True)
+class DailyOverviewRow:
+    """Lecturas consolidadas de una empresa para el segundo correo diario."""
+
+    ticker: str
+    company_name: str
+    held: bool
+    price: float
+    as_of: str
+    technical_score: int | None
+    technical_label: str
+    position_label: str
+    growth_score: int | None = None
+    growth_label: str = ""
+    fundamental_score: int | None = None
+    fundamental_label: str = ""
+    opportunity_score: int | None = None
+    opportunity_status: str = ""
+    changed: bool = False
+    data_note: str = ""
+
+
+@dataclass(frozen=True)
 class AlertState:
     """Último estado evaluado, utilizado para no repetir avisos idénticos."""
 
@@ -483,6 +505,185 @@ def build_digest_content(
       <p style="font-size:12px;color:#64748b;margin-top:22px">{html.escape(disclaimer)}</p>
       <p style="font-size:12px;color:#64748b">
         Puedes cambiar o desactivar los avisos desde la aplicación.
+      </p>
+    </div>
+    """
+    return subject, "\n".join(plain_lines), html_body
+
+
+def _overview_display_label(row: DailyOverviewRow) -> str:
+    raw_ticker = row.ticker.strip().upper()
+    ticker = non_linking_ticker_text(raw_ticker)
+    name = row.company_name.strip()
+    if not name or name.casefold() == raw_ticker.casefold():
+        return ticker
+    return f"{name} ({ticker})"
+
+
+def _overview_decision(row: DailyOverviewRow) -> str:
+    """Resume la lectura sin convertir una puntuación aislada en una orden."""
+
+    if (
+        row.technical_score is None
+        and row.growth_score is None
+        and row.fundamental_score is None
+        and row.opportunity_score is None
+    ):
+        return "Datos insuficientes"
+    position = row.position_label.strip().casefold()
+    if row.held:
+        if "vender" in position:
+            return "Revisar posible salida"
+        if "reduc" in position:
+            return "Revisar / reducir"
+        if "esper" in position:
+            return "Esperar y vigilar"
+        return "Mantener / revisar protección"
+    if "comprable" in row.opportunity_status.casefold():
+        return "Entrada validada para revisar"
+    if (
+        row.growth_score is not None
+        and row.growth_score >= 75
+        and (row.technical_score or 0) >= 70
+    ):
+        return "Crecimiento y momento fuertes; validar precio"
+    if (row.technical_score or 0) >= 75:
+        return "Momento fuerte; faltan confirmaciones"
+    if row.fundamental_score is not None and row.fundamental_score >= 65:
+        return "Buena empresa; esperar momento"
+    return "Vigilancia"
+
+
+def _overview_priority(row: DailyOverviewRow) -> tuple[int, int, str]:
+    decision = _overview_decision(row)
+    if decision == "Revisar posible salida":
+        priority = 0
+    elif decision == "Revisar / reducir":
+        priority = 1
+    elif decision == "Entrada validada para revisar":
+        priority = 2
+    elif "fuertes" in decision or "Momento fuerte" in decision:
+        priority = 3
+    elif row.changed:
+        priority = 4
+    elif row.held:
+        priority = 5
+    else:
+        priority = 6
+    combined = max(
+        row.opportunity_score or 0,
+        row.growth_score or 0,
+        row.technical_score or 0,
+    )
+    return priority, -combined, row.ticker
+
+
+def build_daily_overview_content(
+    display_name: str,
+    rows: Iterable[DailyOverviewRow],
+) -> tuple[str, str, str]:
+    """Crea el segundo correo: todas las empresas, una fila por empresa."""
+
+    values = sorted(list(rows), key=_overview_priority)
+    total = len(values)
+    buyable = sum(
+        "comprable" in row.opportunity_status.casefold() for row in values
+    )
+    portfolio_reviews = sum(
+        row.held
+        and _overview_decision(row) in {"Revisar posible salida", "Revisar / reducir"}
+        for row in values
+    )
+    changed = sum(row.changed for row in values)
+    incomplete = sum(
+        row.fundamental_score is None or row.growth_score is None for row in values
+    )
+    subject = f"Stock Signal Lab · resumen diario · {total} empresas revisadas"
+    plain_lines = [
+        f"Hola {display_name},",
+        "",
+        "RESUMEN DIARIO COMBINADO",
+        f"Empresas revisadas: {total}",
+        f"Entradas validadas para revisar: {buyable}",
+        f"Posiciones para revisar/reducir/salir: {portfolio_reviews}",
+        f"Lecturas que han cambiado: {changed}",
+        f"Empresas con datos parciales: {incomplete}",
+        "",
+        "Cada empresa aparece una sola vez. Técnica, crecimiento, fundamentos y "
+        "oportunidad son lecturas distintas; ninguna garantiza rentabilidad.",
+        "",
+        "TODAS LAS FAVORITAS Y POSICIONES",
+    ]
+    for row in values:
+        scores = (
+            f"Técnica {row.technical_score if row.technical_score is not None else 'N/D'} · "
+            f"Crecimiento {row.growth_score if row.growth_score is not None else 'N/D'} · "
+            f"Fundamental {row.fundamental_score if row.fundamental_score is not None else 'N/D'} · "
+            f"Oportunidad {row.opportunity_score if row.opportunity_score is not None else 'N/D'}"
+        )
+        marker = " · CAMBIO" if row.changed else ""
+        plain_lines.extend(
+            [
+                f"{_overview_display_label(row)}{marker}",
+                f"{scores} · {_overview_decision(row)}",
+            ]
+        )
+        if row.data_note:
+            plain_lines.append(f"Datos: {row.data_note}")
+        plain_lines.append("")
+
+    def score_cell(value: int | None) -> str:
+        return "—" if value is None else str(value)
+
+    table_rows = "".join(
+        f"""
+        <tr style="border-bottom:1px solid #e2e8f0">
+          <td style="padding:9px 7px;min-width:150px">
+            <strong>{html.escape(_overview_display_label(row))}</strong>
+            {'<br><span style="color:#b7791f;font-size:11px">CAMBIO</span>' if row.changed else ''}
+          </td>
+          <td style="padding:9px 7px;text-align:center">{score_cell(row.technical_score)}</td>
+          <td style="padding:9px 7px;text-align:center">{score_cell(row.growth_score)}</td>
+          <td style="padding:9px 7px;text-align:center">{score_cell(row.fundamental_score)}</td>
+          <td style="padding:9px 7px;text-align:center">{score_cell(row.opportunity_score)}</td>
+          <td style="padding:9px 7px;min-width:170px">{html.escape(_overview_decision(row))}</td>
+        </tr>
+        """
+        for row in values
+    )
+    html_body = f"""
+    <div style="font-family:Arial,sans-serif;max-width:920px;margin:auto;color:#1e293b">
+      <h2 style="color:#14213d">Stock Signal Lab · resumen diario</h2>
+      <p>Hola {html.escape(display_name)},</p>
+      <div style="background:#f8fafc;border:1px solid #cbd5e1;border-radius:12px;
+                  padding:14px 16px;margin:14px 0">
+        <strong>{total} empresas revisadas</strong><br>
+        Entradas validadas: {buyable} · Cartera para revisar: {portfolio_reviews} ·
+        Cambios: {changed} · Datos parciales: {incomplete}
+      </div>
+      <p style="color:#475569">
+        Cada empresa aparece una sola vez. Las columnas son lecturas independientes
+        y no una probabilidad de ganar.
+      </p>
+      <div style="overflow-x:auto">
+        <table style="border-collapse:collapse;width:100%;font-size:12px">
+          <thead>
+            <tr style="background:#e8f4ef;color:#0f5132">
+              <th style="padding:9px 7px;text-align:left">Empresa</th>
+              <th style="padding:9px 7px">Técnica</th>
+              <th style="padding:9px 7px">Crecimiento</th>
+              <th style="padding:9px 7px">Fundamental</th>
+              <th style="padding:9px 7px">Oportunidad</th>
+              <th style="padding:9px 7px;text-align:left">Lectura</th>
+            </tr>
+          </thead>
+          <tbody>{table_rows}</tbody>
+        </table>
+      </div>
+      <p style="font-size:12px;color:#64748b;margin-top:22px">
+        Son señales probabilísticas basadas en datos históricos. No constituyen
+        asesoramiento financiero ni garantizan rentabilidad. Los datos N/D no se
+        convierten en una nota negativa.
       </p>
     </div>
     """
