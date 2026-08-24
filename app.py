@@ -10168,20 +10168,21 @@ def main() -> None:
 
     # La navegación se dibuja antes de cualquier descarga o cálculo. Así permanece
     # estable y responde al instante incluso cuando actualizar el mercado tarda.
-    selected_section = st.segmented_control(
-        "Navegación principal",
-        MAIN_OPTIONS,
-        key="main_navigation",
-        required=True,
-        label_visibility="collapsed",
-        format_func=lambda value: {
-            "Inicio": "⌂  Inicio",
-            "Analizar": "↗  Analizar",
-            "Favoritos": "♡  Favoritos",
-            "Carteras": "▱  Cartera",
-            "Más": "···  Más",
-        }[value],
-    )
+    with st.container(key="main_navigation_container"):
+        selected_section = st.segmented_control(
+            "Navegación principal",
+            MAIN_OPTIONS,
+            key="main_navigation",
+            required=True,
+            label_visibility="collapsed",
+            format_func=lambda value: {
+                "Inicio": "⌂  Inicio",
+                "Analizar": "↗  Analizar",
+                "Favoritos": "♡  Favoritos",
+                "Carteras": "▱  Cartera",
+                "Más": "···  Más",
+            }[value],
+        )
     analysis_section = ""
     analysis_detail = ""
     favorite_view = ""
