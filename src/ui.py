@@ -551,8 +551,19 @@ button[data-baseweb="tab"] {
     margin: 0.55rem 0 0.35rem;
 }
 
-[class*="st-key-section_subnavigation"] [data-testid="stSegmentedControl"] {
+[class*="st-key-section_subnavigation"] [data-testid="stSegmentedControl"],
+[class*="st-key-section_subnavigation"] [data-testid="stButtonGroup"] {
     width: 100%;
+}
+
+/* Las dos barras de navegación son carriles independientes. Esta regla queda
+   deliberadamente acotada a sus contenedores para no alterar los controles de
+   filtros, riesgo o periodos que sí pueden envolver sus opciones. */
+[class*="st-key-main_navigation_container"] [data-testid="stSegmentedControl"],
+[class*="st-key-main_navigation_container"] [data-testid="stButtonGroup"],
+[class*="st-key-section_subnavigation"] [data-testid="stSegmentedControl"],
+[class*="st-key-section_subnavigation"] [data-testid="stButtonGroup"] {
+    max-width: 100%;
 }
 
 /* Streamlit conserva brevemente la versión anterior de un elemento durante un
@@ -679,15 +690,65 @@ div[data-testid="stForm"]:has(input[autocomplete="username"]) {
         min-width: 6.2rem;
         white-space: nowrap;
     }
+    [class*="st-key-main_navigation_container"],
+    [class*="st-key-section_subnavigation"] {
+        min-width: 0;
+        width: 100%;
+    }
+    [class*="st-key-main_navigation_container"] [data-testid="stSegmentedControl"],
+    [class*="st-key-main_navigation_container"] [data-testid="stButtonGroup"],
+    [class*="st-key-section_subnavigation"] [data-testid="stSegmentedControl"],
+    [class*="st-key-section_subnavigation"] [data-testid="stButtonGroup"],
     [data-testid="stTabs"] [data-baseweb="tab-list"] {
-        flex-wrap: wrap;
-        overflow: visible;
+        display: block;
+        max-width: 100%;
+        overflow-x: auto !important;
+        overflow-y: hidden !important;
+        overscroll-behavior-x: contain;
+        scrollbar-width: thin;
+        scrollbar-color: rgba(8, 122, 92, 0.45) transparent;
+        scroll-snap-type: x proximity;
+        -webkit-overflow-scrolling: touch;
+        touch-action: pan-x;
+    }
+    [class*="st-key-main_navigation_container"] [data-testid="stSegmentedControl"]::-webkit-scrollbar,
+    [class*="st-key-main_navigation_container"] [data-testid="stButtonGroup"]::-webkit-scrollbar,
+    [class*="st-key-section_subnavigation"] [data-testid="stSegmentedControl"]::-webkit-scrollbar,
+    [class*="st-key-section_subnavigation"] [data-testid="stButtonGroup"]::-webkit-scrollbar,
+    [data-testid="stTabs"] [data-baseweb="tab-list"]::-webkit-scrollbar {
+        height: 4px;
+    }
+    [class*="st-key-main_navigation_container"] [data-testid="stSegmentedControl"] > div,
+    [class*="st-key-main_navigation_container"] [data-testid="stSegmentedControl"] [role="radiogroup"],
+    [class*="st-key-main_navigation_container"] [data-testid="stButtonGroup"] [role="radiogroup"],
+    [class*="st-key-section_subnavigation"] [data-testid="stSegmentedControl"] > div,
+    [class*="st-key-section_subnavigation"] [data-testid="stSegmentedControl"] [role="radiogroup"],
+    [class*="st-key-section_subnavigation"] [data-testid="stButtonGroup"] [role="radiogroup"] {
+        display: flex !important;
+        flex-wrap: nowrap !important;
+        width: max-content !important;
+        min-width: 100% !important;
+    }
+    [class*="st-key-main_navigation_container"] [data-testid="stSegmentedControl"] button,
+    [class*="st-key-main_navigation_container"] [data-testid="stButtonGroup"] button,
+    [class*="st-key-section_subnavigation"] [data-testid="stSegmentedControl"] button,
+    [class*="st-key-section_subnavigation"] [data-testid="stButtonGroup"] button {
+        flex: 1 0 7rem !important;
+        min-width: 7rem;
+        min-height: 2.75rem;
+        white-space: nowrap;
+        scroll-snap-align: start;
+    }
+    [data-testid="stTabs"] [data-baseweb="tab-list"] {
+        display: flex;
+        flex-wrap: nowrap;
     }
     [data-testid="stTabs"] button[data-baseweb="tab"] {
-        flex: 1 1 8.5rem;
+        flex: 0 0 auto;
         padding-left: 0.65rem;
         padding-right: 0.65rem;
-        white-space: normal;
+        white-space: nowrap;
+        scroll-snap-align: start;
     }
     [class*="st-key-app_header_container"] [data-testid="stColumn"]:last-child {
         flex-basis: 4.5rem !important;
