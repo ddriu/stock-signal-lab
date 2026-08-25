@@ -32,7 +32,6 @@ def test_mobile_tabs_scroll_instead_of_wrapping() -> None:
     assert '[data-testid="stTabs"] [data-baseweb="tab-list"]' in mobile_rules
     assert "flex-wrap: nowrap" in mobile_rules
     assert "overflow-x: auto !important" in mobile_rules
-
 def _css_rule(selector: str) -> str:
     start = APP_CSS.index(selector)
     opening_brace = APP_CSS.index("{", start)
