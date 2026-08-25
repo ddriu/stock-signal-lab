@@ -173,7 +173,9 @@ from src.speculative import (
     SpeculativeCandidate,
     assess_speculative_candidate,
     discover_speculative_candidates,
+    is_speculative_rate_limit_error,
     rank_speculative_assessments,
+    speculative_discovery_error_message,
 )
 from src.portfolio_snapshot_import import (
     account_summaries_from_positions,
@@ -383,11 +385,21 @@ def cached_company_search(query: str) -> list[TickerSearchResult]:
     return search_instruments(query, max_results=25)
 
 
-@st.cache_data(ttl=1_800, max_entries=2, show_spinner=False)
+SPECULATIVE_RETRY_COOLDOWN_MINUTES = 15
+
+
+@st.cache_data(ttl=21_600, max_entries=1, show_spinner=False)
 def cached_speculative_candidates() -> list[SpeculativeCandidate]:
-    """Universo externo pequeño; la evaluación completa se realiza después."""
+    """Universo externo estable durante seis horas para no saturar al proveedor."""
 
     return discover_speculative_candidates(limit=12)
+
+
+@st.cache_resource(show_spinner=False)
+def speculative_candidate_memory() -> dict[str, object]:
+    """Último universo público válido, compartido mientras el proceso siga activo."""
+
+    return {"candidates": [], "as_of": ""}
 
 
 def apply_section_layout(section: str, analysis_section: str = "") -> None:
@@ -6063,9 +6075,36 @@ def _request_complete_review() -> None:
     st.session_state["_requested_analysis_navigation"] = "Radar"
 
 
+def _speculative_retry_wait_minutes(
+    now: pd.Timestamp | None = None,
+) -> int:
+    """Minutos que faltan para permitir otra consulta tras un rate limit."""
+
+    raw_retry_after = str(
+        st.session_state.get("_speculative_retry_after", "") or ""
+    ).strip()
+    if not raw_retry_after:
+        return 0
+    try:
+        retry_after = pd.Timestamp(raw_retry_after)
+        current = now or pd.Timestamp.now(tz="UTC")
+        if retry_after.tzinfo is None:
+            retry_after = retry_after.tz_localize("UTC")
+        if current.tzinfo is None:
+            current = current.tz_localize("UTC")
+        seconds = (retry_after - current).total_seconds()
+    except (TypeError, ValueError):
+        return 0
+    if seconds <= 0:
+        return 0
+    return max(1, int((seconds + 59) // 60))
+
+
 def _request_speculative_search() -> None:
     """Inicia el screener; si falta revisar favoritas, las completa primero."""
 
+    if _speculative_retry_wait_minutes() > 0:
+        return
     st.session_state["_pending_speculative_discovery"] = True
     st.session_state["_requested_main_navigation"] = "Analizar"
     st.session_state["_requested_analysis_navigation"] = "Oportunidades"
@@ -7724,11 +7763,16 @@ def render_entry_opportunities_page(
         args=("Radar",),
     )
     st.button(
-        "Buscar small caps líquidas fuera de mis favoritas",
+        (
+            "Reintentar screener especulativo"
+            if speculative_discoveries
+            else "Buscar small caps líquidas fuera de mis favoritas"
+        ),
         icon=":material/travel_explore:",
         key="start_speculative_search",
         width="stretch",
         on_click=_request_speculative_search,
+        disabled=_speculative_retry_wait_minutes() > 0,
         help=(
             "Consulta un universo externo de Nasdaq/NYSE y después descarga el "
             "histórico y los fundamentales de un máximo de 12 candidatas."
@@ -7738,7 +7782,18 @@ def render_entry_opportunities_page(
         st.session_state.get("_speculative_discovery_error", "") or ""
     )
     if speculative_error:
-        st.warning(f"El screener especulativo no pudo completarse: {speculative_error}")
+        retry_wait = _speculative_retry_wait_minutes()
+        retry_note = (
+            f" Podrás volver a intentarlo en unos {retry_wait} minutos."
+            if retry_wait
+            else " Ya puedes volver a intentarlo."
+        )
+        st.warning(f"{speculative_error}{retry_note}")
+        if speculative_discoveries:
+            st.caption(
+                "Mientras tanto se mantiene visible el último universo encontrado; "
+                "no se ha borrado por este fallo temporal."
+            )
     if not prepared:
         st.info(
             "Todavía no hay precios actualizados para esta lectura. Elige favoritas en "
@@ -10544,17 +10599,39 @@ def main() -> None:
         try:
             discoveries = cached_speculative_candidates()
         except Exception as exc:
-            st.session_state["_speculative_candidates"] = []
-            st.session_state["_speculative_discovery_error"] = str(exc)
+            previous = list(
+                st.session_state.get("_speculative_candidates", []) or []
+            )
+            remembered = speculative_candidate_memory()
+            if not previous:
+                previous = list(remembered.get("candidates", []) or [])
+            st.session_state["_speculative_candidates"] = previous
+            st.session_state["_speculative_discovery_error"] = (
+                speculative_discovery_error_message(exc)
+            )
+            if previous and not st.session_state.get("_speculative_discovery_at"):
+                st.session_state["_speculative_discovery_at"] = str(
+                    remembered.get("as_of", "") or ""
+                )
+            if is_speculative_rate_limit_error(exc):
+                st.session_state["_speculative_retry_after"] = (
+                    pd.Timestamp.now(tz="UTC")
+                    + pd.Timedelta(minutes=SPECULATIVE_RETRY_COOLDOWN_MINUTES)
+                ).isoformat()
+            else:
+                st.session_state.pop("_speculative_retry_after", None)
         else:
+            discovered_at = pd.Timestamp.now(tz="UTC").isoformat()
             st.session_state["_speculative_candidates"] = discoveries
             st.session_state.pop("_speculative_discovery_error", None)
+            st.session_state.pop("_speculative_retry_after", None)
             st.session_state["_growth_scan_tickers"] = [
                 candidate.ticker for candidate in discoveries
             ]
-            st.session_state["_speculative_discovery_at"] = pd.Timestamp.now(
-                tz="UTC"
-            ).isoformat()
+            st.session_state["_speculative_discovery_at"] = discovered_at
+            remembered = speculative_candidate_memory()
+            remembered["candidates"] = list(discoveries)
+            remembered["as_of"] = discovered_at
         st.session_state["_requested_main_navigation"] = "Analizar"
         st.session_state["_requested_analysis_navigation"] = "Oportunidades"
         st.rerun()
