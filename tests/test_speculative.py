@@ -4,6 +4,8 @@ from src.entry_opportunity import STATUS_BUYABLE, STATUS_WAIT_PRICE
 from src.speculative import (
     assess_speculative_candidate,
     discover_speculative_candidates,
+    is_speculative_rate_limit_error,
+    speculative_discovery_error_message,
 )
 
 
@@ -95,3 +97,22 @@ def test_speculative_candidate_rejects_an_explosive_daily_jump() -> None:
 
     assert result.eligible is False
     assert "explosiva" in " ".join(result.reasons)
+
+
+def test_discovery_translates_rate_limit_without_leaking_raw_provider_error() -> None:
+    def limited_screen() -> dict[str, object]:
+        raise RuntimeError("Too Many Requests. Rate limited. Try after a while.")
+
+    try:
+        discover_speculative_candidates(screener=limited_screen)
+    except RuntimeError as exc:
+        error = exc
+    else:
+        raise AssertionError("El rate limit debía producir un error específico")
+
+    assert is_speculative_rate_limit_error(error) is True
+    assert type(error).__name__ == "SpeculativeDiscoveryRateLimited"
+    message = speculative_discovery_error_message(error)
+    assert "limitado temporalmente" in message
+    assert "Too Many Requests" not in message
+    assert "favoritas" in message

@@ -27,6 +27,39 @@ render_entry_opportunities_page(
     assert any("small caps" in button.label.lower() for button in app.button)
 
 
+def test_speculative_rate_limit_keeps_previous_results_and_disables_retry() -> None:
+    script = '''
+from datetime import timedelta
+import pandas as pd
+import streamlit as st
+from app import render_entry_opportunities_page
+from config import StrategyConfig
+from src.speculative import SpeculativeCandidate
+
+st.session_state["_speculative_discovery_error"] = (
+    "El proveedor gratuito ha limitado temporalmente las consultas del screener."
+)
+st.session_state["_speculative_retry_after"] = (
+    pd.Timestamp.now(tz="UTC") + timedelta(minutes=15)
+).isoformat()
+previous = [SpeculativeCandidate(
+    ticker="OLD", company_name="Old Result", exchange="NMS", price=5.0,
+    market_cap=800_000_000, average_volume_3m=1_000_000,
+    daily_turnover=5_000_000,
+)]
+render_entry_opportunities_page(
+    {}, StrategyConfig(), {}, {}, {}, {}, {}, object(), [], {}, previous
+)
+'''
+    app = AppTest.from_string(script, default_timeout=15).run()
+
+    retry = next(button for button in app.button if "screener" in button.label.lower())
+    assert not app.exception
+    assert retry.disabled is True
+    assert "unos 15 minutos" in app.warning[0].value
+    assert any("último universo" in item.value for item in app.caption)
+
+
 def test_complete_review_requests_favorites_and_external_discovery() -> None:
     script = '''
 import streamlit as st
