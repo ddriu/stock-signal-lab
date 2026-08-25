@@ -23,6 +23,39 @@ MIN_DAILY_TURNOVER = 2_000_000
 MIN_RISK_REWARD = 2.0
 MIN_CONFIDENCE = 60
 MAX_DAILY_JUMP_PCT = 15.0
+RATE_LIMIT_MARKERS = (
+    "too many requests",
+    "rate limit",
+    "rate limited",
+    "429",
+)
+
+
+class SpeculativeDiscoveryRateLimited(RuntimeError):
+    """El proveedor externo ha rechazado temporalmente nuevas consultas."""
+
+
+def is_speculative_rate_limit_error(error: BaseException) -> bool:
+    """Reconoce las variantes habituales de un bloqueo temporal del proveedor."""
+
+    if isinstance(error, SpeculativeDiscoveryRateLimited):
+        return True
+    description = f"{type(error).__name__}: {error}".lower()
+    return any(marker in description for marker in RATE_LIMIT_MARKERS)
+
+
+def speculative_discovery_error_message(error: BaseException) -> str:
+    """Traduce errores técnicos sin exponerlos directamente en la interfaz."""
+
+    if is_speculative_rate_limit_error(error):
+        return (
+            "El proveedor gratuito ha limitado temporalmente las consultas del "
+            "screener. Tus favoritas y el último resultado válido se conservan."
+        )
+    return (
+        "No se pudo consultar ahora el universo externo. Tus favoritas y el último "
+        "resultado válido se conservan; puedes seguir usando el resto del análisis."
+    )
 
 
 @dataclass(frozen=True)
@@ -66,31 +99,40 @@ def discover_speculative_candidates(
 
     if limit <= 0:
         return []
-    if screener is None:
-        import yfinance as yf
-        from yfinance import EquityQuery
+    try:
+        if screener is None:
+            import yfinance as yf
+            from yfinance import EquityQuery
 
-        query = EquityQuery(
-            "and",
-            [
-                EquityQuery("eq", ["region", "us"]),
-                EquityQuery("is-in", ["exchange", "NMS", "NGM", "NCM", "NYQ"]),
-                EquityQuery(
-                    "btwn",
-                    ["intradaymarketcap", MIN_MARKET_CAP, MAX_MARKET_CAP],
-                ),
-                EquityQuery("gte", ["intradayprice", MIN_PRICE]),
-                EquityQuery("gte", ["avgdailyvol3m", MIN_AVERAGE_VOLUME]),
-            ],
-        )
-        response = yf.screen(
-            query,
-            size=min(max(limit * 5, 50), 250),
-            sortField="avgdailyvol3m",
-            sortAsc=False,
-        )
-    else:
-        response = screener()
+            query = EquityQuery(
+                "and",
+                [
+                    EquityQuery("eq", ["region", "us"]),
+                    EquityQuery(
+                        "is-in", ["exchange", "NMS", "NGM", "NCM", "NYQ"]
+                    ),
+                    EquityQuery(
+                        "btwn",
+                        ["intradaymarketcap", MIN_MARKET_CAP, MAX_MARKET_CAP],
+                    ),
+                    EquityQuery("gte", ["intradayprice", MIN_PRICE]),
+                    EquityQuery("gte", ["avgdailyvol3m", MIN_AVERAGE_VOLUME]),
+                ],
+            )
+            response = yf.screen(
+                query,
+                size=min(max(limit * 5, 50), 250),
+                sortField="avgdailyvol3m",
+                sortAsc=False,
+            )
+        else:
+            response = screener()
+    except Exception as exc:
+        if is_speculative_rate_limit_error(exc):
+            raise SpeculativeDiscoveryRateLimited(
+                "El proveedor ha limitado temporalmente el screener."
+            ) from exc
+        raise
 
     candidates: list[SpeculativeCandidate] = []
     seen: set[str] = set()
