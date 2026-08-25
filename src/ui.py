@@ -128,8 +128,7 @@ APP_CSS = """
 }
 
 [data-testid="stAppViewContainer"] {
-    position: relative;
-    background:
+    
         radial-gradient(circle at 92% 2%, rgba(67, 199, 162, 0.13), transparent 29rem),
         radial-gradient(circle at 8% 34%, rgba(39, 118, 210, 0.055), transparent 23rem),
         linear-gradient(rgba(8, 122, 92, 0.024) 1px, transparent 1px),
@@ -154,6 +153,23 @@ APP_CSS = """
     background:
         linear-gradient(180deg, rgba(227, 245, 239, 0.78), rgba(251, 253, 252, 0.96) 15rem);
     border-right: 1px solid var(--ssl-border);
+}
+/* Streamlit es quien fija el panel al viewport. El contenido, no la aplicación
+   completa, debe recibir el gesto vertical en móvil y escritorio. */
+[data-testid="stSidebarContent"] {
+    max-height: 100dvh;
+    overflow-y: auto !important;
+    overscroll-behavior-y: contain;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
+}
+
+[data-testid="stPopoverBody"] {
+    max-height: min(74dvh, 42rem) !important;
+    overflow-y: auto !important;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
 }
 
 [data-testid="stSidebar"] [data-testid="stButton"] button {
@@ -385,7 +401,7 @@ button[data-baseweb="tab"] {
     letter-spacing: 0.09em;
 }
 
-.ssl-page-intro h2 span {
+.ssl-page-intro h2 span {160
     color: inherit;
     font-size: inherit;
     font-weight: inherit;
