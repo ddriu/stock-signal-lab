@@ -5,7 +5,9 @@ import pytest
 
 from src.alerts import (
     AlertCandidate,
+    DailyOverviewRow,
     build_alert_candidate,
+    build_daily_overview_content,
     build_digest_content,
     build_alert_state,
     filter_changed_candidates,
@@ -160,3 +162,65 @@ def test_alert_state_preserves_the_last_real_notification() -> None:
 
     assert state.signature.endswith("ESPERAR_PRECIO")
     assert state.notified_at == "2026-08-19T08:00:00+02:00"
+
+
+def test_daily_overview_combines_all_readings_and_keeps_missing_data_visible() -> None:
+    rows = [
+        DailyOverviewRow(
+            ticker="HALO",
+            company_name="Halozyme Therapeutics",
+            held=True,
+            price=108.68,
+            as_of="2026-08-24",
+            technical_score=80,
+            technical_label="Entrada fuerte",
+            position_label="Mantener",
+            growth_score=76,
+            growth_label="Crecimiento fuerte",
+            fundamental_score=72,
+            fundamental_label="Interesante para estudiar",
+            opportunity_score=74,
+            opportunity_status="VIGILAR",
+            changed=True,
+        ),
+        DailyOverviewRow(
+            ticker="XE",
+            company_name="X-Energy",
+            held=True,
+            price=18.81,
+            as_of="2026-08-24",
+            technical_score=42,
+            technical_label="Esperar",
+            position_label="Reducir",
+            growth_score=48,
+            growth_label="Débil",
+            opportunity_score=45,
+            opportunity_status="ESPERAR",
+        ),
+        DailyOverviewRow(
+            ticker="DGE.L",
+            company_name="Diageo plc",
+            held=False,
+            price=0.0,
+            as_of="",
+            technical_score=None,
+            technical_label="Sin datos",
+            position_label="Sin datos",
+            data_note="precios no disponibles",
+        ),
+    ]
+
+    subject, plain, html = build_daily_overview_content("David", rows)
+
+    assert "resumen diario" in subject
+    assert "3 empresas revisadas" in subject
+    assert "Halozyme Therapeutics (HALO)" in plain
+    assert "Técnica 80" in plain
+    assert "Crecimiento 76" in plain
+    assert "Fundamental 72" in plain
+    assert "Oportunidad 74" in plain
+    assert "Diageo plc (DGE." in plain
+    assert "Técnica N/D" in plain
+    assert "Datos insuficientes" in plain
+    assert html.count("Halozyme Therapeutics (HALO)") == 1
+    assert "href=" not in html

@@ -114,16 +114,22 @@ def test_one_invalid_ticker_does_not_cancel_the_user_digest(monkeypatch) -> None
     summary = run_daily_alerts(
         journal_factory=journal_factory,
         downloader=downloader,
+        fundamental_downloader=lambda ticker: {
+            "symbol": ticker,
+            "longName": f"Empresa {ticker}",
+        },
         sender=lambda *args: sent.append(args),
         today=date(2026, 7, 29),
     )
 
     assert summary.users_checked == 1
     assert summary.tickers_checked == 2
-    assert summary.emails_sent == 1
+    assert summary.emails_sent == 2
     assert summary.alerts_sent == 1
     assert any("ddriu / BAD" in error for error in summary.errors)
-    assert len(sent) == 1
+    assert len(sent) == 2
+    assert "1 alerta" in sent[0][1]
+    assert "resumen diario" in sent[1][1]
     assert [state.ticker for state in user.saved_states] == ["GOOD"]
     assert user.saved_states[0].signature.endswith(STATUS_BUYABLE)
 
@@ -189,10 +195,15 @@ def test_buy_email_waits_until_the_full_opportunity_is_buyable(monkeypatch) -> N
     summary = run_daily_alerts(
         journal_factory=journal_factory,
         downloader=lambda *args, **kwargs: frame,
+        fundamental_downloader=lambda ticker: {
+            "symbol": ticker,
+            "longName": f"Empresa {ticker}",
+        },
         sender=lambda *args: sent.append(args),
         today=date(2026, 7, 29),
     )
 
-    assert summary.emails_sent == 0
-    assert sent == []
+    assert summary.emails_sent == 1
+    assert len(sent) == 1
+    assert "resumen diario" in sent[0][1]
     assert user.saved_states[0].signature.endswith(STATUS_WAIT_PRICE)
