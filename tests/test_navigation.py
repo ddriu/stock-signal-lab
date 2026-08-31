@@ -8,6 +8,7 @@ from src.navigation import (
     growth_radar_ticker_groups,
     market_data_freshness_rows,
     merge_analysis_ticker_sources,
+    next_daily_review_batch,
     sanitize_favorite_selection,
 )
 
@@ -68,6 +69,20 @@ def test_analysis_picker_merges_favorites_history_and_recent_views() -> None:
         ["MA", "RTX", None],
         ["aapl", "HALO"],
     ) == ["AAPL", "MA", "RTX", "HALO"]
+
+
+def test_daily_review_batches_cover_every_favorite_without_repeating() -> None:
+    universe = [f"TICKER{index:03d}" for index in range(107)]
+    attempted: list[str] = []
+    batches: list[list[str]] = []
+
+    while batch := next_daily_review_batch(universe, attempted, limit=25):
+        batches.append(batch)
+        attempted.extend(batch)
+
+    assert [len(batch) for batch in batches] == [25, 25, 25, 25, 7]
+    assert attempted == universe
+    assert len(set(attempted)) == len(universe)
 
 
 def test_growth_radar_groups_keep_order_and_classify_readings() -> None:
