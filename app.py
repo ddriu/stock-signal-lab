@@ -5866,24 +5866,58 @@ def render_automatic_review_status(username: str) -> None:
     failed = sorted(
         {str(ticker).strip().upper() for ticker in failed_values if ticker}
     )
+    fundamentals = dict(st.session_state.get("fundamental_data", {}) or {})
+    fundamental_statuses = [
+        growth_fundamental_status(fundamentals.get(ticker))
+        for ticker in {
+            str(value).strip().upper() for value in attempted if str(value).strip()
+        }
+    ]
+    fundamental_complete = sum(
+        status == "complete" for status in fundamental_statuses
+    )
+    fundamental_partial = sum(
+        status == "partial" for status in fundamental_statuses
+    )
+    fundamental_error = sum(status == "error" for status in fundamental_statuses)
+    fundamental_pending = sum(
+        status == "pending" for status in fundamental_statuses
+    )
+    price_complete = max(reviewed - len(failed), 0)
     if total <= 0:
         return
     if reviewed >= total:
-        if failed:
+        summary = (
+            f"Revisión terminada: precios {price_complete}/{total} · "
+            f"análisis empresarial completo {fundamental_complete}/{total}"
+        )
+        details = (
+            f"Parciales: {fundamental_partial} · con error: {fundamental_error} · "
+            f"pendientes: {fundamental_pending}."
+        )
+        if failed or fundamental_complete < total:
+            missing_prices = (
+                f" Sin precio: {', '.join(failed)}." if failed else ""
+            )
             st.warning(
-                f"Revisión terminada: {total - len(failed)} con precio y "
-                f"{len(failed)} sin completar ({', '.join(failed)}). Puedes reintentarlas "
-                "con «Actualizar ahora todas mis favoritas»."
+                summary
+                + ". "
+                + details
+                + missing_prices
+                + " Puedes reintentar con «Actualizar ahora todas mis favoritas»."
             )
         else:
             st.caption(
-                f"✓ Revisión automática de hoy terminada: {total} empresas con "
-                "precio. Mi radar, Entradas hoy y Crecimiento comparten estos datos."
+                "✓ "
+                + summary
+                + ". Mi radar, Entradas hoy y Crecimiento comparten estos datos."
             )
     else:
         st.caption(
-            f"Revisión automática de hoy: {reviewed} de {total} empresas consultadas. "
-            "La aplicación continúa en bloques internos de 25."
+            f"Revisión en curso: {reviewed}/{total} empresas consultadas · "
+            f"precios {price_complete}/{reviewed} · análisis empresarial completo "
+            f"{fundamental_complete}/{reviewed}. La aplicación continúa en bloques "
+            "internos de 25."
         )
 
 
@@ -10569,16 +10603,20 @@ def main() -> None:
     review_attempted_key = f"_automatic_review_attempted_{review_suffix}"
     review_failed_key = f"_automatic_review_failed_{review_suffix}"
     review_total_key = f"_automatic_review_total_{review_suffix}"
+    review_continue_key = f"_automatic_review_continue_{review_suffix}"
     today_key = date.today().isoformat()
     force_all_favorite_refresh = bool(
         st.session_state.pop("_force_all_favorite_refresh", False)
     )
+    continue_all_favorite_refresh = bool(
+        st.session_state.pop(review_continue_key, False)
+    )
+    review_cycle_active = bool(
+        force_all_favorite_refresh or continue_all_favorite_refresh
+    )
     automatic_review_batch: list[str] = []
-    if automatic_review_page and force_all_favorite_refresh:
-        if (
-            st.session_state.get(review_date_key) != today_key
-            or force_all_favorite_refresh
-        ):
+    if automatic_review_page and review_cycle_active:
+        if force_all_favorite_refresh:
             st.session_state[review_date_key] = today_key
             st.session_state[review_attempted_key] = []
             st.session_state[review_failed_key] = []
@@ -10676,7 +10714,7 @@ def main() -> None:
                 load_clicked
                 or pending_analysis_ticker
                 or portfolio_refresh_requested
-                or force_all_favorite_refresh
+                or review_cycle_active
             )
             price_refresh_token = (
                 str(pd.Timestamp.now(tz="UTC").value)
@@ -10740,6 +10778,7 @@ def main() -> None:
                 # Cada rerun constituye una petición pequeña e independiente. Así
                 # se recorren todas las favoritas sin un proceso único demasiado
                 # pesado para Streamlit Community Cloud.
+                st.session_state[review_continue_key] = True
                 st.rerun()
     attempted_after_refresh = {
         str(ticker).strip().upper()
