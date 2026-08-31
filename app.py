@@ -8,47 +8,9 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 import html
-import importlib
 
 import pandas as pd
 import streamlit as st
-
-# Streamlit puede conservar módulos Python en memoria entre dos despliegues
-# consecutivos. Recargamos la capa visual antes de importar sus símbolos para
-# que un cambio de marca no requiera suspender o reiniciar manualmente la app.
-from src import brand as _brand_module
-from src import auth as _auth_module
-from src import current_positions as _current_positions_module
-from src import entry_opportunity as _entry_opportunity_module
-from src import growth_momentum as _growth_momentum_module
-from src import journal as _journal_module
-from src import navigation as _navigation_module
-from src import opportunity_catalog as _opportunity_catalog_module
-from src import portfolio_snapshot_import as _portfolio_snapshot_import_module
-from src import risk as _risk_module
-from src import speculative as _speculative_module
-from src import supabase_journal as _supabase_journal_module
-from src import storage as _storage_module
-from src import ui as _ui_module
-from src import visualization as _visualization_module
-
-_brand_module = importlib.reload(_brand_module)
-_auth_module = importlib.reload(_auth_module)
-_current_positions_module = importlib.reload(_current_positions_module)
-_entry_opportunity_module = importlib.reload(_entry_opportunity_module)
-_growth_momentum_module = importlib.reload(_growth_momentum_module)
-_journal_module = importlib.reload(_journal_module)
-_navigation_module = importlib.reload(_navigation_module)
-_opportunity_catalog_module = importlib.reload(_opportunity_catalog_module)
-_portfolio_snapshot_import_module = importlib.reload(
-    _portfolio_snapshot_import_module
-)
-_risk_module = importlib.reload(_risk_module)
-_speculative_module = importlib.reload(_speculative_module)
-_supabase_journal_module = importlib.reload(_supabase_journal_module)
-_storage_module = importlib.reload(_storage_module)
-_ui_module = importlib.reload(_ui_module)
-_visualization_module = importlib.reload(_visualization_module)
 
 from config import BacktestConfig, StrategyConfig
 from src.alerts import normalize_alert_preferences
@@ -76,6 +38,7 @@ from src.current_positions import (
     snapshot_with_current_position,
     snapshot_without_positions,
 )
+from src.conviction import MANUAL_OPTIONS, evaluate_conviction, summarize_conviction
 from src.dashboard import build_position_dashboard
 from src.data_loader import (
     DataDownloadError,
@@ -182,23 +145,14 @@ from src.portfolio_snapshot_import import (
     import_portfolio_workbook_snapshot,
     parse_portfolio_snapshot_excel,
 )
-from src import portfolio_snapshot as _portfolio_snapshot_module
-
-_portfolio_snapshot_module = importlib.reload(_portfolio_snapshot_module)
-group_portfolio_snapshot_for_home = (
-    _portfolio_snapshot_module.group_portfolio_snapshot_for_home
+from src.portfolio_snapshot import (
+    compare_portfolio_valuations,
+    group_portfolio_snapshot_for_home,
+    latest_portfolio_snapshot,
+    portfolio_platform_reconciliation,
+    reconcile_current_portfolio,
+    refresh_portfolio_snapshot_prices,
 )
-compare_portfolio_valuations = (
-    _portfolio_snapshot_module.compare_portfolio_valuations
-)
-latest_portfolio_snapshot = _portfolio_snapshot_module.latest_portfolio_snapshot
-portfolio_platform_reconciliation = (
-    _portfolio_snapshot_module.portfolio_platform_reconciliation
-)
-refresh_portfolio_snapshot_prices = (
-    _portfolio_snapshot_module.refresh_portfolio_snapshot_prices
-)
-reconcile_current_portfolio = _portfolio_snapshot_module.reconcile_current_portfolio
 from src.portfolio_decisions import (
     build_portfolio_decision_rows,
     entry_opportunity_rows,
@@ -400,6 +354,13 @@ def speculative_candidate_memory() -> dict[str, object]:
     """Último universo público válido, compartido mientras el proceso siga activo."""
 
     return {"candidates": [], "as_of": ""}
+
+
+@st.cache_resource(show_spinner=False)
+def cached_journal(owner: str):
+    """Reutiliza el cliente SQLite/Supabase entre reruns de navegación."""
+
+    return create_journal(owner)
 
 
 def apply_section_layout(section: str, analysis_section: str = "") -> None:
@@ -1485,6 +1446,189 @@ def render_extended_market_report(
                     )
 
 
+def render_conviction_analysis(
+    ticker: str,
+    raw_fundamentals: dict[str, object],
+    *,
+    entry_score: int,
+) -> None:
+    """Presenta la hoja de convicción sin mezclar empresa, precio y entrada."""
+
+    result = evaluate_conviction(
+        raw_fundamentals,
+        ticker=ticker,
+        entry_score=entry_score,
+    )
+    answers_key = f"conviction_answers_{ticker}"
+    saved_answers = st.session_state.get(answers_key, {})
+    if not isinstance(saved_answers, dict):
+        saved_answers = {}
+    summary = summarize_conviction(result, saved_answers)
+
+    st.markdown("**Convicción empresarial a 3–5 años**")
+    st.caption(
+        "Las 22 preguntas de la hoja están aquí, pero no pesan todas igual. "
+        "La calidad del negocio, la valoración, el momento de entrada y tu "
+        "tolerancia personal permanecen separados."
+    )
+
+    score_cols = st.columns(4)
+    score_cols[0].metric(
+        result.label,
+        (
+            f"{summary.automatic_score}/100"
+            if summary.automatic_score is not None
+            else "N/D"
+        ),
+        help="Nota normalizada sólo con criterios empresariales que tienen datos.",
+    )
+    score_cols[1].metric(
+        "Cobertura automática",
+        f"{summary.automatic_coverage_pct}%",
+        help="Los datos ausentes reducen cobertura; nunca se convierten en un cero.",
+    )
+    score_cols[2].metric(
+        f"Tesis revisada · {summary.manual_answered}/{summary.manual_total}",
+        (
+            f"{summary.manual_score}/100"
+            if summary.manual_score is not None
+            else "Pendiente"
+        ),
+        help="La nota aparece al revisar al menos la mitad de los criterios cualitativos que puntúan.",
+    )
+    score_cols[3].metric(
+        summary.label,
+        (
+            f"{summary.combined_score}/100"
+            if summary.combined_score is not None
+            else "N/D"
+        ),
+        help="60% datos automáticos y 40% tesis cualitativa cuando ambas coberturas son suficientes.",
+    )
+
+    if summary.combined_score is None:
+        st.info(
+            "Completa la revisión cualitativa antes de interpretar una nota conjunta. "
+            "Mientras tanto, los datos automáticos son sólo un primer filtro."
+        )
+    elif summary.combined_score >= 65 and entry_score >= 65:
+        st.success(
+            "La empresa y el momento superan sus filtros por separado: candidata "
+            "para estudiar entrada, tamaño y riesgo."
+        )
+    elif summary.combined_score >= 65:
+        st.info(
+            "La tesis empresarial es suficiente, pero el momento no acompaña: "
+            "mantener en vigilancia y esperar precio o confirmación."
+        )
+    elif summary.combined_score < 50 and entry_score >= 65:
+        st.warning(
+            "Hay impulso sin convicción empresarial suficiente. Si se opera, debe "
+            "tratarse como posición táctica o especulativa, no como inversión estable."
+        )
+    else:
+        st.warning(
+            "La evidencia actual no sostiene una entrada de convicción. Conviene "
+            "resolver los puntos débiles antes de aportar capital."
+        )
+
+    automatic_checks = [check for check in result.checks if check.automatic]
+    manual_checks = [check for check in result.checks if not check.automatic]
+    st.markdown("**1 · Evidencia calculada**")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "Lectura": check.status,
+                    "Dato": check.value,
+                    "Pregunta": check.question,
+                    "Uso": "Convicción" if check.counts_for_score else "Contexto",
+                    "Bloque": check.block,
+                    "Regla aplicada": check.rule,
+                }
+                for check in automatic_checks
+            ]
+        ),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Lectura": st.column_config.TextColumn(width="small"),
+            "Dato": st.column_config.TextColumn(width="small"),
+            "Pregunta": st.column_config.TextColumn(width="large"),
+            "Uso": st.column_config.TextColumn(width="small"),
+            "Bloque": st.column_config.TextColumn(width="small"),
+            "Regla aplicada": st.column_config.TextColumn(width="large"),
+        },
+    )
+    with st.expander("Cómo se interpreta la evidencia automática"):
+        for check in automatic_checks:
+            st.markdown(f"**{check.question}** · {check.evidence}")
+
+    st.markdown("**2 · Tu revisión cualitativa**")
+    st.caption(
+        "Responde «Sí» sólo cuando puedas justificarlo con cuentas, informes o "
+        "hechos verificables. Guardar el formulario evita recalcular al cambiar cada celda."
+    )
+    manual_rows = pd.DataFrame(
+        [
+            {
+                "Respuesta": saved_answers.get(check.key, MANUAL_OPTIONS[0]),
+                "Pregunta": check.question,
+                "Uso": "Convicción" if check.counts_for_score else "Contexto",
+                "Qué comprobar": check.evidence,
+                "Bloque": check.block,
+            }
+            for check in manual_checks
+        ]
+    )
+    with st.form(f"conviction_form_{ticker}"):
+        edited = st.data_editor(
+            manual_rows,
+            width="stretch",
+            hide_index=True,
+            num_rows="fixed",
+            disabled=["Bloque", "Pregunta", "Qué comprobar", "Uso"],
+            column_config={
+                "Respuesta": st.column_config.SelectboxColumn(
+                    options=list(MANUAL_OPTIONS),
+                    required=True,
+                    width="medium",
+                ),
+                "Pregunta": st.column_config.TextColumn(width="large"),
+                "Uso": st.column_config.TextColumn(width="small"),
+                "Qué comprobar": st.column_config.TextColumn(width="large"),
+                "Bloque": st.column_config.TextColumn(width="small"),
+            },
+            key=f"conviction_editor_{ticker}",
+        )
+        submitted = st.form_submit_button(
+            "Guardar mi revisión",
+            type="primary",
+            width="stretch",
+        )
+    if submitted:
+        st.session_state[answers_key] = {
+            check.key: str(response)
+            for check, response in zip(
+                manual_checks,
+                edited["Respuesta"].tolist(),
+                strict=True,
+            )
+        }
+        st.rerun()
+
+    answered_context = sum(
+        saved_answers.get(check.key) in MANUAL_OPTIONS[1:]
+        for check in manual_checks
+    )
+    st.caption(
+        f"Checklist completo: {len(result.checks)} preguntas · "
+        f"{len(automatic_checks)} calculadas · "
+        f"{answered_context}/{len(manual_checks)} cualitativas revisadas. "
+        "Las respuestas se conservan durante tu sesión actual."
+    )
+
+
 def render_analysis(
     ticker: str,
     frame: pd.DataFrame,
@@ -1774,8 +1918,13 @@ def render_analysis(
                         },
                     )
 
-    company_tab, entry_tab, risk_data_tab = st.tabs(
-        ["Empresa y valoración", "Momento y liderazgo", "Riesgo y fuentes"]
+    company_tab, conviction_tab, entry_tab, risk_data_tab = st.tabs(
+        [
+            "Empresa y valoración",
+            "Convicción 3–5 años",
+            "Momento y liderazgo",
+            "Riesgo y fuentes",
+        ]
     )
     with company_tab:
         if fundamentals.score is None:
@@ -1843,6 +1992,13 @@ def render_analysis(
                 width="stretch",
                 hide_index=True,
             )
+
+    with conviction_tab:
+        render_conviction_analysis(
+            ticker,
+            raw_fundamentals,
+            entry_score=signal.score,
+        )
 
     with entry_tab:
         favorable, caution = st.columns(2)
@@ -4854,7 +5010,7 @@ def render_admin_panel(
     summary_rows: list[dict[str, object]] = []
 
     for username in usernames:
-        journal = create_journal(username)
+        journal = cached_journal(username)
         operations = journal.list_operations()
         positions = calculate_open_positions(operations)
         portfolio_snapshot = pd.DataFrame()
@@ -10188,8 +10344,8 @@ def main() -> None:
     authenticated_user = require_login()
     accounts = load_auth_accounts()
     try:
-        journal = create_journal(authenticated_user.username)
-        group_journal = create_journal(GROUP_PORTFOLIO_OWNER)
+        journal = cached_journal(authenticated_user.username)
+        group_journal = cached_journal(GROUP_PORTFOLIO_OWNER)
     except JournalStorageError as exc:
         st.error(str(exc))
         st.stop()
@@ -10392,13 +10548,15 @@ def main() -> None:
             and analysis_detail in {"Crecimiento", "Calidad fundamental"}
         )
     )
-    try:
-        review_position_tickers = [
-            *_portfolio_tracking_tickers(journal),
-            *_portfolio_tracking_tickers(group_journal),
-        ]
-    except JournalStorageError:
-        review_position_tickers = []
+    review_position_tickers: list[str] = []
+    if automatic_review_page:
+        try:
+            review_position_tickers = [
+                *_portfolio_tracking_tickers(journal),
+                *_portfolio_tracking_tickers(group_journal),
+            ]
+        except JournalStorageError:
+            review_position_tickers = []
     review_universe = list(
         dict.fromkeys(
             resolve_analysis_ticker(str(ticker))
@@ -10416,7 +10574,7 @@ def main() -> None:
         st.session_state.pop("_force_all_favorite_refresh", False)
     )
     automatic_review_batch: list[str] = []
-    if automatic_review_page:
+    if automatic_review_page and force_all_favorite_refresh:
         if (
             st.session_state.get(review_date_key) != today_key
             or force_all_favorite_refresh
@@ -10471,7 +10629,7 @@ def main() -> None:
                     if owner == authenticated_user.username
                     else group_journal
                     if owner == GROUP_PORTFOLIO_OWNER
-                    else create_journal(owner)
+                    else cached_journal(owner)
                 )
             except JournalStorageError as exc:
                 st.sidebar.warning(
