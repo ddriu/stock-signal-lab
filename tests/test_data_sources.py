@@ -23,11 +23,17 @@ def test_official_fundamentals_override_yahoo_accounting_fields() -> None:
         },
         {
             "returnOnEquity": 0.25,
+            "totalCash": 2_000_000,
+            "operatingCashflow": 500_000,
+            "capitalExpenditures": 100_000,
             "_official_source": "SEC EDGAR",
             "_official_period_end": "2025-12-31",
         },
     )
     assert result["returnOnEquity"] == 0.25
+    assert result["totalCash"] == 2_000_000
+    assert result["operatingCashflow"] == 500_000
+    assert result["capitalExpenditures"] == 100_000
     assert result["forwardPE"] == 20
     assert result["_sources"]["returnOnEquity"] == "SEC EDGAR"
     assert result["_sources"]["forwardPE"] == "Yahoo Finance"
