@@ -627,6 +627,14 @@ def _yahoo_statement_snapshot(stock: object) -> dict[str, object]:
         ("CurrentLiabilities", "TotalCurrentLiabilities"),
     )
     debt = _statement_series(balance, ("TotalDebt",))
+    cash = _statement_series(
+        balance,
+        (
+            "CashCashEquivalentsAndShortTermInvestments",
+            "CashAndCashEquivalents",
+            "CashFinancial",
+        ),
+    )
     free_cashflow = _statement_series(cashflow, ("FreeCashFlow",))
     operating_cash = _statement_series(
         cashflow,
@@ -665,6 +673,11 @@ def _yahoo_statement_snapshot(stock: object) -> dict[str, object]:
             else None
         ),
         "freeCashflow": latest_fcf,
+        "totalCash": cash[0] if cash else None,
+        "totalDebt": debt[0] if debt else None,
+        "operatingCashflow": operating_cash[0] if operating_cash else None,
+        "capitalExpenditures": abs(capex[0]) if capex else None,
+        "totalRevenue": latest_revenue,
     }
     return {key: value for key, value in metrics.items() if value is not None}
 
@@ -700,6 +713,11 @@ def download_fundamental_snapshot(ticker: str) -> dict[str, object]:
         "debtToEquity",
         "currentRatio",
         "freeCashflow",
+        "totalCash",
+        "totalDebt",
+        "operatingCashflow",
+        "capitalExpenditures",
+        "totalRevenue",
         "marketCap",
         "forwardPE",
         "trailingPE",
@@ -707,6 +725,7 @@ def download_fundamental_snapshot(ticker: str) -> dict[str, object]:
         "enterpriseToEbitda",
         "pegRatio",
         "sharesOutstanding",
+        "sharesChangeYoY",
         # Fechas orientativas del próximo evento. Yahoo puede no publicarlas o
         # modificarlas; la capa de oportunidades conserva esa incertidumbre.
         "earningsTimestamp",

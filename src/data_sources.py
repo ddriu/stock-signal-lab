@@ -252,6 +252,14 @@ def download_sec_fundamental_snapshot(
         company_facts,
         ("LiabilitiesCurrent", "CurrentLiabilities"),
     )
+    cash = _instant_series(
+        company_facts,
+        (
+            "CashAndCashEquivalentsAtCarryingValue",
+            "CashCashEquivalentsAndShortTermInvestments",
+            "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+        ),
+    )
     debt_current = _instant_series(
         company_facts,
         (
@@ -295,8 +303,13 @@ def download_sec_fundamental_snapshot(
     average_equity = (
         sum(annual_equities) / len(annual_equities) if annual_equities else latest_equity
     )
-    current_debt = _latest_value(debt_current) or 0.0
-    noncurrent_debt = _latest_value(debt_noncurrent) or 0.0
+    current_debt_value = _latest_value(debt_current)
+    noncurrent_debt_value = _latest_value(debt_noncurrent)
+    total_debt = (
+        (current_debt_value or 0.0) + (noncurrent_debt_value or 0.0)
+        if current_debt_value is not None or noncurrent_debt_value is not None
+        else None
+    )
     cash_from_operations = _latest_value(operating_cash)
     capital_expenditure = _latest_value(capex)
 
@@ -309,8 +322,8 @@ def download_sec_fundamental_snapshot(
         "revenueGrowth": _growth(revenue),
         "earningsGrowth": _growth(net_income),
         "debtToEquity": (
-            _safe_ratio(current_debt + noncurrent_debt, latest_equity) * 100
-            if latest_equity not in (None, 0)
+            _safe_ratio(total_debt, latest_equity) * 100
+            if total_debt is not None and latest_equity not in (None, 0)
             else None
         ),
         "currentRatio": _safe_ratio(
@@ -322,6 +335,15 @@ def download_sec_fundamental_snapshot(
             if cash_from_operations is not None and capital_expenditure is not None
             else None
         ),
+        "totalCash": _latest_value(cash),
+        "totalDebt": total_debt,
+        "operatingCashflow": cash_from_operations,
+        "capitalExpenditures": (
+            abs(capital_expenditure)
+            if capital_expenditure is not None
+            else None
+        ),
+        "totalRevenue": latest_revenue,
         "_official_period_end": max(
             (
                 str(series[-1]["end"])
@@ -369,6 +391,11 @@ def merge_fundamental_sources(
         "debtToEquity",
         "currentRatio",
         "freeCashflow",
+        "totalCash",
+        "totalDebt",
+        "operatingCashflow",
+        "capitalExpenditures",
+        "totalRevenue",
     }
     for key in official_fields:
         value = official.get(key)
