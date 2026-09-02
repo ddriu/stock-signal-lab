@@ -17,6 +17,7 @@ from src.alerts import (
     build_alert_state,
     build_daily_overview_content,
     build_digest_content,
+    describe_state_change,
     filter_changed_candidates,
     signal_signature,
 )
@@ -338,6 +339,13 @@ def run_daily_alerts(
                             state_signature = candidate.signature
                             if enhanced.status_code != STATUS_BUYABLE:
                                 candidate = None
+                    changed, change_kind, previous_state, current_state = (
+                        describe_state_change(
+                            previous_signatures.get(ticker),
+                            state_signature,
+                            held=held,
+                        )
+                    )
                     overview_rows.append(
                         DailyOverviewRow(
                             ticker=ticker,
@@ -368,9 +376,10 @@ def run_daily_alerts(
                             opportunity_status=(
                                 enhanced.status_label if enhanced is not None else ""
                             ),
-                            changed=(
-                                previous_signatures.get(ticker) != state_signature
-                            ),
+                            changed=changed,
+                            change_kind=change_kind,
+                            previous_state=previous_state,
+                            current_state=current_state,
                             data_note=", ".join(dict.fromkeys(data_notes)),
                         )
                     )

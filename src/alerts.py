@@ -109,6 +109,9 @@ class DailyOverviewRow:
     opportunity_score: int | None = None
     opportunity_status: str = ""
     changed: bool = False
+    change_kind: str = ""
+    previous_state: str = ""
+    current_state: str = ""
     data_note: str = ""
 
 
@@ -208,6 +211,68 @@ def signal_signature(signal: SignalResult, *, held: bool) -> str:
     if not held and signal.label in {LABEL_BUY, LABEL_STRONG}:
         return f"entry:{signal.label}"
     return "neutral"
+
+
+def _signature_state(signature: str, *, held: bool) -> tuple[str, tuple[int, int]]:
+    """Traduce el estado persistido a una lectura humana y comparable."""
+
+    normalized = str(signature or "").strip()
+    if not normalized or normalized == "neutral":
+        label = "Mantener / vigilar" if held else "Vigilancia"
+        return label, (2 if held else 0, 0)
+
+    if normalized.startswith("position:"):
+        position = normalized.split(":", 1)[1]
+        ranks = {LABEL_SELL: 0, LABEL_REDUCE: 1}
+        return position, (ranks.get(position, 1), 0)
+
+    if normalized.startswith("entry:"):
+        parts = normalized.split(":")
+        technical = parts[1] if len(parts) > 1 else "Entrada"
+        status = parts[2] if len(parts) > 2 else ""
+        technical_rank = 2 if technical == LABEL_STRONG else 1
+        status_states = {
+            "COMPRABLE": ("Entrada validada", 4),
+            "ESPERAR_PRECIO": ("Esperar mejor precio", 3),
+            "EXTENDIDA": ("No perseguir: extendida", 2),
+            "EVENTO_NO_ENTRAR": ("Esperar evento", 1),
+            "OPORTUNIDAD_INCOMPLETA": ("Entrada sin validar", 1),
+        }
+        if status in status_states:
+            label, rank = status_states[status]
+            return label, (rank, technical_rank)
+        return technical, (3, technical_rank)
+
+    return "Estado actualizado", (1, 0)
+
+
+def describe_state_change(
+    previous_signature: str | None,
+    current_signature: str,
+    *,
+    held: bool,
+) -> tuple[bool, str, str, str]:
+    """Distingue primera lectura, mejora y deterioro sin llamar cambio a todo."""
+
+    current_label, current_rank = _signature_state(current_signature, held=held)
+    if previous_signature is None:
+        return False, "new", "", current_label
+
+    previous_label, previous_rank = _signature_state(previous_signature, held=held)
+    if previous_signature == current_signature:
+        return False, "", previous_label, current_label
+    role_transition = (held and previous_signature.startswith("entry:")) or (
+        not held and previous_signature.startswith("position:")
+    )
+    if role_transition:
+        kind = "change"
+    elif current_rank > previous_rank:
+        kind = "improvement"
+    elif current_rank < previous_rank:
+        kind = "deterioration"
+    else:
+        kind = "change"
+    return True, kind, previous_label, current_label
 
 
 def build_alert_candidate(
@@ -578,6 +643,22 @@ def _overview_priority(row: DailyOverviewRow) -> tuple[int, int, str]:
     return priority, -combined, row.ticker
 
 
+def _overview_change_label(row: DailyOverviewRow) -> str:
+    if row.change_kind == "new":
+        return "NUEVA · Primera lectura"
+    prefixes = {
+        "improvement": "MEJORA",
+        "deterioration": "DETERIORO",
+        "change": "CAMBIO DE ESTADO",
+    }
+    prefix = prefixes.get(row.change_kind, "")
+    if not prefix:
+        return ""
+    if row.previous_state and row.current_state:
+        return f"{prefix} · {row.previous_state} → {row.current_state}"
+    return prefix
+
+
 def build_daily_overview_content(
     display_name: str,
     rows: Iterable[DailyOverviewRow],
@@ -595,6 +676,7 @@ def build_daily_overview_content(
         for row in values
     )
     changed = sum(row.changed for row in values)
+    new_readings = sum(row.change_kind == "new" for row in values)
     incomplete = sum(
         row.fundamental_score is None or row.growth_score is None for row in values
     )
@@ -606,14 +688,24 @@ def build_daily_overview_content(
         f"Empresas revisadas: {total}",
         f"Entradas validadas para revisar: {buyable}",
         f"Posiciones para revisar/reducir/salir: {portfolio_reviews}",
-        f"Lecturas que han cambiado: {changed}",
+        f"Cambios relevantes desde el análisis anterior: {changed}",
+        f"Primeras lecturas: {new_readings}",
         f"Empresas con datos parciales: {incomplete}",
         "",
         "Cada empresa aparece una sola vez. Técnica, crecimiento, fundamentos y "
         "oportunidad son lecturas distintas; ninguna garantiza rentabilidad.",
         "",
-        "TODAS LAS FAVORITAS Y POSICIONES",
+        "QUÉ REQUIERE ATENCIÓN HOY",
     ]
+    changed_rows = [row for row in values if row.changed]
+    if changed_rows:
+        plain_lines.append(
+            f"Hay {changed} cambio{'s' if changed != 1 else ''} de estado. "
+            "Aparecen destacados en la tabla."
+        )
+    else:
+        plain_lines.append("Sin cambios de estado relevantes.")
+    plain_lines.extend(["", "TODAS LAS FAVORITAS Y POSICIONES"])
     for row in values:
         scores = (
             f"Técnica {row.technical_score if row.technical_score is not None else 'N/D'} · "
@@ -621,13 +713,15 @@ def build_daily_overview_content(
             f"Fundamental {row.fundamental_score if row.fundamental_score is not None else 'N/D'} · "
             f"Oportunidad {row.opportunity_score if row.opportunity_score is not None else 'N/D'}"
         )
-        marker = " · CAMBIO" if row.changed else ""
+        marker = _overview_change_label(row)
         plain_lines.extend(
             [
-                f"{_overview_display_label(row)}{marker}",
+                _overview_display_label(row),
                 f"{scores} · {_overview_decision(row)}",
             ]
         )
+        if marker:
+            plain_lines.append(marker)
         if row.data_note:
             plain_lines.append(f"Datos: {row.data_note}")
         plain_lines.append("")
@@ -640,7 +734,7 @@ def build_daily_overview_content(
         <tr style="border-bottom:1px solid #e2e8f0">
           <td style="padding:9px 7px;min-width:150px">
             <strong>{html.escape(_overview_display_label(row))}</strong>
-            {'<br><span style="color:#b7791f;font-size:11px">CAMBIO</span>' if row.changed else ''}
+            {f'<br><span style="color:#b7791f;font-size:11px">{html.escape(_overview_change_label(row))}</span>' if _overview_change_label(row) else ''}
           </td>
           <td style="padding:9px 7px;text-align:center">{score_cell(row.technical_score)}</td>
           <td style="padding:9px 7px;text-align:center">{score_cell(row.growth_score)}</td>
@@ -651,6 +745,12 @@ def build_daily_overview_content(
         """
         for row in values
     )
+    attention_text = (
+        f"Hay {changed} cambio{'s' if changed != 1 else ''} de estado. "
+        "Aparecen destacados en la tabla."
+        if changed_rows
+        else "Sin cambios de estado relevantes."
+    )
     html_body = f"""
     <div style="font-family:Arial,sans-serif;max-width:920px;margin:auto;color:#1e293b">
       <h2 style="color:#14213d">Stock Signal Lab · resumen diario</h2>
@@ -659,7 +759,13 @@ def build_daily_overview_content(
                   padding:14px 16px;margin:14px 0">
         <strong>{total} empresas revisadas</strong><br>
         Entradas validadas: {buyable} · Cartera para revisar: {portfolio_reviews} ·
-        Cambios: {changed} · Datos parciales: {incomplete}
+        Cambios relevantes: {changed} · Primeras lecturas: {new_readings} ·
+        Datos parciales: {incomplete}
+      </div>
+      <div style="background:#fffaf0;border:1px solid #f6d58a;border-radius:12px;
+                  padding:12px 16px;margin:14px 0">
+        <strong>Qué requiere atención hoy</strong><br>
+        <span style="color:#475569">{html.escape(attention_text)}</span>
       </div>
       <p style="color:#475569">
         Cada empresa aparece una sola vez. Las columnas son lecturas independientes
