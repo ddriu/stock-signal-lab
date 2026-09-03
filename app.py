@@ -22,6 +22,11 @@ from src.auth import (
     require_login,
 )
 from src.backtesting import BacktestResult, run_backtest
+from src.benchmark_outperformance import (
+    HORIZONS as BENCHMARK_HORIZONS,
+    StrategyEvidence,
+    evaluate_benchmark_outperformance,
+)
 from src.brand import (
     BRAND_FAVICON_SVG,
     brand_mark_html,
@@ -215,10 +220,18 @@ st.set_page_config(
 )
 
 MAIN_OPTIONS = ["Inicio", "Analizar", "Favoritos", "Carteras", "Más"]
-ANALYSIS_OPTIONS = ["Radar", "Oportunidades", "Empresa", "Estrategias", "Más análisis"]
+ANALYSIS_OPTIONS = [
+    "Radar",
+    "Oportunidades",
+    "Superar índice",
+    "Empresa",
+    "Estrategias",
+    "Más análisis",
+]
 ANALYSIS_LABELS = {
     "Radar": "◎ Mi radar",
     "Oportunidades": "🎯 Entradas",
+    "Superar índice": "△ vs S&P 500",
     "Empresa": "↗ Empresa",
     "Estrategias": "◱ Estrategias",
     "Más análisis": "··· Herramientas",
@@ -236,6 +249,10 @@ ANALYSIS_VIEW_DESCRIPTIONS = {
     "Oportunidades": (
         "Filtra el radar por precio actual: distingue una entrada posible hoy de una "
         "buena empresa que llega tarde, está cara o tiene un evento próximo."
+    ),
+    "Superar índice": (
+        "Compara cartera y favoritas con el S&P 500 a corto, medio y largo plazo. "
+        "Muestra candidatas y cobertura; no promete rentabilidad futura."
     ),
     "Crecimiento": (
         "Busca futuros líderes combinando crecimiento del negocio, fortaleza del precio, "
@@ -283,6 +300,7 @@ LEGACY_ANALYSIS_ROUTES = {
 SIDEBAR_ANALYSIS_SECTIONS = {
     "Radar",
     "Oportunidades",
+    "Superar índice",
     "Estrategias",
     "Comparar empresas",
     "Prueba con el pasado",
@@ -974,6 +992,10 @@ def load_market_data(
             text=f"{ticker}: {mode}",
         )
     reference_symbols: set[str] = set()
+    # La vista de ventaja relativa compara todas las cotizaciones con la misma
+    # referencia. Se descarga una sola vez y se comparte con todo el universo.
+    if downloaded:
+        reference_symbols.add("SPY")
     for ticker in downloaded:
         reference_symbols.add(benchmark_for_ticker(ticker))
         sector_reference = sector_benchmark(
@@ -5833,7 +5855,7 @@ def render_app_header(user: AuthConfig) -> None:
 
 
 def render_analysis_view_guide() -> None:
-    """Explica las tres lecturas actuales sin añadir otra pantalla de configuración."""
+    """Explica las lecturas actuales sin añadir otra pantalla de configuración."""
 
     with st.popover(
         "Qué hace cada lectura",
@@ -5847,6 +5869,9 @@ def render_analysis_view_guide() -> None:
             f"**Entradas hoy**  \n{ANALYSIS_VIEW_DESCRIPTIONS['Oportunidades']}"
         )
         st.markdown(
+            f"**S&P 500**  \n{ANALYSIS_VIEW_DESCRIPTIONS['Superar índice']}"
+        )
+        st.markdown(
             f"**Crecimiento**  \n{ANALYSIS_VIEW_DESCRIPTIONS['Crecimiento']}"
         )
         st.caption(
@@ -5856,7 +5881,7 @@ def render_analysis_view_guide() -> None:
 
 
 def render_automatic_review_status(username: str) -> None:
-    """Muestra el estado compartido por Radar, Entradas hoy y Crecimiento."""
+    """Muestra el avance compartido por las vistas que recorren el universo."""
 
     suffix = username.strip().lower() or "usuario"
     total = int(st.session_state.get(f"_automatic_review_total_{suffix}", 0) or 0)
@@ -6245,12 +6270,14 @@ def _request_analysis_page(page: str) -> None:
     st.session_state["_requested_analysis_navigation"] = page
 
 
-def _request_all_favorite_refresh() -> None:
+def _request_all_favorite_refresh(destination: str = "Radar") -> None:
     """Solicita una revisión completa sin reutilizar la caché de precios."""
 
     st.session_state["_force_all_favorite_refresh"] = True
     st.session_state["_requested_main_navigation"] = "Analizar"
-    st.session_state["_requested_analysis_navigation"] = "Radar"
+    st.session_state["_requested_analysis_navigation"] = (
+        destination if destination in ANALYSIS_OPTIONS else "Radar"
+    )
 
 
 def _request_complete_review() -> None:
@@ -8670,6 +8697,492 @@ def render_capital_projection_page(username: str) -> None:
     )
 
 
+def _favorite_company_names(
+    favorite_labels: dict[str, str],
+) -> dict[str, str]:
+    """Conserva el nombre legible al normalizar símbolos usados por brókeres."""
+
+    names: dict[str, str] = {}
+    for raw_ticker, label in favorite_labels.items():
+        ticker = resolve_analysis_ticker(raw_ticker)
+        marker = f" ({raw_ticker})"
+        name = str(label).split(marker, 1)[0].strip() if marker in str(label) else ""
+        if name and name.upper() != raw_ticker.upper():
+            names.setdefault(ticker, name)
+    return names
+
+
+def _benchmark_pending_row(
+    ticker: str,
+    *,
+    name: str,
+    source: str,
+    in_portfolio: bool,
+) -> dict[str, object]:
+    return {
+        "Ticker": ticker,
+        "Empresa": name,
+        "Origen": source,
+        "En cartera": "Sí" if in_portfolio else "No",
+        "Lectura": "Pendiente de actualizar",
+        "Puntuación": float("nan"),
+        "Ventaja vs S&P": float("nan"),
+        "Rentabilidad empresa": float("nan"),
+        "Rentabilidad S&P 500": float("nan"),
+        "Histórico favorable": float("nan"),
+        "Ventanas": float("nan"),
+        "Estrategias favorables": "Sin datos actuales",
+        "Cobertura": 0,
+        "Mejor plazo": "N/D",
+        "Corto": float("nan"),
+        "Medio": float("nan"),
+        "Largo": float("nan"),
+        "Entrada": float("nan"),
+        "Oportunidad": float("nan"),
+        "Crecimiento": float("nan"),
+        "Calidad": float("nan"),
+        "Convicción": float("nan"),
+        "Valoración": float("nan"),
+        "Riesgo": float("nan"),
+        "Si ya la tienes": "Revisar",
+        "Periodo comparado": "N/D",
+        "Datos hasta": None,
+    }
+
+
+def render_benchmark_outperformance_page(
+    prepared: dict[str, pd.DataFrame],
+    strategy: StrategyConfig,
+    raw_fundamentals: dict[str, dict[str, object]],
+    reference_data: dict[str, pd.DataFrame],
+    valuation_results: dict[str, ValuationResult],
+    relative_results: dict[str, RelativeStrengthResult],
+    risk_results: dict[str, RiskResult],
+    opportunity_results: dict[str, OpportunityResult],
+    journal: object,
+    favorite_tickers: list[str],
+    favorite_labels: dict[str, str],
+    private_favorites: pd.DataFrame | None = None,
+) -> None:
+    """Ordena cartera y favoritas por evidencia relativa, no por promesas."""
+
+    render_page_intro(
+        "VENTAJA RELATIVA",
+        "¿Puede superar al S&P 500?",
+        "Cruza fuerza frente al índice con Entrada, Oportunidad, Crecimiento, Calidad, "
+        "Convicción, Valoración y Riesgo. Una nota alta es una prioridad de estudio, "
+        "no una rentabilidad garantizada.",
+    )
+    st.info(
+        "La comparación responde a tres preguntas distintas: corto plazo (1–3 meses), "
+        "medio plazo (6–12 meses) y largo plazo (3–5 años). Cambiar de plazo no vuelve "
+        "a descargar datos."
+    )
+
+    held_tickers = set(_portfolio_tracking_tickers(journal))
+    private_tickers = (
+        private_favorites["ticker"].fillna("").astype(str).tolist()
+        if private_favorites is not None
+        and not private_favorites.empty
+        and "ticker" in private_favorites
+        else favorite_tickers
+    )
+    resolved_favorites = {
+        resolve_analysis_ticker(ticker) for ticker in private_tickers if ticker
+    }
+    universe = merge_analysis_ticker_sources(
+        [resolve_analysis_ticker(ticker) for ticker in private_tickers],
+        sorted(held_tickers),
+    )
+    if not universe:
+        st.warning(
+            "Todavía no hay cartera ni favoritas que comparar. Guarda una empresa "
+            "o registra una posición para empezar."
+        )
+        return
+
+    controls_a, controls_b = st.columns([2, 1])
+    with controls_a:
+        selected_horizon = st.segmented_control(
+            "Plazo",
+            [definition.key for definition in BENCHMARK_HORIZONS],
+            default="medium",
+            key="benchmark_horizon",
+            format_func=lambda key: next(
+                definition.label
+                for definition in BENCHMARK_HORIZONS
+                if definition.key == key
+            ),
+        )
+    with controls_b:
+        st.button(
+            "Revisar todo el universo",
+            icon=":material/refresh:",
+            type="primary",
+            width="stretch",
+            key="benchmark_refresh_all",
+            on_click=_request_all_favorite_refresh,
+            args=("Superar índice",),
+            help="Actualiza cartera y favoritas en bloques de 25 para no saturar los proveedores.",
+        )
+    selected_horizon = str(selected_horizon or "medium")
+    benchmark_frame = reference_data.get("SPY")
+    favorite_names = _favorite_company_names(favorite_labels)
+    assessments: dict[str, object] = {}
+    base_rows: dict[str, dict[str, object]] = {}
+
+    for ticker in universe:
+        info = raw_fundamentals.get(ticker, {})
+        name = str(
+            info.get("shortName")
+            or info.get("longName")
+            or favorite_names.get(ticker)
+            or ticker
+        ).strip()
+        is_favorite = ticker in resolved_favorites
+        in_portfolio = ticker in held_tickers
+        source = (
+            "Cartera y favorita"
+            if is_favorite and in_portfolio
+            else "Cartera"
+            if in_portfolio
+            else "Favorita"
+        )
+        frame = prepared.get(ticker)
+        if frame is None or frame.empty:
+            base_rows[ticker] = _benchmark_pending_row(
+                ticker,
+                name=name,
+                source=source,
+                in_portfolio=in_portfolio,
+            )
+            continue
+
+        signal = None
+        try:
+            signal = evaluate_latest_signal(frame, strategy, ticker=ticker)
+        except ValueError:
+            pass
+        growth = None
+        try:
+            growth = evaluate_growth_momentum(
+                ticker=ticker,
+                frame=frame,
+                info=info,
+                relative=relative_results.get(ticker),
+                risk=risk_results.get(ticker),
+                broad_market=reference_data.get(benchmark_for_ticker(ticker)),
+                config=GrowthMomentumConfig(),
+            )
+        except ValueError:
+            pass
+        fundamental_filter = evaluate_fundamental_filter(info, ticker)
+        quote_type = str(info.get("quoteType") or "").upper()
+        conviction = (
+            None
+            if quote_type in {"ETF", "MUTUALFUND"}
+            else evaluate_conviction(
+                info,
+                ticker,
+                entry_score=signal.score if signal is not None else None,
+            )
+        )
+        risk = risk_results.get(ticker)
+        valuation = valuation_results.get(ticker)
+        opportunity = opportunity_results.get(ticker)
+        strategy_evidence = {
+            "technical": StrategyEvidence(
+                signal.score if signal is not None else None,
+                100 if signal is not None else 0,
+            ),
+            "opportunity": StrategyEvidence(
+                opportunity.score if opportunity is not None else None,
+                opportunity.confidence_pct if opportunity is not None else 0,
+            ),
+            "growth": StrategyEvidence(
+                growth.score if growth is not None else None,
+                growth.confidence_pct if growth is not None else 0,
+            ),
+            "fundamental": StrategyEvidence(
+                fundamental_filter.score,
+                fundamental_filter.coverage_pct,
+            ),
+            "conviction": StrategyEvidence(
+                conviction.automatic_score if conviction is not None else None,
+                conviction.automatic_coverage_pct if conviction is not None else 0,
+            ),
+            "valuation": StrategyEvidence(
+                valuation.score if valuation is not None else None,
+                valuation.coverage_pct if valuation is not None else 0,
+            ),
+            "risk": StrategyEvidence(
+                risk.score if risk is not None else None,
+                risk.coverage_pct if risk is not None else 0,
+            ),
+        }
+        assessment = evaluate_benchmark_outperformance(
+            ticker=ticker,
+            stock=frame,
+            benchmark=benchmark_frame,
+            strategies=strategy_evidence,
+        )
+        assessments[ticker] = assessment
+        selected = assessment.for_horizon(selected_horizon)
+        horizon_scores = {
+            horizon.key: (
+                float(horizon.score) if horizon.score is not None else float("nan")
+            )
+            for horizon in assessment.horizons
+        }
+        period_label = (
+            f"{selected.period_sessions} sesiones"
+            if selected.period_sessions is not None
+            else "N/D"
+        )
+        base_rows[ticker] = {
+            "Ticker": ticker,
+            "Empresa": name,
+            "Origen": source,
+            "En cartera": "Sí" if in_portfolio else "No",
+            "Lectura": selected.status,
+            "Puntuación": (
+                float(selected.score) if selected.score is not None else float("nan")
+            ),
+            "Ventaja vs S&P": (
+                selected.excess_return_pct
+                if selected.excess_return_pct is not None
+                else float("nan")
+            ),
+            "Rentabilidad empresa": (
+                selected.stock_return_pct
+                if selected.stock_return_pct is not None
+                else float("nan")
+            ),
+            "Rentabilidad S&P 500": (
+                selected.benchmark_return_pct
+                if selected.benchmark_return_pct is not None
+                else float("nan")
+            ),
+            "Histórico favorable": (
+                selected.historical_beat_rate_pct
+                if selected.historical_beat_rate_pct is not None
+                else float("nan")
+            ),
+            "Ventanas": (
+                selected.historical_windows
+                if selected.historical_windows
+                else float("nan")
+            ),
+            "Estrategias favorables": (
+                " · ".join(selected.favorable_strategies)
+                if selected.favorable_strategies
+                else "Ninguna confirmada"
+            ),
+            "Cobertura": selected.coverage_pct,
+            "Mejor plazo": assessment.best_horizon or "N/D",
+            "Corto": horizon_scores["short"],
+            "Medio": horizon_scores["medium"],
+            "Largo": horizon_scores["long"],
+            "Entrada": (
+                float(signal.score) if signal is not None else float("nan")
+            ),
+            "Oportunidad": (
+                float(opportunity.score)
+                if opportunity is not None
+                else float("nan")
+            ),
+            "Crecimiento": (
+                float(growth.score) if growth is not None else float("nan")
+            ),
+            "Calidad": (
+                float(fundamental_filter.score)
+                if fundamental_filter.score is not None
+                else float("nan")
+            ),
+            "Convicción": (
+                float(conviction.automatic_score)
+                if conviction is not None and conviction.automatic_score is not None
+                else float("nan")
+            ),
+            "Valoración": (
+                float(valuation.score)
+                if valuation is not None and valuation.score is not None
+                else float("nan")
+            ),
+            "Riesgo": (
+                float(risk.score)
+                if risk is not None and risk.score is not None
+                else float("nan")
+            ),
+            "Si ya la tienes": signal.position_label if signal is not None else "Revisar",
+            "Periodo comparado": period_label,
+            "Datos hasta": pd.Timestamp(frame.index[-1]).date(),
+        }
+
+    candidate_statuses = {"Ventaja fuerte a validar", "Candidata a superar"}
+    loaded_count = sum(ticker in assessments for ticker in universe)
+    selected_candidates = sum(
+        assessment.for_horizon(selected_horizon).status in candidate_statuses
+        for assessment in assessments.values()
+    )
+    selected_watch = sum(
+        assessment.for_horizon(selected_horizon).status == "Vigilar"
+        for assessment in assessments.values()
+    )
+    summary_cols = st.columns(4)
+    summary_cols[0].metric("Universo", len(universe), "cartera + favoritas privadas")
+    summary_cols[1].metric("Con datos actuales", loaded_count, f"de {len(universe)}")
+    summary_cols[2].metric("Candidatas", selected_candidates)
+    summary_cols[3].metric("En vigilancia", selected_watch)
+
+    filter_a, filter_b = st.columns(2)
+    universe_filter = filter_a.selectbox(
+        "Qué empresas ver",
+        ["Todo el universo", "Sólo mi cartera", "Sólo favoritas"],
+        key="benchmark_universe_filter",
+    )
+    reading_filter = filter_b.selectbox(
+        "Nivel mínimo",
+        ["Candidatas", "Candidatas y vigilancia", "Todas, incluidas pendientes"],
+        key="benchmark_reading_filter",
+    )
+    visible_rows = list(base_rows.values())
+    if universe_filter == "Sólo mi cartera":
+        visible_rows = [row for row in visible_rows if row["En cartera"] == "Sí"]
+    elif universe_filter == "Sólo favoritas":
+        visible_rows = [row for row in visible_rows if "Favorita" in str(row["Origen"])]
+    if reading_filter == "Candidatas":
+        visible_rows = [row for row in visible_rows if row["Lectura"] in candidate_statuses]
+    elif reading_filter == "Candidatas y vigilancia":
+        visible_rows = [
+            row
+            for row in visible_rows
+            if row["Lectura"] in {*candidate_statuses, "Vigilar"}
+        ]
+
+    status_order = {
+        "Ventaja fuerte a validar": 0,
+        "Candidata a superar": 1,
+        "Vigilar": 2,
+        "Sin ventaja actual": 3,
+        "Historial largo insuficiente": 4,
+        "Datos insuficientes": 5,
+        "Pendiente de actualizar": 6,
+    }
+    visible_rows.sort(
+        key=lambda row: (
+            status_order.get(str(row["Lectura"]), 9),
+            -float(row["Puntuación"])
+            if pd.notna(row["Puntuación"])
+            else 0.0,
+            -float(row["Ventaja vs S&P"])
+            if pd.notna(row["Ventaja vs S&P"])
+            else 0.0,
+        )
+    )
+    if not visible_rows:
+        st.warning(
+            "Ninguna empresa pasa este filtro con la evidencia disponible. Amplía el "
+            "nivel a vigilancia o revisa todo el universo; no se rellenan huecos con "
+            "suposiciones."
+        )
+    else:
+        leaders = [
+            str(row["Ticker"])
+            for row in visible_rows
+            if row["Lectura"] in candidate_statuses
+        ][:6]
+        if leaders:
+            st.success("Mejor alineadas en este plazo: " + ", ".join(leaders) + ".")
+        table = pd.DataFrame(visible_rows)
+        table.insert(0, "Ranking", range(1, len(table) + 1))
+        st.caption(
+            "Marca una empresa para abrir su análisis o varias para compararlas. Los "
+            "puntos de ventaja son rentabilidad de la empresa menos rentabilidad del S&P 500."
+        )
+        render_ticker_dataframe(
+            table,
+            key=f"benchmark_outperformance_{selected_horizon}",
+            height=720,
+            column_config={
+                "Puntuación": st.column_config.ProgressColumn(
+                    "Plazo elegido /100", min_value=0, max_value=100, format="%d"
+                ),
+                "Ventaja vs S&P": st.column_config.NumberColumn(format="%+.1f pp"),
+                "Rentabilidad empresa": st.column_config.NumberColumn(format="%+.1f%%"),
+                "Rentabilidad S&P 500": st.column_config.NumberColumn(format="%+.1f%%"),
+                "Histórico favorable": st.column_config.NumberColumn(format="%.0f%%"),
+                "Cobertura": st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d%%"
+                ),
+                "Corto": st.column_config.ProgressColumn(
+                    "Corto /100", min_value=0, max_value=100, format="%d"
+                ),
+                "Medio": st.column_config.ProgressColumn(
+                    "Medio /100", min_value=0, max_value=100, format="%d"
+                ),
+                "Largo": st.column_config.ProgressColumn(
+                    "Largo /100", min_value=0, max_value=100, format="%d"
+                ),
+                "Entrada": st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d"
+                ),
+                "Oportunidad": st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d"
+                ),
+                "Crecimiento": st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d"
+                ),
+                "Calidad": st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d"
+                ),
+                "Convicción": st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d"
+                ),
+                "Valoración": st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d"
+                ),
+                "Riesgo": st.column_config.ProgressColumn(
+                    min_value=0, max_value=100, format="%d"
+                ),
+                "Datos hasta": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            },
+        )
+        st.download_button(
+            "Descargar comparación completa",
+            table.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"candidatas_vs_sp500_{selected_horizon}.csv",
+            mime="text/csv",
+            width="stretch",
+            key=f"benchmark_download_{selected_horizon}",
+        )
+
+    with st.expander("Cómo se calcula y qué significa"):
+        st.markdown(
+            """
+            - **Corto (1–3 meses):** fuerza frente al S&P 500, oportunidad actual,
+              entrada técnica y riesgo.
+            - **Medio (6–12 meses):** fuerza sostenida, crecimiento y momentum,
+              calidad fundamental y riesgo.
+            - **Largo (3–5 años):** historial relativo largo, checklist de convicción,
+              calidad, valoración y riesgo. Sin tres años de precios se marca como
+              historial insuficiente.
+            - **Histórico favorable:** porcentaje de ventanas no solapadas en las que
+              la empresa superó al índice. El número de ventanas se muestra al lado.
+
+            «Candidata» significa que varias lecturas coinciden y que la rentabilidad
+            relativa observada es positiva. No es una probabilidad calibrada ni una
+            recomendación automática de compra.
+            """
+        )
+        st.warning(
+            "La comparación usa precios ajustados, pero no corrige el efecto histórico "
+            "de divisa de cotizaciones no denominadas en dólares, ni impuestos, spreads "
+            "o comisiones. En acciones de Londres, Europa o Asia la rentabilidad real en "
+            "euros puede diferir."
+        )
+
+
 def _fundamental_technical_reading(
     fundamental_score: int | None,
     entry_score: int | None,
@@ -10576,7 +11089,7 @@ def main() -> None:
         dict.fromkeys(requested_growth_scan_tickers)
     )[:25]
     automatic_review_page = selected_section == "Analizar" and (
-        analysis_section in {"Radar", "Oportunidades"}
+        analysis_section in {"Radar", "Oportunidades", "Superar índice"}
         or (
             analysis_section == "Estrategias"
             and analysis_detail in {"Crecimiento", "Calidad fundamental"}
@@ -10591,10 +11104,17 @@ def main() -> None:
             ]
         except JournalStorageError:
             review_position_tickers = []
+    review_favorite_tickers = favorite_tickers
+    if analysis_section == "Superar índice" and not private_favorites.empty:
+        review_favorite_tickers = [
+            str(ticker).strip().upper()
+            for ticker in private_favorites.get("ticker", [])
+            if str(ticker).strip()
+        ]
     review_universe = list(
         dict.fromkeys(
             resolve_analysis_ticker(str(ticker))
-            for ticker in [*favorite_tickers, *review_position_tickers]
+            for ticker in [*review_favorite_tickers, *review_position_tickers]
             if str(ticker).strip()
         )
     )
@@ -10928,6 +11448,21 @@ def main() -> None:
                 speculative_discoveries=list(
                     st.session_state.get("_speculative_candidates", []) or []
                 ),
+            )
+        elif analysis_section == "Superar índice":
+            render_benchmark_outperformance_page(
+                prepared,
+                strategy,
+                raw_fundamentals,
+                reference_data,
+                valuation_results,
+                relative_results,
+                risk_results,
+                opportunity_results,
+                journal,
+                favorite_tickers,
+                favorite_labels,
+                private_favorites,
             )
         elif analysis_section == "Empresa":
             render_page_intro(

@@ -6,6 +6,7 @@ def test_entry_opportunities_is_independent_from_existing_radar() -> None:
 
     assert "Radar" in ANALYSIS_OPTIONS
     assert "Oportunidades" in ANALYSIS_OPTIONS
+    assert "Superar índice" in ANALYSIS_OPTIONS
     assert "Oportunidades" not in LEGACY_ANALYSIS_ROUTES
     assert "Calidad fundamental" in STRATEGY_OPTIONS
 
