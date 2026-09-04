@@ -4,6 +4,13 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 
+def _configure_test_account(monkeypatch, username: str) -> None:
+    """Configura una cuenta mínima para que AppTest pruebe la app autenticada."""
+
+    monkeypatch.setenv("STOCK_SIGNAL_LAB_USERNAME", username)
+    monkeypatch.setenv("STOCK_SIGNAL_LAB_PASSWORD_HASH", "test-only-hash")
+
+
 @pytest.mark.parametrize("username", ["ddriu", "luci", "fer", "xavi", "alberite"])
 def test_authenticated_user_can_open_home_without_requested_ticker(
     username: str,
@@ -13,6 +20,7 @@ def test_authenticated_user_can_open_home_without_requested_ticker(
     """El primer render tras el login no debe exigir una empresa seleccionada."""
 
     monkeypatch.setenv("STOCK_SIGNAL_LAB_DATA_DIR", str(tmp_path))
+    _configure_test_account(monkeypatch, username)
     app_path = Path(__file__).resolve().parents[1] / "app.py"
     app = AppTest.from_file(str(app_path), default_timeout=30)
     app.session_state["_authenticated_user"] = username
@@ -29,6 +37,7 @@ def test_analysis_company_page_exposes_explicit_new_company_search(
     tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("STOCK_SIGNAL_LAB_DATA_DIR", str(tmp_path))
+    _configure_test_account(monkeypatch, "ddriu")
     app_path = Path(__file__).resolve().parents[1] / "app.py"
     app = AppTest.from_file(str(app_path), default_timeout=30)
     app.session_state["_authenticated_user"] = "ddriu"
@@ -49,6 +58,7 @@ def test_each_favorite_list_has_a_visible_add_company_action(
     tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("STOCK_SIGNAL_LAB_DATA_DIR", str(tmp_path))
+    _configure_test_account(monkeypatch, "ddriu")
     app_path = Path(__file__).resolve().parents[1] / "app.py"
     app = AppTest.from_file(str(app_path), default_timeout=30)
     app.session_state["_authenticated_user"] = "ddriu"
@@ -66,6 +76,7 @@ def test_favorite_add_page_searches_by_name_or_symbol(
     tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("STOCK_SIGNAL_LAB_DATA_DIR", str(tmp_path))
+    _configure_test_account(monkeypatch, "ddriu")
     app_path = Path(__file__).resolve().parents[1] / "app.py"
     app = AppTest.from_file(str(app_path), default_timeout=30)
     app.session_state["_authenticated_user"] = "ddriu"
@@ -79,6 +90,29 @@ def test_favorite_add_page_searches_by_name_or_symbol(
     assert any(widget.label == "Dónde guardarla" for widget in app.radio)
 
 
+def test_private_portfolio_exposes_broker_reconciliation_fields(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("STOCK_SIGNAL_LAB_DATA_DIR", str(tmp_path))
+    _configure_test_account(monkeypatch, "ddriu")
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    app = AppTest.from_file(str(app_path), default_timeout=30)
+    app.session_state["_authenticated_user"] = "ddriu"
+    app.session_state["main_navigation"] = "Carteras"
+    app.session_state["portfolio_navigation"] = "Privada"
+
+    app.run()
+
+    assert not app.exception
+    assert not app.error
+    assert any(widget.label == "Cuenta / plataforma" for widget in app.selectbox)
+    assert any(
+        widget.label == "Importe liquidado en EUR (opcional)"
+        for widget in app.text_input
+    )
+
+
 @pytest.mark.parametrize("analysis_page", ["Radar", "Oportunidades"])
 def test_analysis_overview_pages_open_without_market_data(
     analysis_page: str,
@@ -86,6 +120,7 @@ def test_analysis_overview_pages_open_without_market_data(
     tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("STOCK_SIGNAL_LAB_DATA_DIR", str(tmp_path))
+    _configure_test_account(monkeypatch, "ddriu")
     app_path = Path(__file__).resolve().parents[1] / "app.py"
     app = AppTest.from_file(str(app_path), default_timeout=30)
     app.session_state["_authenticated_user"] = "ddriu"
@@ -95,4 +130,5 @@ def test_analysis_overview_pages_open_without_market_data(
     app.run()
 
     assert not app.exception
+    assert not app.error
     assert app.session_state["analysis_navigation"] == analysis_page

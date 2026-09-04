@@ -213,7 +213,9 @@ def test_daily_overview_combines_all_readings_and_keeps_missing_data_visible() -
     subject, plain, html = build_daily_overview_content("David", rows)
 
     assert "resumen diario" in subject
-    assert "3 empresas revisadas" in subject
+    assert "2/3 empresas procesadas" in subject
+    assert "Empresas solicitadas: 3" in plain
+    assert "Empresas procesadas con precios: 2" in plain
     assert "Halozyme Therapeutics (HALO)" in plain
     assert "Técnica 80" in plain
     assert "Crecimiento 76" in plain

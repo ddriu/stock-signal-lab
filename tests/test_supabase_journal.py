@@ -5,8 +5,9 @@ from typing import Any
 
 import pandas as pd
 import pytest
+import requests
 
-from src.supabase_journal import SupabaseTradingJournal
+from src.supabase_journal import JournalStorageError, SupabaseTradingJournal
 from src.alerts import AlertState, normalize_alert_preferences
 
 
@@ -14,9 +15,11 @@ from src.alerts import AlertState, normalize_alert_preferences
 class FakeResponse:
     payload: Any
     status_code: int = 200
+    text: str = ""
 
     def raise_for_status(self) -> None:
-        return None
+        if self.status_code >= 400:
+            raise requests.HTTPError(response=self)
 
     def json(self) -> Any:
         return self.payload
@@ -67,6 +70,9 @@ def test_supabase_journal_filters_every_request_by_owner(monkeypatch) -> None:
         "2025-01-01",
         currency="usd",
         recorded_by="Luci",
+        account_name="Revolut",
+        settlement_amount_eur=190,
+        fee_eur=0.95,
     )
     operations = journal.list_operations()
     journal.delete_operation(operation_id)
@@ -76,6 +82,9 @@ def test_supabase_journal_filters_every_request_by_owner(monkeypatch) -> None:
     assert calls[0]["params"]["owner"] == "eq.stocklab"
     assert calls[1]["json"]["owner"] == "stocklab"
     assert calls[1]["json"]["recorded_by"] == "luci"
+    assert calls[1]["json"]["account_name"] == "Revolut"
+    assert calls[1]["json"]["settlement_amount_eur"] == 190
+    assert calls[1]["json"]["fee_eur"] == 0.95
     assert calls[2]["params"]["owner"] == "eq.stocklab"
     assert calls[3]["params"] == {"id": "eq.7", "owner": "eq.stocklab"}
     assert "Authorization" not in calls[0]["headers"]
@@ -102,6 +111,87 @@ def test_legacy_service_role_key_uses_bearer_header() -> None:
         "stocklab",
     )
     assert journal.headers["Authorization"] == "Bearer legacy-jwt"
+
+
+def test_supabase_operations_remain_readable_before_reconciliation_migration(
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    responses = [
+        FakeResponse(
+            {},
+            status_code=400,
+            text='column operations.account_name does not exist',
+        ),
+        FakeResponse(
+            [
+                {
+                    "id": 7,
+                    "ticker": "AAPL",
+                    "side": "Compra",
+                    "quantity": 2.0,
+                    "price": 100.0,
+                    "fees": 1.0,
+                    "executed_at": "2025-01-01T00:00:00",
+                    "notes": "",
+                    "currency": "USD",
+                    "recorded_by": "ddriu",
+                    "created_at": "2025-01-01T12:00:00",
+                }
+            ]
+        ),
+    ]
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        return responses.pop(0)
+
+    monkeypatch.setattr("src.supabase_journal.requests.request", fake_request)
+    journal = SupabaseTradingJournal(
+        "https://example.supabase.co", "sb_secret_test", "ddriu"
+    )
+
+    operations = journal.list_operations()
+
+    assert len(calls) == 2
+    assert "account_name" in calls[0]["params"]["select"]
+    assert "account_name" not in calls[1]["params"]["select"]
+    assert operations.iloc[0]["account_name"] is None
+    assert operations.iloc[0]["settlement_amount_eur"] is None
+
+
+def test_supabase_does_not_silently_lose_reconciliation_fields_before_migration(
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        return FakeResponse(
+            {},
+            status_code=400,
+            text="Could not find the 'account_name' column in the schema cache",
+        )
+
+    monkeypatch.setattr("src.supabase_journal.requests.request", fake_request)
+    journal = SupabaseTradingJournal(
+        "https://example.supabase.co", "sb_secret_test", "ddriu"
+    )
+
+    with pytest.raises(JournalStorageError, match="no se ha guardado"):
+        journal.add_operation(
+            "AAPL",
+            "Compra",
+            1,
+            100,
+            0,
+            "2026-09-04",
+            currency="USD",
+            account_name="Revolut",
+            settlement_amount_eur=90,
+        )
+
+    assert len(calls) == 1
 
 
 def test_supabase_favorites_use_separate_table_and_owner(monkeypatch) -> None:
@@ -457,6 +547,11 @@ def test_supabase_email_alerts_are_filtered_and_upserted_by_owner(monkeypatch) -
                 position_label="Mantener",
                 price=150,
                 evaluated_at="2026-07-29T08:00:00Z",
+                company_name="Taiwan Semiconductor",
+                growth_score=75,
+                fundamental_score=85,
+                opportunity_score=72,
+                opportunity_status="Vigilancia",
             )
         ]
     )
@@ -467,6 +562,8 @@ def test_supabase_email_alerts_are_filtered_and_upserted_by_owner(monkeypatch) -
     assert calls[1]["json"]["owner"] == "ddriu"
     assert calls[2]["params"]["owner"] == "eq.ddriu"
     assert calls[3]["json"][0]["owner"] == "ddriu"
+    assert calls[3]["json"][0]["company_name"] == "Taiwan Semiconductor"
+    assert calls[3]["json"][0]["growth_score"] == 75
     assert all(
         call["url"].endswith(
             "/rest/v1/email_alert_preferences"
@@ -475,3 +572,86 @@ def test_supabase_email_alerts_are_filtered_and_upserted_by_owner(monkeypatch) -
         )
         for index, call in enumerate(calls)
     )
+
+
+def test_supabase_alert_states_fall_back_to_legacy_schema(monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+    responses = [
+        FakeResponse(
+            {},
+            status_code=400,
+            text="column email_alert_states.company_name does not exist",
+        ),
+        FakeResponse(
+            [
+                {
+                    "owner": "ddriu",
+                    "ticker": "TSM",
+                    "signature": "neutral",
+                    "entry_score": 50,
+                    "entry_label": "Esperar",
+                    "position_label": "Mantener",
+                    "price": 150,
+                    "evaluated_at": "2026-09-04T08:00:00Z",
+                    "notified_at": None,
+                }
+            ]
+        ),
+    ]
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        return responses.pop(0)
+
+    monkeypatch.setattr("src.supabase_journal.requests.request", fake_request)
+    journal = SupabaseTradingJournal(
+        "https://example.supabase.co", "sb_secret_test", "ddriu"
+    )
+
+    states = journal.list_alert_states()
+
+    assert len(calls) == 2
+    assert "company_name" in calls[0]["params"]["select"]
+    assert "company_name" not in calls[1]["params"]["select"]
+    assert states.iloc[0]["ticker"] == "TSM"
+    assert states.iloc[0]["company_name"] is None
+
+
+def test_supabase_alert_state_upsert_falls_back_to_legacy_schema(monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+    responses = [
+        FakeResponse(
+            {},
+            status_code=400,
+            text="Could not find the 'growth_score' column in the schema cache",
+        ),
+        FakeResponse(None, status_code=204),
+    ]
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        return responses.pop(0)
+
+    monkeypatch.setattr("src.supabase_journal.requests.request", fake_request)
+    journal = SupabaseTradingJournal(
+        "https://example.supabase.co", "sb_secret_test", "ddriu"
+    )
+    state = AlertState(
+        owner="ddriu",
+        ticker="TSM",
+        signature="neutral",
+        entry_score=50,
+        entry_label="Esperar",
+        position_label="Mantener",
+        price=150,
+        evaluated_at="2026-09-04T08:00:00Z",
+        company_name="Taiwan Semiconductor",
+        growth_score=75,
+    )
+
+    journal.upsert_alert_states([state])
+
+    assert len(calls) == 2
+    assert "company_name" in calls[0]["json"][0]
+    assert "company_name" not in calls[1]["json"][0]
+    assert calls[1]["json"][0]["ticker"] == "TSM"

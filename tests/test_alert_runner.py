@@ -124,6 +124,7 @@ def test_one_invalid_ticker_does_not_cancel_the_user_digest(monkeypatch) -> None
 
     assert summary.users_checked == 1
     assert summary.tickers_checked == 2
+    assert summary.tickers_with_prices == 2
     assert summary.emails_sent == 2
     assert summary.alerts_sent == 1
     assert any("ddriu / BAD" in error for error in summary.errors)
@@ -132,6 +133,8 @@ def test_one_invalid_ticker_does_not_cancel_the_user_digest(monkeypatch) -> None
     assert "resumen diario" in sent[1][1]
     assert [state.ticker for state in user.saved_states] == ["GOOD"]
     assert user.saved_states[0].signature.endswith(STATUS_BUYABLE)
+    assert user.saved_states[0].company_name == "Empresa GOOD"
+    assert user.saved_states[0].opportunity_score == 80
 
 
 def test_buy_email_waits_until_the_full_opportunity_is_buyable(monkeypatch) -> None:

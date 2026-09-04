@@ -1,8 +1,65 @@
+import sqlite3
+
 import pandas as pd
 import pytest
 
 from src.alerts import AlertState, normalize_alert_preferences
 from src.journal import TradingJournal, default_database_path
+
+
+def test_existing_sqlite_database_is_migrated_without_losing_operations(tmp_path) -> None:
+    database = tmp_path / "journal.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE operations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT NOT NULL,
+                side TEXT NOT NULL,
+                quantity REAL NOT NULL,
+                price REAL NOT NULL,
+                fees REAL NOT NULL,
+                executed_at TEXT NOT NULL,
+                notes TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                recorded_by TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO operations (
+                ticker, side, quantity, price, fees, executed_at, notes,
+                currency, recorded_by, created_at
+            ) VALUES ('ABC', 'Compra', 1, 10, 0, '2026-01-01', '', 'EUR', '', '2026-01-01')
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE email_alert_states (
+                owner TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                signature TEXT NOT NULL,
+                entry_score INTEGER NOT NULL,
+                entry_label TEXT NOT NULL DEFAULT '',
+                position_label TEXT NOT NULL DEFAULT '',
+                price REAL NOT NULL,
+                evaluated_at TEXT NOT NULL,
+                notified_at TEXT,
+                PRIMARY KEY (owner, ticker)
+            )
+            """
+        )
+
+    journal = TradingJournal(database)
+
+    operations = journal.list_operations()
+    states = journal.list_alert_states()
+    assert operations["ticker"].tolist() == ["ABC"]
+    assert operations.iloc[0]["account_name"] == ""
+    assert pd.isna(operations.iloc[0]["settlement_amount_eur"])
+    assert "opportunity_score" in states.columns
 
 
 def test_journal_reconstructs_average_cost_and_realized_pnl(tmp_path) -> None:
@@ -24,6 +81,49 @@ def test_journal_rejects_sale_larger_than_position(tmp_path) -> None:
     journal.add_operation("ABC", "Compra", 2, 100, 1, "2025-01-01", currency="EUR")
     with pytest.raises(ValueError, match="supera"):
         journal.add_operation("ABC", "Venta", 3, 110, 1, "2025-02-01", currency="EUR")
+
+
+def test_journal_separates_the_same_ticker_by_broker(tmp_path) -> None:
+    journal = TradingJournal(tmp_path / "journal.db")
+    journal.add_operation(
+        "ABC", "Compra", 2, 100, 1, "2026-01-01", currency="USD",
+        account_name="Revolut", settlement_amount_eur=185,
+    )
+    journal.add_operation(
+        "ABC", "Compra", 1, 110, 1, "2026-01-02", currency="USD",
+        account_name="Trade Republic", settlement_amount_eur=102,
+    )
+
+    positions = journal.open_positions()
+
+    assert len(positions) == 2
+    assert set(positions["account_name"]) == {"Revolut", "Trade Republic"}
+    assert positions.set_index("account_name").loc["Revolut", "cost_basis_eur"] == 185
+    with pytest.raises(ValueError, match="supera"):
+        journal.add_operation(
+            "ABC", "Venta", 2.5, 120, 1, "2026-01-03", currency="USD",
+            account_name="Revolut", settlement_amount_eur=275,
+        )
+
+
+def test_journal_preserves_actual_eur_settlement_for_foreign_operations(tmp_path) -> None:
+    journal = TradingJournal(tmp_path / "journal.db")
+    journal.add_operation(
+        "ABC", "Compra", 2, 100, 1, "2026-01-01", currency="USD",
+        account_name="Revolut", settlement_amount_eur=190, fee_eur=0.95,
+    )
+    journal.add_operation(
+        "ABC", "Venta", 1, 120, 1, "2026-02-01", currency="USD",
+        account_name="Revolut", settlement_amount_eur=110, fee_eur=0.92,
+    )
+
+    position = journal.open_positions().iloc[0]
+
+    assert position["quantity"] == 1
+    assert position["cost_basis_eur"] == pytest.approx(95)
+    assert position["realized_pnl_eur"] == pytest.approx(15)
+    assert position["paid_fees_eur"] == pytest.approx(1.87)
+    assert bool(position["eur_values_complete"])
 
 
 def test_journal_records_who_added_an_operation(tmp_path) -> None:
@@ -260,6 +360,11 @@ def test_email_alert_preferences_and_states_are_private(tmp_path) -> None:
                 price=155,
                 evaluated_at="2026-07-29T08:00:00+02:00",
                 notified_at="2026-07-29T08:00:00+02:00",
+                company_name="Taiwan Semiconductor",
+                growth_score=82,
+                fundamental_score=88,
+                opportunity_score=79,
+                opportunity_status="Comprable",
             )
         ]
     )
@@ -269,6 +374,9 @@ def test_email_alert_preferences_and_states_are_private(tmp_path) -> None:
     assert stored.email == "luci@example.com"
     assert stored.minimum_buy_score == 75
     assert states.iloc[0]["signature"] == "entry:Entrada fuerte"
+    assert states.iloc[0]["company_name"] == "Taiwan Semiconductor"
+    assert states.iloc[0]["growth_score"] == 82
+    assert states.iloc[0]["opportunity_score"] == 79
 
     with pytest.raises(ValueError, match="otro usuario"):
         journal.save_alert_preferences(

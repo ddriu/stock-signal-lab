@@ -114,3 +114,43 @@ def test_dashboard_uses_analysis_alias_for_broker_ticker() -> None:
     assert dashboard.iloc[0]["ticker"] == "CEBS"
     assert dashboard.iloc[0]["current_price"] == pytest.approx(10.0)
     assert kpis.priced_positions_count == 1
+
+
+def test_dashboard_keeps_historical_eur_cost_when_fx_changes() -> None:
+    operations = pd.DataFrame(
+        [
+            {
+                "id": 1,
+                "ticker": "ABC",
+                "account_name": "Revolut",
+                "side": "Compra",
+                "quantity": 2.0,
+                "price": 100.0,
+                "fees": 1.0,
+                "settlement_amount_eur": 180.0,
+                "fee_eur": 0.9,
+                "fx_rate_to_eur": 180 / 201,
+                "executed_at": "2026-01-01",
+                "notes": "",
+                "currency": "USD",
+                "created_at": "2026-01-01",
+            }
+        ]
+    )
+    positions = calculate_open_positions(operations)
+
+    dashboard, kpis = build_position_dashboard(
+        operations,
+        positions,
+        {"ABC": 110.0},
+        {"EUR": 1.0, "USD": 1.25},
+        sell_fee_eur=0,
+    )
+
+    row = dashboard.iloc[0]
+    assert row["account_name"] == "Revolut"
+    assert row["cost_basis_eur"] == pytest.approx(180.0)
+    assert row["cost_basis_source"] == "Liquidación del bróker"
+    assert row["net_value_eur"] == pytest.approx(176.0)
+    assert row["net_pnl_eur"] == pytest.approx(-4.0)
+    assert kpis.unrealized_pnl_eur == pytest.approx(-4.0)

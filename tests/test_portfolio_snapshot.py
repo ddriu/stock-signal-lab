@@ -416,3 +416,50 @@ def test_recent_complete_snapshot_wins_over_older_diary_purchase() -> None:
     reconciled = reconcile_current_portfolio(snapshot, operations, dashboard)
 
     assert reconciled["analysis_ticker"].tolist() == ["ORCL"]
+
+
+def test_same_day_operation_after_snapshot_is_reconciled() -> None:
+    snapshot = pd.DataFrame(
+        [
+            {
+                "snapshot_date": "2026-08-13",
+                "updated_at": "2026-08-13T10:00:00+00:00",
+                "platform": "Revolut",
+                "asset_name": "Oracle",
+                "analysis_ticker": "ORCL",
+                "asset_type": "Acción",
+                "value_eur": 270.0,
+            }
+        ]
+    )
+    operations = pd.DataFrame(
+        [
+            {
+                "ticker": "MRNA",
+                "side": "Compra",
+                "executed_at": "2026-08-13T11:00:00+00:00",
+                "created_at": "2026-08-13T11:01:00+00:00",
+            }
+        ]
+    )
+    dashboard = pd.DataFrame(
+        [
+            {
+                "ticker": "MRNA",
+                "account_name": "Revolut",
+                "currency": "USD",
+                "quantity": 1.0,
+                "current_price": 52.0,
+                "cost_basis_eur": 50.0,
+                "net_value_eur": 51.0,
+                "net_pnl_eur": 1.0,
+                "net_return_pct": 2.0,
+            }
+        ]
+    )
+
+    reconciled = reconcile_current_portfolio(snapshot, operations, dashboard)
+
+    assert set(reconciled["analysis_ticker"]) == {"ORCL", "MRNA"}
+    moderna = reconciled.loc[reconciled["analysis_ticker"] == "MRNA"].iloc[0]
+    assert moderna["platform"] == "Revolut"
