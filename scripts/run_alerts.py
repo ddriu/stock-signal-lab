@@ -12,7 +12,7 @@ def main() -> int:
     print(
         "Alertas terminadas: "
         f"{result.users_checked} usuarios, "
-        f"{result.tickers_checked} empresas, "
+        f"{result.tickers_with_prices}/{result.tickers_checked} empresas con precios, "
         f"{result.emails_sent} correos y "
         f"{result.alerts_sent} avisos."
     )
@@ -25,4 +25,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
