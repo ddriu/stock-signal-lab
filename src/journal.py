@@ -23,10 +23,14 @@ from src.favorite_tags import serialize_favorite_tags
 OPERATION_COLUMNS = [
     "id",
     "ticker",
+    "account_name",
     "side",
     "quantity",
     "price",
     "fees",
+    "settlement_amount_eur",
+    "fee_eur",
+    "fx_rate_to_eur",
     "executed_at",
     "notes",
     "currency",
@@ -155,9 +159,16 @@ def normalize_operation(
     executed_at: date | datetime | str,
     notes: str = "",
     currency: str = "EUR",
+    account_name: str = "",
+    settlement_amount_eur: float | None = None,
+    fee_eur: float | None = None,
+    fx_rate_to_eur: float | None = None,
 ) -> dict[str, object]:
     """Valida una operación y devuelve valores normalizados para cualquier backend."""
 
+    normalized_ticker = ticker.strip().upper()
+    if not normalized_ticker:
+        raise ValueError("La operación necesita un ticker.")
     if side not in {"Compra", "Venta"}:
         raise ValueError("El tipo debe ser Compra o Venta.")
     if quantity <= 0 or price <= 0 or fees < 0:
@@ -165,12 +176,55 @@ def normalize_operation(
     normalized_currency = currency.strip().upper()
     if len(normalized_currency) != 3:
         raise ValueError("La moneda debe tener tres letras, por ejemplo EUR o USD.")
+    normalized_account = account_name.strip()[:120]
+    normalized_settlement = (
+        float(settlement_amount_eur)
+        if settlement_amount_eur is not None and pd.notna(settlement_amount_eur)
+        else None
+    )
+    normalized_fee_eur = (
+        float(fee_eur) if fee_eur is not None and pd.notna(fee_eur) else None
+    )
+    normalized_fx = (
+        float(fx_rate_to_eur)
+        if fx_rate_to_eur is not None and pd.notna(fx_rate_to_eur)
+        else None
+    )
+    if normalized_settlement is not None and normalized_settlement <= 0:
+        raise ValueError("El importe liquidado en euros debe ser positivo.")
+    if normalized_fee_eur is not None and normalized_fee_eur < 0:
+        raise ValueError("La comisión en euros no puede ser negativa.")
+    if normalized_fx is not None and normalized_fx <= 0:
+        raise ValueError("El tipo de cambio a euros debe ser positivo.")
+
+    local_settlement = (
+        float(quantity) * float(price) + float(fees)
+        if side == "Compra"
+        else float(quantity) * float(price) - float(fees)
+    )
+    if local_settlement <= 0:
+        raise ValueError("La liquidación de la operación debe ser positiva.")
+    if normalized_currency == "EUR":
+        normalized_settlement = normalized_settlement or local_settlement
+        normalized_fee_eur = (
+            float(fees) if normalized_fee_eur is None else normalized_fee_eur
+        )
+        normalized_fx = 1.0
+    elif normalized_settlement is None and normalized_fx is not None:
+        normalized_settlement = local_settlement * normalized_fx
+    elif normalized_settlement is not None and normalized_fx is None:
+        normalized_fx = normalized_settlement / local_settlement
+
     return {
-        "ticker": ticker.strip().upper(),
+        "ticker": normalized_ticker,
+        "account_name": normalized_account,
         "side": side,
         "quantity": float(quantity),
         "price": float(price),
         "fees": float(fees),
+        "settlement_amount_eur": normalized_settlement,
+        "fee_eur": normalized_fee_eur,
+        "fx_rate_to_eur": normalized_fx,
         "executed_at": pd.Timestamp(executed_at).isoformat(),
         "notes": notes.strip(),
         "currency": normalized_currency,
@@ -450,39 +504,73 @@ def calculate_position_states(
 
     columns = [
         "ticker",
+        "account_name",
         "currency",
         "quantity",
         "average_cost",
         "cost_basis",
         "realized_pnl",
         "paid_fees",
+        "cost_basis_eur",
+        "realized_pnl_eur",
+        "paid_fees_eur",
+        "eur_values_complete",
     ]
     if operations.empty:
         return pd.DataFrame(columns=columns)
 
     operations = operations.sort_values(["executed_at", "id"])
-    states: dict[tuple[str, str], dict[str, float | str]] = {}
+    states: dict[tuple[str, str, str], dict[str, float | str | bool | None]] = {}
     for operation in operations.itertuples(index=False):
         currency = str(getattr(operation, "currency", "EUR") or "EUR").upper()
-        key = (str(operation.ticker), currency)
+        account_name = str(getattr(operation, "account_name", "") or "").strip()
+        key = (str(operation.ticker), currency, account_name)
         state = states.setdefault(
             key,
             {
                 "ticker": key[0],
                 "currency": key[1],
+                "account_name": key[2],
                 "quantity": 0.0,
                 "cost_basis": 0.0,
                 "realized_pnl": 0.0,
                 "paid_fees": 0.0,
+                "cost_basis_eur": 0.0,
+                "realized_pnl_eur": 0.0,
+                "paid_fees_eur": 0.0,
             },
         )
         quantity = float(operation.quantity)
         price = float(operation.price)
         fee = float(operation.fees)
+        settlement_eur = pd.to_numeric(
+            getattr(operation, "settlement_amount_eur", None), errors="coerce"
+        )
+        fee_eur = pd.to_numeric(
+            getattr(operation, "fee_eur", None), errors="coerce"
+        )
+        if pd.isna(settlement_eur) and currency == "EUR":
+            settlement_eur = (
+                quantity * price + fee
+                if operation.side == "Compra"
+                else quantity * price - fee
+            )
+        if pd.isna(fee_eur) and currency == "EUR":
+            fee_eur = fee
         state["paid_fees"] = float(state["paid_fees"]) + fee
+        if pd.isna(fee_eur):
+            state["paid_fees_eur"] = None
+        elif state["paid_fees_eur"] is not None:
+            state["paid_fees_eur"] = float(state["paid_fees_eur"]) + float(fee_eur)
         if operation.side == "Compra":
             state["quantity"] = float(state["quantity"]) + quantity
             state["cost_basis"] = float(state["cost_basis"]) + quantity * price + fee
+            if pd.isna(settlement_eur):
+                state["cost_basis_eur"] = None
+            elif state["cost_basis_eur"] is not None:
+                state["cost_basis_eur"] = float(state["cost_basis_eur"]) + float(
+                    settlement_eur
+                )
             continue
 
         available = float(state["quantity"])
@@ -493,11 +581,28 @@ def calculate_position_states(
         allocated_fee = fee * (sold / quantity)
         proceeds = sold * price - allocated_fee
         removed_cost = average_cost * sold
+        removed_cost_eur: float | None = None
+        if state["cost_basis_eur"] is not None:
+            removed_cost_eur = float(state["cost_basis_eur"]) / available * sold
         state["realized_pnl"] = float(state["realized_pnl"]) + proceeds - removed_cost
+        if (
+            removed_cost_eur is None
+            or pd.isna(settlement_eur)
+            or state["realized_pnl_eur"] is None
+        ):
+            state["realized_pnl_eur"] = None
+        else:
+            state["realized_pnl_eur"] = float(state["realized_pnl_eur"]) + float(
+                settlement_eur
+            ) - removed_cost_eur
         state["quantity"] = available - sold
         state["cost_basis"] = max(0.0, float(state["cost_basis"]) - removed_cost)
+        if removed_cost_eur is not None:
+            state["cost_basis_eur"] = max(
+                0.0, float(state["cost_basis_eur"]) - removed_cost_eur
+            )
 
-    rows: list[dict[str, float | str]] = []
+    rows: list[dict[str, object]] = []
     for state in states.values():
         quantity = float(state["quantity"])
         if not include_closed and quantity <= 1e-9:
@@ -507,12 +612,20 @@ def calculate_position_states(
             {
                 **state,
                 "average_cost": cost_basis / quantity if quantity > 1e-9 else 0.0,
+                "eur_values_complete": all(
+                    state.get(field) is not None
+                    for field in (
+                        "cost_basis_eur",
+                        "realized_pnl_eur",
+                        "paid_fees_eur",
+                    )
+                ),
             }
         )
     if not rows:
         return pd.DataFrame(columns=columns)
     return pd.DataFrame(rows, columns=columns).sort_values(
-        ["ticker", "currency"], ignore_index=True
+        ["ticker", "account_name", "currency"], ignore_index=True
     )
 
 
@@ -548,10 +661,14 @@ class TradingJournal:
                 CREATE TABLE IF NOT EXISTS operations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ticker TEXT NOT NULL,
+                    account_name TEXT NOT NULL DEFAULT '',
                     side TEXT NOT NULL CHECK (side IN ('Compra', 'Venta')),
                     quantity REAL NOT NULL CHECK (quantity > 0),
                     price REAL NOT NULL CHECK (price > 0),
                     fees REAL NOT NULL DEFAULT 0 CHECK (fees >= 0),
+                    settlement_amount_eur REAL,
+                    fee_eur REAL,
+                    fx_rate_to_eur REAL,
                     executed_at TEXT NOT NULL,
                     notes TEXT NOT NULL DEFAULT '',
                     currency TEXT NOT NULL DEFAULT 'EUR',
@@ -572,6 +689,16 @@ class TradingJournal:
                 connection.execute(
                     "ALTER TABLE operations ADD COLUMN recorded_by TEXT NOT NULL DEFAULT ''"
                 )
+            for column, definition in (
+                ("account_name", "TEXT NOT NULL DEFAULT ''"),
+                ("settlement_amount_eur", "REAL"),
+                ("fee_eur", "REAL"),
+                ("fx_rate_to_eur", "REAL"),
+            ):
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE operations ADD COLUMN {column} {definition}"
+                    )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS favorites (
@@ -657,10 +784,34 @@ class TradingJournal:
                     price REAL NOT NULL,
                     evaluated_at TEXT NOT NULL,
                     notified_at TEXT,
+                    company_name TEXT NOT NULL DEFAULT '',
+                    growth_score INTEGER,
+                    fundamental_score INTEGER,
+                    opportunity_score INTEGER,
+                    opportunity_status TEXT NOT NULL DEFAULT '',
+                    data_note TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (owner, ticker)
                 )
                 """
             )
+            alert_state_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(email_alert_states)"
+                ).fetchall()
+            }
+            for column, definition in (
+                ("company_name", "TEXT NOT NULL DEFAULT ''"),
+                ("growth_score", "INTEGER"),
+                ("fundamental_score", "INTEGER"),
+                ("opportunity_score", "INTEGER"),
+                ("opportunity_status", "TEXT NOT NULL DEFAULT ''"),
+                ("data_note", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if column not in alert_state_columns:
+                    connection.execute(
+                        f"ALTER TABLE email_alert_states ADD COLUMN {column} {definition}"
+                    )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS private_investments (
@@ -746,6 +897,10 @@ class TradingJournal:
         notes: str = "",
         currency: str = "EUR",
         recorded_by: str = "",
+        account_name: str = "",
+        settlement_amount_eur: float | None = None,
+        fee_eur: float | None = None,
+        fx_rate_to_eur: float | None = None,
     ) -> int:
         operation = normalize_operation(
             ticker,
@@ -756,12 +911,17 @@ class TradingJournal:
             executed_at,
             notes,
             currency,
+            account_name,
+            settlement_amount_eur,
+            fee_eur,
+            fx_rate_to_eur,
         )
         if side == "Venta":
             positions = self.open_positions()
             available = positions.loc[
                 (positions["ticker"] == operation["ticker"])
-                & (positions["currency"] == operation["currency"]),
+                & (positions["currency"] == operation["currency"])
+                & (positions["account_name"] == operation["account_name"]),
                 "quantity",
             ]
             if available.empty or float(available.iloc[0]) + 1e-9 < quantity:
@@ -771,17 +931,22 @@ class TradingJournal:
                 """
                 INSERT INTO operations
                     (
-                        ticker, side, quantity, price, fees, executed_at, notes,
-                        currency, recorded_by, created_at
+                        ticker, account_name, side, quantity, price, fees,
+                        settlement_amount_eur, fee_eur, fx_rate_to_eur,
+                        executed_at, notes, currency, recorded_by, created_at
                     )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     operation["ticker"],
+                    operation["account_name"],
                     operation["side"],
                     operation["quantity"],
                     operation["price"],
                     operation["fees"],
+                    operation["settlement_amount_eur"],
+                    operation["fee_eur"],
+                    operation["fx_rate_to_eur"],
                     operation["executed_at"],
                     operation["notes"],
                     operation["currency"],
@@ -1204,7 +1369,9 @@ class TradingJournal:
             return pd.read_sql_query(
                 """
                 SELECT owner, ticker, signature, entry_score, entry_label,
-                       position_label, price, evaluated_at, notified_at
+                       position_label, price, evaluated_at, notified_at,
+                       company_name, growth_score, fundamental_score,
+                       opportunity_score, opportunity_status, data_note
                 FROM email_alert_states
                 ORDER BY ticker
                 """,
@@ -1219,9 +1386,11 @@ class TradingJournal:
                 """
                 INSERT INTO email_alert_states (
                     owner, ticker, signature, entry_score, entry_label,
-                    position_label, price, evaluated_at, notified_at
+                    position_label, price, evaluated_at, notified_at,
+                    company_name, growth_score, fundamental_score,
+                    opportunity_score, opportunity_status, data_note
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(owner, ticker) DO UPDATE SET
                     signature = excluded.signature,
                     entry_score = excluded.entry_score,
@@ -1229,6 +1398,12 @@ class TradingJournal:
                     position_label = excluded.position_label,
                     price = excluded.price,
                     evaluated_at = excluded.evaluated_at,
+                    company_name = excluded.company_name,
+                    growth_score = excluded.growth_score,
+                    fundamental_score = excluded.fundamental_score,
+                    opportunity_score = excluded.opportunity_score,
+                    opportunity_status = excluded.opportunity_status,
+                    data_note = excluded.data_note,
                     notified_at = COALESCE(
                         excluded.notified_at,
                         email_alert_states.notified_at

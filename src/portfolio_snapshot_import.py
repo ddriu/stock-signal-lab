@@ -9,6 +9,8 @@ from typing import BinaryIO
 
 import pandas as pd
 
+from src.instruments import ANALYSIS_TICKER_ALIASES, resolve_analysis_ticker
+
 
 PORTFOLIO_SHEET = "Cartera"
 REQUIRED_COLUMNS = (
@@ -31,16 +33,7 @@ REQUIRED_COLUMNS = (
 PORTFOLIO_IMPORT_NOTE_PREFIX = "Importado desde fotografía de cartera."
 CIVISLEND_IMPORT_NOTE_PREFIX = "Importado desde fotografía de cartera de Civislend."
 
-ANALYSIS_TICKER_OVERRIDES = {
-    "6VO": "RDDT",
-    "AMZ": "AMZN",
-    "CEBS": "CEBS.DE",
-    "NETFLIX": "NFLX",
-    "7974 / NTDOY": "NTDOY",
-    "KAP": "KAP.IL",
-    "1801": "1801.HK",
-    "05Y": "05Y.F",
-}
+ANALYSIS_TICKER_OVERRIDES = ANALYSIS_TICKER_ALIASES
 
 
 @dataclass(frozen=True)
@@ -78,7 +71,7 @@ def _analysis_ticker(raw_identifier: object) -> str:
     raw = str(raw_identifier or "").strip().upper()
     if not raw or (len(raw) == 12 and raw[:2].isalpha()):
         return ""
-    return ANALYSIS_TICKER_OVERRIDES.get(raw, raw)
+    return resolve_analysis_ticker(raw)
 
 
 def _canonical_platform(platform: object, asset_type: object) -> str:

@@ -206,6 +206,12 @@ div[data-testid="stExpander"] summary {
     color: var(--ssl-ink);
 }
 
+/* Los campos blancos dentro de un desplegable blanco necesitan un límite
+   visible, especialmente en móvil. */
+div[data-testid="stExpander"] [data-testid="stTextInputRootElement"] {
+    border: 1px solid var(--ssl-border) !important;
+}
+
 div[data-testid="stVerticalBlockBorderWrapper"] {
     background: rgba(255, 255, 255, 0.90);
     backdrop-filter: blur(8px);

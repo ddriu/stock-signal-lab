@@ -235,14 +235,31 @@ def reconcile_current_portfolio(
     relevant_operations = operations
     if not frame.empty and "executed_at" in operations.columns:
         snapshot_dates = pd.to_datetime(
-            frame.get("snapshot_date", pd.Series(dtype=object)), errors="coerce"
+            frame.get("snapshot_date", pd.Series(dtype=object)), errors="coerce", utc=True
         )
-        operation_dates = pd.to_datetime(operations["executed_at"], errors="coerce")
+        operation_dates = pd.to_datetime(
+            operations["executed_at"], errors="coerce", utc=True
+        )
         if snapshot_dates.notna().any() and operation_dates.notna().any():
             latest_snapshot_date = snapshot_dates.max().normalize()
-            relevant_operations = operations.loc[
-                operation_dates.dt.normalize() > latest_snapshot_date
-            ]
+            relevant_mask = operation_dates.dt.normalize() > latest_snapshot_date
+            # Si la operación se registró después de subir la fotografía del mismo
+            # día, se considera posterior. Esto evita que una compra/venta nueva
+            # desaparezca hasta el día siguiente sin inventar el orden histórico.
+            if "updated_at" in frame.columns and "created_at" in operations.columns:
+                latest_rows = snapshot_dates.dt.normalize() == latest_snapshot_date
+                snapshot_updates = pd.to_datetime(
+                    frame.loc[latest_rows, "updated_at"], errors="coerce", utc=True
+                )
+                operation_created = pd.to_datetime(
+                    operations["created_at"], errors="coerce", utc=True
+                )
+                if snapshot_updates.notna().any() and operation_created.notna().any():
+                    same_day = operation_dates.dt.normalize() == latest_snapshot_date
+                    relevant_mask |= same_day & (
+                        operation_created > snapshot_updates.max()
+                    )
+            relevant_operations = operations.loc[relevant_mask]
 
     operated_tickers = {
         resolve_analysis_ticker(str(value).strip().upper())
@@ -291,10 +308,21 @@ def reconcile_current_portfolio(
                 )
                 == ticker
             ]
+            account_name = str(position.get("account_name") or "").strip()
+            if account_name and not matching.empty and "platform" in matching:
+                account_match = matching.loc[
+                    matching["platform"].fillna("").astype(str).str.strip()
+                    == account_name
+                ]
+                if not account_match.empty:
+                    matching = account_match
             row = matching.iloc[0].to_dict() if not matching.empty else {}
             if len(matching) > 1:
                 row["platform"] = "Varias cuentas"
-            row.setdefault("platform", "Diario de operaciones")
+            if account_name:
+                row["platform"] = account_name
+            else:
+                row.setdefault("platform", "Diario de operaciones")
             row.setdefault("asset_name", raw_ticker or ticker)
             row.setdefault("asset_type", "Acción / ETF")
             row.setdefault("portfolio_block", "Cartera actual")

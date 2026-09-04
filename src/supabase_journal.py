@@ -38,6 +38,38 @@ from src.journal import (
 class JournalStorageError(RuntimeError):
     """Error recuperable al leer o escribir el diario remoto."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        response_body: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_body = response_body
+
+
+LEGACY_OPERATION_COLUMNS = [
+    column
+    for column in OPERATION_COLUMNS
+    if column
+    not in {
+        "account_name",
+        "settlement_amount_eur",
+        "fee_eur",
+        "fx_rate_to_eur",
+    }
+]
+LEGACY_ALERT_STATE_COLUMNS = ALERT_STATE_COLUMNS[:9]
+RECONCILIATION_COLUMNS = {
+    "account_name",
+    "settlement_amount_eur",
+    "fee_eur",
+    "fx_rate_to_eur",
+}
+EXTENDED_ALERT_STATE_COLUMNS = set(ALERT_STATE_COLUMNS[9:])
+
 
 class SupabaseTradingJournal:
     """Implementa el mismo contrato del diario SQLite sobre PostgREST."""
@@ -151,12 +183,34 @@ class SupabaseTradingJournal:
             response.raise_for_status()
             return response
         except requests.RequestException as exc:
-            status = getattr(getattr(exc, "response", None), "status_code", None)
+            error_response = getattr(exc, "response", None)
+            status = getattr(error_response, "status_code", None)
+            response_body = str(getattr(error_response, "text", "") or "")[:2_000]
             suffix = f" (HTTP {status})" if status else ""
             raise JournalStorageError(
                 f"Supabase no pudo completar la operación{suffix}. "
-                "Revisa la tabla y los secretos del despliegue."
+                "Revisa la tabla y los secretos del despliegue.",
+                status_code=status,
+                response_body=response_body,
             ) from exc
+
+    @staticmethod
+    def _is_missing_columns_error(
+        error: JournalStorageError,
+        columns: set[str],
+    ) -> bool:
+        if error.status_code not in {400, 404}:
+            return False
+        body = error.response_body.lower()
+        return any(column.lower() in body for column in columns) and any(
+            marker in body
+            for marker in (
+                "does not exist",
+                "could not find",
+                "schema cache",
+                "pgrst",
+            )
+        )
 
     def healthcheck(self) -> None:
         self._request(
@@ -179,6 +233,10 @@ class SupabaseTradingJournal:
         notes: str = "",
         currency: str = "EUR",
         recorded_by: str = "",
+        account_name: str = "",
+        settlement_amount_eur: float | None = None,
+        fee_eur: float | None = None,
+        fx_rate_to_eur: float | None = None,
     ) -> int:
         operation = normalize_operation(
             ticker,
@@ -189,12 +247,17 @@ class SupabaseTradingJournal:
             executed_at,
             notes,
             currency,
+            account_name,
+            settlement_amount_eur,
+            fee_eur,
+            fx_rate_to_eur,
         )
         if side == "Venta":
             positions = self.open_positions()
             available = positions.loc[
                 (positions["ticker"] == operation["ticker"])
-                & (positions["currency"] == operation["currency"]),
+                & (positions["currency"] == operation["currency"])
+                & (positions["account_name"] == operation["account_name"]),
                 "quantity",
             ]
             if available.empty or float(available.iloc[0]) + 1e-9 < quantity:
@@ -204,28 +267,46 @@ class SupabaseTradingJournal:
             **operation,
             "recorded_by": recorded_by.strip().lower(),
         }
-        response = self._request(
-            "POST",
-            json=payload,
-            headers={
-                **self.headers,
-                "Prefer": "return=representation",
-            },
-        )
+        try:
+            response = self._request(
+                "POST",
+                json=payload,
+                headers={
+                    **self.headers,
+                    "Prefer": "return=representation",
+                },
+            )
+        except JournalStorageError as exc:
+            if not self._is_missing_columns_error(exc, RECONCILIATION_COLUMNS):
+                raise
+            raise JournalStorageError(
+                "La base de datos todavía no admite cuenta de bróker ni "
+                "liquidación exacta en euros. Ejecuta primero "
+                "supabase/migration_operation_reconciliation.sql; no se ha "
+                "guardado la operación.",
+                status_code=exc.status_code,
+                response_body=exc.response_body,
+            ) from exc
         rows = response.json()
         if not isinstance(rows, list) or not rows or "id" not in rows[0]:
             raise JournalStorageError("Supabase guardó una respuesta inesperada.")
         return int(rows[0]["id"])
 
     def list_operations(self) -> pd.DataFrame:
-        response = self._request(
-            "GET",
-            params={
-                "owner": f"eq.{self.owner}",
-                "select": ",".join(OPERATION_COLUMNS),
-                "order": "executed_at.desc,id.desc",
-            },
-        )
+        params = {
+            "owner": f"eq.{self.owner}",
+            "select": ",".join(OPERATION_COLUMNS),
+            "order": "executed_at.desc,id.desc",
+        }
+        try:
+            response = self._request("GET", params=params)
+        except JournalStorageError as exc:
+            if not self._is_missing_columns_error(exc, RECONCILIATION_COLUMNS):
+                raise
+            response = self._request(
+                "GET",
+                params={**params, "select": ",".join(LEGACY_OPERATION_COLUMNS)},
+            )
         rows = response.json()
         if not isinstance(rows, list):
             raise JournalStorageError("Supabase devolvió un histórico inválido.")
@@ -680,15 +761,30 @@ class SupabaseTradingJournal:
         ]
 
     def list_alert_states(self) -> pd.DataFrame:
-        response = self._request(
-            "GET",
-            endpoint=self.alert_states_endpoint,
-            params={
-                "owner": f"eq.{self.owner}",
-                "select": ",".join(ALERT_STATE_COLUMNS),
-                "order": "ticker.asc",
-            },
-        )
+        params = {
+            "owner": f"eq.{self.owner}",
+            "select": ",".join(ALERT_STATE_COLUMNS),
+            "order": "ticker.asc",
+        }
+        try:
+            response = self._request(
+                "GET",
+                endpoint=self.alert_states_endpoint,
+                params=params,
+            )
+        except JournalStorageError as exc:
+            if not self._is_missing_columns_error(
+                exc, EXTENDED_ALERT_STATE_COLUMNS
+            ):
+                raise
+            response = self._request(
+                "GET",
+                endpoint=self.alert_states_endpoint,
+                params={
+                    **params,
+                    "select": ",".join(LEGACY_ALERT_STATE_COLUMNS),
+                },
+            )
         rows = response.json()
         if not isinstance(rows, list):
             raise JournalStorageError("Supabase devolvió estados de alertas inválidos.")
@@ -706,16 +802,36 @@ class SupabaseTradingJournal:
         for state in states:
             if state.owner != self.owner.strip().lower():
                 raise ValueError("No se pueden modificar estados de otro usuario.")
-        self._request(
-            "POST",
-            endpoint=self.alert_states_endpoint,
-            params={"on_conflict": "owner,ticker"},
-            json=[state.__dict__ for state in states],
-            headers={
+        request_kwargs = {
+            "endpoint": self.alert_states_endpoint,
+            "params": {"on_conflict": "owner,ticker"},
+            "headers": {
                 **self.headers,
                 "Prefer": "resolution=merge-duplicates,return=minimal",
             },
-        )
+        }
+        try:
+            self._request(
+                "POST",
+                json=[state.__dict__ for state in states],
+                **request_kwargs,
+            )
+        except JournalStorageError as exc:
+            if not self._is_missing_columns_error(
+                exc, EXTENDED_ALERT_STATE_COLUMNS
+            ):
+                raise
+            self._request(
+                "POST",
+                json=[
+                    {
+                        column: getattr(state, column)
+                        for column in LEGACY_ALERT_STATE_COLUMNS
+                    }
+                    for state in states
+                ],
+                **request_kwargs,
+            )
 
     def open_positions(self) -> pd.DataFrame:
         return calculate_open_positions(self.list_operations())
