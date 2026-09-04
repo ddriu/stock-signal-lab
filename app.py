@@ -1,12 +1,12 @@
 """Interfaz Streamlit de Stock Signal Lab.
 
 Ejecutar con: ``streamlit run app.py``
-Versión de despliegue auditada: 2026-08-04.
+Versión de estabilización auditada: 2026-09-04.
 """
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import html
 
 import pandas as pd
@@ -2873,10 +2873,29 @@ def render_operation_form(
         else "Registrar operación"
     )
     st.subheader(heading)
+    account_options = ["Trade Republic", "Revolut", "MyInvestor"]
+    try:
+        if hasattr(journal, "list_portfolio_accounts"):
+            saved_accounts = journal.list_portfolio_accounts()
+            if not saved_accounts.empty:
+                account_options.extend(
+                    str(value).strip()
+                    for value in saved_accounts.get("account_name", [])
+                    if str(value).strip()
+                )
+    except JournalStorageError:
+        pass
+    account_options = list(dict.fromkeys(account_options))
+    account_options.append("Sin especificar")
     # Conserva lo escrito cuando falla una validación (por ejemplo, una venta
     # superior a la cantidad disponible). Así el usuario puede corregir un solo
     # campo sin tener que volver a introducir toda la operación.
     with st.form(form_key, clear_on_submit=False):
+        account_name = st.selectbox(
+            "Cuenta / plataforma",
+            account_options,
+            help="Permite reconciliar una misma empresa mantenida en varios brókeres.",
+        )
         ticker = st.text_input("Ticker")
         side = st.selectbox("Tipo", ["Compra", "Venta"])
         quantity = st.number_input(
@@ -2902,7 +2921,26 @@ def render_operation_form(
             format="%.2f",
             help="Por defecto se utiliza 1 unidad monetaria por operación.",
         )
-        executed_at = st.date_input("Fecha", value=date.today())
+        date_col, time_col = st.columns(2)
+        executed_on = date_col.date_input("Fecha", value=date.today())
+        executed_time = time_col.time_input(
+            "Hora aproximada",
+            value=datetime.now().time().replace(second=0, microsecond=0),
+            help="Distingue operaciones y fotografías realizadas el mismo día.",
+        )
+        with st.expander("Cuadre exacto con el bróker", expanded=False):
+            settlement_col, fee_col = st.columns(2)
+            settlement_text = settlement_col.text_input(
+                "Importe liquidado en EUR (opcional)",
+                help=(
+                    "En una compra, introduce el total cargado. En una venta, el neto "
+                    "recibido. Así el resultado conserva el cambio y spread reales."
+                ),
+            )
+            fee_eur_text = fee_col.text_input(
+                "Comisión real en EUR (opcional)",
+                help="Déjalo vacío si la operación está en EUR o no aparece separada.",
+            )
         notes = st.text_area(notes_label)
         submitted = st.form_submit_button("Guardar", type="primary")
     if not submitted:
@@ -2910,25 +2948,43 @@ def render_operation_form(
     if not ticker.strip():
         st.session_state[f"{flash_key}_error"] = "El ticker es obligatorio."
         st.rerun()
+    def optional_decimal(value: str, label: str) -> float | None:
+        cleaned = value.strip().replace(" ", "").replace(",", ".")
+        if not cleaned:
+            return None
+        try:
+            return float(cleaned)
+        except ValueError as exc:
+            raise ValueError(f"{label} debe ser un número válido.") from exc
+
     try:
+        settlement_amount_eur = optional_decimal(
+            settlement_text, "El importe liquidado"
+        )
+        fee_eur = optional_decimal(fee_eur_text, "La comisión en euros")
         journal.add_operation(
             ticker,
             side,
             quantity,
             price,
             fees,
-            executed_at,
+            datetime.combine(executed_on, executed_time),
             notes,
             currency=currency,
             recorded_by=recorded_by,
+            account_name=("" if account_name == "Sin especificar" else account_name),
+            settlement_amount_eur=settlement_amount_eur,
+            fee_eur=fee_eur,
         )
     except (ValueError, JournalStorageError) as exc:
         st.session_state[f"{flash_key}_error"] = str(exc)
         st.rerun()
+    destination = owner_label or (
+        account_name if account_name != "Sin especificar" else "el diario"
+    )
     st.session_state[flash_key] = (
-        f"Operación guardada para {owner_label}."
-        if owner_label
-        else f"Operación guardada en {getattr(journal, 'backend_name', 'el diario')}."
+        f"{side} guardada: {quantity:g} {ticker.strip().upper()} a {price:g} "
+        f"{currency} en {destination}."
     )
     st.rerun()
 
@@ -2940,10 +2996,14 @@ def operation_history_for_display(operations: pd.DataFrame) -> pd.DataFrame:
         columns={
             "id": "ID",
             "ticker": "Empresa",
+            "account_name": "Cuenta",
             "side": "Tipo",
             "quantity": "Cantidad",
             "price": "Precio",
             "fees": "Comisión",
+            "settlement_amount_eur": "Liquidación EUR",
+            "fee_eur": "Comisión EUR",
+            "fx_rate_to_eur": "Cambio a EUR",
             "executed_at": "Fecha",
             "notes": "Motivo / notas",
             "currency": "Moneda",
@@ -4592,30 +4652,50 @@ def render_journal(
         )
     analysis_rows: list[dict[str, object]] = []
     details: dict[str, dict[str, object]] = {}
+    dashboard_by_position = {
+        (
+            str(row.ticker),
+            str(row.currency),
+            str(getattr(row, "account_name", "") or ""),
+        ): row
+        for row in positions_dashboard.itertuples(index=False)
+    }
     for position in positions.itertuples(index=False):
         ticker = str(position.ticker)
-        key = f"{ticker} · {position.currency}"
-        if ticker not in prepared:
+        analysis_ticker = resolve_analysis_ticker(ticker)
+        account_name = str(getattr(position, "account_name", "") or "")
+        account_label = account_name or "Sin especificar"
+        key = f"{ticker} · {account_label} · {position.currency}"
+        dashboard_row = dashboard_by_position.get(
+            (ticker, str(position.currency), account_name)
+        )
+        if analysis_ticker not in prepared:
             analysis_rows.append(
                 {
                     "Ticker": ticker,
+                    "Cuenta": account_label,
                     "Moneda": position.currency,
                     "Cantidad": position.quantity,
                     "Coste medio": position.average_cost,
+                    "Coste EUR": (
+                        getattr(dashboard_row, "cost_basis_eur", float("nan"))
+                        if dashboard_row is not None
+                        else float("nan")
+                    ),
                     "Lectura": "Faltan precios",
                 }
             )
             continue
-        frame = prepared[ticker]
+        frame = prepared[analysis_ticker]
         latest_price = float(frame["close"].iloc[-1])
         signal = evaluate_latest_signal(
             frame,
             strategy,
-            ticker=ticker,
+            ticker=analysis_ticker,
             entry_price=float(position.average_cost),
         )
-        fundamentals = fundamental_results[ticker]
-        opportunity = opportunity_results[ticker]
+        fundamentals = fundamental_results[analysis_ticker]
+        opportunity = opportunity_results[analysis_ticker]
         quote_currency = fundamentals.currency
         comparable = quote_currency is None or quote_currency == position.currency
         try:
@@ -4637,13 +4717,20 @@ def render_journal(
         analysis_rows.append(
             {
                 "Ticker": ticker,
+                "Cuenta": account_label,
                 "Moneda": position.currency,
                 "Cantidad": float(position.quantity),
                 "Coste medio": float(position.average_cost),
                 "Precio actual": latest_price,
-                "Beneficio neto": valuation.net_pnl if comparable else float("nan"),
+                "Beneficio neto EUR": (
+                    getattr(dashboard_row, "net_pnl_eur", float("nan"))
+                    if dashboard_row is not None and comparable
+                    else float("nan")
+                ),
                 "Rentabilidad neta": (
-                    valuation.net_return_pct if comparable else float("nan")
+                    getattr(dashboard_row, "net_return_pct", float("nan"))
+                    if dashboard_row is not None and comparable
+                    else float("nan")
                 ),
                 "Beneficio ya realizado": float(position.realized_pnl),
                 "Comisiones pagadas": float(position.paid_fees),
@@ -4655,6 +4742,11 @@ def render_journal(
                 "Entrada": signal.score,
                 "Oportunidad": opportunity.score,
                 "Lectura": signal.position_label,
+                "Origen del coste": (
+                    getattr(dashboard_row, "cost_basis_source", "")
+                    if dashboard_row is not None
+                    else ""
+                ),
             }
         )
         details[key] = {
@@ -4724,7 +4816,8 @@ def render_journal(
                     column_config={
                         "Coste medio": st.column_config.NumberColumn(format="%.2f"),
                         "Precio actual": st.column_config.NumberColumn(format="%.2f"),
-                        "Beneficio neto": st.column_config.NumberColumn(format="%+.2f"),
+                        "Coste EUR": st.column_config.NumberColumn(format="%.2f"),
+                        "Beneficio neto EUR": st.column_config.NumberColumn(format="%+.2f"),
                         "Rentabilidad neta": st.column_config.NumberColumn(format="%+.2f%%"),
                         "Beneficio ya realizado": st.column_config.NumberColumn(format="%+.2f"),
                         "Comisiones pagadas": st.column_config.NumberColumn(format="%.2f"),
@@ -4742,7 +4835,7 @@ def render_journal(
             missing = [
                 str(row.ticker)
                 for row in positions.itertuples(index=False)
-                if str(row.ticker) not in prepared
+                if resolve_analysis_ticker(str(row.ticker)) not in prepared
             ]
             if missing:
                 st.warning(
@@ -10746,31 +10839,58 @@ def render_email_alert_settings(journal: object) -> None:
     except (JournalStorageError, AttributeError):
         states = pd.DataFrame()
     if not states.empty:
-        evaluated_times = pd.to_datetime(states["evaluated_at"], errors="coerce")
+        evaluated_times = pd.to_datetime(
+            states["evaluated_at"], errors="coerce", utc=True
+        ).dt.tz_convert("Europe/Madrid")
         notified_values = states.get(
             "notified_at", pd.Series(index=states.index, dtype=object)
         )
-        notified_times = pd.to_datetime(notified_values, errors="coerce")
+        notified_times = pd.to_datetime(
+            notified_values, errors="coerce", utc=True
+        ).dt.tz_convert("Europe/Madrid")
+        latest_evaluated = (
+            evaluated_times.max() if evaluated_times.notna().any() else pd.NaT
+        )
+        latest_review_mask = (
+            evaluated_times.dt.date == latest_evaluated.date()
+            if pd.notna(latest_evaluated)
+            else pd.Series(False, index=states.index)
+        )
         audit_metrics = st.columns(3)
-        audit_metrics[0].metric("Empresas revisadas", len(states))
+        audit_metrics[0].metric(
+            "Lecturas de la última revisión", int(latest_review_mask.sum())
+        )
         audit_metrics[1].metric("Con correo registrado", int(notified_times.notna().sum()))
         audit_metrics[2].metric(
             "Última revisión",
             (
-                evaluated_times.max().strftime("%d/%m %H:%M")
-                if evaluated_times.notna().any()
+                latest_evaluated.strftime("%d/%m %H:%M")
+                if pd.notna(latest_evaluated)
                 else "N/D"
             ),
         )
         st.caption(
             "Trazabilidad automática: «Último correo» sólo cambia después de que el "
-            "servidor SMTP acepte el resumen; una revisión sin novedades no lo borra."
+            "servidor SMTP acepte el resumen; una revisión sin novedades no lo borra. "
+            "El correo indica por separado cuántas favoritas se solicitaron, cuántas "
+            "tuvieron precios y cuáles quedaron con datos parciales."
+        )
+        states = states.copy()
+        states["review_status"] = latest_review_mask.map(
+            {True: "Última revisión", False: "Lectura anterior"}
         )
         visible = states.rename(
             columns={
                 "ticker": "Ticker",
+                "company_name": "Empresa",
                 "entry_score": "Entrada",
                 "entry_label": "Momento",
+                "growth_score": "Crecimiento",
+                "fundamental_score": "Fundamental",
+                "opportunity_score": "Oportunidad",
+                "opportunity_status": "Estado de oportunidad",
+                "data_note": "Cobertura",
+                "review_status": "Vigencia",
                 "position_label": "Si ya la tienes",
                 "price": "Último cierre",
                 "evaluated_at": "Revisada",
@@ -10782,12 +10902,19 @@ def render_email_alert_settings(journal: object) -> None:
                 :,
                 [
                     "Ticker",
+                    "Empresa",
                     "Entrada",
                     "Momento",
+                    "Crecimiento",
+                    "Fundamental",
+                    "Oportunidad",
+                    "Estado de oportunidad",
                     "Si ya la tienes",
                     "Último cierre",
                     "Revisada",
                     "Último correo",
+                    "Cobertura",
+                    "Vigencia",
                 ],
             ],
             key="alert_states_companies",

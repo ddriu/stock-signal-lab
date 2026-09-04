@@ -70,6 +70,9 @@ No pegues la contraseña en GitHub y no subas el archivo local de secretos.
 1. Crea un proyecto gratuito en Supabase.
 2. Abre **SQL Editor**, pega `supabase/schema.sql` y ejecútalo. Es seguro volver
    a ejecutarlo al actualizar: añade las columnas nuevas sin borrar operaciones.
+   Para la versión de estabilización también puedes ejecutar únicamente
+   `supabase/migration_operation_reconciliation.sql`: añade cuenta de bróker,
+   liquidación real en euros y las notas del último análisis enviado por correo.
 3. Copia la **Project URL** y una clave secreta `sb_secret_*`.
 4. Añádelas al bloque `[supabase]` de los Secrets de Streamlit.
 5. Reinicia la aplicación.
@@ -85,7 +88,9 @@ El mismo esquema crea listas de favoritos privadas y del grupo y el historial pr
 de análisis, sin borrar ni modificar las operaciones existentes.
 También crea `email_alert_preferences` y `email_alert_states`: la primera conserva
 el correo y las opciones privadas; la segunda recuerda el último estado de cada
-empresa para no repetir el mismo aviso.
+empresa para no repetir el mismo aviso. Desde la versión de estabilización guarda
+además las notas de crecimiento, fundamentales y oportunidad de esa misma revisión,
+por lo que la tabla visible en la aplicación coincide con el correo diario.
 
 Sin `[supabase]`, la instalación local continúa usando SQLite. En Community Cloud,
 `persistent_journal = false` mantiene el diario desactivado para evitar pérdidas.

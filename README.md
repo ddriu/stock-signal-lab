@@ -207,6 +207,11 @@ lo añadió; un usuario puede eliminar los suyos y el administrador puede correg
 Ambas carteras muestran capital pendiente, valor neto, beneficio latente y realizado,
 rentabilidad, comisiones y cobertura de precios. El rol administrador también ve un
 resumen de las cuatro carteras privadas y puede registrar operaciones para un usuario.
+Cada operación puede asociarse a Trade Republic, Revolut, MyInvestor u otra cuenta. Si
+la moneda no es EUR, el campo opcional **Importe liquidado en EUR** conserva el cargo
+real de una compra o el abono neto de una venta; así el coste histórico no cambia cuando
+varía el EUR/USD. Si ese dato falta, la interfaz identifica el resultado como una
+estimación con el cambio actual en lugar de presentarlo como un cuadre exacto del bróker.
 
 La pestaña **Evolución por años** separa compras, ventas, dinero neto aportado, valor de
 mercado y resultado acumulado. Incluye una gráfica temporal, otra anual y un Excel con
@@ -260,7 +265,9 @@ reducción y posible salida, elegir una nota mínima de entrada e incluir el seg
 del grupo. El proceso genera dos formatos complementarios. El **resumen diario** reúne
 todas las favoritas y posiciones en una tabla con técnica, crecimiento, calidad
 fundamental y oportunidad; una fuente ausente se marca como N/D y la empresa no
-desaparece. La **alerta accionable** sólo se envía cuando existe una entrada comprable
+desaparece. La cabecera indica cuántas empresas se solicitaron y cuántas se pudieron
+procesar con precios, para que una descarga fallida no parezca una revisión completa.
+La **alerta accionable** sólo se envía cuando existe una entrada comprable
 o una posición cambia a reducir/vender y, por defecto, no repite el mismo estado.
 Cuando hay datos suficientes, esta alerta comienza con un bloque compacto de mejores
 oportunidades que añade nombre, ticker, timing, score conjunto, estado y zona preferida.
@@ -272,7 +279,9 @@ o vender se limitan a posiciones registradas y utilizan su coste medio para comp
 el stop loss. El proceso usa el perfil equilibrado predeterminado y precios diarios:
 no vigila el mercado en tiempo real ni garantiza que el precio continúe disponible.
 La interfaz conserva la fecha del último correo aceptado por SMTP aunque las revisiones
-posteriores no tengan novedades, permitiendo distinguir revisión de entrega.
+posteriores no tengan novedades, permitiendo distinguir revisión de entrega. También
+conserva las notas de crecimiento, fundamentales y oportunidad calculadas en la misma
+ejecución del correo.
 
 El workflow `.github/workflows/daily-alerts.yml` se ejecuta por la mañana de lunes
 a viernes y también puede iniciarse manualmente. Necesita cuatro secretos de GitHub:
