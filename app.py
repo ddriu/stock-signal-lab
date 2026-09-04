@@ -223,23 +223,28 @@ MAIN_OPTIONS = ["Inicio", "Analizar", "Favoritos", "Carteras", "Más"]
 ANALYSIS_OPTIONS = [
     "Radar",
     "Oportunidades",
-    "Superar índice",
     "Empresa",
     "Estrategias",
-    "Más análisis",
+    "Validar",
 ]
 ANALYSIS_LABELS = {
     "Radar": "◎ Mi radar",
-    "Oportunidades": "🎯 Entradas",
-    "Superar índice": "△ vs S&P 500",
+    "Oportunidades": "🎯 Entradas hoy",
     "Empresa": "↗ Empresa",
     "Estrategias": "◱ Estrategias",
-    "Más análisis": "··· Herramientas",
+    "Validar": "✓ Validar método",
 }
+COMPANY_OPTIONS = ["Análisis individual", "Comparar empresas"]
 STRATEGY_OPTIONS = [
-    "Crecimiento",
     "Calidad fundamental",
-    "Resultado tras 30+ días",
+    "Crecimiento y momentum",
+    "Ventaja relativa",
+    "Especulativas",
+]
+VALIDATION_OPTIONS = [
+    "Evolución del análisis",
+    "Resultado posterior",
+    "Backtest técnico",
 ]
 ANALYSIS_VIEW_DESCRIPTIONS = {
     "Radar": (
@@ -250,11 +255,13 @@ ANALYSIS_VIEW_DESCRIPTIONS = {
         "Filtra el radar por precio actual: distingue una entrada posible hoy de una "
         "buena empresa que llega tarde, está cara o tiene un evento próximo."
     ),
-    "Superar índice": (
-        "Compara cartera y favoritas con el S&P 500 a corto, medio y largo plazo. "
-        "Muestra candidatas y cobertura; no promete rentabilidad futura."
+    "Análisis individual": (
+        "Reúne decisión, negocio, valoración, entrada, gestión y riesgos de una empresa."
     ),
-    "Crecimiento": (
+    "Comparar empresas": (
+        "Compara de dos a diez empresas semejantes sin confundir precio nominal con valor."
+    ),
+    "Crecimiento y momentum": (
         "Busca futuros líderes combinando crecimiento del negocio, fortaleza del precio, "
         "sector y riesgo para dimensionar una entrada."
     ),
@@ -262,48 +269,72 @@ ANALYSIS_VIEW_DESCRIPTIONS = {
         "Comprueba valoración, rentabilidad, crecimiento, deuda y márgenes. Sirve para "
         "estudiar el negocio; el momento de compra se mantiene separado."
     ),
-    "Resultado tras 30+ días": (
+    "Ventaja relativa": (
+        "Compara cartera y favoritas con una referencia de mercado a corto, medio y largo "
+        "plazo. Muestra evidencia observada y cobertura; no promete rentabilidad futura."
+    ),
+    "Especulativas": (
+        "Busca small caps líquidas fuera de tus favoritas y les aplica controles de "
+        "liquidez, riesgo, timing y beneficio/riesgo."
+    ),
+    "Evolución del análisis": (
+        "Muestra cómo cambiaron el precio y las notas guardadas de una empresa entre revisiones."
+    ),
+    "Resultado posterior": (
         "Comprueba qué ocurrió después de señales pasadas. Sirve para validar el método; "
         "no es una cuarta recomendación actual."
     ),
+    "Backtest técnico": (
+        "Simula las reglas sobre datos pasados, con costes y stops, para detectar fragilidad; "
+        "no predice la próxima subida."
+    ),
 }
-ANALYSIS_TOOL_OPTIONS = [
-    "Comparar empresas",
-    "Historial",
-    "Prueba con el pasado",
-    "Plan de capital",
-]
 LEGACY_ANALYSIS_ROUTES = {
-    "Crecimiento y momentum": ("Estrategias", "analysis_strategy_navigation", "Crecimiento"),
-    "Objetivo 30+ días": (
+    "Crecimiento": (
         "Estrategias",
         "analysis_strategy_navigation",
-        "Resultado tras 30+ días",
+        "Crecimiento y momentum",
+    ),
+    "Crecimiento y momentum": (
+        "Estrategias",
+        "analysis_strategy_navigation",
+        "Crecimiento y momentum",
+    ),
+    "Superar índice": (
+        "Estrategias",
+        "analysis_strategy_navigation",
+        "Ventaja relativa",
+    ),
+    "Objetivo 30+ días": (
+        "Validar",
+        "analysis_validation_navigation",
+        "Resultado posterior",
     ),
     "Comparador sectorial": (
-        "Más análisis",
-        "analysis_tool_navigation",
+        "Empresa",
+        "analysis_company_navigation",
         "Comparar empresas",
     ),
-    "Historial guardado": ("Más análisis", "analysis_tool_navigation", "Historial"),
-    "Prueba histórica": (
-        "Más análisis",
-        "analysis_tool_navigation",
-        "Prueba con el pasado",
+    "Historial guardado": (
+        "Validar",
+        "analysis_validation_navigation",
+        "Evolución del análisis",
     ),
-    "Proyección de capital": (
-        "Más análisis",
-        "analysis_tool_navigation",
-        "Plan de capital",
+    "Prueba histórica": (
+        "Validar",
+        "analysis_validation_navigation",
+        "Backtest técnico",
     ),
 }
 SIDEBAR_ANALYSIS_SECTIONS = {
     "Radar",
     "Oportunidades",
-    "Superar índice",
-    "Estrategias",
+    "Crecimiento y momentum",
+    "Calidad fundamental",
+    "Ventaja relativa",
+    "Especulativas",
     "Comparar empresas",
-    "Prueba con el pasado",
+    "Backtest técnico",
 }
 
 
@@ -412,37 +443,6 @@ def parse_tickers(raw_value: str) -> list[str]:
 
 def format_pct(value: float) -> str:
     return f"{value:+.2f}%"
-
-
-PLAIN_SIGNAL_GUIDANCE = {
-    "Entrada fuerte": (
-        "El precio reúne una combinación especialmente fuerte de tendencia, impulso y liderazgo. "
-        "Es el mejor momento técnico del radar, pero aún requiere revisar la empresa y el riesgo."
-    ),
-    "Entrada interesante": (
-        "La empresa muestra una combinación fuerte de tendencia, impulso y liderazgo. "
-        "Merece una revisión más profunda antes de decidir una entrada."
-    ),
-    "Vigilancia": (
-        "Hay señales prometedoras, pero todavía falta alguna confirmación. Conviene seguirla "
-        "sin tratarla aún como una entrada completa."
-    ),
-    "Esperar": (
-        "La empresa puede ser interesante, pero el precio parece demasiado acelerado. "
-        "Perseguirlo ahora aumenta el riesgo de comprar justo antes de una pausa."
-    ),
-    "Mantener": (
-        "La tendencia sigue razonablemente sana, pero hoy no aparece una entrada especialmente clara."
-    ),
-    "Reducir": (
-        "La fuerza se está debilitando. Si ya tienes la acción, conviene revisar cuánto riesgo "
-        "quieres mantener; si no la tienes, todavía no destaca como nueva entrada."
-    ),
-    "Vender": (
-        "La tendencia principal está dañada o se ha activado el límite de pérdida. "
-        "No equivale a una certeza de caída, sino a una señal de deterioro."
-    ),
-}
 
 
 def friendly_factor(text: str) -> str:
@@ -1436,7 +1436,7 @@ def render_extended_market_report(
             comparison_rows = [
                 {
                     "Ticker": ticker,
-                    "Oportunidad": opportunities[ticker].score,
+                    "Atractivo global": opportunities[ticker].score,
                     "Lectura": opportunities[ticker].label,
                     "Calidad": (
                         fundamentals[ticker].score
@@ -1448,7 +1448,9 @@ def render_extended_market_report(
                 if ticker in opportunities
             ]
             if comparison_rows:
-                comparison_rows.sort(key=lambda row: row["Oportunidad"], reverse=True)
+                comparison_rows.sort(
+                    key=lambda row: row["Atractivo global"], reverse=True
+                )
                 for rank, row in enumerate(comparison_rows, start=1):
                     row["Puesto"] = rank
                 st.markdown("**Ranking entre comparables cargadas en esta sesión**")
@@ -1457,7 +1459,9 @@ def render_extended_market_report(
                     hide_index=True,
                     width="stretch",
                     column_config={
-                        "Oportunidad": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
+                        "Atractivo global": st.column_config.ProgressColumn(
+                            min_value=0, max_value=100, format="%d"
+                        ),
                         "Calidad": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
                     },
                 )
@@ -1759,7 +1763,7 @@ def render_analysis(
     daily_change = (latest["close"] / previous - 1) * 100
     col1, col2, col3, col4 = st.columns(4)
     col1.metric(
-        "Oportunidad conjunta",
+        "Atractivo global",
         f"{opportunity.score}/100",
         opportunity.label,
         help="Combina cinco familias de análisis sin ocultar sus notas individuales.",
@@ -1781,7 +1785,7 @@ def render_analysis(
     )
     col5, col6, col7, col8 = st.columns(4)
     col5.metric(
-        "Momento de entrada",
+        "Momento técnico",
         f"{signal.score}/100",
         help="Resume tendencia, impulso, liderazgo, volumen y calidad de entrada.",
     )
@@ -1803,6 +1807,26 @@ def render_analysis(
         format_quote_price(float(latest["close"]), display_currency),
         format_pct(daily_change),
     )
+    new_position_action = {
+        "Entrada fuerte": "Estudiar compra",
+        "Entrada interesante": "Preparar entrada",
+        "Vigilancia": "Esperar confirmación",
+    }.get(signal.label, "No comprar ahora")
+    decision_reasons = [
+        friendly_factor(factor)
+        for factor in (*opportunity.positive_factors, *signal.positive_factors)
+    ]
+    if not decision_reasons:
+        decision_reasons = [opportunity.explanation]
+    render_decision_strip(
+        new_position_action,
+        decision_reasons,
+        data_note=(
+            f"Datos de precio: {pd.Timestamp(signal.as_of).date()} · "
+            f"cobertura {opportunity.confidence_pct}%"
+        ),
+        position_note=f"Si ya la tienes: {signal.position_label}",
+    )
     render_extended_market_report(
         extended_report,
         peer_opportunities=peer_opportunities,
@@ -1810,25 +1834,13 @@ def render_analysis(
     )
     if auto_snapshot_saved:
         st.caption(
-            "✓ Seguimiento de hoy guardado automáticamente en «Historial guardado»."
+            "✓ Seguimiento de hoy guardado automáticamente en «Evolución del análisis»."
         )
-    if opportunity.label in {"Oportunidad destacada", "Candidata"}:
-        st.success(f"**{opportunity.label}:** {opportunity.explanation}")
-    elif opportunity.label == "Vigilancia":
-        st.info(f"**{opportunity.label}:** {opportunity.explanation}")
-    else:
-        st.warning(f"**{opportunity.label}:** {opportunity.explanation}")
     st.caption(
-        f"Lectura técnica: {signal.label} · Si ya la tienes: {signal.position_label} · "
+        f"Atractivo global: {opportunity.label} · Momento técnico: {signal.label} · "
+        f"Si ya la tienes: {signal.position_label} · "
         f"RSI: {latest['rsi']:.1f}"
     )
-    plain_message = PLAIN_SIGNAL_GUIDANCE.get(signal.label, signal.explanation)
-    if signal.label in {"Entrada fuerte", "Entrada interesante"}:
-        st.success(f"**{signal.label}:** {plain_message}")
-    elif signal.label == "Vigilancia":
-        st.info(f"**{signal.label}:** {plain_message}")
-    else:
-        st.warning(f"**{signal.label}:** {plain_message}")
 
     if journal is not None:
         with st.expander("Guardar este análisis y consultar su evolución"):
@@ -1912,7 +1924,7 @@ def render_analysis(
                         columns={
                             "analyzed_at": "Fecha",
                             "price": "Precio",
-                            "opportunity_score": "Oportunidad",
+                            "opportunity_score": "Atractivo global",
                             "entry_score": "Entrada",
                             "entry_label": "Lectura",
                             "expected_return_pct": "Retorno histórico",
@@ -1925,7 +1937,7 @@ def render_analysis(
                         hide_index=True,
                         column_config={
                             "Precio": st.column_config.NumberColumn(format="%.2f"),
-                            "Oportunidad": st.column_config.ProgressColumn(
+                            "Atractivo global": st.column_config.ProgressColumn(
                                 min_value=0, max_value=100, format="%d"
                             ),
                             "Entrada": st.column_config.ProgressColumn(
@@ -1942,10 +1954,10 @@ def render_analysis(
 
     company_tab, conviction_tab, entry_tab, risk_data_tab = st.tabs(
         [
-            "Empresa y valoración",
+            "Negocio y valoración",
             "Convicción 3–5 años",
-            "Momento y liderazgo",
-            "Riesgo y fuentes",
+            "Entrada y liderazgo",
+            "Riesgos y fuentes",
         ]
     )
     with company_tab:
@@ -2556,7 +2568,12 @@ def render_long_horizon_calibration(
 ) -> None:
     """Traduce las señales históricas a objetivos de rentabilidad de 30+ días."""
 
-    st.subheader("Objetivo de rentabilidad a 30 días o más")
+    render_page_intro(
+        "VALIDAR MÉTODO",
+        "Resultado posterior de las señales",
+        "Mide qué ocurrió después de señales históricas a varios plazos y lo compara "
+        "con otras alternativas de inversión; no propone una compra actual.",
+    )
     st.write(
         "Esta prueba no intenta ganar en una operación rápida. Simula una compra en "
         "la apertura posterior a cada nueva señal y mantiene la inversión durante todo "
@@ -4734,13 +4751,13 @@ def render_journal(
                 ),
                 "Beneficio ya realizado": float(position.realized_pnl),
                 "Comisiones pagadas": float(position.paid_fees),
-                "Empresa": (
+                "Calidad negocio": (
                     float(fundamentals.score)
                     if fundamentals.score is not None
                     else float("nan")
                 ),
-                "Entrada": signal.score,
-                "Oportunidad": opportunity.score,
+                "Momento técnico": signal.score,
+                "Atractivo global": opportunity.score,
                 "Lectura": signal.position_label,
                 "Origen del coste": (
                     getattr(dashboard_row, "cost_basis_source", "")
@@ -4821,13 +4838,13 @@ def render_journal(
                         "Rentabilidad neta": st.column_config.NumberColumn(format="%+.2f%%"),
                         "Beneficio ya realizado": st.column_config.NumberColumn(format="%+.2f"),
                         "Comisiones pagadas": st.column_config.NumberColumn(format="%.2f"),
-                        "Empresa": st.column_config.ProgressColumn(
+                        "Calidad negocio": st.column_config.ProgressColumn(
                             min_value=0, max_value=100, format="%d"
                         ),
-                        "Entrada": st.column_config.ProgressColumn(
+                        "Momento técnico": st.column_config.ProgressColumn(
                             min_value=0, max_value=100, format="%d"
                         ),
-                        "Oportunidad": st.column_config.ProgressColumn(
+                        "Atractivo global": st.column_config.ProgressColumn(
                             min_value=0, max_value=100, format="%d"
                         ),
                     },
@@ -5962,14 +5979,13 @@ def render_analysis_view_guide() -> None:
             f"**Entradas hoy**  \n{ANALYSIS_VIEW_DESCRIPTIONS['Oportunidades']}"
         )
         st.markdown(
-            f"**S&P 500**  \n{ANALYSIS_VIEW_DESCRIPTIONS['Superar índice']}"
+            f"**Empresa**  \n{ANALYSIS_VIEW_DESCRIPTIONS['Análisis individual']}"
         )
         st.markdown(
-            f"**Crecimiento**  \n{ANALYSIS_VIEW_DESCRIPTIONS['Crecimiento']}"
+            f"**Estrategias**  \n{ANALYSIS_VIEW_DESCRIPTIONS['Crecimiento y momentum']}"
         )
-        st.caption(
-            "Resultado tras 30+ días no busca una compra nueva: mide cómo se comportaron "
-            "las señales anteriores para detectar si el método está siendo útil."
+        st.markdown(
+            f"**Validar método**  \n{ANALYSIS_VIEW_DESCRIPTIONS['Resultado posterior']}"
         )
 
 
@@ -6135,6 +6151,34 @@ def render_page_intro(eyebrow: str, title: str, description: str) -> None:
     )
 
 
+def render_decision_strip(
+    action: str,
+    reasons: list[str] | tuple[str, ...],
+    *,
+    data_note: str,
+    position_note: str = "",
+) -> None:
+    """Resume una lectura en el mismo orden mental en todas las empresas."""
+
+    concise_reasons = [
+        str(reason).strip() for reason in reasons if str(reason).strip()
+    ][:3]
+    with st.container(border=True):
+        decision_col, context_col = st.columns([1, 2])
+        with decision_col:
+            st.caption("QUÉ HACER AHORA")
+            st.markdown(f"### {action}")
+            if position_note:
+                st.caption(position_note)
+        with context_col:
+            st.caption("POR QUÉ")
+            if concise_reasons:
+                st.write(" · ".join(concise_reasons))
+            else:
+                st.write("Faltan factores suficientes para justificar una actuación.")
+            st.caption(data_note)
+
+
 def render_subnavigation(
     label: str,
     options: list[str],
@@ -6199,9 +6243,9 @@ def render_opportunity_cards(
                         <span class="ssl-badge ssl-{tone}">{html.escape(label)}</span>
                     </div>
                     <div class="ssl-score-row">
-                        <div class="ssl-score"><span>Oportunidad</span><strong>{_score_text(row.get("Oportunidad"))}/100</strong></div>
-                        <div class="ssl-score"><span>Empresa</span><strong>{_score_text(row.get("Calidad empresa"))}</strong></div>
-                        <div class="ssl-score"><span>Entrada</span><strong>{_score_text(row.get("Momento entrada"))}</strong></div>
+                        <div class="ssl-score"><span>Atractivo global</span><strong>{_score_text(row.get("Oportunidad"))}/100</strong></div>
+                        <div class="ssl-score"><span>Calidad</span><strong>{_score_text(row.get("Calidad empresa"))}</strong></div>
+                        <div class="ssl-score"><span>Momento técnico</span><strong>{_score_text(row.get("Momento entrada"))}</strong></div>
                     </div>
                     <div class="ssl-card-footer"><span>Cierre {close_text}</span><span>Si la tienes: {html.escape(position_label)}</span></div>
                     <div class="ssl-card-footer"><span>{html.escape(data_text)}</span><span>{date_value}</span></div>
@@ -6348,12 +6392,11 @@ def _set_navigation(
         st.session_state[subsection_key] = subsection
 
 
-def _set_analysis_tool(tool: str) -> None:
-    """Abre una herramienta secundaria sin exponer rutas técnicas al usuario."""
+def _open_capital_projection() -> None:
+    """Abre la planificación desde una estrategia sin devolverla a Analizar."""
 
-    st.session_state["main_navigation"] = "Analizar"
-    st.session_state["analysis_navigation"] = "Más análisis"
-    st.session_state["analysis_tool_navigation"] = tool
+    st.session_state["main_navigation"] = "Carteras"
+    st.session_state["portfolio_navigation"] = "Plan de capital"
 
 
 def _request_analysis_page(page: str) -> None:
@@ -6368,9 +6411,13 @@ def _request_all_favorite_refresh(destination: str = "Radar") -> None:
 
     st.session_state["_force_all_favorite_refresh"] = True
     st.session_state["_requested_main_navigation"] = "Analizar"
-    st.session_state["_requested_analysis_navigation"] = (
-        destination if destination in ANALYSIS_OPTIONS else "Radar"
-    )
+    if destination in STRATEGY_OPTIONS:
+        st.session_state["_requested_analysis_navigation"] = "Estrategias"
+        st.session_state["analysis_strategy_navigation"] = destination
+    else:
+        st.session_state["_requested_analysis_navigation"] = (
+            destination if destination in ANALYSIS_OPTIONS else "Radar"
+        )
 
 
 def _request_complete_review() -> None:
@@ -6417,7 +6464,8 @@ def _request_speculative_search() -> None:
         return
     st.session_state["_pending_speculative_discovery"] = True
     st.session_state["_requested_main_navigation"] = "Analizar"
-    st.session_state["_requested_analysis_navigation"] = "Oportunidades"
+    st.session_state["_requested_analysis_navigation"] = "Estrategias"
+    st.session_state["analysis_strategy_navigation"] = "Especulativas"
 
 
 def _sync_analysis_ticker(source_key: str) -> None:
@@ -6469,6 +6517,7 @@ def _open_ticker_analysis(ticker: str) -> None:
     # rechaza esos cambios si los menús ya se crearon durante la interacción.
     st.session_state["_requested_main_navigation"] = "Analizar"
     st.session_state["_requested_analysis_navigation"] = "Empresa"
+    st.session_state["analysis_company_navigation"] = "Análisis individual"
     st.session_state["_requested_analysis_ticker"] = normalized
     st.session_state["_pending_analysis_ticker"] = normalized
     _reset_analysis_company_picker()
@@ -6482,8 +6531,8 @@ def _open_ticker_comparison(tickers: list[str]) -> None:
         return
     st.session_state["_comparison_seed_tickers"] = selected
     st.session_state["_requested_main_navigation"] = "Analizar"
-    st.session_state["_requested_analysis_navigation"] = "Más análisis"
-    st.session_state["analysis_tool_navigation"] = "Comparar empresas"
+    st.session_state["_requested_analysis_navigation"] = "Empresa"
+    st.session_state["analysis_company_navigation"] = "Comparar empresas"
 
 
 def _clear_table_selection(revision_key: str, revision: int) -> None:
@@ -7260,11 +7309,14 @@ def render_home(
     )
     if decision_view == "Mi cartera":
         if decision_rows:
+            decision_frame = pd.DataFrame(decision_rows).rename(
+                columns={"Oportunidad": "Atractivo global"}
+            )
             render_ticker_dataframe(
-                pd.DataFrame(decision_rows),
+                decision_frame,
                 key="home_portfolio_decisions",
                 column_config={
-                    "Oportunidad": st.column_config.ProgressColumn(
+                    "Atractivo global": st.column_config.ProgressColumn(
                         min_value=0, max_value=100, format="%d"
                     ),
                     "Peso": st.column_config.ProgressColumn(
@@ -7300,21 +7352,28 @@ def render_home(
                 ]
                 if column in entry_frame.columns
             ]
+            entry_frame = entry_frame.loc[:, entry_columns].rename(
+                columns={
+                    "Momento entrada": "Momento técnico",
+                    "Oportunidad": "Atractivo global",
+                    "Calidad empresa": "Calidad negocio",
+                }
+            )
             render_ticker_dataframe(
-                entry_frame.loc[:, entry_columns],
+                entry_frame,
                 key=(
                     "home_strong_entries"
                     if decision_view == "Entradas fuertes"
                     else "home_candidate_entries"
                 ),
                 column_config={
-                    "Momento entrada": st.column_config.ProgressColumn(
+                    "Momento técnico": st.column_config.ProgressColumn(
                         min_value=0, max_value=100, format="%d"
                     ),
-                    "Oportunidad": st.column_config.ProgressColumn(
+                    "Atractivo global": st.column_config.ProgressColumn(
                         min_value=0, max_value=100, format="%d"
                     ),
-                    "Calidad empresa": st.column_config.ProgressColumn(
+                    "Calidad negocio": st.column_config.ProgressColumn(
                         min_value=0, max_value=100, format="%d"
                     ),
                 },
@@ -7350,7 +7409,7 @@ def render_home(
         for row in entry_alerts[:3]:
             st.success(
                 f"**{row['Ticker']} · {row['Lectura conjunta']}:** "
-                f"oportunidad {row.get('Oportunidad', 'N/D')}/100. Requiere revisión."
+                f"atractivo global {row.get('Oportunidad', 'N/D')}/100. Requiere revisión."
             )
 
     if summary:
@@ -7531,37 +7590,51 @@ def render_opportunities_page(
     essential_columns = [
         column for column in essential_columns if column in radar.columns
     ]
+    essential_radar = radar.loc[:, essential_columns].rename(
+        columns={
+            "Oportunidad": "Atractivo global",
+            "Calidad empresa": "Calidad negocio",
+            "Momento entrada": "Momento técnico",
+        }
+    )
     render_ticker_dataframe(
-        radar.loc[:, essential_columns],
+        essential_radar,
         key="opportunity_essential_table",
         column_config={
-            "Oportunidad": st.column_config.ProgressColumn(
+            "Atractivo global": st.column_config.ProgressColumn(
                 min_value=0, max_value=100, format="%d"
             ),
-            "Calidad empresa": st.column_config.ProgressColumn(
+            "Calidad negocio": st.column_config.ProgressColumn(
                 "Empresa /100", min_value=0, max_value=100, format="%d"
             ),
-            "Momento entrada": st.column_config.ProgressColumn(
+            "Momento técnico": st.column_config.ProgressColumn(
                 "Entrada /100", min_value=0, max_value=100, format="%d"
             ),
         },
     )
 
     with st.expander("Ver indicadores y ranking completo"):
+        full_radar = radar.rename(
+            columns={
+                "Oportunidad": "Atractivo global",
+                "Calidad empresa": "Calidad negocio",
+                "Momento entrada": "Momento técnico",
+            }
+        )
         render_ticker_dataframe(
-            radar,
+            full_radar,
             key="opportunity_full_table",
             column_config={
-                "Oportunidad": st.column_config.ProgressColumn(
+                "Atractivo global": st.column_config.ProgressColumn(
                     min_value=0, max_value=100, format="%d"
                 ),
                 "Confianza datos": st.column_config.ProgressColumn(
                     min_value=0, max_value=100, format="%d%%"
                 ),
-                "Calidad empresa": st.column_config.ProgressColumn(
+                "Calidad negocio": st.column_config.ProgressColumn(
                     "Empresa /100", min_value=0, max_value=100, format="%d"
                 ),
-                "Momento entrada": st.column_config.ProgressColumn(
+                "Momento técnico": st.column_config.ProgressColumn(
                     "Entrada /100", min_value=0, max_value=100, format="%d"
                 ),
                 "Valoración": st.column_config.ProgressColumn(
@@ -7767,7 +7840,7 @@ def render_speculative_opportunities(
                 "Ticker": assessment.ticker,
                 "Estado": assessment.label,
                 "Score especulativo": assessment.score,
-                "Oportunidad": opportunity.opportunity_score,
+                "Entrada hoy": opportunity.opportunity_score,
                 "Timing": opportunity.timing.score,
                 "Capitalización": assessment.market_cap,
                 "Negociación diaria": assessment.daily_turnover,
@@ -7784,7 +7857,7 @@ def render_speculative_opportunities(
                 "Score especulativo": st.column_config.ProgressColumn(
                     min_value=0, max_value=100, format="%d"
                 ),
-                "Oportunidad": st.column_config.ProgressColumn(
+                "Entrada hoy": st.column_config.ProgressColumn(
                     min_value=0, max_value=100, format="%d"
                 ),
                 "Timing": st.column_config.ProgressColumn(
@@ -7808,7 +7881,7 @@ def _opportunity_sort_value(
     result: EntryOpportunityResult,
     order: str,
 ) -> float:
-    if order == "Score técnico":
+    if order == "Momento técnico":
         return float(result.technical_score)
     if order == "Timing":
         return float(result.timing.score)
@@ -7831,13 +7904,13 @@ def _render_entry_opportunity_card(
         st.caption(f"#{rank} · {result.status_label}")
         st.markdown(
             f"### {non_linking_ticker_text(result.ticker)} · "
-            f"{result.opportunity_score}/100"
+            f"Entrada hoy {result.opportunity_score}/100"
         )
         if result.company_name != result.ticker:
             st.caption(result.company_name)
         st.write(f"Entrada preferida: **{result.zones.preferred_entry.label}**")
         st.caption(
-            f"Técnico {result.technical_score} · Timing {result.timing.score} · "
+            f"Momento técnico {result.technical_score} · Timing {result.timing.score} · "
             f"Cobertura {result.confidence_pct}%"
         )
         st.button(
@@ -7863,7 +7936,7 @@ def _render_entry_opportunity_detail(
         st.write(result.explanation)
         score_a, score_b, score_c, score_d = st.columns(4)
         score_a.metric(
-            "Score técnico",
+            "Momento técnico",
             f"{result.technical_score}/100",
             result.technical_label,
             delta_color="off",
@@ -7878,7 +7951,7 @@ def _render_entry_opportunity_detail(
             if result.fundamental_score is not None
             else "N/D",
         )
-        score_d.metric("Oportunidad", f"{result.opportunity_score}/100")
+        score_d.metric("Entrada hoy", f"{result.opportunity_score}/100")
 
         st.markdown("#### Precio y riesgo")
         price_a, price_b, price_c, price_d = st.columns(4)
@@ -8011,7 +8084,7 @@ def _render_entry_opportunity_detail(
             width="stretch",
             key=f"save_entry_opportunity_{safe_key}",
             help=(
-                "Guarda precio, score técnico y score de oportunidad. El timing y la "
+                "Guarda precio, momento técnico y score de entrada. El timing y la "
                 "zona quedan anotados para poder contrastarlos más adelante."
             ),
         )
@@ -8055,7 +8128,6 @@ def render_entry_opportunities_page(
     journal: object,
     favorite_tickers: list[str],
     favorite_labels: dict[str, str],
-    speculative_discoveries: list[SpeculativeCandidate] | None = None,
 ) -> None:
     """Nueva capa: distingue una buena señal de un buen precio de entrada."""
 
@@ -8072,38 +8144,6 @@ def render_entry_opportunities_page(
         on_click=_request_analysis_page,
         args=("Radar",),
     )
-    st.button(
-        (
-            "Reintentar screener especulativo"
-            if speculative_discoveries
-            else "Buscar small caps líquidas fuera de mis favoritas"
-        ),
-        icon=":material/travel_explore:",
-        key="start_speculative_search",
-        width="stretch",
-        on_click=_request_speculative_search,
-        disabled=_speculative_retry_wait_minutes() > 0,
-        help=(
-            "Consulta un universo externo de Nasdaq/NYSE y después descarga el "
-            "histórico y los fundamentales de un máximo de 12 candidatas."
-        ),
-    )
-    speculative_error = str(
-        st.session_state.get("_speculative_discovery_error", "") or ""
-    )
-    if speculative_error:
-        retry_wait = _speculative_retry_wait_minutes()
-        retry_note = (
-            f" Podrás volver a intentarlo en unos {retry_wait} minutos."
-            if retry_wait
-            else " Ya puedes volver a intentarlo."
-        )
-        st.warning(f"{speculative_error}{retry_note}")
-        if speculative_discoveries:
-            st.caption(
-                "Mientras tanto se mantiene visible el último universo encontrado; "
-                "no se ha borrado por este fallo temporal."
-            )
     if not prepared:
         st.info(
             "Todavía no hay precios actualizados para esta lectura. Elige favoritas en "
@@ -8138,13 +8178,6 @@ def render_entry_opportunities_page(
     st.caption(
         f"{len(results)} empresas con lectura actual. Sólo las verdes pasan a la vez "
         "los filtros de tendencia, timing, score conjunto y beneficio/riesgo."
-    )
-
-    render_speculative_opportunities(
-        results,
-        risk_results,
-        raw_fundamentals,
-        speculative_discoveries or [],
     )
 
     held_tickers = set(_portfolio_tracking_tickers(journal))
@@ -8206,7 +8239,7 @@ def render_entry_opportunities_page(
     with st.expander("Filtrar y ordenar", expanded=False):
         filter_a, filter_b, filter_c = st.columns(3)
         minimum_score = filter_a.slider(
-            "Score oportunidad mínimo",
+            "Entrada hoy mínima",
             0,
             100,
             0,
@@ -8220,8 +8253,8 @@ def render_entry_opportunities_page(
         order = filter_c.selectbox(
             "Ordenar por",
             [
-                "Score oportunidad",
-                "Score técnico",
+                "Entrada hoy",
+                "Momento técnico",
                 "Timing",
                 "Beneficio/riesgo",
                 "Momentum 20 sesiones",
@@ -8299,10 +8332,10 @@ def render_entry_opportunities_page(
                 "Ticker": result.ticker,
                 "Empresa": result.company_name,
                 "Precio": result.price,
-                "Score técnico": result.technical_score,
+                "Momento técnico": result.technical_score,
                 "Timing": result.timing.score,
                 "Empresa /100": result.fundamental_score,
-                "Oportunidad": result.opportunity_score,
+                "Entrada hoy": result.opportunity_score,
                 "Cobertura": result.confidence_pct,
                 "Evento próximo": result.event.label,
                 "Gap señal": result.timing.gap_from_signal_pct,
@@ -8335,10 +8368,10 @@ def render_entry_opportunities_page(
                         format="%d",
                     )
                     for column in [
-                        "Score técnico",
+                        "Momento técnico",
                         "Timing",
                         "Empresa /100",
-                        "Oportunidad",
+                        "Entrada hoy",
                     ]
                 },
             },
@@ -8354,6 +8387,92 @@ def render_entry_opportunities_page(
     )
     for result in visible[:25]:
         _render_entry_opportunity_detail(result, journal)
+
+
+def render_speculative_opportunities_page(
+    prepared: dict[str, pd.DataFrame],
+    strategy: StrategyConfig,
+    fundamental_results: dict[str, FundamentalResult],
+    valuation_results: dict[str, ValuationResult],
+    relative_results: dict[str, RelativeStrengthResult],
+    risk_results: dict[str, RiskResult],
+    raw_fundamentals: dict[str, dict[str, object]],
+    favorite_labels: dict[str, str],
+    discoveries: list[SpeculativeCandidate],
+) -> None:
+    """Mantiene el universo especulativo fuera de las entradas convencionales."""
+
+    render_page_intro(
+        "ESTRATEGIA DE ALTO RIESGO",
+        "Oportunidades especulativas",
+        "Busca small caps líquidas fuera de tus favoritas y exige después controles "
+        "de timing, liquidez, cobertura y beneficio/riesgo.",
+    )
+    st.warning(
+        "Esta estrategia no comparte el tamaño de una posición normal. Una candidata "
+        "debe revisarse manualmente y dimensionarse desde la pérdida máxima aceptable."
+    )
+    st.button(
+        "Reintentar screener" if discoveries else "Buscar small caps líquidas",
+        icon=":material/travel_explore:",
+        key="start_speculative_search",
+        width="stretch",
+        on_click=_request_speculative_search,
+        disabled=_speculative_retry_wait_minutes() > 0,
+        help=(
+            "Consulta un universo externo de Nasdaq/NYSE y después descarga el "
+            "histórico y los fundamentales de un máximo de 12 candidatas."
+        ),
+    )
+    speculative_error = str(
+        st.session_state.get("_speculative_discovery_error", "") or ""
+    )
+    if speculative_error:
+        retry_wait = _speculative_retry_wait_minutes()
+        retry_note = (
+            f" Podrás volver a intentarlo en unos {retry_wait} minutos."
+            if retry_wait
+            else " Ya puedes volver a intentarlo."
+        )
+        st.warning(f"{speculative_error}{retry_note}")
+        if discoveries:
+            st.caption(
+                "Mientras tanto se mantiene visible el último universo encontrado; "
+                "no se ha borrado por este fallo temporal."
+            )
+    if not discoveries:
+        st.info(
+            "El screener sólo se ejecuta cuando lo solicitas. Sus resultados no se "
+            "mezclan con tus favoritas ni con Entradas hoy."
+        )
+        return
+    if not prepared:
+        st.info(
+            "El universo se conserva, pero todavía faltan precios para aplicar los "
+            "controles completos. Vuelve a intentarlo cuando termine la actualización."
+        )
+        return
+
+    results, errors = _build_entry_opportunities(
+        prepared,
+        fundamental_results,
+        valuation_results,
+        relative_results,
+        risk_results,
+        raw_fundamentals,
+        favorite_labels,
+        strategy,
+    )
+    if errors:
+        with st.expander(f"{len(errors)} empresas sin lectura completa"):
+            for error in errors:
+                st.caption(error)
+    render_speculative_opportunities(
+        results,
+        risk_results,
+        raw_fundamentals,
+        discoveries,
+    )
 
 
 def render_company_analysis_page(
@@ -8830,8 +8949,8 @@ def _benchmark_pending_row(
         "Corto": float("nan"),
         "Medio": float("nan"),
         "Largo": float("nan"),
-        "Entrada": float("nan"),
-        "Oportunidad": float("nan"),
+        "Momento técnico": float("nan"),
+        "Atractivo global": float("nan"),
         "Crecimiento": float("nan"),
         "Calidad": float("nan"),
         "Convicción": float("nan"),
@@ -8861,8 +8980,8 @@ def render_benchmark_outperformance_page(
 
     render_page_intro(
         "VENTAJA RELATIVA",
-        "¿Puede superar al S&P 500?",
-        "Cruza fuerza frente al índice con Entrada, Oportunidad, Crecimiento, Calidad, "
+        "Ventaja relativa frente al mercado",
+        "Cruza fuerza frente al S&P 500 con Momento técnico, Atractivo global, Crecimiento, Calidad, "
         "Convicción, Valoración y Riesgo. Una nota alta es una prioridad de estudio, "
         "no una rentabilidad garantizada.",
     )
@@ -8915,7 +9034,7 @@ def render_benchmark_outperformance_page(
             width="stretch",
             key="benchmark_refresh_all",
             on_click=_request_all_favorite_refresh,
-            args=("Superar índice",),
+            args=("Ventaja relativa",),
             help="Actualiza cartera y favoritas en bloques de 25 para no saturar los proveedores.",
         )
     selected_horizon = str(selected_horizon or "medium")
@@ -9076,10 +9195,10 @@ def render_benchmark_outperformance_page(
             "Corto": horizon_scores["short"],
             "Medio": horizon_scores["medium"],
             "Largo": horizon_scores["long"],
-            "Entrada": (
+            "Momento técnico": (
                 float(signal.score) if signal is not None else float("nan")
             ),
-            "Oportunidad": (
+            "Atractivo global": (
                 float(opportunity.score)
                 if opportunity is not None
                 else float("nan")
@@ -9217,10 +9336,10 @@ def render_benchmark_outperformance_page(
                 "Largo": st.column_config.ProgressColumn(
                     "Largo /100", min_value=0, max_value=100, format="%d"
                 ),
-                "Entrada": st.column_config.ProgressColumn(
+                "Momento técnico": st.column_config.ProgressColumn(
                     min_value=0, max_value=100, format="%d"
                 ),
-                "Oportunidad": st.column_config.ProgressColumn(
+                "Atractivo global": st.column_config.ProgressColumn(
                     min_value=0, max_value=100, format="%d"
                 ),
                 "Crecimiento": st.column_config.ProgressColumn(
@@ -9364,7 +9483,7 @@ def render_fundamental_filter_page(
                 "Fundamental": result.score,
                 "Cobertura": result.coverage_pct,
                 "Cumple": f"{result.passed}/{result.evaluated}",
-                "Momento": entry_score,
+                "Momento técnico": entry_score,
                 "Lectura": _fundamental_technical_reading(result.score, entry_score),
                 "PER": values.get("pe", "N/D"),
                 "ROIC": values.get("roic", "N/D"),
@@ -9408,7 +9527,7 @@ def render_fundamental_filter_page(
             "Cobertura": st.column_config.ProgressColumn(
                 min_value=0, max_value=100, format="%d%%"
             ),
-            "Momento": st.column_config.ProgressColumn(
+            "Momento técnico": st.column_config.ProgressColumn(
                 min_value=0, max_value=100, format="%d"
             ),
         },
@@ -9726,8 +9845,7 @@ def render_growth_momentum_page(
         icon=":material/monitoring:",
         width="stretch",
         key="growth_open_capital_projection",
-        on_click=_set_analysis_tool,
-        args=("Plan de capital",),
+        on_click=_open_capital_projection,
     )
 
     radar_prepared = prepared
@@ -10582,10 +10700,10 @@ def render_saved_analysis_history(
         ["opportunity_score", "entry_score", "timing_score", "company_score"]
     ].rename(
         columns={
-            "opportunity_score": "Oportunidad",
-            "entry_score": "Técnico",
+            "opportunity_score": "Atractivo global",
+            "entry_score": "Momento técnico",
             "timing_score": "Timing",
-            "company_score": "Empresa",
+            "company_score": "Calidad negocio",
         }
     )
     st.line_chart(evolution, height=330)
@@ -10595,9 +10713,9 @@ def render_saved_analysis_history(
             "id": "ID",
             "analyzed_at": "Fecha",
             "price": "Precio",
-            "opportunity_score": "Oportunidad",
-            "company_score": "Empresa",
-            "entry_score": "Técnico",
+            "opportunity_score": "Atractivo global",
+            "company_score": "Calidad negocio",
+            "entry_score": "Momento técnico",
             "timing_score": "Timing",
             "valuation_score": "Valoración",
             "risk_score": "Riesgo",
@@ -10620,9 +10738,9 @@ def render_saved_analysis_history(
                 "ID",
                 "Fecha",
                 "Precio",
-                "Oportunidad",
-                "Empresa",
-                "Técnico",
+                "Atractivo global",
+                "Calidad negocio",
+                "Momento técnico",
                 "Timing",
                 "Valoración",
                 "Riesgo",
@@ -10653,9 +10771,9 @@ def render_saved_analysis_history(
                     min_value=0, max_value=100, format="%d"
                 )
                 for column in [
-                    "Oportunidad",
-                    "Empresa",
-                    "Técnico",
+                    "Atractivo global",
+                    "Calidad negocio",
+                    "Momento técnico",
                     "Timing",
                     "Valoración",
                     "Riesgo",
@@ -10887,8 +11005,8 @@ def render_email_alert_settings(journal: object) -> None:
                 "entry_label": "Momento",
                 "growth_score": "Crecimiento",
                 "fundamental_score": "Fundamental",
-                "opportunity_score": "Oportunidad",
-                "opportunity_status": "Estado de oportunidad",
+                "opportunity_score": "Atractivo global",
+                "opportunity_status": "Estado global",
                 "data_note": "Cobertura",
                 "review_status": "Vigencia",
                 "position_label": "Si ya la tienes",
@@ -10907,8 +11025,8 @@ def render_email_alert_settings(journal: object) -> None:
                     "Momento",
                     "Crecimiento",
                     "Fundamental",
-                    "Oportunidad",
-                    "Estado de oportunidad",
+                    "Atractivo global",
+                    "Estado global",
                     "Si ya la tienes",
                     "Último cierre",
                     "Revisada",
@@ -10940,9 +11058,9 @@ def render_methodology() -> None:
         - **Nuevo máximo o ruptura:** supera una zona que antes no podía superar.
         - **Actividad o volumen:** cuánto se negocia comparado con un día normal.
         - **Peor caída temporal:** mayor pérdida sufrida desde un máximo anterior.
-        - **Oportunidad conjunta:** combina calidad, valoración, momento, fortaleza
+        - **Atractivo global:** combina calidad, valoración, momento, fortaleza
           frente al mercado y riesgo. No sustituye las cinco notas individuales.
-        - **Oportunidades (nueva pestaña):** conserva el score técnico y pregunta si
+        - **Entrada hoy:** conserva el momento técnico y pregunta si
           el precio actual todavía ofrece un timing razonable. Utiliza distancia desde
           la señal, ATR, medias, ruptura, RSI, volumen, evento próximo y beneficio/riesgo.
           Una empresa excelente puede aparecer como «esperar precio».
@@ -10956,11 +11074,11 @@ def render_methodology() -> None:
           del precio medio de compra.
         - **Beneficio esperado:** mediana histórica de señales parecidas, no una
           rentabilidad garantizada.
-        - **Objetivo 30+ días:** frecuencia histórica con la que una nueva señal,
+        - **Resultado posterior:** frecuencia histórica con la que una nueva señal,
           mantenida durante todo el periodo, terminó en positivo o superó la tasa
           anual equivalente de Segofactoring y Civislend. Exige 30 casos para
           considerar suficiente la muestra.
-        - **Crecimiento y momentum:** estrategia anexa para una parte del dinero
+        - **Crecimiento y momentum:** estrategia para una parte del dinero
           mensual nuevo. Mantiene separadas las notas de crecimiento empresarial,
           fortaleza del precio y contexto de mercado/riesgo. Adapta el tamaño y las
           comprobaciones a tecnología, consumo, energía, biotecnología, industria,
@@ -11037,6 +11155,30 @@ def main() -> None:
     requested_route = requested_analysis_navigation or st.session_state.get(
         "analysis_navigation"
     )
+    if requested_route == "Más análisis":
+        legacy_tool = str(st.session_state.get("analysis_tool_navigation", ""))
+        if legacy_tool == "Comparar empresas":
+            requested_route = "Empresa"
+            st.session_state["analysis_company_navigation"] = "Comparar empresas"
+        elif legacy_tool == "Prueba con el pasado":
+            requested_route = "Validar"
+            st.session_state["analysis_validation_navigation"] = "Backtest técnico"
+        elif legacy_tool == "Plan de capital":
+            st.session_state["main_navigation"] = "Carteras"
+            st.session_state["portfolio_navigation"] = "Plan de capital"
+            requested_route = "Radar"
+        else:
+            requested_route = "Validar"
+            st.session_state["analysis_validation_navigation"] = (
+                "Evolución del análisis"
+            )
+    if (
+        requested_route == "Estrategias"
+        and st.session_state.get("analysis_strategy_navigation")
+        == "Resultado tras 30+ días"
+    ):
+        requested_route = "Validar"
+        st.session_state["analysis_validation_navigation"] = "Resultado posterior"
     if requested_route in LEGACY_ANALYSIS_ROUTES:
         parent, child_key, child_value = LEGACY_ANALYSIS_ROUTES[str(requested_route)]
         st.session_state["analysis_navigation"] = parent
@@ -11046,10 +11188,12 @@ def main() -> None:
         st.session_state["analysis_navigation"] = requested_route
     else:
         st.session_state["analysis_navigation"] = "Radar"
+    if st.session_state.get("analysis_company_navigation") not in COMPANY_OPTIONS:
+        st.session_state["analysis_company_navigation"] = COMPANY_OPTIONS[0]
     if st.session_state.get("analysis_strategy_navigation") not in STRATEGY_OPTIONS:
         st.session_state["analysis_strategy_navigation"] = STRATEGY_OPTIONS[0]
-    if st.session_state.get("analysis_tool_navigation") not in ANALYSIS_TOOL_OPTIONS:
-        st.session_state["analysis_tool_navigation"] = ANALYSIS_TOOL_OPTIONS[0]
+    if st.session_state.get("analysis_validation_navigation") not in VALIDATION_OPTIONS:
+        st.session_state["analysis_validation_navigation"] = VALIDATION_OPTIONS[0]
 
     # La navegación se dibuja antes de cualquier descarga o cálculo. Así permanece
     # estable y responde al instante incluso cuando actualizar el mercado tarda.
@@ -11081,21 +11225,33 @@ def main() -> None:
             format_func=lambda value: ANALYSIS_LABELS[value],
             on_change=_reset_analysis_company_picker,
         )
-        if analysis_section == "Estrategias":
+        if analysis_section == "Empresa":
+            analysis_detail = render_subnavigation(
+                "Empresa",
+                COMPANY_OPTIONS,
+                key="analysis_company_navigation",
+                format_func=lambda value: (
+                    "↗ Análisis individual"
+                    if value == "Análisis individual"
+                    else "◇ Comparar"
+                ),
+            )
+        elif analysis_section == "Estrategias":
             analysis_detail = render_subnavigation(
                 "Estrategia",
                 STRATEGY_OPTIONS,
                 key="analysis_strategy_navigation",
             )
-        elif analysis_section == "Más análisis":
+        elif analysis_section == "Validar":
             analysis_detail = render_subnavigation(
-                "Herramienta",
-                ANALYSIS_TOOL_OPTIONS,
-                key="analysis_tool_navigation",
+                "Validación",
+                VALIDATION_OPTIONS,
+                key="analysis_validation_navigation",
             )
         current_reading = (
             analysis_detail
-            if analysis_section == "Estrategias" and analysis_detail
+            if analysis_section in {"Empresa", "Estrategias", "Validar"}
+            and analysis_detail
             else analysis_section
         )
         current_description = ANALYSIS_VIEW_DESCRIPTIONS.get(current_reading)
@@ -11124,16 +11280,18 @@ def main() -> None:
             ),
         )
     elif selected_section == "Carteras":
-        portfolio_options = ["Privada", "Grupo"]
+        portfolio_options = ["Privada", "Grupo", "Plan de capital"]
         if st.session_state.get("portfolio_navigation") not in portfolio_options:
             st.session_state["portfolio_navigation"] = "Privada"
         portfolio_section = render_subnavigation(
             "Cartera",
             portfolio_options,
             key="portfolio_navigation",
-            format_func=lambda value: (
-                "▱ Mi cartera" if value == "Privada" else "◎ Grupo"
-            ),
+            format_func=lambda value: {
+                "Privada": "▱ Mi cartera",
+                "Grupo": "◎ Grupo",
+                "Plan de capital": "↗ Planificar",
+            }[value],
         )
     elif selected_section == "Más":
         more_options = ["Alertas por correo"]
@@ -11153,9 +11311,7 @@ def main() -> None:
             }.get(value, value),
         )
 
-    layout_analysis_section = (
-        analysis_detail if analysis_section == "Más análisis" else analysis_section
-    )
+    layout_analysis_section = analysis_detail or analysis_section
     apply_section_layout(str(selected_section), layout_analysis_section)
     favorite_storage_error = ""
     try:
@@ -11216,10 +11372,16 @@ def main() -> None:
         dict.fromkeys(requested_growth_scan_tickers)
     )[:25]
     automatic_review_page = selected_section == "Analizar" and (
-        analysis_section in {"Radar", "Oportunidades", "Superar índice"}
+        analysis_section in {"Radar", "Oportunidades"}
         or (
             analysis_section == "Estrategias"
-            and analysis_detail in {"Crecimiento", "Calidad fundamental"}
+            and analysis_detail
+            in {
+                "Crecimiento y momentum",
+                "Calidad fundamental",
+                "Ventaja relativa",
+                "Especulativas",
+            }
         )
     )
     review_position_tickers: list[str] = []
@@ -11232,7 +11394,11 @@ def main() -> None:
         except JournalStorageError:
             review_position_tickers = []
     review_favorite_tickers = favorite_tickers
-    if analysis_section == "Superar índice" and not private_favorites.empty:
+    if (
+        analysis_section == "Estrategias"
+        and analysis_detail == "Ventaja relativa"
+        and not private_favorites.empty
+    ):
         review_favorite_tickers = [
             str(ticker).strip().upper()
             for ticker in private_favorites.get("ticker", [])
@@ -11477,7 +11643,8 @@ def main() -> None:
             remembered["candidates"] = list(discoveries)
             remembered["as_of"] = discovered_at
         st.session_state["_requested_main_navigation"] = "Analizar"
-        st.session_state["_requested_analysis_navigation"] = "Oportunidades"
+        st.session_state["_requested_analysis_navigation"] = "Estrategias"
+        st.session_state["analysis_strategy_navigation"] = "Especulativas"
         st.rerun()
     for error in st.session_state.get("download_errors", []):
         st.warning(error)
@@ -11572,11 +11739,11 @@ def main() -> None:
                 journal,
                 favorite_tickers,
                 favorite_labels,
-                speculative_discoveries=list(
-                    st.session_state.get("_speculative_candidates", []) or []
-                ),
             )
-        elif analysis_section == "Superar índice":
+        elif (
+            analysis_section == "Estrategias"
+            and analysis_detail == "Ventaja relativa"
+        ):
             render_benchmark_outperformance_page(
                 prepared,
                 strategy,
@@ -11591,7 +11758,10 @@ def main() -> None:
                 favorite_labels,
                 private_favorites,
             )
-        elif analysis_section == "Empresa":
+        elif (
+            analysis_section == "Empresa"
+            and analysis_detail == "Análisis individual"
+        ):
             render_page_intro(
                 "ANÁLISIS DE EMPRESA",
                 "Entender una empresa",
@@ -11617,7 +11787,28 @@ def main() -> None:
                 price_verifications,
                 journal,
             )
-        elif analysis_section == "Estrategias" and analysis_detail == "Crecimiento":
+        elif (
+            analysis_section == "Empresa"
+            and analysis_detail == "Comparar empresas"
+        ):
+            render_page_intro(
+                "COMPARAR",
+                "Comparar empresas",
+                "Compara negocios semejantes; el precio nominal de una acción no indica "
+                "si está más barata o es mejor que otra.",
+            )
+            render_sector_comparison(
+                prepared,
+                fundamental_results,
+                valuation_results,
+                risk_results,
+                private_favorites,
+                group_favorites,
+            )
+        elif (
+            analysis_section == "Estrategias"
+            and analysis_detail == "Crecimiento y momentum"
+        ):
             render_growth_momentum_page(
                 prepared,
                 raw_fundamentals,
@@ -11642,47 +11833,43 @@ def main() -> None:
                 group_favorites,
                 favorite_labels,
             )
-        elif (
-            analysis_section == "Estrategias"
-            and analysis_detail == "Resultado tras 30+ días"
-        ):
+        elif analysis_section == "Estrategias" and analysis_detail == "Especulativas":
+            render_speculative_opportunities_page(
+                prepared,
+                strategy,
+                fundamental_results,
+                valuation_results,
+                relative_results,
+                risk_results,
+                raw_fundamentals,
+                favorite_labels,
+                list(st.session_state.get("_speculative_candidates", []) or []),
+            )
+        elif analysis_section == "Validar" and analysis_detail == "Resultado posterior":
             render_long_horizon_calibration(
                 prepared,
                 summary,
                 backtest,
                 fundamental_results,
             )
-        elif analysis_detail == "Comparar empresas":
+        elif analysis_section == "Validar" and analysis_detail == "Evolución del análisis":
             render_page_intro(
-                "MÁS ANÁLISIS",
-                "Comparar empresas",
-                "Compara negocios semejantes; el precio nominal de una acción no indica "
-                "si está más barata o es mejor que otra.",
-            )
-            render_sector_comparison(
-                prepared,
-                fundamental_results,
-                valuation_results,
-                risk_results,
-                private_favorites,
-                group_favorites,
-            )
-        elif analysis_detail == "Historial":
-            render_page_intro(
-                "MÁS ANÁLISIS",
-                "Historial",
+                "VALIDAR MÉTODO",
+                "Evolución del análisis",
                 "Consulta cómo cambiaron el precio y las notas entre revisiones; no es "
                 "un registro de compras y ventas.",
             )
             render_saved_analysis_history(journal, prepared)
-        elif analysis_detail == "Plan de capital":
-            render_capital_projection_page(authenticated_user.username)
-        elif analysis_detail == "Prueba con el pasado" and not prepared:
+        elif (
+            analysis_section == "Validar"
+            and analysis_detail == "Backtest técnico"
+            and not prepared
+        ):
             st.info("Actualiza empresas antes de ejecutar una prueba histórica.")
-        elif analysis_detail == "Prueba con el pasado":
+        elif analysis_section == "Validar" and analysis_detail == "Backtest técnico":
             render_page_intro(
-                "MÁS ANÁLISIS",
-                "Prueba con el pasado",
+                "VALIDAR MÉTODO",
+                "Backtest técnico",
                 "Simula las reglas sobre datos históricos. Sirve para detectar una "
                 "estrategia frágil; no predice la próxima subida.",
             )
@@ -11733,6 +11920,9 @@ def main() -> None:
                 is_admin=authenticated_user.is_admin,
                 favorite_view=favorite_view,
             )
+
+    elif selected_section == "Carteras" and portfolio_section == "Plan de capital":
+        render_capital_projection_page(authenticated_user.username)
 
     elif selected_section == "Carteras":
         if not persistent_journal_enabled():
