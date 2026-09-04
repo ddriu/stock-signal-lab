@@ -2,13 +2,28 @@ from streamlit.testing.v1 import AppTest
 
 
 def test_entry_opportunities_is_independent_from_existing_radar() -> None:
-    from app import ANALYSIS_OPTIONS, LEGACY_ANALYSIS_ROUTES, STRATEGY_OPTIONS
+    from app import (
+        ANALYSIS_OPTIONS,
+        COMPANY_OPTIONS,
+        LEGACY_ANALYSIS_ROUTES,
+        STRATEGY_OPTIONS,
+        VALIDATION_OPTIONS,
+    )
 
-    assert "Radar" in ANALYSIS_OPTIONS
-    assert "Oportunidades" in ANALYSIS_OPTIONS
-    assert "Superar índice" in ANALYSIS_OPTIONS
+    assert ANALYSIS_OPTIONS == [
+        "Radar",
+        "Oportunidades",
+        "Empresa",
+        "Estrategias",
+        "Validar",
+    ]
     assert "Oportunidades" not in LEGACY_ANALYSIS_ROUTES
+    assert "Comparar empresas" in COMPANY_OPTIONS
     assert "Calidad fundamental" in STRATEGY_OPTIONS
+    assert "Ventaja relativa" in STRATEGY_OPTIONS
+    assert "Especulativas" in STRATEGY_OPTIONS
+    assert "Resultado posterior" in VALIDATION_OPTIONS
+    assert "Backtest técnico" in VALIDATION_OPTIONS
 
 
 def test_entry_opportunities_explains_when_prices_are_not_loaded() -> None:
@@ -25,7 +40,7 @@ render_entry_opportunities_page(
     assert not app.exception
     assert not app.error
     assert "no hay precios actualizados" in app.info[0].value.lower()
-    assert any("small caps" in button.label.lower() for button in app.button)
+    assert not any("small caps" in button.label.lower() for button in app.button)
 
 
 def test_speculative_rate_limit_keeps_previous_results_and_disables_retry() -> None:
@@ -33,7 +48,7 @@ def test_speculative_rate_limit_keeps_previous_results_and_disables_retry() -> N
 from datetime import timedelta
 import pandas as pd
 import streamlit as st
-from app import render_entry_opportunities_page
+from app import render_speculative_opportunities_page
 from config import StrategyConfig
 from src.speculative import SpeculativeCandidate
 
@@ -48,8 +63,8 @@ previous = [SpeculativeCandidate(
     market_cap=800_000_000, average_volume_3m=1_000_000,
     daily_turnover=5_000_000,
 )]
-render_entry_opportunities_page(
-    {}, StrategyConfig(), {}, {}, {}, {}, {}, object(), [], {}, previous
+render_speculative_opportunities_page(
+    {}, StrategyConfig(), {}, {}, {}, {}, {}, {}, previous
 )
 '''
     app = AppTest.from_string(script, default_timeout=15).run()
@@ -57,7 +72,7 @@ render_entry_opportunities_page(
     retry = next(button for button in app.button if "screener" in button.label.lower())
     assert not app.exception
     assert retry.disabled is True
-    assert "unos 15 minutos" in app.warning[0].value
+    assert any("unos 15 minutos" in item.value for item in app.warning)
     assert any("último universo" in item.value for item in app.caption)
 
 
