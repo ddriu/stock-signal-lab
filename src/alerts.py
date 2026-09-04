@@ -46,6 +46,12 @@ ALERT_STATE_COLUMNS = [
     "price",
     "evaluated_at",
     "notified_at",
+    "company_name",
+    "growth_score",
+    "fundamental_score",
+    "opportunity_score",
+    "opportunity_status",
+    "data_note",
 ]
 
 
@@ -128,6 +134,12 @@ class AlertState:
     price: float
     evaluated_at: str
     notified_at: str | None = None
+    company_name: str = ""
+    growth_score: int | None = None
+    fundamental_score: int | None = None
+    opportunity_score: int | None = None
+    opportunity_status: str = ""
+    data_note: str = ""
 
 
 def is_valid_email(value: str) -> bool:
@@ -356,6 +368,12 @@ def build_alert_state(
     evaluated_at: str | None = None,
     signature: str | None = None,
     previous_notified_at: str | None = None,
+    company_name: str = "",
+    growth_score: int | None = None,
+    fundamental_score: int | None = None,
+    opportunity_score: int | None = None,
+    opportunity_status: str = "",
+    data_note: str = "",
 ) -> AlertState:
     now = evaluated_at or datetime.now().astimezone().isoformat(timespec="seconds")
     return AlertState(
@@ -370,6 +388,12 @@ def build_alert_state(
         # Conserva la última entrega real. De lo contrario, una revisión sin
         # novedades borraría al día siguiente la única evidencia del correo.
         notified_at=now if notified else previous_notified_at,
+        company_name=company_name.strip(),
+        growth_score=growth_score,
+        fundamental_score=fundamental_score,
+        opportunity_score=opportunity_score,
+        opportunity_status=opportunity_status.strip(),
+        data_note=data_note.strip(),
     )
 
 
@@ -680,12 +704,18 @@ def build_daily_overview_content(
     incomplete = sum(
         row.fundamental_score is None or row.growth_score is None for row in values
     )
-    subject = f"Stock Signal Lab · resumen diario · {total} empresas revisadas"
+    priced = sum(row.technical_score is not None for row in values)
+    unavailable = total - priced
+    subject = (
+        f"Stock Signal Lab · resumen diario · {priced}/{total} empresas procesadas"
+    )
     plain_lines = [
         f"Hola {display_name},",
         "",
         "RESUMEN DIARIO COMBINADO",
-        f"Empresas revisadas: {total}",
+        f"Empresas solicitadas: {total}",
+        f"Empresas procesadas con precios: {priced}",
+        f"Empresas sin precio o sin análisis: {unavailable}",
         f"Entradas validadas para revisar: {buyable}",
         f"Posiciones para revisar/reducir/salir: {portfolio_reviews}",
         f"Cambios relevantes desde el análisis anterior: {changed}",
@@ -757,7 +787,8 @@ def build_daily_overview_content(
       <p>Hola {html.escape(display_name)},</p>
       <div style="background:#f8fafc;border:1px solid #cbd5e1;border-radius:12px;
                   padding:14px 16px;margin:14px 0">
-        <strong>{total} empresas revisadas</strong><br>
+        <strong>{priced} de {total} empresas procesadas con precios</strong><br>
+        Sin precio o sin análisis: {unavailable} ·
         Entradas validadas: {buyable} · Cartera para revisar: {portfolio_reviews} ·
         Cambios relevantes: {changed} · Primeras lecturas: {new_readings} ·
         Datos parciales: {incomplete}

@@ -44,6 +44,7 @@ class AlertRunSummary:
     emails_sent: int
     alerts_sent: int
     errors: tuple[str, ...]
+    tickers_with_prices: int = 0
 
 
 def _favorite_names(journal: object) -> dict[str, str]:
@@ -69,13 +70,22 @@ def _position_costs(journal: object) -> dict[str, float]:
     positions = journal.open_positions()
     if positions.empty:
         return {}
-    result: dict[str, float] = {}
+    weighted_costs: dict[str, tuple[float, float]] = {}
     for row in positions.itertuples(index=False):
         ticker = str(row.ticker).strip().upper()
         average_cost = float(row.average_cost)
-        if ticker and average_cost > 0:
-            result[ticker] = average_cost
-    return result
+        quantity = float(row.quantity)
+        if ticker and average_cost > 0 and quantity > 0:
+            current_cost, current_quantity = weighted_costs.get(ticker, (0.0, 0.0))
+            weighted_costs[ticker] = (
+                current_cost + average_cost * quantity,
+                current_quantity + quantity,
+            )
+    return {
+        ticker: total_cost / total_quantity
+        for ticker, (total_cost, total_quantity) in weighted_costs.items()
+        if total_quantity > 0
+    }
 
 
 def _download_alert_frames(
@@ -180,14 +190,13 @@ def run_daily_alerts(
                 if not previous.empty and "notified_at" in previous.columns
                 else {}
             )
-            evaluated: list[tuple[object, float, bool, str]] = []
+            evaluated: list[tuple[object, float, bool, str, DailyOverviewRow]] = []
             candidates: list[AlertCandidate] = []
             overview_rows: list[DailyOverviewRow] = []
             for ticker in sorted(scope):
                 frame = frames.get(ticker)
                 if frame is None or frame.empty:
-                    overview_rows.append(
-                        DailyOverviewRow(
+                    overview_row = DailyOverviewRow(
                             ticker=ticker,
                             company_name=names.get(ticker, ticker),
                             held=ticker in positions,
@@ -198,7 +207,7 @@ def run_daily_alerts(
                             position_label="Sin datos",
                             data_note="precios no disponibles",
                         )
-                    )
+                    overview_rows.append(overview_row)
                     continue
                 try:
                     held = ticker in positions
@@ -346,8 +355,7 @@ def run_daily_alerts(
                             held=held,
                         )
                     )
-                    overview_rows.append(
-                        DailyOverviewRow(
+                    overview_row = DailyOverviewRow(
                             ticker=ticker,
                             company_name=company_name,
                             held=held,
@@ -382,10 +390,12 @@ def run_daily_alerts(
                             current_state=current_state,
                             data_note=", ".join(dict.fromkeys(data_notes)),
                         )
-                    )
+                    overview_rows.append(overview_row)
                     if candidate is not None:
                         candidates.append(candidate)
-                    evaluated.append((signal, price, held, state_signature))
+                    evaluated.append(
+                        (signal, price, held, state_signature, overview_row)
+                    )
                 except Exception as exc:
                     # Un ticker con poco histórico o datos incompletos no debe
                     # cancelar el resumen de las demás empresas del usuario.
@@ -474,8 +484,14 @@ def run_daily_alerts(
                         if pd.isna(previous_notified.get(signal.ticker))
                         else str(previous_notified.get(signal.ticker))
                     ),
+                    company_name=overview.company_name,
+                    growth_score=overview.growth_score,
+                    fundamental_score=overview.fundamental_score,
+                    opportunity_score=overview.opportunity_score,
+                    opportunity_status=overview.opportunity_status,
+                    data_note=overview.data_note,
                 )
-                for signal, price, held, signature in evaluated
+                for signal, price, held, signature, overview in evaluated
             ]
             journal.upsert_alert_states(states)
         except Exception as exc:
@@ -484,8 +500,9 @@ def run_daily_alerts(
 
     return AlertRunSummary(
         users_checked=len(scopes),
-        tickers_checked=len(frames),
+        tickers_checked=len(all_tickers),
         emails_sent=emails_sent,
         alerts_sent=alerts_sent,
         errors=tuple(errors),
+        tickers_with_prices=len(frames),
     )

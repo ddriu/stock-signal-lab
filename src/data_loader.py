@@ -16,6 +16,7 @@ from src.data_sources import (
     download_sec_fundamental_snapshot,
     merge_fundamental_sources,
 )
+from src.instruments import ANALYSIS_TICKER_ALIASES, resolve_analysis_ticker
 
 
 REQUIRED_COLUMNS = ("open", "high", "low", "close", "volume")
@@ -36,25 +37,6 @@ STOOQ_INDEX_SYMBOLS = {
     "^GSPC": "^SPX",
     "^IXIC": "^NDQ",
 }
-
-# Nombres y abreviaturas habituales de algunos brókeres no siempre coinciden
-# con el símbolo que utilizan las fuentes gratuitas. La app conserva el nombre
-# original en la cartera, pero usa esta cotización principal para el análisis.
-ANALYSIS_TICKER_ALIASES = {
-    "6VO": "RDDT",
-    "AMAZON": "AMZN",
-    "AMAZON.COM": "AMZN",
-    "AMZ": "AMZN",
-    # Trade Republic/Revolut pueden mostrar sólo el símbolo de Xetra. Yahoo
-    # necesita el sufijo de mercado para distinguir esta cotización en euros.
-    "CEBS": "CEBS.DE",
-    "NETFLIX": "NFLX",
-    "ORACLE": "ORCL",
-    "REDDIT": "RDDT",
-    "SERVICE NOW": "NOW",
-    "SERVICENOW": "NOW",
-}
-
 
 class DataDownloadError(RuntimeError):
     """Error recuperable al obtener o validar precios."""
@@ -258,15 +240,6 @@ def _curated_search_results(query: str) -> list[TickerSearchResult]:
         for aliases, result in _CURATED_INTERNATIONAL_LISTINGS
         if any(normalized_query in alias or alias in normalized_query for alias in aliases)
     ]
-
-
-def resolve_analysis_ticker(ticker: str) -> str:
-    """Convierte nombres/abreviaturas de bróker en un ticker analizable."""
-
-    value = ticker.strip().upper()
-    if not value:
-        raise ValueError("El ticker no puede estar vacío.")
-    return ANALYSIS_TICKER_ALIASES.get(value, value)
 
 
 def normalize_ticker(ticker: str) -> str:

@@ -57,9 +57,18 @@ def build_position_dashboard(
 
     for position in positions.itertuples(index=False):
         ticker = str(position.ticker)
+        account_name = str(getattr(position, "account_name", "") or "").strip()
         currency = str(position.currency).upper()
         cost_basis = float(position.cost_basis)
-        cost_eur = _to_eur(cost_basis, currency, rates_per_eur)
+        recorded_cost_eur = pd.to_numeric(
+            getattr(position, "cost_basis_eur", None), errors="coerce"
+        )
+        has_recorded_cost = pd.notna(recorded_cost_eur)
+        cost_eur = (
+            float(recorded_cost_eur)
+            if has_recorded_cost
+            else _to_eur(cost_basis, currency, rates_per_eur)
+        )
         if cost_eur is not None:
             invested_eur += cost_eur
 
@@ -90,27 +99,35 @@ def build_position_dashboard(
                 currency,
                 rates_per_eur,
             )
-            net_pnl_eur = _to_eur(
-                float(valuation.net_pnl),
-                currency,
-                rates_per_eur,
+            net_pnl_eur = (
+                net_value_eur - cost_eur
+                if net_value_eur is not None and cost_eur is not None
+                else None
             )
             if net_value_eur is not None and net_pnl_eur is not None and cost_eur is not None:
                 priced_positions += 1
                 priced_cost_eur += cost_eur
                 current_net_value_eur += net_value_eur
                 unrealized_pnl_eur += net_pnl_eur
-                net_return_pct = float(valuation.net_return_pct)
+                net_return_pct = (
+                    net_pnl_eur / cost_eur * 100.0 if cost_eur > 0 else 0.0
+                )
 
         rows.append(
             {
                 "ticker": ticker,
+                "account_name": account_name,
                 "currency": currency,
                 "quantity": float(position.quantity),
                 "average_cost": float(position.average_cost),
                 "cost_basis": cost_basis,
                 "cost_basis_eur": (
                     cost_eur if cost_eur is not None else float("nan")
+                ),
+                "cost_basis_source": (
+                    "Liquidación del bróker"
+                    if has_recorded_cost
+                    else "Estimación con cambio actual"
                 ),
                 "current_price": (
                     float(current_price) if current_price is not None else float("nan")
@@ -139,8 +156,22 @@ def build_position_dashboard(
     states = calculate_position_states(operations, include_closed=True)
     for state in states.itertuples(index=False):
         currency = str(state.currency).upper()
-        realized = _to_eur(float(state.realized_pnl), currency, rates_per_eur)
-        fees = _to_eur(float(state.paid_fees), currency, rates_per_eur)
+        recorded_realized = pd.to_numeric(
+            getattr(state, "realized_pnl_eur", None), errors="coerce"
+        )
+        recorded_fees = pd.to_numeric(
+            getattr(state, "paid_fees_eur", None), errors="coerce"
+        )
+        realized = (
+            float(recorded_realized)
+            if pd.notna(recorded_realized)
+            else _to_eur(float(state.realized_pnl), currency, rates_per_eur)
+        )
+        fees = (
+            float(recorded_fees)
+            if pd.notna(recorded_fees)
+            else _to_eur(float(state.paid_fees), currency, rates_per_eur)
+        )
         if realized is not None:
             realized_pnl_eur += realized
         if fees is not None:
