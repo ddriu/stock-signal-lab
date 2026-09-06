@@ -5432,8 +5432,8 @@ def _favorites_matching_tags(
 def _open_favorite_add(destination: str) -> None:
     """Abre el alta de favoritas con la lista de destino ya elegida."""
 
-    st.session_state["main_navigation"] = "Favoritos"
-    st.session_state["favorite_view"] = "Añadir empresa"
+    st.session_state["_requested_main_navigation"] = "Favoritos"
+    st.session_state["_requested_favorite_view"] = "Añadir empresa"
     st.session_state["_requested_favorite_destination"] = destination
 
 
@@ -6387,16 +6387,27 @@ def _set_navigation(
     subsection_key: str | None = None,
     subsection: str | None = None,
 ) -> None:
-    st.session_state["main_navigation"] = section
+    """Encola un cambio de pantalla para aplicarlo antes de crear los widgets."""
+
+    st.session_state["_requested_main_navigation"] = section
     if subsection_key and subsection:
-        st.session_state[subsection_key] = subsection
+        request_key = {
+            "analysis_company_navigation": "_requested_analysis_company_navigation",
+            "analysis_strategy_navigation": "_requested_analysis_strategy_navigation",
+            "analysis_validation_navigation": "_requested_analysis_validation_navigation",
+            "favorite_view": "_requested_favorite_view",
+            "portfolio_navigation": "_requested_portfolio_navigation",
+            "more_navigation": "_requested_more_navigation",
+        }.get(subsection_key)
+        if request_key:
+            st.session_state[request_key] = subsection
 
 
 def _open_capital_projection() -> None:
     """Abre la planificación desde una estrategia sin devolverla a Analizar."""
 
-    st.session_state["main_navigation"] = "Carteras"
-    st.session_state["portfolio_navigation"] = "Plan de capital"
+    st.session_state["_requested_main_navigation"] = "Carteras"
+    st.session_state["_requested_portfolio_navigation"] = "Plan de capital"
 
 
 def _request_analysis_page(page: str) -> None:
@@ -6413,7 +6424,7 @@ def _request_all_favorite_refresh(destination: str = "Radar") -> None:
     st.session_state["_requested_main_navigation"] = "Analizar"
     if destination in STRATEGY_OPTIONS:
         st.session_state["_requested_analysis_navigation"] = "Estrategias"
-        st.session_state["analysis_strategy_navigation"] = destination
+        st.session_state["_requested_analysis_strategy_navigation"] = destination
     else:
         st.session_state["_requested_analysis_navigation"] = (
             destination if destination in ANALYSIS_OPTIONS else "Radar"
@@ -6465,7 +6476,7 @@ def _request_speculative_search() -> None:
     st.session_state["_pending_speculative_discovery"] = True
     st.session_state["_requested_main_navigation"] = "Analizar"
     st.session_state["_requested_analysis_navigation"] = "Estrategias"
-    st.session_state["analysis_strategy_navigation"] = "Especulativas"
+    st.session_state["_requested_analysis_strategy_navigation"] = "Especulativas"
 
 
 def _sync_analysis_ticker(source_key: str) -> None:
@@ -6494,8 +6505,8 @@ def _continue_search_in_favorites(
 ) -> None:
     """Lleva una búsqueda rápida a la pantalla donde puede guardarse."""
 
-    st.session_state["main_navigation"] = "Favoritos"
-    st.session_state["favorite_view"] = "Añadir empresa"
+    st.session_state["_requested_main_navigation"] = "Favoritos"
+    st.session_state["_requested_favorite_view"] = "Añadir empresa"
     st.session_state["favorite_search_query"] = query
     st.session_state["favorite_search_results"] = results
     st.session_state.pop("favorite_market_filter", None)
@@ -6517,7 +6528,9 @@ def _open_ticker_analysis(ticker: str) -> None:
     # rechaza esos cambios si los menús ya se crearon durante la interacción.
     st.session_state["_requested_main_navigation"] = "Analizar"
     st.session_state["_requested_analysis_navigation"] = "Empresa"
-    st.session_state["analysis_company_navigation"] = "Análisis individual"
+    st.session_state["_requested_analysis_company_navigation"] = (
+        "Análisis individual"
+    )
     st.session_state["_requested_analysis_ticker"] = normalized
     st.session_state["_pending_analysis_ticker"] = normalized
     _reset_analysis_company_picker()
@@ -6532,7 +6545,7 @@ def _open_ticker_comparison(tickers: list[str]) -> None:
     st.session_state["_comparison_seed_tickers"] = selected
     st.session_state["_requested_main_navigation"] = "Analizar"
     st.session_state["_requested_analysis_navigation"] = "Empresa"
-    st.session_state["analysis_company_navigation"] = "Comparar empresas"
+    st.session_state["_requested_analysis_company_navigation"] = "Comparar empresas"
 
 
 def _clear_table_selection(revision_key: str, revision: int) -> None:
@@ -11150,6 +11163,24 @@ def main() -> None:
     requested_analysis_navigation = st.session_state.pop(
         "_requested_analysis_navigation", None
     )
+    requested_analysis_company_navigation = st.session_state.pop(
+        "_requested_analysis_company_navigation", None
+    )
+    requested_analysis_strategy_navigation = st.session_state.pop(
+        "_requested_analysis_strategy_navigation", None
+    )
+    requested_analysis_validation_navigation = st.session_state.pop(
+        "_requested_analysis_validation_navigation", None
+    )
+    requested_favorite_view = st.session_state.pop(
+        "_requested_favorite_view", None
+    )
+    requested_portfolio_navigation = st.session_state.pop(
+        "_requested_portfolio_navigation", None
+    )
+    requested_more_navigation = st.session_state.pop(
+        "_requested_more_navigation", None
+    )
     if st.session_state.get("main_navigation") not in MAIN_OPTIONS:
         st.session_state["main_navigation"] = "Inicio"
     requested_route = requested_analysis_navigation or st.session_state.get(
@@ -11188,6 +11219,32 @@ def main() -> None:
         st.session_state["analysis_navigation"] = requested_route
     else:
         st.session_state["analysis_navigation"] = "Radar"
+    if requested_analysis_company_navigation in COMPANY_OPTIONS:
+        st.session_state["analysis_company_navigation"] = (
+            requested_analysis_company_navigation
+        )
+    if requested_analysis_strategy_navigation in STRATEGY_OPTIONS:
+        st.session_state["analysis_strategy_navigation"] = (
+            requested_analysis_strategy_navigation
+        )
+    if requested_analysis_validation_navigation in VALIDATION_OPTIONS:
+        st.session_state["analysis_validation_navigation"] = (
+            requested_analysis_validation_navigation
+        )
+    if requested_favorite_view in {"Mis listas", "Añadir empresa"}:
+        st.session_state["favorite_view"] = requested_favorite_view
+    if requested_portfolio_navigation in {
+        "Privada",
+        "Grupo",
+        "Plan de capital",
+    }:
+        st.session_state["portfolio_navigation"] = requested_portfolio_navigation
+    if requested_more_navigation in {
+        "Alertas por correo",
+        "Administración",
+        "Guía y riesgos",
+    }:
+        st.session_state["more_navigation"] = requested_more_navigation
     if st.session_state.get("analysis_company_navigation") not in COMPANY_OPTIONS:
         st.session_state["analysis_company_navigation"] = COMPANY_OPTIONS[0]
     if st.session_state.get("analysis_strategy_navigation") not in STRATEGY_OPTIONS:
@@ -11644,7 +11701,9 @@ def main() -> None:
             remembered["as_of"] = discovered_at
         st.session_state["_requested_main_navigation"] = "Analizar"
         st.session_state["_requested_analysis_navigation"] = "Estrategias"
-        st.session_state["analysis_strategy_navigation"] = "Especulativas"
+        st.session_state["_requested_analysis_strategy_navigation"] = (
+            "Especulativas"
+        )
         st.rerun()
     for error in st.session_state.get("download_errors", []):
         st.warning(error)
