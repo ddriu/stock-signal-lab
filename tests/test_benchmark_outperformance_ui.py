@@ -62,4 +62,4 @@ render_benchmark_outperformance_page(
     state = app.session_state.filtered_state
     assert state["_force_all_favorite_refresh"] is True
     assert state["_requested_analysis_navigation"] == "Estrategias"
-    assert state["analysis_strategy_navigation"] == "Ventaja relativa"
+    assert state["_requested_analysis_strategy_navigation"] == "Ventaja relativa"
