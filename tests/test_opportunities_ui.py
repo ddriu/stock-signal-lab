@@ -209,5 +209,6 @@ render_analysis_company_picker(
     assert state["analysis_navigation"] == "Empresa"
     assert state["_requested_main_navigation"] == "Analizar"
     assert state["_requested_analysis_navigation"] == "Empresa"
+    assert state["_requested_analysis_company_navigation"] == "Análisis individual"
     assert state["_requested_analysis_ticker"] == "MA"
     assert state["_pending_analysis_ticker"] == "MA"
