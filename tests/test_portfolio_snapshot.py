@@ -2,13 +2,52 @@ import pandas as pd
 import pytest
 
 from src.portfolio_snapshot import (
+    PortfolioRefreshSummary,
     compare_portfolio_valuations,
     group_portfolio_snapshot_for_home,
     latest_portfolio_snapshot,
     portfolio_platform_reconciliation,
+    preferred_portfolio_summary,
     reconcile_current_portfolio,
     refresh_portfolio_snapshot_prices,
 )
+
+
+def test_home_prefers_market_estimate_when_prices_were_refreshed() -> None:
+    positions = pd.DataFrame(
+        [
+            {
+                "snapshot_date": "2026-09-20",
+                "platform": "Broker",
+                "asset_name": "Arista Networks",
+                "asset_type": "Acción",
+                "analysis_ticker": "ANET",
+                "value_eur": 300.0,
+                "cost_estimate_eur": 280.0,
+                "gain_loss_eur": 20.0,
+            }
+        ]
+    )
+    _, declared = latest_portfolio_snapshot(positions)
+    market = positions.copy()
+    market["value_eur"] = 340.0
+    market["gain_loss_eur"] = 60.0
+    _, estimate = latest_portfolio_snapshot(market)
+
+    selected, is_estimate = preferred_portfolio_summary(
+        declared,
+        estimate,
+        refresh=PortfolioRefreshSummary(
+            market_priced_count=1,
+            manual_count=0,
+            pending_count=0,
+            market_as_of="2026-09-25",
+        ),
+    )
+
+    assert is_estimate
+    assert selected is estimate
+    assert selected.value_eur == pytest.approx(340.0)
 
 
 def test_latest_snapshot_does_not_mix_historical_dates() -> None:

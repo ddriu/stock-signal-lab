@@ -4,6 +4,7 @@ import pandas as pd
 
 from src.navigation import (
     analysis_refresh_tickers,
+    daily_refresh_due,
     direct_ticker_from_query,
     growth_radar_ticker_groups,
     market_data_freshness_rows,
@@ -11,6 +12,12 @@ from src.navigation import (
     next_daily_review_batch,
     sanitize_favorite_selection,
 )
+
+
+def test_daily_portfolio_refresh_runs_again_when_the_calendar_day_changes() -> None:
+    assert not daily_refresh_due("2026-09-25", today=date(2026, 9, 25))
+    assert daily_refresh_due("2026-09-24", today=date(2026, 9, 25))
+    assert daily_refresh_due(True, today=date(2026, 9, 25))
 
 
 def test_market_data_freshness_separates_market_date_from_download_time() -> None:

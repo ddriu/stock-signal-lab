@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pandas as pd
 
 from src.alerts import normalize_alert_preferences
-from src.alert_runner import run_daily_alerts
+from src.alert_runner import _snapshot_positions, run_daily_alerts
 from src.entry_opportunity import STATUS_BUYABLE, STATUS_WAIT_PRICE
 from src.signal_engine import SignalResult
 from src.storage import GROUP_PORTFOLIO_OWNER
@@ -28,6 +28,44 @@ class FakeJournal:
 
     def upsert_alert_states(self, states: list[object]) -> None:
         self.saved_states.extend(states)
+
+
+def test_latest_snapshot_positions_are_included_in_the_daily_scope() -> None:
+    class SnapshotJournal(FakeJournal):
+        def list_portfolio_snapshot_positions(self) -> pd.DataFrame:
+            return pd.DataFrame(
+                [
+                    {
+                        "snapshot_date": "2026-09-20",
+                        "platform": "Broker",
+                        "asset_name": "Posición antigua",
+                        "asset_type": "Acción",
+                        "analysis_ticker": "OLD",
+                        "value_eur": 100.0,
+                    },
+                    {
+                        "snapshot_date": "2026-09-25",
+                        "platform": "Broker",
+                        "asset_name": "AST SpaceMobile",
+                        "asset_type": "Acción",
+                        "analysis_ticker": "ASTS",
+                        "value_eur": 320.0,
+                    },
+                    {
+                        "snapshot_date": "2026-09-25",
+                        "platform": "Broker",
+                        "asset_name": "Cobre",
+                        "asset_type": "ETF",
+                        "analysis_ticker": "CEBS",
+                        "value_eur": 150.0,
+                    },
+                ]
+            )
+
+    assert _snapshot_positions(SnapshotJournal()) == {
+        "ASTS": "AST SpaceMobile",
+        "CEBS.DE": "Cobre",
+    }
 
 
 class FakeGroupJournal(FakeJournal):
