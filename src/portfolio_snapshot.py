@@ -39,6 +39,27 @@ class PortfolioRefreshSummary:
     market_as_of: str | None
 
 
+def preferred_portfolio_summary(
+    declared: PortfolioSnapshotSummary | None,
+    market_estimate: PortfolioSnapshotSummary | None,
+    refresh: PortfolioRefreshSummary | None,
+) -> tuple[PortfolioSnapshotSummary | None, bool]:
+    """Elige la cifra más reciente sin ocultar que es una estimación.
+
+    La fotografía importada conserva cantidades, costes y activos manuales. Cuando
+    al menos una posición cotizada se ha revalorizado, la portada debe mostrar el
+    resumen mixto actualizado como cifra principal, no la fotografía antigua.
+    """
+
+    if (
+        market_estimate is not None
+        and refresh is not None
+        and refresh.market_priced_count > 0
+    ):
+        return market_estimate, True
+    return declared, False
+
+
 def compare_portfolio_valuations(
     declared: pd.DataFrame,
     market_estimate: pd.DataFrame,

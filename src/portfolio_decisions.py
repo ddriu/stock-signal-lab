@@ -61,6 +61,7 @@ def build_portfolio_decision_rows(
                     "Oportunidad": None,
                     "Peso": allocation,
                     "Motivo": "Falta un precio o análisis reciente.",
+                    "Fecha": None,
                 }
             )
             continue
@@ -74,13 +75,14 @@ def build_portfolio_decision_rows(
             and opportunity is not None
             and opportunity >= 65.0
         )
+        technical_reason = str(source.get("Motivo posición") or "").strip()
 
         if position_label == "Vender":
-            decision = "Revisar venta"
-            reason = "La tendencia principal o el límite de pérdida están dañados."
+            decision = "Revisar posible salida"
+            reason = technical_reason or "La tendencia principal aparece deteriorada."
         elif position_label == "Reducir":
-            decision = "Reducir"
-            reason = "La señal de la posición se ha debilitado."
+            decision = "Revisar exposición"
+            reason = technical_reason or "La señal técnica de la posición se ha debilitado."
         elif position_label == "Mantener" and attractive_entry and has_room:
             decision = "Posible ampliar"
             reason = "Mantiene la tendencia y el precio vuelve a ofrecer una entrada razonable."
@@ -99,6 +101,7 @@ def build_portfolio_decision_rows(
                 "Oportunidad": opportunity,
                 "Peso": allocation,
                 "Motivo": reason,
+                "Fecha": source.get("Fecha"),
             }
         )
     return rows

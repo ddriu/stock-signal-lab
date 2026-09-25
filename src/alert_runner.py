@@ -25,6 +25,7 @@ from src.data_loader import (
     DataDownloadError,
     download_fundamental_snapshot,
     download_prices,
+    resolve_analysis_ticker,
 )
 from src.email_sender import send_email
 from src.entry_opportunity import STATUS_BUYABLE, evaluate_entry_opportunity
@@ -33,6 +34,7 @@ from src.fundamental_filter import evaluate_fundamental_filter
 from src.growth_momentum import GrowthMomentumConfig, evaluate_growth_momentum
 from src.indicators import add_indicators
 from src.opportunity import evaluate_risk, evaluate_valuation
+from src.portfolio_snapshot import latest_portfolio_snapshot
 from src.signal_engine import evaluate_latest_signal
 from src.storage import GROUP_PORTFOLIO_OWNER, create_journal
 
@@ -66,7 +68,7 @@ def _favorite_tickers(journal: object) -> set[str]:
     return set(_favorite_names(journal))
 
 
-def _position_costs(journal: object) -> dict[str, float]:
+def _position_costs(journal: object) -> dict[str, float | None]:
     positions = journal.open_positions()
     if positions.empty:
         return {}
@@ -86,6 +88,36 @@ def _position_costs(journal: object) -> dict[str, float]:
         for ticker, (total_cost, total_quantity) in weighted_costs.items()
         if total_quantity > 0
     }
+
+
+def _snapshot_positions(journal: object) -> dict[str, str]:
+    """Devuelve las posiciones de la última fotografía aptas para analizar.
+
+    No se infiere un precio de entrada desde importes en euros: sólo se incorpora
+    el ticker al seguimiento diario y se conserva el nombre para el correo.
+    """
+
+    if not hasattr(journal, "list_portfolio_snapshot_positions"):
+        return {}
+    try:
+        stored = journal.list_portfolio_snapshot_positions()
+        latest, _ = latest_portfolio_snapshot(stored)
+    except (AttributeError, TypeError, ValueError):
+        return {}
+    if latest.empty or "analysis_ticker" not in latest:
+        return {}
+    positions: dict[str, str] = {}
+    for _, row in latest.iterrows():
+        raw_ticker = str(row.get("analysis_ticker") or "").strip()
+        if not raw_ticker:
+            continue
+        try:
+            ticker = resolve_analysis_ticker(raw_ticker)
+        except ValueError:
+            continue
+        name = str(row.get("asset_name") or "").strip()
+        positions[ticker] = name or ticker
+    return positions
 
 
 def _download_alert_frames(
@@ -134,9 +166,19 @@ def run_daily_alerts(
     group_names = _favorite_names(group_journal)
     group_favorites = set(group_names)
     group_positions = _position_costs(group_journal)
+    group_snapshot_positions = _snapshot_positions(group_journal)
+    for ticker, name in group_snapshot_positions.items():
+        group_positions.setdefault(ticker, None)
+        group_names.setdefault(ticker, name)
     scopes: dict[
         str,
-        tuple[AlertPreferences, object, set[str], dict[str, float], dict[str, str]],
+        tuple[
+            AlertPreferences,
+            object,
+            set[str],
+            dict[str, float | None],
+            dict[str, str],
+        ],
     ] = {}
     all_tickers: set[str] = set()
     errors: list[str] = []
@@ -146,6 +188,10 @@ def run_daily_alerts(
             names = _favorite_names(user_journal)
             favorites = set(names)
             positions = _position_costs(user_journal)
+            snapshot_positions = _snapshot_positions(user_journal)
+            for ticker, name in snapshot_positions.items():
+                positions.setdefault(ticker, None)
+                names.setdefault(ticker, name)
             if preference.include_group:
                 favorites |= group_favorites
                 for ticker, name in group_names.items():

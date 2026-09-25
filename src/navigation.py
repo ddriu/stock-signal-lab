@@ -118,6 +118,21 @@ def next_daily_review_batch(
     return pending[: max(int(limit), 1)]
 
 
+def daily_refresh_due(
+    last_refresh_date: object,
+    *,
+    today: date | None = None,
+) -> bool:
+    """Indica si falta la actualización automática del día.
+
+    Streamlit puede mantener una sesión abierta durante varios días. Guardar un
+    simple booleano impediría volver a descargar precios al cambiar de fecha.
+    """
+
+    expected = (today or date.today()).isoformat()
+    return str(last_refresh_date or "").strip() != expected
+
+
 def market_data_freshness_rows(
     frames: dict[str, pd.DataFrame],
     *,
