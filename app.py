@@ -114,6 +114,7 @@ from src.journal import (
 from src.msn_research import build_msn_research_links
 from src.navigation import (
     analysis_refresh_tickers,
+    daily_refresh_due,
     direct_ticker_from_query,
     growth_radar_ticker_groups,
     market_data_freshness_rows,
@@ -155,6 +156,7 @@ from src.portfolio_snapshot import (
     group_portfolio_snapshot_for_home,
     latest_portfolio_snapshot,
     portfolio_platform_reconciliation,
+    preferred_portfolio_summary,
     reconcile_current_portfolio,
     refresh_portfolio_snapshot_prices,
 )
@@ -1144,6 +1146,11 @@ def prepare_data(
                 ),
                 "Lectura entrada": signal.label,
                 "Si ya la tienes": signal.position_label,
+                "Motivo posición": (
+                    "; ".join(signal.risk_factors[:2])
+                    if signal.risk_factors
+                    else "Sin deterioro técnico confirmado"
+                ),
                 "Cierre": float(latest["close"]),
                 "RSI": float(latest["rsi"]),
                 "Fuerza 3 meses": float(latest["momentum_medium_pct"]),
@@ -7020,12 +7027,12 @@ def render_home(
                 f"{snapshot_refresh.pending_count} pendientes."
             )
         st.caption(
-            "La fotografía del bróker no cambia. El botón calcula aparte una estimación "
-            "con últimos cierres y cambio BCE; para añadir una compra o quitar una venta "
-            "usa Inicio → Mi cartera."
+            "Las cantidades y costes proceden de tu cartera. Los precios cotizados se "
+            "actualizan automáticamente una vez al día; fondos e inversiones sin ticker "
+            "conservan su último valor manual."
         )
     refresh_b.button(
-        "Estimar con mercado",
+        "Actualizar precios ahora",
         icon=":material/refresh:",
         width="stretch",
         key="home_refresh_portfolio",
@@ -7066,25 +7073,38 @@ def render_home(
     if section in {"Resumen", "Hoy"} and (
         snapshot_summary is not None or private_kpis is not None
     ):
-        if snapshot_summary is not None:
-            result_label = "Resultado según foto"
-            value_text = f"{snapshot_summary.value_eur:,.2f} €"
+        display_summary, uses_market_estimate = preferred_portfolio_summary(
+            snapshot_summary,
+            market_summary,
+            snapshot_refresh,
+        )
+        if display_summary is not None:
+            result_label = (
+                "Resultado estimado" if uses_market_estimate else "Resultado según foto"
+            )
+            value_text = f"{display_summary.value_eur:,.2f} €"
             result_text = (
-                f"{snapshot_summary.gain_loss_eur:+,.2f} €"
-                if snapshot_summary.gain_loss_eur is not None
+                f"{display_summary.gain_loss_eur:+,.2f} €"
+                if display_summary.gain_loss_eur is not None
                 else "N/D"
             )
             result_detail = (
-                f"{snapshot_summary.return_pct:+.2f}% calculado con los datos importados"
-                if snapshot_summary.return_pct is not None
+                f"{display_summary.return_pct:+.2f}% sobre los costes guardados"
+                if display_summary.return_pct is not None
                 else "El archivo no incluye un coste completo"
             )
-            positions_text = snapshot_summary.investment_count
+            positions_text = display_summary.investment_count
             positions_detail = (
-                f"{snapshot_summary.line_count} partidas · "
-                f"{snapshot_summary.platform_count} plataformas"
+                f"{display_summary.line_count} partidas · "
+                f"{display_summary.platform_count} plataformas"
             )
-            value_detail = f"Fotografía declarada del {snapshot_summary.snapshot_date}"
+            if uses_market_estimate and snapshot_refresh is not None:
+                value_detail = (
+                    f"Estimación: {snapshot_refresh.market_priced_count} precios hasta "
+                    f"{snapshot_refresh.market_as_of or 'el último cierre'}; resto manual"
+                )
+            else:
+                value_detail = f"Fotografía declarada del {display_summary.snapshot_date}"
         else:
             result_label = "Resultado latente"
             value_text = (
@@ -7307,7 +7327,12 @@ def render_home(
     decision_metrics[1].metric(
         "Requieren atención",
         sum(
-            row["Decisión"] in {"Reducir", "Revisar venta", "Actualizar datos"}
+            row["Decisión"]
+            in {
+                "Revisar exposición",
+                "Revisar posible salida",
+                "Actualizar datos",
+            }
             for row in decision_rows
         ),
     )
@@ -7415,9 +7440,15 @@ def render_home(
         )
     else:
         for row in risk_alerts[:3]:
+            review_label = (
+                "Revisar posible salida"
+                if row.get("Si ya la tienes") == "Vender"
+                else "Revisar exposición"
+            )
             st.warning(
-                f"**{row['Ticker']} · {row['Si ya la tienes']}:** "
-                f"momento de entrada {row.get('Momento entrada', 'N/D')}/100."
+                f"**{row['Ticker']} · {review_label}:** "
+                f"{row.get('Motivo posición', 'Señal técnica debilitada')}. "
+                f"Datos {row.get('Fecha', 'sin fecha')}."
             )
         for row in entry_alerts[:3]:
             st.success(
@@ -11513,10 +11544,13 @@ def main() -> None:
     auto_refresh_key = f"_portfolio_auto_refresh_done_{authenticated_user.username}"
     portfolio_auto_refresh = (
         selected_section in {"Inicio", "Carteras"}
-        and not bool(st.session_state.get(auto_refresh_key, False))
+        and daily_refresh_due(
+            st.session_state.get(auto_refresh_key),
+            today=date.today(),
+        )
     )
     if portfolio_auto_refresh:
-        st.session_state[auto_refresh_key] = True
+        st.session_state[auto_refresh_key] = today_key
 
     should_load_market = bool(
         load_clicked
