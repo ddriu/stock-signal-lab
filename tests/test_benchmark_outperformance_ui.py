@@ -59,7 +59,9 @@ render_benchmark_outperformance_page(
     assert any("Corto · 1–3 meses" in control.options for control in app.segmented_control)
     refresh = next(button for button in app.button if button.label == "Revisar todo el universo")
     refresh.click().run()
-    state = app.session_state.filtered_state
-    assert state["_force_all_favorite_refresh"] is True
-    assert state["_requested_analysis_navigation"] == "Estrategias"
-    assert state["_requested_analysis_strategy_navigation"] == "Ventaja relativa"
+    assert app.session_state["_force_all_favorite_refresh"] is True
+    assert app.session_state["_requested_analysis_navigation"] == "Estrategias"
+    assert (
+        app.session_state["_requested_analysis_strategy_navigation"]
+        == "Ventaja relativa"
+    )

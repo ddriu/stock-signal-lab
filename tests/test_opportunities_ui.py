@@ -202,13 +202,15 @@ render_analysis_company_picker(
     app.selectbox[0].set_value("Mastercard (MA)").run()
     next(button for button in app.button if button.label == "Abrir").click().run()
 
-    state = app.session_state.filtered_state
     assert not app.exception
-    assert state.get("analysis_ticker") is None
-    assert state["main_navigation"] == "Analizar"
-    assert state["analysis_navigation"] == "Empresa"
-    assert state["_requested_main_navigation"] == "Analizar"
-    assert state["_requested_analysis_navigation"] == "Empresa"
-    assert state["_requested_analysis_company_navigation"] == "Análisis individual"
-    assert state["_requested_analysis_ticker"] == "MA"
-    assert state["_pending_analysis_ticker"] == "MA"
+    assert "analysis_ticker" not in app.session_state
+    assert app.session_state["main_navigation"] == "Analizar"
+    assert app.session_state["analysis_navigation"] == "Empresa"
+    assert app.session_state["_requested_main_navigation"] == "Analizar"
+    assert app.session_state["_requested_analysis_navigation"] == "Empresa"
+    assert (
+        app.session_state["_requested_analysis_company_navigation"]
+        == "Análisis individual"
+    )
+    assert app.session_state["_requested_analysis_ticker"] == "MA"
+    assert app.session_state["_pending_analysis_ticker"] == "MA"

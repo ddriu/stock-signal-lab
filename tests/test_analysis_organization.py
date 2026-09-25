@@ -132,12 +132,14 @@ if st.button("Abrir MA"):
 
     app.button[0].click().run()
 
-    state = app.session_state.filtered_state
     assert not app.exception
-    assert state["_requested_main_navigation"] == "Analizar"
-    assert state["_requested_analysis_navigation"] == "Empresa"
-    assert state["_requested_analysis_company_navigation"] == "Análisis individual"
-    assert state["_requested_analysis_ticker"] == "MA"
+    assert app.session_state["_requested_main_navigation"] == "Analizar"
+    assert app.session_state["_requested_analysis_navigation"] == "Empresa"
+    assert (
+        app.session_state["_requested_analysis_company_navigation"]
+        == "Análisis individual"
+    )
+    assert app.session_state["_requested_analysis_ticker"] == "MA"
 
 
 def test_navigation_helper_queues_portfolio_child_instead_of_mutating_widget() -> None:
@@ -160,7 +162,6 @@ if st.button("Abrir cartera"):
 
     app.button[0].click().run()
 
-    state = app.session_state.filtered_state
     assert not app.exception
-    assert state["_requested_main_navigation"] == "Carteras"
-    assert state["_requested_portfolio_navigation"] == "Privada"
+    assert app.session_state["_requested_main_navigation"] == "Carteras"
+    assert app.session_state["_requested_portfolio_navigation"] == "Privada"
