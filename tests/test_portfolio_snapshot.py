@@ -107,6 +107,41 @@ def test_latest_snapshot_handles_empty_data() -> None:
     assert summary is None
 
 
+def test_latest_snapshot_hides_aggregate_result_when_one_investment_lacks_cost() -> None:
+    positions = pd.DataFrame(
+        [
+            {
+                "snapshot_date": "2026-09-27",
+                "platform": "Broker",
+                "asset_name": "Completa",
+                "asset_type": "Acción",
+                "analysis_ticker": "FULL",
+                "value_eur": 120.0,
+                "cost_estimate_eur": 100.0,
+                "gain_loss_eur": 20.0,
+            },
+            {
+                "snapshot_date": "2026-09-27",
+                "platform": "Banco",
+                "asset_name": "Sin coste",
+                "asset_type": "Fondo",
+                "analysis_ticker": "",
+                "value_eur": 200.0,
+                "cost_estimate_eur": None,
+                "gain_loss_eur": None,
+            },
+        ]
+    )
+
+    _, summary = latest_portfolio_snapshot(positions)
+
+    assert summary is not None
+    assert summary.value_eur == pytest.approx(320.0)
+    assert summary.cost_estimate_eur is None
+    assert summary.gain_loss_eur is None
+    assert summary.return_pct is None
+
+
 def test_home_groups_civislend_projects_without_losing_the_total() -> None:
     positions = pd.DataFrame(
         [

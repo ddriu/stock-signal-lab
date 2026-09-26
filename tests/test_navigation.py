@@ -9,6 +9,7 @@ from src.navigation import (
     growth_radar_ticker_groups,
     market_data_freshness_rows,
     merge_analysis_ticker_sources,
+    next_daily_refresh_batch,
     next_daily_review_batch,
     sanitize_favorite_selection,
 )
@@ -90,6 +91,31 @@ def test_daily_review_batches_cover_every_favorite_without_repeating() -> None:
     assert [len(batch) for batch in batches] == [25, 25, 25, 25, 7]
     assert attempted == universe
     assert len(set(attempted)) == len(universe)
+
+
+def test_daily_refresh_prioritizes_positions_and_only_retries_pending() -> None:
+    held = [" pos2 ", "POS1"]
+    favorites = ["FAV1", "POS1", "FAV2", "FAV3"]
+
+    first = next_daily_refresh_batch(held, favorites, [], limit=3)
+    second = next_daily_refresh_batch(
+        held,
+        favorites,
+        ["POS2", "FAV1"],
+        limit=3,
+    )
+
+    assert first == ["POS2", "POS1", "FAV1"]
+    assert second == ["POS1", "FAV2", "FAV3"]
+
+
+def test_daily_refresh_does_not_consider_failed_tickers_completed() -> None:
+    universe = [f"TICKER{i}" for i in range(8)]
+    succeeded = ["TICKER0", "TICKER2"]
+
+    retry = next_daily_refresh_batch([], universe, succeeded, limit=4)
+
+    assert retry == ["TICKER1", "TICKER3", "TICKER4", "TICKER5"]
 
 
 def test_growth_radar_groups_keep_order_and_classify_readings() -> None:

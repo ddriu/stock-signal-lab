@@ -8,6 +8,7 @@ import pandas as pd
 from src.alerts import normalize_alert_preferences
 from src.alert_runner import _snapshot_positions, run_daily_alerts
 from src.entry_opportunity import STATUS_BUYABLE, STATUS_WAIT_PRICE
+from src.opportunity import evaluate_relative_strength
 from src.signal_engine import SignalResult
 from src.storage import GROUP_PORTFOLIO_OWNER
 
@@ -248,3 +249,155 @@ def test_buy_email_waits_until_the_full_opportunity_is_buyable(monkeypatch) -> N
     assert len(sent) == 1
     assert "resumen diario" in sent[0][1]
     assert user.saved_states[0].signature.endswith(STATUS_WAIT_PRICE)
+
+
+def test_daily_snapshots_use_cached_broad_and_sector_relative_strength(
+    monkeypatch,
+) -> None:
+    class SnapshotJournal(FakeJournal):
+        def __init__(self, *, tickers: tuple[str, ...] = ()) -> None:
+            super().__init__(tickers=tickers)
+            self.snapshots: list[dict[str, object]] = []
+
+        def list_analysis_snapshots(self) -> pd.DataFrame:
+            return pd.DataFrame(columns=["ticker", "analyzed_at"])
+
+        def add_analysis_snapshot(self, **values: object) -> int:
+            self.snapshots.append(values)
+            return len(self.snapshots)
+
+    group = FakeGroupJournal()
+    user = SnapshotJournal(tickers=("AAA", "BBB"))
+
+    def journal_factory(owner: str) -> FakeJournal:
+        return group if owner == GROUP_PORTFOLIO_OWNER else user
+
+    index = pd.date_range(end="2026-07-28", periods=253, freq="B")
+
+    def price_frame(final_price: float) -> pd.DataFrame:
+        close = [100.0 + (final_price - 100.0) * step / 252 for step in range(253)]
+        return pd.DataFrame(
+            {
+                "open": close,
+                "high": [value * 1.01 for value in close],
+                "low": [value * 0.99 for value in close],
+                "close": close,
+                "volume": [1_000_000.0] * len(close),
+                "atr_14": [2.0] * len(close),
+            },
+            index=index,
+        )
+
+    downloaded = {
+        "AAA": price_frame(160.0),
+        "BBB": price_frame(140.0),
+        "SPY": price_frame(105.0),
+        "XLK": price_frame(110.0),
+    }
+    download_calls: list[str] = []
+
+    def downloader(
+        ticker: str,
+        start: date,
+        end: date,
+        *,
+        auto_adjust: bool,
+    ) -> pd.DataFrame:
+        del start, end, auto_adjust
+        download_calls.append(ticker)
+        return downloaded[ticker]
+
+    monkeypatch.setattr("src.alert_runner.add_indicators", lambda frame, config: frame)
+    monkeypatch.setattr(
+        "src.alert_runner.evaluate_latest_signal",
+        lambda frame, config, *, ticker, entry_price=None: SignalResult(
+            ticker=ticker,
+            as_of=frame.index[-1],
+            score=82,
+            label="Entrada fuerte",
+            position_label="Mantener",
+            explanation="Señal de prueba.",
+            positive_factors=(),
+            risk_factors=(),
+        ),
+    )
+    monkeypatch.setattr(
+        "src.alert_runner.evaluate_fundamental_filter",
+        lambda *args, **kwargs: SimpleNamespace(score=75, label="Sólida"),
+    )
+    monkeypatch.setattr(
+        "src.alert_runner.evaluate_fundamentals",
+        lambda info, ticker: SimpleNamespace(
+            score=75, coverage_pct=80, sector="Technology", country="US"
+        ),
+    )
+    monkeypatch.setattr(
+        "src.alert_runner.evaluate_valuation",
+        lambda *args, **kwargs: SimpleNamespace(score=70, coverage_pct=80),
+    )
+    monkeypatch.setattr(
+        "src.alert_runner.evaluate_risk",
+        lambda *args, **kwargs: SimpleNamespace(score=70, coverage_pct=100),
+    )
+    monkeypatch.setattr(
+        "src.alert_runner.evaluate_growth_momentum",
+        lambda **kwargs: SimpleNamespace(score=75, label="Fuerte"),
+    )
+    opportunity_inputs: list[tuple[int | None, int]] = []
+
+    def entry_opportunity(**kwargs):
+        opportunity_inputs.append(
+            (kwargs["relative_score"], kwargs["relative_coverage"])
+        )
+        return SimpleNamespace(
+            timing=SimpleNamespace(score=65),
+            opportunity_score=72,
+            status_code=STATUS_WAIT_PRICE,
+            status_label="🟡 ESPERAR PRECIO",
+            zones=SimpleNamespace(preferred_entry=SimpleNamespace(label="95–100")),
+            event=SimpleNamespace(label="Sin evento próximo"),
+            explanation="Análisis automático.",
+        )
+
+    monkeypatch.setattr(
+        "src.alert_runner.evaluate_entry_opportunity",
+        entry_opportunity,
+    )
+
+    summary = run_daily_alerts(
+        journal_factory=journal_factory,
+        downloader=downloader,
+        fundamental_downloader=lambda ticker: {
+            "symbol": ticker,
+            "longName": f"Empresa {ticker}",
+            "sector": "Technology",
+        },
+        sender=lambda *args: None,
+        today=date(2026, 7, 29),
+    )
+
+    expected_scores = {
+        ticker: evaluate_relative_strength(
+            ticker,
+            downloaded[ticker],
+            downloaded["SPY"],
+            broad_name="SPY",
+            sector=downloaded["XLK"],
+            sector_name="XLK",
+        ).score
+        for ticker in ("AAA", "BBB")
+    }
+    saved_scores = {
+        str(snapshot["ticker"]): snapshot["relative_score"]
+        for snapshot in user.snapshots
+    }
+
+    assert summary.tickers_checked == 2
+    assert summary.tickers_with_prices == 2
+    assert download_calls.count("SPY") == 1
+    assert download_calls.count("XLK") == 1
+    assert saved_scores == expected_scores
+    assert opportunity_inputs == [
+        (expected_scores["AAA"], 100),
+        (expected_scores["BBB"], 100),
+    ]

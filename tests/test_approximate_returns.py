@@ -233,6 +233,7 @@ def test_missing_operation_and_unpriced_position_are_reported() -> None:
     assert report.summary.incomplete_operations == 1
     assert report.summary.unpriced_positions == 1
     assert report.missing_prices == ("NOPRICE",)
+    assert report.summary.approximate_return_pct is None
 
 
 def test_combined_return_uses_closed_and_open_cost_without_double_counting() -> None:
