@@ -1,7 +1,7 @@
 """Interfaz Streamlit de Stock Signal Lab.
 
 Ejecutar con: ``streamlit run app.py``
-Versión de estabilización auditada: 2026-09-04.
+Versión de estabilización auditada: 2026-09-26.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import streamlit as st
 
 from config import BacktestConfig, StrategyConfig
 from src.alerts import normalize_alert_preferences
+from src.approximate_returns import build_approximate_return_report
 from src.auth import (
     AuthConfig,
     load_auth_accounts,
@@ -162,6 +163,7 @@ from src.portfolio_snapshot import (
 )
 from src.portfolio_decisions import (
     build_portfolio_decision_rows,
+    build_switch_candidate_rows,
     entry_opportunity_rows,
 )
 from src.recommendations import (
@@ -3037,6 +3039,225 @@ def operation_history_for_display(operations: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def render_approximate_returns(
+    operations: pd.DataFrame,
+    latest_prices: dict[str, float],
+    fx_snapshot: FxSnapshot,
+    *,
+    view_key: str,
+    default_sell_fee_eur: float,
+) -> None:
+    """Explica el resultado económico sin presentarlo como liquidación fiscal exacta."""
+
+    st.subheader("Resultado real aproximado")
+    st.caption(
+        "Parte del importe liquidado por el bróker cuando existe. Si falta, estima "
+        "con cantidad, precio, comisión y divisa. Las ventas consumen compras por FIFO."
+    )
+    if operations.empty:
+        st.info("Registra compras y ventas para calcular la rentabilidad.")
+        return
+
+    operation_dates = pd.to_datetime(operations.get("executed_at"), errors="coerce")
+    years = sorted(
+        {int(value) for value in operation_dates.dt.year.dropna().tolist()}
+        | {date.today().year},
+        reverse=True,
+    )
+    year_col, tax_col = st.columns(2)
+    selected_year = year_col.selectbox(
+        "Año de las ventas realizadas",
+        years,
+        key=f"{view_key}_real_result_year",
+    )
+    tax_rate = tax_col.number_input(
+        "Impuesto estimado sobre ganancias",
+        min_value=0.0,
+        max_value=100.0,
+        value=20.0,
+        step=0.5,
+        format="%.2f",
+        key=f"{view_key}_real_result_tax",
+        help=(
+            "Es editable y orientativo. No aplica tramos, compensaciones, exenciones "
+            "ni circunstancias fiscales personales."
+        ),
+    )
+    with st.expander("Supuestos de vender hoy", expanded=False):
+        fee_col, spread_col, fx_col = st.columns(3)
+        sell_fee = fee_col.number_input(
+            "Comisión por venta",
+            min_value=0.0,
+            value=float(default_sell_fee_eur),
+            step=0.25,
+            format="%.2f",
+            key=f"{view_key}_real_result_sell_fee",
+        )
+        spread = spread_col.number_input(
+            "Spread / deslizamiento",
+            min_value=0.0,
+            max_value=100.0,
+            value=0.15,
+            step=0.05,
+            format="%.2f",
+            key=f"{view_key}_real_result_spread",
+        )
+        fx_cost = fx_col.number_input(
+            "Coste de cambio de divisa",
+            min_value=0.0,
+            max_value=100.0,
+            value=0.20,
+            step=0.05,
+            format="%.2f",
+            key=f"{view_key}_real_result_fx",
+        )
+        st.caption(
+            "La comisión de compra ya está en cada operación. Estos supuestos sólo "
+            "se aplican a la venta hipotética de posiciones todavía abiertas."
+        )
+
+    report = build_approximate_return_report(
+        operations,
+        latest_prices,
+        fx_snapshot.rates_per_eur,
+        tax_rate_pct=float(tax_rate),
+        sell_fee_eur=float(sell_fee),
+        spread_pct=float(spread),
+        fx_cost_pct=float(fx_cost),
+        year=int(selected_year),
+    )
+    summary = report.summary
+    total_return = (
+        f"{summary.approximate_return_pct:+.2f}%"
+        if summary.approximate_return_pct is not None
+        else "N/D"
+    )
+    metric_cols = st.columns(4)
+    metric_cols[0].metric(
+        "Resultado realizado neto",
+        f"{summary.realized_after_tax_eur:+,.2f} €",
+        help=f"Ventas de {summary.year}, después del impuesto configurado.",
+    )
+    metric_cols[1].metric(
+        "Resultado latente neto",
+        f"{summary.unrealized_after_tax_eur:+,.2f} €",
+        help="Lo que quedaría si se vendiesen hoy las posiciones valoradas.",
+    )
+    metric_cols[2].metric(
+        "Impuesto aproximado",
+        f"{summary.estimated_realized_tax_eur + summary.estimated_unrealized_tax_eur:,.2f} €",
+        help="La parte latente no se paga mientras no se venda.",
+    )
+    metric_cols[3].metric(
+        "Rentabilidad combinada",
+        total_return,
+        help=(
+            "Resultado neto de las ventas del año más las posiciones abiertas, "
+            "dividido por su coste FIFO."
+        ),
+    )
+
+    if summary.incomplete_operations:
+        st.warning(
+            f"{summary.incomplete_operations} operación(es) tienen datos incompletos "
+            "o no cuadran con las compras registradas. No se han inventado importes."
+        )
+    if report.missing_prices:
+        st.warning(
+            "Falta un precio actual para: " + ", ".join(report.missing_prices) + "."
+        )
+    if report.missing_currencies:
+        st.warning(
+            "No se pudo convertir la moneda de: "
+            + ", ".join(report.missing_currencies)
+            + "."
+        )
+
+    st.markdown("#### 1. Posiciones abiertas")
+    st.caption(
+        "Cuánto pagaste, cuánto vale y qué capital neto estimado quedaría al vender."
+    )
+    if report.open_positions.empty:
+        st.info("No hay posiciones abiertas con precio suficiente para valorarlas.")
+    else:
+        st.dataframe(
+            report.open_positions,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Has pagado": st.column_config.NumberColumn(format="%.2f €"),
+                "Ahora vale": st.column_config.NumberColumn(format="%.2f €"),
+                "Coste de vender": st.column_config.NumberColumn(format="%.2f €"),
+                "Recibirías si vendieras": st.column_config.NumberColumn(format="%.2f €"),
+                "Ganancia antes de impuestos": st.column_config.NumberColumn(format="%+.2f €"),
+                "Rentabilidad": st.column_config.NumberColumn(format="%+.2f%%"),
+                "Impuesto aproximado": st.column_config.NumberColumn(format="%.2f €"),
+                "Ganancia neta estimada": st.column_config.NumberColumn(format="%+.2f €"),
+                "Capital neto disponible": st.column_config.NumberColumn(format="%.2f €"),
+            },
+        )
+        st.caption(
+            "El impuesto potencial sólo aparece cuando existe ganancia. No se paga "
+            "mientras no se venda."
+        )
+
+    st.markdown("#### 2. Operaciones cerradas")
+    closed_year = report.closed_operations.loc[
+        report.closed_operations["Año"] == int(selected_year)
+    ]
+    if closed_year.empty:
+        st.info(f"No hay ventas cerradas registradas en {selected_year}.")
+    else:
+        st.dataframe(
+            closed_year,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Has pagado por lo vendido": st.column_config.NumberColumn(format="%.2f €"),
+                "Recibiste": st.column_config.NumberColumn(format="%.2f €"),
+                "Ganancia antes de impuestos": st.column_config.NumberColumn(format="%+.2f €"),
+                "Impuesto aproximado": st.column_config.NumberColumn(format="%.2f €"),
+                "Ganancia neta": st.column_config.NumberColumn(format="%+.2f €"),
+                "Comisión informativa": st.column_config.NumberColumn(format="%.2f €"),
+            },
+        )
+        if (closed_year["Ganancia antes de impuestos"] < 0).any():
+            st.info(
+                "Una pérdida podría compensar otras ganancias, pero la aplicación "
+                "no realiza una liquidación fiscal completa."
+            )
+
+    st.markdown(f"#### 3. Resumen de {selected_year}")
+    summary_rows = pd.DataFrame(
+        [
+            ("Total gastado en compras", summary.purchases_eur),
+            ("Total recibido por ventas", summary.sales_eur),
+            ("Comisiones registradas", summary.fees_eur),
+            ("Ganancia o pérdida realizada", summary.realized_pnl_eur),
+            ("Impuesto realizado estimado", summary.estimated_realized_tax_eur),
+            ("Resultado realizado después de impuestos", summary.realized_after_tax_eur),
+            ("Coste de posiciones abiertas", summary.open_cost_eur),
+            ("Valor neto si vendieras hoy", summary.open_value_eur),
+            ("Costes estimados de salida", summary.estimated_exit_costs_eur),
+            ("Ganancia o pérdida latente", summary.unrealized_pnl_eur),
+            ("Resultado combinado aproximado", summary.approximate_total_pnl_eur),
+        ],
+        columns=["Concepto", "Importe"],
+    )
+    st.dataframe(
+        summary_rows,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Importe": st.column_config.NumberColumn(format="%+.2f €"),
+        },
+    )
+    st.warning(
+        "Estimación orientativa basada en las operaciones registradas. No sustituye "
+        "el cálculo fiscal del bróker o de un asesor."
+    )
+
+
 def _sync_accounts_from_complete_snapshot(
     journal: object,
     positions: pd.DataFrame,
@@ -4531,6 +4752,7 @@ def render_journal(
     )
     tab_labels = [
         "Posiciones analizadas",
+        "Resultado real aproximado",
         "Comprar / vender",
         "Evolución por años",
         "Comparar un cambio",
@@ -4539,8 +4761,24 @@ def render_journal(
     if current_portfolio_enabled:
         tab_labels.append("Mi cartera actual")
     journal_tabs = st.tabs(tab_labels)
-    positions_tab, register_tab, evolution_tab, switch_tab, history_tab = journal_tabs[:5]
-    private_tab = journal_tabs[5] if current_portfolio_enabled else None
+    (
+        positions_tab,
+        real_result_tab,
+        register_tab,
+        evolution_tab,
+        switch_tab,
+        history_tab,
+    ) = journal_tabs[:6]
+    private_tab = journal_tabs[6] if current_portfolio_enabled else None
+
+    with real_result_tab:
+        render_approximate_returns(
+            operations,
+            latest_prices,
+            fx_snapshot,
+            view_key=view_key,
+            default_sell_fee_eur=float(fixed_fee),
+        )
 
     with register_tab:
         render_operation_form(
@@ -4985,6 +5223,25 @@ def render_journal(
         if not details:
             st.info("Registra y actualiza al menos una posición para comparar cambios.")
         else:
+            switch_tax_rate = float(
+                st.session_state.get(f"{view_key}_real_result_tax", 20.0)
+            )
+            switch_spread = float(
+                st.session_state.get(f"{view_key}_real_result_spread", 0.15)
+            )
+            switch_fx_cost = float(
+                st.session_state.get(f"{view_key}_real_result_fx", 0.20)
+            )
+            switch_report = build_approximate_return_report(
+                operations,
+                latest_prices,
+                fx_snapshot.rates_per_eur,
+                tax_rate_pct=switch_tax_rate,
+                sell_fee_eur=float(fixed_fee),
+                spread_pct=switch_spread,
+                fx_cost_pct=switch_fx_cost,
+                year=date.today().year,
+            )
             current_key = st.selectbox(
                 "Acción que venderías",
                 list(details),
@@ -5042,20 +5299,114 @@ def render_journal(
                             "El BCE no ofrece el tipo de cambio necesario."
                         )
                     else:
-                        switch_cols = st.columns(5)
-                        switch_cols[0].metric("Comisión de venta", f"{fixed_fee:.2f} EUR")
-                        switch_cols[1].metric("Comisión de compra", f"{fixed_fee:.2f} EUR")
-                        switch_cols[2].metric(
-                            "Dinero reinvertido",
-                            f"{comparison.cash_invested:,.2f} {candidate_currency}",
+                        account_label = (
+                            str(current["position"].account_name).strip()
+                            or "Sin especificar"
                         )
-                        switch_cols[3].metric(
-                            f"Unidades de {candidate_ticker}",
-                            f"{comparison.candidate_quantity:,.4f}",
-                        )
-                        switch_cols[4].metric(
-                            "Ventaja mínima para cubrir costes",
-                            f"{comparison.fee_hurdle_pct:.3f}%",
+                        current_rows = switch_report.open_positions
+                        if not current_rows.empty:
+                            current_rows = current_rows.loc[
+                                (current_rows["Ticker"] == current_ticker)
+                                & (current_rows["Cuenta"] == account_label)
+                                & (current_rows["Moneda"] == current_currency)
+                            ]
+                        if current_rows.empty:
+                            st.warning(
+                                "No se pudo reconstruir el coste fiscal aproximado de esta "
+                                "posición. Se muestran sólo las comisiones conocidas."
+                            )
+                            switch_cols = st.columns(4)
+                            switch_cols[0].metric(
+                                "Comisión de venta", f"{fixed_fee:.2f} EUR"
+                            )
+                            switch_cols[1].metric(
+                                "Comisión de compra", f"{fixed_fee:.2f} EUR"
+                            )
+                            switch_cols[2].metric(
+                                "Dinero reinvertido",
+                                f"{comparison.cash_invested:,.2f} {candidate_currency}",
+                            )
+                            switch_cols[3].metric(
+                                f"Unidades de {candidate_ticker}",
+                                f"{comparison.candidate_quantity:,.4f}",
+                            )
+                            total_hurdle_pct = comparison.fee_hurdle_pct
+                        else:
+                            current_result = current_rows.iloc[0]
+                            capital_after_sale_eur = float(
+                                current_result["Capital neto disponible"]
+                            )
+                            potential_tax_eur = float(
+                                current_result["Impuesto aproximado"]
+                            )
+                            sale_cost_eur = float(current_result["Coste de vender"])
+                            buy_fee_eur = float(fixed_fee)
+                            buy_spread_eur = (
+                                capital_after_sale_eur * switch_spread / 100.0
+                            )
+                            buy_fx_eur = (
+                                capital_after_sale_eur * switch_fx_cost / 100.0
+                                if candidate_currency != "EUR"
+                                else 0.0
+                            )
+                            buy_cost_eur = buy_fee_eur + buy_spread_eur + buy_fx_eur
+                            reinvestable_eur = max(
+                                0.0, capital_after_sale_eur - buy_cost_eur
+                            )
+                            try:
+                                reinvestable_candidate = convert_currency(
+                                    reinvestable_eur,
+                                    "EUR",
+                                    candidate_currency,
+                                    fx_snapshot.rates_per_eur,
+                                )
+                            except ValueError:
+                                reinvestable_candidate = 0.0
+                            candidate_quantity_after_costs = (
+                                reinvestable_candidate / candidate_price
+                                if candidate_price > 0
+                                else 0.0
+                            )
+                            total_rotation_cost_eur = (
+                                sale_cost_eur + potential_tax_eur + buy_cost_eur
+                            )
+                            gross_current_eur = float(current_result["Ahora vale"])
+                            total_hurdle_pct = (
+                                total_rotation_cost_eur / gross_current_eur * 100.0
+                                if gross_current_eur > 0
+                                else 0.0
+                            )
+                            sale_cols = st.columns(3)
+                            sale_cols[0].metric(
+                                "Coste estimado de vender",
+                                f"{sale_cost_eur:,.2f} €",
+                            )
+                            sale_cols[1].metric(
+                                "Impuesto potencial",
+                                f"{potential_tax_eur:,.2f} €",
+                                help="Cero si la posición lleva pérdida.",
+                            )
+                            sale_cols[2].metric(
+                                "Capital después de vender",
+                                f"{capital_after_sale_eur:,.2f} €",
+                            )
+                            buy_cols = st.columns(3)
+                            buy_cols[0].metric(
+                                "Coste estimado de comprar",
+                                f"{buy_cost_eur:,.2f} €",
+                            )
+                            buy_cols[1].metric(
+                                "Capital reinvertido",
+                                f"{reinvestable_eur:,.2f} €",
+                            )
+                            buy_cols[2].metric(
+                                f"Unidades de {candidate_ticker}",
+                                f"{candidate_quantity_after_costs:,.4f}",
+                            )
+                        st.caption(
+                            "La alternativa tendría que recuperar aproximadamente "
+                            f"un {total_hurdle_pct:.2f}% sólo para cubrir la rotación "
+                            "estimada antes de aportar una ventaja real."
                         )
                         technical_gain = candidate_signal.score - current["signal"].score
                         opportunity_gain = (
@@ -5081,7 +5432,7 @@ def render_journal(
                             current_is_weak
                             and candidate_is_entry
                             and technical_gain >= 10
-                            and opportunity_gain >= 5
+                            and opportunity_gain >= 12
                             and quality_ok
                         )
                         if change_worth_studying:
@@ -5095,7 +5446,7 @@ def render_journal(
                             st.info(
                                 "**No aparece una ventaja suficientemente clara para cambiar.** "
                                 "La aplicación exige deterioro de la posición actual, una entrada "
-                                "atractiva, 10 puntos de mejora técnica y 5 de oportunidad conjunta."
+                                "atractiva, 10 puntos de mejora técnica y 12 de oportunidad conjunta."
                             )
                         if comparison.conversion_rate not in (None, 1.0):
                             st.caption(
@@ -5104,9 +5455,10 @@ def render_journal(
                                 f"(BCE {comparison.fx_as_of or 'sin fecha disponible'})."
                             )
                         st.caption(
-                            "El cálculo descuenta 1 comisión al vender y 1 al comprar. No incluye "
-                            "impuestos, spread, coste adicional de cambio del broker ni la futura "
-                            "venta de la nueva acción."
+                            "Incluye los supuestos configurados de comisión, impuesto, spread y "
+                            "cambio de divisa. No incluye compensaciones fiscales ni la futura "
+                            "venta de la nueva acción; sigue siendo una comparación para estudiar, "
+                            "no una orden."
                         )
 
 
@@ -7313,14 +7665,15 @@ def render_home(
         held_tickers,
         allocations_pct=allocations,
     )
+    switch_rows = build_switch_candidate_rows(summary, held_tickers)
     strong_entries, candidate_entries = entry_opportunity_rows(
         summary,
         held_tickers,
     )
     st.markdown("### Panel de decisiones")
     st.caption(
-        "Separa lo que ya tienes de las nuevas entradas. «Posible ampliar» exige "
-        "una posición sana, una entrada atractiva y un peso no excesivo."
+        "Separa posición, entrada y cambio de activo. Una alerta técnica aislada "
+        "no se presenta como una orden de venta; exige confirmación de tesis y riesgo."
     )
     decision_metrics = st.columns(4)
     decision_metrics[0].metric("Posiciones", len(decision_rows))
@@ -7340,7 +7693,7 @@ def render_home(
     decision_metrics[3].metric("Candidatas", len(candidate_entries))
     decision_view = st.segmented_control(
         "Vista del panel de decisiones",
-        ["Mi cartera", "Entradas fuertes", "Candidatas"],
+        ["Mi cartera", "Cambios a estudiar", "Entradas fuertes", "Candidatas"],
         default="Mi cartera",
         key="home_decision_view",
         label_visibility="collapsed",
@@ -7366,6 +7719,35 @@ def render_home(
             st.info(
                 "Todavía no hay posiciones registradas ni tickers reconocibles en la "
                 "última fotografía."
+            )
+    elif decision_view == "Cambios a estudiar":
+        st.caption(
+            "Comparación preliminar por atractivo, calidad y riesgo. Sólo se destaca "
+            "un cambio si existe margen suficiente; faltan siempre fiscalidad, divisa, "
+            "correlación y revisión de tesis."
+        )
+        if not switch_rows:
+            st.info(
+                "No hay datos suficientes para comparar posiciones con alternativas."
+            )
+        else:
+            switch_frame = pd.DataFrame(switch_rows)
+            render_ticker_dataframe(
+                switch_frame,
+                key="home_switch_candidates",
+                ticker_column="Alternativa",
+                column_config={
+                    "Ventaja": st.column_config.NumberColumn(format="%+.0f puntos"),
+                    "Atractivo actual": st.column_config.ProgressColumn(
+                        min_value=0, max_value=100, format="%d"
+                    ),
+                    "Atractivo alternativa": st.column_config.ProgressColumn(
+                        min_value=0, max_value=100, format="%d"
+                    ),
+                    "Confianza alternativa": st.column_config.ProgressColumn(
+                        min_value=0, max_value=100, format="%d%%"
+                    ),
+                },
             )
     else:
         entry_rows = strong_entries if decision_view == "Entradas fuertes" else candidate_entries
@@ -7419,8 +7801,14 @@ def render_home(
 
     risk_alerts = [
         row
-        for row in summary
-        if row.get("Si ya la tienes") in {"Reducir", "Vender"}
+        for row in decision_rows
+        if row.get("Decisión")
+        in {
+            "Revisar posible salida",
+            "Revisar exposición",
+            "Esperar confirmación",
+            "Actualizar datos",
+        }
     ]
     entry_alerts = [
         row
@@ -7439,15 +7827,11 @@ def render_home(
             "antes de tomar decisiones."
         )
     else:
-        for row in risk_alerts[:3]:
-            review_label = (
-                "Revisar posible salida"
-                if row.get("Si ya la tienes") == "Vender"
-                else "Revisar exposición"
-            )
+        for row in risk_alerts[:5]:
             st.warning(
-                f"**{row['Ticker']} · {review_label}:** "
-                f"{row.get('Motivo posición', 'Señal técnica debilitada')}. "
+                f"**{row['Ticker']} · {row['Decisión']}:** "
+                f"{row.get('Motivo', 'Requiere revisión')}. "
+                f"Antes: {row.get('Confirmar antes', 'confirmar los datos')}. "
                 f"Datos {row.get('Fecha', 'sin fecha')}."
             )
         for row in entry_alerts[:3]:

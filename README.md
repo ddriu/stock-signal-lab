@@ -154,6 +154,12 @@ el coste medio incluyendo las comisiones, admite ventas parciales y calcula bene
 y beneficio neto si se vendiera al último cierre. Las posiciones guardadas se añaden
 automáticamente a la próxima descarga.
 
+La pestaña **Resultado real aproximado** reconstruye las operaciones por lotes FIFO y resume
+compras, ventas, beneficio bruto, comisiones, costes de cambio, impuestos estimados y resultado
+neto por año. Prioriza el importe realmente liquidado por el bróker cuando está disponible y,
+si falta, permite configurar de forma visible comisión, spread, coste de divisa y tipo fiscal.
+Es una ayuda para decidir y comprobar órdenes, no una liquidación tributaria oficial.
+
 La pestaña **Favoritos** permite buscar una empresa por su nombre normal, sin conocer el
 ticker, y guardarla en una lista privada o compartida. Los resultados indican mercado,
 país, moneda y tipo de cotización para distinguir una acción local de alternativas ADR,
@@ -243,12 +249,14 @@ Segofactoring se separa de MyInvestor al sumar cuentas para evitar contarlo dos 
 proyectos genéricos de Civislend se copian al detalle de inversiones privadas con una nota
 visible cuando faltan fecha real, vencimiento o rentabilidad prevista.
 
-El comparador de cambios resta por defecto 1 € por vender y otro por comprar,
-muestra cuántas unidades de la alternativa podrían adquirirse y calcula la mejora técnica.
+El comparador de cambios resta por defecto 1 € por vender y otro por comprar, incorpora
+el spread, el cambio de divisa y el posible impuesto sobre la plusvalía configurados, muestra
+el capital neto reinvertible y cuántas unidades de la alternativa podrían adquirirse.
+Además calcula la mejora técnica y el umbral mínimo que debe recuperar la alternativa antes
+de que el cambio empiece a compensar sus costes.
 Sólo recomienda estudiar un cambio si la posición actual está deteriorada, la alternativa
-tiene una entrada atractiva, mejora al menos 10 puntos técnicos y 5 puntos de oportunidad.
+tiene una entrada atractiva, mejora al menos 10 puntos técnicos y 12 puntos de oportunidad.
 Para monedas distintas convierte el importe con el último tipo de referencia del BCE.
-No incluye fiscalidad, spread ni el margen de cambio aplicado por el broker.
 
 Desde Inicio, **Revisar toda mi cartera y buscar oportunidades** ejecuta un recorrido
 único: actualiza posiciones y favoritas, abre el Radar y después consulta un universo
