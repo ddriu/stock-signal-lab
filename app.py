@@ -120,6 +120,7 @@ from src.navigation import (
     growth_radar_ticker_groups,
     market_data_freshness_rows,
     merge_analysis_ticker_sources,
+    next_daily_refresh_batch,
     next_daily_review_batch,
     sanitize_favorite_selection,
 )
@@ -154,7 +155,6 @@ from src.portfolio_snapshot_import import (
 )
 from src.portfolio_snapshot import (
     compare_portfolio_valuations,
-    group_portfolio_snapshot_for_home,
     latest_portfolio_snapshot,
     portfolio_platform_reconciliation,
     preferred_portfolio_summary,
@@ -163,8 +163,20 @@ from src.portfolio_snapshot import (
 )
 from src.portfolio_decisions import (
     build_portfolio_decision_rows,
-    build_switch_candidate_rows,
-    entry_opportunity_rows,
+)
+from src.portfolio_rotation import (
+    HORIZON_POLICIES,
+    ROTATION_COLORS,
+    RotationDashboard,
+    build_pair_correlations,
+    build_recovery_hurdles,
+    build_rotation_priorities,
+    build_rotation_dashboard,
+)
+from src.portfolio_thesis import (
+    apply_thesis_invalidations,
+    build_thesis_update_rows,
+    thesis_invalidations,
 )
 from src.recommendations import (
     build_entry_guide,
@@ -206,10 +218,10 @@ from src.visualization import (
     normalized_comparison_chart,
     portfolio_evolution_chart,
     portfolio_snapshot_allocation_chart,
-    portfolio_snapshot_assets_chart,
     portfolio_snapshot_history_chart,
     price_chart,
     private_investments_chart,
+    rotation_allocation_chart,
     return_calibration_chart,
     risk_return_chart,
     staircase_projection_chart,
@@ -1011,8 +1023,13 @@ def load_market_data(
     references: dict[str, pd.DataFrame] = (
         dict(st.session_state.get("reference_data", {})) if merge_existing else {}
     )
-    missing_references = reference_symbols.difference(downloaded).difference(references)
-    for symbol in sorted(missing_references):
+    reference_candidates = reference_symbols.difference(downloaded)
+    references_to_download = (
+        reference_candidates
+        if price_refresh_token
+        else reference_candidates.difference(references)
+    )
+    for symbol in sorted(references_to_download):
         try:
             references[symbol] = cached_download(
                 symbol, start, end, auto_adjust, price_refresh_token
@@ -1146,6 +1163,10 @@ def prepare_data(
                 "Riesgo controlado": (
                     float(risk.score) if risk.score is not None else float("nan")
                 ),
+                "Sector": fundamentals.sector or "Sin clasificar",
+                "País": fundamentals.country or "Sin clasificar",
+                "Moneda": str(fundamentals.currency or quote_currency or "").upper(),
+                "Cobertura fundamental": fundamentals.coverage_pct,
                 "Lectura entrada": signal.label,
                 "Si ya la tienes": signal.position_label,
                 "Motivo posición": (
@@ -3149,11 +3170,11 @@ def render_approximate_returns(
         help="La parte latente no se paga mientras no se venda.",
     )
     metric_cols[3].metric(
-        "Rentabilidad combinada",
+        "Resultado combinado / coste",
         total_return,
         help=(
-            "Resultado neto de las ventas del año más las posiciones abiertas, "
-            "dividido por su coste FIFO."
+            "Resultado neto de las ventas del año más las posiciones abiertas actuales, "
+            "dividido por su coste FIFO. No es TWR, XIRR ni rentabilidad anual."
         ),
     )
 
@@ -3171,6 +3192,15 @@ def render_approximate_returns(
             "No se pudo convertir la moneda de: "
             + ", ".join(report.missing_currencies)
             + "."
+        )
+    if summary.approximate_return_pct is None and (
+        summary.incomplete_operations
+        or report.missing_prices
+        or report.missing_currencies
+    ):
+        st.info(
+            "El porcentaje agregado se oculta porque la cobertura es incompleta. "
+            "Sí se mantienen visibles los importes que pueden comprobarse."
         )
 
     st.markdown("#### 1. Posiciones abiertas")
@@ -6641,30 +6671,120 @@ def _portfolio_snapshot(
     )
 
 
-def _portfolio_tracking_tickers(journal: object) -> list[str]:
-    """Une posiciones reconstruidas y tickers de la última fotografía."""
+_ROTATION_EXCLUDED_ASSET_TERMS = (
+    "civislend",
+    "segofactoring",
+    "sego factoring",
+    "crowdlending",
+)
 
-    tickers: list[str] = []
+
+def _rotation_excluded_asset_mask(snapshot: pd.DataFrame) -> pd.Series:
+    """Marca inversiones ilíquidas que nunca deben entrar en el motor bursátil."""
+
+    if snapshot.empty:
+        return pd.Series(False, index=snapshot.index, dtype=bool)
+    description = pd.Series("", index=snapshot.index, dtype=str)
+    for column in ("platform", "asset_name", "asset_type", "portfolio_block"):
+        if column in snapshot:
+            description = description.str.cat(
+                snapshot[column].fillna("").astype(str), sep=" "
+            )
+    pattern = "|".join(_ROTATION_EXCLUDED_ASSET_TERMS)
+    return description.str.casefold().str.contains(pattern, regex=True, na=False)
+
+
+def _rotation_eligible_snapshot(snapshot: pd.DataFrame) -> pd.DataFrame:
+    """Conserva el snapshot, salvo alternativas explícitamente no rotables."""
+
+    if snapshot.empty:
+        return snapshot.copy()
+    return snapshot.loc[~_rotation_excluded_asset_mask(snapshot)].copy()
+
+
+def _current_rotation_tickers(
+    dashboard: pd.DataFrame,
+    reconciled_snapshot: pd.DataFrame,
+) -> list[str]:
+    """Tickers realmente abiertos tras reconciliar fotografía y operaciones."""
+
+    values: list[str] = []
+    eligible = _rotation_eligible_snapshot(reconciled_snapshot)
+    # La presencia del esquema de fotografía indica que la reconciliación ya es
+    # autoritativa, aunque no queden filas (por ejemplo, tras vender la última
+    # posición). En ese caso no debemos resucitar valores desde un dashboard viejo.
+    if "analysis_ticker" in eligible.columns:
+        rows = eligible
+        if "value_eur" in rows:
+            values_eur = pd.to_numeric(rows["value_eur"], errors="coerce")
+            rows = rows.loc[values_eur.isna() | (values_eur > 0)]
+        values.extend(rows["analysis_ticker"].fillna("").astype(str).tolist())
+    elif not dashboard.empty and "ticker" in dashboard:
+        rows = dashboard
+        if "quantity" in rows:
+            quantities = pd.to_numeric(rows["quantity"], errors="coerce")
+            rows = rows.loc[quantities.isna() | (quantities > 0)]
+        values.extend(rows["ticker"].fillna("").astype(str).tolist())
+    return list(
+        dict.fromkeys(
+            resolve_analysis_ticker(value)
+            for value in values
+            if str(value).strip()
+        )
+    )
+
+
+def _portfolio_tracking_tickers(journal: object) -> list[str]:
+    """Devuelve posiciones vigentes sin resucitar ventas ni alternativas."""
+
+    positions = pd.DataFrame()
     try:
         positions = journal.open_positions()
-        if not positions.empty and "ticker" in positions:
-            tickers.extend(positions["ticker"].fillna("").astype(str).tolist())
     except (JournalStorageError, AttributeError, ValueError):
         pass
+
+    operations = pd.DataFrame()
+    if hasattr(journal, "list_operations"):
+        try:
+            operations = journal.list_operations()
+        except (JournalStorageError, AttributeError, ValueError):
+            pass
+
+    latest = pd.DataFrame()
+    has_snapshot = False
     if hasattr(journal, "list_portfolio_snapshot_positions"):
         try:
             stored = journal.list_portfolio_snapshot_positions()
-            latest, _ = latest_portfolio_snapshot(stored)
-            if not latest.empty and "analysis_ticker" in latest:
-                tickers.extend(
-                    latest["analysis_ticker"].fillna("").astype(str).tolist()
-                )
+            has_snapshot = not stored.empty
+            if has_snapshot:
+                latest, _ = latest_portfolio_snapshot(stored)
         except (JournalStorageError, AttributeError, ValueError):
             pass
+
+    if has_snapshot:
+        # La foto completa manda sobre operaciones anteriores. Sólo los movimientos
+        # posteriores pueden añadir, reducir o cerrar sus tickers.
+        current = (
+            reconcile_current_portfolio(latest, operations, positions)
+            if not operations.empty
+            else latest
+        )
+        eligible = _rotation_eligible_snapshot(current)
+        values = (
+            eligible["analysis_ticker"].fillna("").astype(str).tolist()
+            if "analysis_ticker" in eligible
+            else []
+        )
+    else:
+        values = (
+            positions["ticker"].fillna("").astype(str).tolist()
+            if "ticker" in positions
+            else []
+        )
     return list(
         dict.fromkeys(
             resolve_analysis_ticker(ticker)
-            for ticker in tickers
+            for ticker in values
             if str(ticker).strip()
         )
     )
@@ -6683,7 +6803,7 @@ def _portfolio_allocations(
     """Devuelve pesos aproximados sin sumar dos veces operaciones y fotografía."""
 
     if not snapshot.empty and {"analysis_ticker", "value_eur"}.issubset(snapshot.columns):
-        listed = snapshot.copy()
+        listed = _rotation_eligible_snapshot(snapshot)
         listed["analysis_ticker"] = (
             listed["analysis_ticker"].fillna("").astype(str).str.strip().str.upper()
         )
@@ -6691,11 +6811,13 @@ def _portfolio_allocations(
             lambda ticker: resolve_analysis_ticker(ticker) if ticker else ""
         )
         listed["value_eur"] = pd.to_numeric(listed["value_eur"], errors="coerce")
-        total = float(listed["value_eur"].fillna(0.0).sum())
+        # El mapa de rotación utiliza el peso dentro de la cartera cotizada.
+        # Efectivo, fondos manuales, Civislend y Segofactoring siguen contando
+        # para patrimonio, pero no diluyen la concentración de las acciones.
+        analyzable = listed.loc[listed["analysis_ticker"] != ""].copy()
+        total = float(analyzable["value_eur"].fillna(0.0).sum())
         if total > 0:
-            grouped = listed.loc[listed["analysis_ticker"] != ""].groupby(
-                "analysis_ticker"
-            )["value_eur"].sum()
+            grouped = analyzable.groupby("analysis_ticker")["value_eur"].sum()
             return {
                 str(ticker): float(value) / total * 100.0
                 for ticker, value in grouped.items()
@@ -6708,6 +6830,362 @@ def _portfolio_allocations(
             if pd.notna(row.allocation_pct)
         }
     return {}
+
+
+def _favorite_rotation_tickers(
+    private_favorites: pd.DataFrame,
+    group_favorites: pd.DataFrame,
+) -> list[str]:
+    """Universo explícito que puede recibir capital desde la portada."""
+
+    values: list[str] = []
+    for frame in (private_favorites, group_favorites):
+        if frame.empty or "ticker" not in frame:
+            continue
+        values.extend(frame["ticker"].fillna("").astype(str).tolist())
+    return list(
+        dict.fromkeys(
+            resolve_analysis_ticker(value)
+            for value in values
+            if str(value).strip()
+        )
+    )
+
+
+def _merge_saved_analysis_summary(
+    live_summary: list[dict[str, object]],
+    journal: object,
+    relevant_tickers: list[str],
+) -> list[dict[str, object]]:
+    """Completa el radar con la última fotografía profunda, sin fingir frescura."""
+
+    rows = {
+        str(row.get("Ticker") or "").strip().upper(): dict(row)
+        for row in live_summary
+        if str(row.get("Ticker") or "").strip()
+    }
+    if not hasattr(journal, "list_analysis_snapshots"):
+        return list(rows.values())
+    try:
+        snapshots = journal.list_analysis_snapshots()
+    except (JournalStorageError, AttributeError, ValueError):
+        return list(rows.values())
+    if snapshots.empty or "ticker" not in snapshots:
+        return list(rows.values())
+    frame = snapshots.copy()
+    frame["ticker"] = frame["ticker"].fillna("").astype(str).str.strip().str.upper()
+    frame["analyzed_at_parsed"] = pd.to_datetime(
+        frame.get("analyzed_at"), errors="coerce"
+    )
+    canonical_scores = [
+        "company_score",
+        "entry_score",
+        "valuation_score",
+        "relative_score",
+        "risk_score",
+    ]
+    if not set(canonical_scores).issubset(frame.columns):
+        return list(rows.values())
+    canonical_mask = pd.Series(True, index=frame.index)
+    for column in canonical_scores:
+        canonical_mask &= pd.to_numeric(frame[column], errors="coerce").notna()
+    if "position_label" in frame:
+        canonical_mask &= ~frame["position_label"].fillna("").astype(str).str.casefold().eq(
+            "plan mensual"
+        )
+    frame = frame.loc[canonical_mask]
+    if frame.empty:
+        return list(rows.values())
+    frame = frame.sort_values("analyzed_at_parsed", ascending=False).drop_duplicates(
+        "ticker", keep="first"
+    )
+    relevant = set(relevant_tickers)
+    mappings = {
+        "opportunity_score": "Oportunidad",
+        "company_score": "Calidad empresa",
+        "entry_score": "Momento entrada",
+        "valuation_score": "Valoración",
+        "relative_score": "Fuerza relativa",
+        "risk_score": "Riesgo controlado",
+        "opportunity_label": "Lectura conjunta",
+        "entry_label": "Lectura entrada",
+        "position_label": "Si ya la tienes",
+        "price": "Cierre",
+        "sector": "Sector",
+    }
+    for snapshot in frame.to_dict("records"):
+        ticker = str(snapshot.get("ticker") or "").strip().upper()
+        if not ticker or ticker not in relevant:
+            continue
+        target = rows.setdefault(ticker, {"Ticker": ticker})
+        used_saved = False
+        for source_column, target_column in mappings.items():
+            current = target.get(target_column)
+            missing = current is None or (
+                not isinstance(current, str) and pd.isna(current)
+            ) or current == ""
+            saved = snapshot.get(source_column)
+            if missing and saved is not None and not pd.isna(saved) and saved != "":
+                target[target_column] = saved
+                used_saved = True
+        if used_saved:
+            analyzed_at = snapshot.get("analyzed_at_parsed")
+            target["Fecha"] = (
+                pd.Timestamp(analyzed_at).date()
+                if analyzed_at is not None and not pd.isna(analyzed_at)
+                else None
+            )
+            # El historial no almacena la confianza original. Un análisis canónico
+            # completo puede servir de respaldo mensual, pero no recibe una
+            # confianza alta inventada ni habilita por sí solo una rotación semanal.
+            snapshot_confidence = 70.0
+            current_confidence = pd.to_numeric(
+                pd.Series([target.get("Confianza datos")]), errors="coerce"
+            ).iloc[0]
+            target["Confianza datos"] = max(
+                float(current_confidence) if pd.notna(current_confidence) else 0.0,
+                snapshot_confidence,
+            )
+            target["Origen análisis"] = "Último análisis profundo guardado"
+    return list(rows.values())
+
+
+def _render_rotation_dashboard(dashboard: RotationDashboard) -> None:
+    """Portada compacta: cartera, cambios que merecen estudio y favoritas."""
+
+    st.markdown("### Mapa de cartera cotizada")
+    st.caption(
+        f"{dashboard.policy.cadence} Los colores son estados de trabajo, no órdenes. "
+        "Rojo exige revisar la tesis; azul exige validar precio, peso y evento antes de comprar."
+    )
+    legend = " · ".join(
+        f"{symbol} **{color}** {ROTATION_COLORS[color]['meaning']}"
+        for color, symbol in (
+            ("Azul", "🔵"),
+            ("Verde", "🟢"),
+            ("Amarillo", "🟡"),
+            ("Naranja", "🟠"),
+            ("Rojo", "🔴"),
+            ("Gris", "⚪"),
+        )
+    )
+    st.markdown(legend)
+
+    position_rows = list(dashboard.positions)
+    candidate_rows = list(dashboard.candidates)
+    switch_rows = list(dashboard.switches)
+    color_symbols = {
+        "Azul": "🔵 Azul",
+        "Verde": "🟢 Verde",
+        "Amarillo": "🟡 Amarillo",
+        "Naranja": "🟠 Naranja",
+        "Rojo": "🔴 Rojo",
+        "Gris": "⚪ Gris",
+    }
+    metrics = st.columns(4)
+    metrics[0].metric("Posiciones cotizadas", len(position_rows))
+    metrics[1].metric(
+        "Mantener / ampliar",
+        sum(row["Color"] in {"Verde", "Azul"} for row in position_rows),
+    )
+    metrics[2].metric(
+        "Revisar",
+        sum(row["Color"] in {"Naranja", "Rojo"} for row in position_rows),
+    )
+    metrics[3].metric(
+        "Favoritas azules",
+        sum(row["Color"] == "Azul" for row in candidate_rows),
+    )
+    st.markdown("#### Qué requiere atención")
+    priority_rows = build_rotation_priorities(dashboard, limit=5)
+    if priority_rows:
+        priority_frame = pd.DataFrame(priority_rows)
+        priority_frame["Estado"] = priority_frame["Estado"].map(color_symbols)
+        render_ticker_dataframe(
+            priority_frame,
+            key=f"home_rotation_priorities_{dashboard.policy.label}",
+            ticker_column="Empresa",
+        )
+        st.caption(
+            "Máximo cinco asuntos, ordenados por ruptura de tesis, exposición, "
+            "calidad de datos y uso potencial del capital. Abrir no ejecuta operaciones."
+        )
+    else:
+        st.success(
+            "No hay una acción prioritaria con evidencia suficiente. Mantener también "
+            "es una decisión; revisa de nuevo según la cadencia elegida."
+        )
+    if position_rows:
+        st.plotly_chart(
+            rotation_allocation_chart(position_rows),
+            width="stretch",
+            config=PLOTLY_CONFIG,
+        )
+
+    positions_tab, switches_tab, candidates_tab = st.tabs(
+        ["Posiciones", "Cambios a estudiar", "Favoritas con mejor encaje"]
+    )
+    with positions_tab:
+        if not position_rows:
+            st.info("No hay posiciones cotizadas reconocibles en la cartera guardada.")
+        else:
+            frame = pd.DataFrame(position_rows)
+            frame["Estado"] = frame["Color"].map(color_symbols)
+            columns = [
+                "Estado",
+                "Ticker",
+                "Peso cotizado",
+                "Score horizonte",
+                "Confianza",
+                "Cobertura",
+                "Acción",
+                "Motivo",
+                "Sector",
+                "Fecha",
+            ]
+            render_ticker_dataframe(
+                frame.loc[:, [column for column in columns if column in frame]],
+                key=f"home_rotation_positions_{dashboard.policy.label}",
+                column_config={
+                    "Peso cotizado": st.column_config.ProgressColumn(
+                        min_value=0, max_value=100, format="%.1f%%"
+                    ),
+                    "Score horizonte": st.column_config.ProgressColumn(
+                        min_value=0, max_value=100, format="%.0f"
+                    ),
+                    "Confianza": st.column_config.ProgressColumn(
+                        min_value=0, max_value=100, format="%.0f%%"
+                    ),
+                    "Cobertura": st.column_config.ProgressColumn(
+                        min_value=0, max_value=100, format="%.0f%%"
+                    ),
+                },
+            )
+    with switches_tab:
+        if not dashboard.policy.normal_rotations:
+            st.info(
+                "En la vista diaria no se proponen saltos normales. Se actualizan riesgo, "
+                "precio y frescura; las decisiones se confirman en semanal o mensual."
+            )
+        elif not switch_rows:
+            st.success(
+                "Ningún cambio supera ahora todos los filtros de origen débil, favorita "
+                "azul, confianza, calidad, riesgo, concentración y coste. No hacer nada es válido."
+            )
+        else:
+            frame = pd.DataFrame(switch_rows)
+            render_ticker_dataframe(
+                frame,
+                key=f"home_rotation_switches_{dashboard.policy.label}",
+                ticker_column="Alternativa",
+                column_config={
+                    "Ventaja score": st.column_config.NumberColumn(format="%+.1f puntos"),
+                    "Peso origen": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Correlación": st.column_config.NumberColumn(format="%.2f"),
+                    "Fricción económica": st.column_config.NumberColumn(format="%.2f €"),
+                    "Reserva fiscal": st.column_config.NumberColumn(format="%.2f €"),
+                    "Capital prudente": st.column_config.NumberColumn(format="%.2f €"),
+                    "Umbral recuperación": st.column_config.NumberColumn(format="%.2f%%"),
+                },
+            )
+            st.caption(
+                "El umbral de recuperación indica cuánto tendría que subir la alternativa "
+                "sólo para reconstruir el valor bruto previo después de venta, reserva fiscal "
+                "y compra. No es una previsión de rentabilidad."
+            )
+    with candidates_tab:
+        if not candidate_rows:
+            st.info("No hay favoritas fuera de cartera con análisis comparable.")
+        else:
+            frame = pd.DataFrame(candidate_rows)
+            frame["Estado"] = frame["Color"].map(color_symbols)
+            columns = [
+                "Estado",
+                "Ticker",
+                "Score horizonte",
+                "Confianza",
+                "Cobertura",
+                "Entrada",
+                "Acción",
+                "Sector",
+                "Fecha",
+            ]
+            render_ticker_dataframe(
+                frame.loc[:, [column for column in columns if column in frame]],
+                key=f"home_rotation_candidates_{dashboard.policy.label}",
+                column_config={
+                    "Score horizonte": st.column_config.ProgressColumn(
+                        min_value=0, max_value=100, format="%.0f"
+                    ),
+                    "Confianza": st.column_config.ProgressColumn(
+                        min_value=0, max_value=100, format="%.0f%%"
+                    ),
+                    "Cobertura": st.column_config.ProgressColumn(
+                        min_value=0, max_value=100, format="%.0f%%"
+                    ),
+                },
+            )
+
+
+def _render_thesis_override(
+    journal: object,
+    snapshot: pd.DataFrame,
+    held_tickers: list[str],
+    *,
+    actor_username: str,
+) -> None:
+    """Permite declarar o restablecer una ruptura de tesis sin fingir automatismo."""
+
+    if snapshot.empty or not held_tickers:
+        return
+    current = thesis_invalidations(snapshot)
+    with st.expander(
+        "Revisión manual de tesis",
+        expanded=False,
+        icon=":material/fact_check:",
+    ):
+        st.caption(
+            "Úsalo sólo si ha cambiado un hecho del negocio, no por una caída de precio. "
+            "El rojo significa revisar una posible salida; nunca vender automáticamente."
+        )
+        selected = st.selectbox(
+            "Posición",
+            held_tickers,
+            key="home_thesis_ticker",
+        )
+        with st.form(f"home_thesis_form_{selected}"):
+            invalidated = st.checkbox(
+                "He confirmado que la tesis empresarial se ha invalidado",
+                value=selected in current,
+            )
+            reason = st.text_input(
+                "Hecho que ha cambiado la tesis",
+                value=current.get(selected, ""),
+                placeholder="Ej.: deterioro estructural de caja y retirada de la guía…",
+                help="Sólo es obligatorio cuando marcas la tesis como invalidada.",
+            )
+            submitted = st.form_submit_button(
+                "Guardar estado de tesis",
+                type="primary",
+                width="stretch",
+            )
+        if submitted:
+            try:
+                rows = build_thesis_update_rows(
+                    snapshot,
+                    selected,
+                    invalidated=invalidated,
+                    reason=reason,
+                )
+                journal.upsert_portfolio_snapshot_positions(
+                    rows,
+                    recorded_by=actor_username,
+                )
+            except (JournalStorageError, ValueError, AttributeError) as exc:
+                st.error(str(exc))
+            else:
+                st.success("Estado de tesis guardado en la fotografía de cartera.")
+                st.rerun()
 
 
 def _search_result_label(result: TickerSearchResult) -> str:
@@ -7422,6 +7900,20 @@ def render_home(
     if not market_snapshot.empty:
         market_snapshot, market_summary = latest_portfolio_snapshot(market_snapshot)
 
+    rotation_snapshot = _rotation_eligible_snapshot(market_snapshot)
+    held_tickers = _current_rotation_tickers(private_dashboard, market_snapshot)
+    allocations = _portfolio_allocations(private_dashboard, rotation_snapshot)
+    favorite_rotation_tickers = _favorite_rotation_tickers(
+        private_favorites,
+        group_favorites,
+    )
+    summary = _merge_saved_analysis_summary(
+        summary,
+        journal,
+        [*held_tickers, *favorite_rotation_tickers],
+    )
+    summary = apply_thesis_invalidations(summary, latest_snapshot)
+
     if section in {"Resumen", "Hoy"} and (
         snapshot_summary is not None or private_kpis is not None
     ):
@@ -7441,9 +7933,10 @@ def render_home(
                 else "N/D"
             )
             result_detail = (
-                f"{display_summary.return_pct:+.2f}% sobre los costes guardados"
+                f"{display_summary.return_pct:+.2f}% acumulado sobre coste declarado; "
+                "no es TWR/XIRR ni rentabilidad del periodo"
                 if display_summary.return_pct is not None
-                else "El archivo no incluye un coste completo"
+                else "No se muestra un porcentaje porque faltan costes o resultados de alguna inversión"
             )
             positions_text = display_summary.investment_count
             positions_detail = (
@@ -7534,88 +8027,115 @@ def render_home(
                 f"resultado latente valorado {group_kpis.unrealized_pnl_eur:+,.2f} EUR."
             )
 
-    if section == "Mi cartera" and snapshot_summary is not None:
-        st.markdown("### Mi cartera")
+    if section in {"Resumen", "Hoy", "Mi cartera"}:
+        rotation_horizon = st.segmented_control(
+            "Horizonte del mapa de decisiones",
+            list(HORIZON_POLICIES),
+            default="Mensual",
+            key="home_rotation_horizon",
+            help=(
+                "Diario vigila; semanal confirma; mensual es la frecuencia preferente "
+                "para estudiar rotaciones; anual revisa tesis y asignación."
+            ),
+        ) or "Mensual"
+        tax_rate = float(st.session_state.get("private_real_result_tax", 20.0))
+        buy_fee = float(st.session_state.get("private_fixed_fee", 1.0))
+        sell_fee = float(
+            st.session_state.get("private_real_result_sell_fee", buy_fee)
+        )
+        spread_pct = float(st.session_state.get("private_real_result_spread", 0.15))
+        fx_cost_pct = float(st.session_state.get("private_real_result_fx", 0.20))
+        rotation_report = build_approximate_return_report(
+            private_operations,
+            latest_prices,
+            fx_snapshot.rates_per_eur,
+            tax_rate_pct=tax_rate,
+            sell_fee_eur=sell_fee,
+            spread_pct=spread_pct,
+            fx_cost_pct=fx_cost_pct,
+            year=date.today().year,
+        )
+        recovery_hurdles = build_recovery_hurdles(
+            rotation_report.open_positions,
+            summary,
+            favorite_rotation_tickers,
+            snapshot=rotation_snapshot,
+            tax_rate_pct=tax_rate,
+            sell_fee_eur=sell_fee,
+            buy_fee_eur=buy_fee,
+            spread_pct=spread_pct,
+            fx_cost_pct=fx_cost_pct,
+        )
+        pair_correlations = build_pair_correlations(
+            prepared,
+            held_tickers,
+            favorite_rotation_tickers,
+        )
+        rotation_dashboard = build_rotation_dashboard(
+            summary,
+            held_tickers,
+            favorite_rotation_tickers,
+            allocations_pct=allocations,
+            horizon=rotation_horizon,
+            recovery_hurdles=recovery_hurdles,
+            pair_correlations=pair_correlations,
+        )
+        _render_rotation_dashboard(rotation_dashboard)
+        _render_thesis_override(
+            journal,
+            latest_snapshot,
+            held_tickers,
+            actor_username=user.username,
+        )
         st.caption(
-            "Vista única: el diario manda en las acciones con compras o ventas; "
-            "el resto conserva su último valor guardado. "
-            f"{snapshot_summary.analyzable_count} partidas tienen ticker reconocible para análisis. "
-            "Civislend y Segofactoring aparecen agrupados para mostrar el capital total invertido."
+            "Civislend, Segofactoring, efectivo y partidas sin ticker se conservan en "
+            "el patrimonio guardado, pero quedan fuera de pesos, colores, benchmark y rotaciones."
         )
-        home_declared_snapshot = group_portfolio_snapshot_for_home(latest_snapshot)
-        home_snapshot = group_portfolio_snapshot_for_home(market_snapshot)
-        chart_a, chart_b = st.columns(2)
-        with chart_a:
-            st.plotly_chart(
-                portfolio_snapshot_allocation_chart(home_snapshot),
-                width="stretch",
-                config=PLOTLY_CONFIG,
+        if not latest_snapshot.empty and "analysis_ticker" in latest_snapshot:
+            blank_ticker = (
+                latest_snapshot["analysis_ticker"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                == ""
             )
-        with chart_b:
-            st.plotly_chart(
-                portfolio_snapshot_assets_chart(home_snapshot),
-                width="stretch",
-                config=PLOTLY_CONFIG,
-            )
-        home_comparison = compare_portfolio_valuations(
-            home_declared_snapshot,
-            home_snapshot,
-        )
-        position_summary = home_declared_snapshot.reset_index(drop=True).copy()
-        position_summary["market_value_eur"] = home_comparison["market_value_eur"]
-        position_summary["market_difference_eur"] = home_comparison["difference_eur"]
-        position_summary["valuation_status"] = home_comparison["valuation_status"]
-        for column in [
-            "value_eur", "market_value_eur", "market_difference_eur",
-            "gain_loss_eur", "return_pct",
-        ]:
-            position_summary[column] = pd.to_numeric(
-                position_summary[column], errors="coerce"
-            )
-        position_summary = position_summary.rename(
-            columns={
-                "asset_name": "Empresa",
-                "analysis_ticker": "Ticker",
-                "platform": "Cuenta",
-                "value_eur": "Valor declarado",
-                "market_value_eur": "Estimación mercado",
-                "market_difference_eur": "Diferencia",
-                "gain_loss_eur": "Resultado foto",
-                "return_pct": "Rentabilidad foto",
-                "valuation_status": "Origen valoración",
-            }
-        )
-        st.caption("Pulsa una posición con ticker para abrir su análisis.")
-        render_ticker_dataframe(
-            position_summary.loc[
-                :,
-                [
-                    "Empresa",
-                    "Ticker",
-                    "Cuenta",
-                    "Valor declarado",
-                    "Estimación mercado",
-                    "Diferencia",
-                    "Resultado foto",
-                    "Rentabilidad foto",
-                    "Origen valoración",
-                ],
-            ],
-            key="home_portfolio_positions",
-            column_config={
-                "Valor declarado": st.column_config.NumberColumn(format="%.2f €"),
-                "Estimación mercado": st.column_config.NumberColumn(format="%.2f €"),
-                "Diferencia": st.column_config.NumberColumn(format="%+.2f €"),
-                "Resultado foto": st.column_config.NumberColumn(format="%+.2f €"),
-                "Rentabilidad foto": st.column_config.NumberColumn(format="%+.2f%%"),
-            },
-        )
-
-    if section == "Mi cartera" and snapshot_summary is None:
-        st.info(
-            "Todavía no hay una fotografía de cartera disponible. Puedes importarla "
-            "desde «Carteras» o reconstruir las posiciones con operaciones."
-        )
+            other_assets = latest_snapshot.loc[
+                blank_ticker | _rotation_excluded_asset_mask(latest_snapshot)
+            ].copy()
+            if not other_assets.empty:
+                other_value = float(
+                    pd.to_numeric(other_assets["value_eur"], errors="coerce")
+                    .fillna(0.0)
+                    .sum()
+                )
+                with st.expander(
+                    f"Otros activos no comparables · {other_value:,.2f} €",
+                    expanded=False,
+                ):
+                    st.caption(
+                        "Sólo se muestran para cuadrar el patrimonio. No compiten con una "
+                        "acción favorita porque su liquidez, valoración y horizonte son distintos."
+                    )
+                    other_columns = [
+                        column
+                        for column in ["asset_name", "platform", "value_eur", "notes"]
+                        if column in other_assets
+                    ]
+                    st.dataframe(
+                        other_assets.loc[:, other_columns].rename(
+                            columns={
+                                "asset_name": "Activo",
+                                "platform": "Plataforma",
+                                "value_eur": "Valor guardado",
+                                "notes": "Notas",
+                            }
+                        ),
+                        hide_index=True,
+                        width="stretch",
+                        column_config={
+                            "Valor guardado": st.column_config.NumberColumn(format="%.2f €")
+                        },
+                    )
 
     if section in {"Resumen", "Hoy"}:
         st.button(
@@ -7658,191 +8178,14 @@ def render_home(
             args=("Carteras", "portfolio_navigation", "Privada"),
         )
 
-    held_tickers = _portfolio_tracking_tickers(journal)
-    allocations = _portfolio_allocations(private_dashboard, latest_snapshot)
-    decision_rows = build_portfolio_decision_rows(
-        summary,
-        held_tickers,
-        allocations_pct=allocations,
-    )
-    switch_rows = build_switch_candidate_rows(summary, held_tickers)
-    strong_entries, candidate_entries = entry_opportunity_rows(
-        summary,
-        held_tickers,
-    )
-    st.markdown("### Panel de decisiones")
-    st.caption(
-        "Separa posición, entrada y cambio de activo. Una alerta técnica aislada "
-        "no se presenta como una orden de venta; exige confirmación de tesis y riesgo."
-    )
-    decision_metrics = st.columns(4)
-    decision_metrics[0].metric("Posiciones", len(decision_rows))
-    decision_metrics[1].metric(
-        "Requieren atención",
-        sum(
-            row["Decisión"]
-            in {
-                "Revisar exposición",
-                "Revisar posible salida",
-                "Actualizar datos",
-            }
-            for row in decision_rows
-        ),
-    )
-    decision_metrics[2].metric("Entradas fuertes", len(strong_entries))
-    decision_metrics[3].metric("Candidatas", len(candidate_entries))
-    decision_view = st.segmented_control(
-        "Vista del panel de decisiones",
-        ["Mi cartera", "Cambios a estudiar", "Entradas fuertes", "Candidatas"],
-        default="Mi cartera",
-        key="home_decision_view",
-        label_visibility="collapsed",
-    )
-    if decision_view == "Mi cartera":
-        if decision_rows:
-            decision_frame = pd.DataFrame(decision_rows).rename(
-                columns={"Oportunidad": "Atractivo global"}
-            )
-            render_ticker_dataframe(
-                decision_frame,
-                key="home_portfolio_decisions",
-                column_config={
-                    "Atractivo global": st.column_config.ProgressColumn(
-                        min_value=0, max_value=100, format="%d"
-                    ),
-                    "Peso": st.column_config.ProgressColumn(
-                        min_value=0, max_value=100, format="%.1f%%"
-                    ),
-                },
-            )
-        else:
-            st.info(
-                "Todavía no hay posiciones registradas ni tickers reconocibles en la "
-                "última fotografía."
-            )
-    elif decision_view == "Cambios a estudiar":
-        st.caption(
-            "Comparación preliminar por atractivo, calidad y riesgo. Sólo se destaca "
-            "un cambio si existe margen suficiente; faltan siempre fiscalidad, divisa, "
-            "correlación y revisión de tesis."
-        )
-        if not switch_rows:
-            st.info(
-                "No hay datos suficientes para comparar posiciones con alternativas."
-            )
-        else:
-            switch_frame = pd.DataFrame(switch_rows)
-            render_ticker_dataframe(
-                switch_frame,
-                key="home_switch_candidates",
-                ticker_column="Alternativa",
-                column_config={
-                    "Ventaja": st.column_config.NumberColumn(format="%+.0f puntos"),
-                    "Atractivo actual": st.column_config.ProgressColumn(
-                        min_value=0, max_value=100, format="%d"
-                    ),
-                    "Atractivo alternativa": st.column_config.ProgressColumn(
-                        min_value=0, max_value=100, format="%d"
-                    ),
-                    "Confianza alternativa": st.column_config.ProgressColumn(
-                        min_value=0, max_value=100, format="%d%%"
-                    ),
-                },
-            )
-    else:
-        entry_rows = strong_entries if decision_view == "Entradas fuertes" else candidate_entries
-        if not entry_rows:
-            st.info(
-                "No hay empresas actualizadas en este grupo. Esto no obliga a comprar: "
-                "puede ser mejor esperar a que aparezca una señal válida."
-            )
-        else:
-            entry_frame = pd.DataFrame(entry_rows)
-            entry_columns = [
-                column
-                for column in [
-                    "Ticker",
-                    "Momento entrada",
-                    "Oportunidad",
-                    "Calidad empresa",
-                    "Lectura entrada",
-                    "Lectura conjunta",
-                    "Cierre",
-                    "Fecha",
-                ]
-                if column in entry_frame.columns
-            ]
-            entry_frame = entry_frame.loc[:, entry_columns].rename(
-                columns={
-                    "Momento entrada": "Momento técnico",
-                    "Oportunidad": "Atractivo global",
-                    "Calidad empresa": "Calidad negocio",
-                }
-            )
-            render_ticker_dataframe(
-                entry_frame,
-                key=(
-                    "home_strong_entries"
-                    if decision_view == "Entradas fuertes"
-                    else "home_candidate_entries"
-                ),
-                column_config={
-                    "Momento técnico": st.column_config.ProgressColumn(
-                        min_value=0, max_value=100, format="%d"
-                    ),
-                    "Atractivo global": st.column_config.ProgressColumn(
-                        min_value=0, max_value=100, format="%d"
-                    ),
-                    "Calidad negocio": st.column_config.ProgressColumn(
-                        min_value=0, max_value=100, format="%d"
-                    ),
-                },
-            )
-
-    risk_alerts = [
-        row
-        for row in decision_rows
-        if row.get("Decisión")
-        in {
-            "Revisar posible salida",
-            "Revisar exposición",
-            "Esperar confirmación",
-            "Actualizar datos",
-        }
-    ]
-    entry_alerts = [
-        row
-        for row in summary
-        if row.get("Lectura conjunta") in {"Oportunidad destacada", "Candidata"}
-    ]
-    st.markdown("### Atención hoy")
     if not summary:
         st.info(
             "Abre «Analizar → Radar» y actualiza las empresas que sigues. Las posiciones "
             "abiertas se añadirán automáticamente."
         )
-    elif not risk_alerts and not entry_alerts:
-        st.success(
-            "No aparecen alertas prioritarias. Revisa las empresas en vigilancia "
-            "antes de tomar decisiones."
-        )
-    else:
-        for row in risk_alerts[:5]:
-            st.warning(
-                f"**{row['Ticker']} · {row['Decisión']}:** "
-                f"{row.get('Motivo', 'Requiere revisión')}. "
-                f"Antes: {row.get('Confirmar antes', 'confirmar los datos')}. "
-                f"Datos {row.get('Fecha', 'sin fecha')}."
-            )
-        for row in entry_alerts[:3]:
-            st.success(
-                f"**{row['Ticker']} · {row['Lectura conjunta']}:** "
-                f"atractivo global {row.get('Oportunidad', 'N/D')}/100. Requiere revisión."
-            )
-
-    if summary:
-        st.markdown("### Empresas que más destacan")
-        render_opportunity_cards(summary, limit=3)
+    elif summary:
+        with st.expander("Ver las tres empresas que más destacan en el radar"):
+            render_opportunity_cards(summary, limit=3)
 
 
 def render_opportunities_page(
@@ -11925,7 +12268,10 @@ def main() -> None:
     portfolio_refresh_requested = bool(
         st.session_state.pop("_portfolio_market_refresh_requested", False)
     )
-    auto_refresh_key = f"_portfolio_auto_refresh_done_{authenticated_user.username}"
+    auto_refresh_key = f"_portfolio_auto_refresh_done_{review_suffix}"
+    auto_refresh_date_key = f"_portfolio_auto_refresh_date_{review_suffix}"
+    auto_refreshed_key = f"_portfolio_auto_refreshed_{review_suffix}"
+    auto_refresh_total_key = f"_portfolio_auto_refresh_total_{review_suffix}"
     portfolio_auto_refresh = (
         selected_section in {"Inicio", "Carteras"}
         and daily_refresh_due(
@@ -11933,15 +12279,15 @@ def main() -> None:
             today=date.today(),
         )
     )
-    if portfolio_auto_refresh:
-        st.session_state[auto_refresh_key] = today_key
+    portfolio_refresh_cycle = bool(
+        portfolio_refresh_requested or portfolio_auto_refresh
+    )
 
     should_load_market = bool(
         load_clicked
         or pending_analysis_ticker
         or growth_scan_tickers
-        or portfolio_refresh_requested
-        or portfolio_auto_refresh
+        or portfolio_refresh_cycle
     )
     if should_load_market:
         held_tickers: list[str] = []
@@ -11964,21 +12310,61 @@ def main() -> None:
                 continue
             held_tickers.extend(_portfolio_tracking_tickers(owner_journal))
         held_tickers = list(dict.fromkeys(held_tickers))
+        daily_favorite_tickers = [
+            resolve_analysis_ticker(str(ticker))
+            for ticker in favorite_tickers
+            if str(ticker).strip()
+        ]
+        automatic_daily_batch: list[str] = []
+        if portfolio_refresh_cycle:
+            if (
+                portfolio_refresh_requested
+                or st.session_state.get(auto_refresh_date_key) != today_key
+            ):
+                st.session_state[auto_refresh_date_key] = today_key
+                st.session_state[auto_refreshed_key] = []
+                st.session_state.pop(auto_refresh_key, None)
+            daily_refreshed = list(
+                st.session_state.get(auto_refreshed_key, []) or []
+            )
+            automatic_daily_batch = next_daily_refresh_batch(
+                held_tickers,
+                daily_favorite_tickers,
+                daily_refreshed,
+                limit=20,
+            )
+            daily_universe = merge_analysis_ticker_sources(
+                held_tickers,
+                daily_favorite_tickers,
+            )
+            st.session_state[auto_refresh_total_key] = len(daily_universe)
+            if not automatic_daily_batch:
+                st.session_state[auto_refresh_key] = today_key
         base_tickers = (
             tickers
             if load_clicked or pending_analysis_ticker
             else []
         )
-        tickers_to_load = (
-            growth_scan_tickers
-            if growth_scan_tickers
-            else analysis_refresh_tickers(
+        loading_daily_batch = False
+        if growth_scan_tickers:
+            tickers_to_load = growth_scan_tickers
+        elif load_clicked or pending_analysis_ticker:
+            tickers_to_load = analysis_refresh_tickers(
                 base_tickers,
                 held_tickers,
                 pending_ticker=pending_analysis_ticker,
                 active_ticker=active_analysis_ticker,
             )
-        )
+        elif portfolio_refresh_cycle:
+            tickers_to_load = automatic_daily_batch
+            loading_daily_batch = bool(automatic_daily_batch)
+        else:
+            tickers_to_load = analysis_refresh_tickers(
+                base_tickers,
+                held_tickers,
+                pending_ticker=pending_analysis_ticker,
+                active_ticker=active_analysis_ticker,
+            )
         refreshed_tickers: set[str] = set()
         if tickers_to_load:
             deep_tickers = (
@@ -11996,7 +12382,7 @@ def main() -> None:
                     ),
                 }
                 if load_clicked or pending_analysis_ticker or growth_scan_tickers
-                else set()
+                else set(held_tickers[:25])
             )
             force_new_prices = bool(
                 load_clicked
@@ -12008,7 +12394,7 @@ def main() -> None:
                 str(pd.Timestamp.now(tz="UTC").value)
                 if force_new_prices
                 else today_key
-                if growth_scan_tickers or portfolio_auto_refresh
+                if growth_scan_tickers or portfolio_refresh_cycle
                 else ""
             )
             refreshed_tickers = load_market_data(
@@ -12020,12 +12406,38 @@ def main() -> None:
                 fundamental_tickers=deep_tickers,
                 merge_existing=bool(
                     growth_scan_tickers
-                    or portfolio_refresh_requested
-                    or portfolio_auto_refresh
+                    or portfolio_refresh_cycle
                 ),
                 refresh_fundamentals=bool(growth_scan_tickers),
                 price_refresh_token=price_refresh_token,
             )
+        if loading_daily_batch:
+            completed_daily = merge_analysis_ticker_sources(
+                st.session_state.get(auto_refreshed_key, []) or [],
+                [
+                    ticker
+                    for ticker in automatic_daily_batch
+                    if ticker in refreshed_tickers
+                ],
+            )
+            st.session_state[auto_refreshed_key] = completed_daily
+            remaining_daily = next_daily_refresh_batch(
+                held_tickers,
+                daily_favorite_tickers,
+                completed_daily,
+                limit=20,
+            )
+            if not remaining_daily:
+                st.session_state[auto_refresh_key] = today_key
+            elif refreshed_tickers:
+                # Cada pasada es pequeña. Los éxitos quedan recordados y los
+                # fallos se reintentan sin descargar otra vez todo el universo.
+                st.rerun()
+            else:
+                st.sidebar.warning(
+                    "La actualización diaria se ha pausado por el límite del "
+                    "proveedor. Se reintentará sólo lo pendiente en el próximo rerun."
+                )
         if growth_scan_tickers:
             attempted_review = list(
                 st.session_state.get(review_attempted_key, [])

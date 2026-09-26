@@ -43,6 +43,7 @@ La instalación local solicita las credenciales guardadas en
 │   ├── ui.py                 # Diseño responsive y perfiles de configuración
 │   ├── risk.py               # Tamaño orientativo de posición y riesgo monetario
 │   ├── portfolio.py          # Valoración y comparación de cambios
+│   ├── portfolio_rotation.py # Colores, horizontes y filtros prudentes de rotación
 │   ├── portfolio_history.py  # Evolución diaria y resumen anual de cartera
 │   ├── portfolio_export.py   # Libro Excel con tablas y gráficos editables
 │   ├── portfolio_snapshot_import.py # Fotografías XLSX sin inventar operaciones
@@ -87,10 +88,17 @@ no un precio objetivo ni una predicción.
 
 ## Interfaz y dispositivos
 
-La portada reúne primero el valor de la cartera, el resultado latente, las posiciones,
-el seguimiento y las alertas del día. Cuando existe una fotografía importada, muestra
-sus cifras aunque todavía no haya operaciones reconstruidas, junto con gráficos por
-plataforma y por activos. La navegación separa inicio, análisis,
+La portada reúne primero el valor de la cartera y un mapa de la parte cotizada. Cada
+posición muestra su peso dentro de esa parte —no sobre el patrimonio ilíquido— y un
+estado con texto y color: azul puede recibir capital, verde mantener, amarillo esperar,
+naranja revisar peso o rotación, rojo revisar una posible salida y gris actualizar datos.
+Rojo y azul nunca son órdenes automáticas. Las vistas diaria, semanal, mensual y anual
+cambian los pesos del análisis y la cadencia: la diaria sólo vigila, mientras la mensual
+es la frecuencia preferente para estudiar cambios. Un bloque de máximo cinco prioridades
+resume primero las revisiones y alternativas; el gráfico y las tablas quedan como detalle.
+La ruptura de tesis puede declararse manualmente con un motivo y se conserva en la
+fotografía de cartera. Ese estado habilita una revisión roja, no una venta automática.
+La navegación separa inicio, análisis,
 favoritos, carteras y guía para cargar únicamente la sección que se está consultando.
 Las oportunidades se presentan en tarjetas fáciles de leer y conservan el ranking
 completo y los gráficos técnicos como detalle desplegable.
@@ -131,10 +139,11 @@ mensual, riesgo monetario, máximo individual y techo total de estrategia. Los p
 tecnología, consumo, energía/uranio, biotecnología, industria/defensa, finanzas y ETF
 adaptan el riesgo y la lista de comprobaciones; el usuario puede corregir manualmente una
 clasificación automática. Segofactoring y Civislend quedan fuera de estos cálculos.
-La pestaña independiente **Proyección de capital** sí los muestra como bolsas separadas
-para explicar el plan mensual sin mezclarlo con la selección de empresas:
-capital actual, 250 euros mensuales de Civislend, 250 de facturas y el resto entre
-acciones tradicionales y escalera. La escalera sólo aumenta su porcentaje después de
+Los registros de Civislend y Segofactoring no se borran: permanecen en una vista secundaria
+para cuadrar patrimonio y vencimientos. Quedan fuera de la portada líquida, colores,
+benchmark y candidatos de rotación porque no son comparables ni tienen la misma liquidez.
+La proyección histórica puede conservarlos como bolsas separadas, sin mezclarlos con la
+selección de empresas. La escalera sólo aumenta su porcentaje después de
 un año que supera el umbral elegido. Muestra capital aportado, cuatro escenarios,
 percentiles de 1.000 recorridos y los horizontes diciembre, 12, 24, 36, 48 meses y
 10 años; no modifica operaciones ni presenta la simulación como una garantía.
@@ -159,6 +168,19 @@ compras, ventas, beneficio bruto, comisiones, costes de cambio, impuestos estima
 neto por año. Prioriza el importe realmente liquidado por el bróker cuando está disponible y,
 si falta, permite configurar de forma visible comisión, spread, coste de divisa y tipo fiscal.
 Es una ayuda para decidir y comprobar órdenes, no una liquidación tributaria oficial.
+Si falta el precio, la divisa o una operación necesaria, se muestran los importes que sí
+pueden comprobarse pero se oculta el porcentaje agregado. Ese porcentaje combina ventas
+del año elegido y posiciones abiertas actuales; no se presenta como TWR, XIRR o rentabilidad
+anual de toda la cartera.
+La portada aplica la misma cautela: no suma un resultado parcial como si fuera el total
+cuando alguna inversión de la fotografía carece de coste o ganancia/pérdida comprobable.
+
+El mapa de rotación compara una posición sólo con empresas guardadas explícitamente en
+favoritos. Antes de mostrar un cambio exige que la posición origen ya necesite revisión,
+que la alternativa tenga entrada y confianza suficientes, que no empeore materialmente
+calidad o riesgo y que respete concentración sectorial. También separa comisión, spread,
+divisa, reserva fiscal, capital prudentemente reinvertible, correlación y el porcentaje que
+la alternativa tendría que recuperar. Si falta el coste FIFO, no propone el salto.
 
 La pestaña **Favoritos** permite buscar una empresa por su nombre normal, sin conocer el
 ticker, y guardarla en una lista privada o compartida. Los resultados indican mercado,
@@ -177,9 +199,12 @@ Cada favorita admite hasta cinco etiquetas visuales —por ejemplo Energía,
 Biotecnología, Tecnología, ETF, Fondo o Small cap— que pueden corregirse y utilizarse
 como filtro. La aplicación propone etiquetas a partir del tipo de instrumento, sector,
 industria y capitalización disponibles, pero la clasificación sigue siendo editable.
-Las posiciones abiertas —también cuando superan 50— se actualizan automáticamente con
-aproximadamente 14 meses de precio y tendencia, evitando solicitar cuentas empresariales
-innecesarias para toda la cartera. El historial de operaciones no tiene ese límite.
+La portada actualiza automáticamente posiciones y favoritas en lotes de 20, empezando
+por la cartera. En la misma sesión recuerda las descargas correctas: si el proveedor
+limita peticiones, el siguiente intento continúa sólo con las pendientes y no vuelve
+a empezar las 136 empresas. La revisión empresarial profunda continúa separada en
+lotes de 25 para no confundir un precio reciente con fundamentales completos. El
+historial de operaciones no tiene ese límite.
 
 La sección **Comparador sectorial** enfrenta de 2 a 10 empresas cargadas durante
 1, 3, 6 o 12 meses. Normaliza todas las cotizaciones a 100, calcula rentabilidad,
