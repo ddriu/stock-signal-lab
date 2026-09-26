@@ -27,13 +27,18 @@ from src.data_loader import (
     download_prices,
     resolve_analysis_ticker,
 )
+from src.data_sources import benchmark_for_ticker, sector_benchmark
 from src.email_sender import send_email
 from src.entry_opportunity import STATUS_BUYABLE, evaluate_entry_opportunity
 from src.fundamentals import evaluate_fundamentals
 from src.fundamental_filter import evaluate_fundamental_filter
 from src.growth_momentum import GrowthMomentumConfig, evaluate_growth_momentum
 from src.indicators import add_indicators
-from src.opportunity import evaluate_risk, evaluate_valuation
+from src.opportunity import (
+    evaluate_relative_strength,
+    evaluate_risk,
+    evaluate_valuation,
+)
 from src.portfolio_snapshot import latest_portfolio_snapshot
 from src.signal_engine import evaluate_latest_signal
 from src.storage import GROUP_PORTFOLIO_OWNER, create_journal
@@ -216,6 +221,32 @@ def run_daily_alerts(
         downloader=downloader,
     )
     errors.extend(download_errors)
+    reference_frames: dict[str, pd.DataFrame | None] = dict(frames)
+    reference_start = resolved_today - timedelta(days=550)
+
+    def reference_frame(symbol: str | None) -> pd.DataFrame | None:
+        """Descarga cada referencia una sola vez sin sumarla al universo analizado."""
+
+        if not symbol:
+            return None
+        normalized = symbol.strip().upper()
+        if normalized not in reference_frames:
+            try:
+                reference_frames[normalized] = downloader(
+                    normalized,
+                    reference_start,
+                    resolved_today,
+                    auto_adjust=True,
+                )
+            except Exception as exc:
+                # La comparación es una dimensión opcional: su ausencia no debe
+                # impedir que se calcule y envíe el análisis principal.
+                reference_frames[normalized] = None
+                errors.append(
+                    f"{normalized}: no se pudo descargar la referencia ({exc})."
+                )
+        return reference_frames[normalized]
+
     config = StrategyConfig()
     growth_config = GrowthMomentumConfig()
     fundamental_cache: dict[str, dict[str, object]] = {}
@@ -236,6 +267,46 @@ def run_daily_alerts(
                 if not previous.empty and "notified_at" in previous.columns
                 else {}
             )
+            saved_snapshot_keys: set[tuple[str, date]] = set()
+            if hasattr(journal, "list_analysis_snapshots"):
+                try:
+                    saved_snapshots = journal.list_analysis_snapshots()
+                    if (
+                        not saved_snapshots.empty
+                        and {"ticker", "analyzed_at"}.issubset(saved_snapshots.columns)
+                    ):
+                        saved_dates = pd.to_datetime(
+                            saved_snapshots["analyzed_at"], errors="coerce"
+                        ).dt.date
+                        canonical_scores = {
+                            "company_score",
+                            "entry_score",
+                            "valuation_score",
+                            "relative_score",
+                            "risk_score",
+                        }
+                        if canonical_scores.issubset(saved_snapshots.columns):
+                            complete = pd.Series(True, index=saved_snapshots.index)
+                            for column in canonical_scores:
+                                complete &= pd.to_numeric(
+                                    saved_snapshots[column], errors="coerce"
+                                ).notna()
+                        else:
+                            complete = pd.Series(False, index=saved_snapshots.index)
+                        saved_snapshot_keys = {
+                            (str(ticker).strip().upper(), saved_date)
+                            for ticker, saved_date, is_complete in zip(
+                                saved_snapshots["ticker"], saved_dates, complete,
+                                strict=True,
+                            )
+                            if (
+                                bool(is_complete)
+                                and str(ticker).strip()
+                                and pd.notna(saved_date)
+                            )
+                        }
+                except Exception:
+                    saved_snapshot_keys = set()
             evaluated: list[tuple[object, float, bool, str, DailyOverviewRow]] = []
             candidates: list[AlertCandidate] = []
             overview_rows: list[DailyOverviewRow] = []
@@ -307,21 +378,45 @@ def run_daily_alerts(
                     except (KeyError, TypeError, ValueError):
                         data_notes.append("riesgo parcial")
 
+                    broad_name = benchmark_for_ticker(ticker)
+                    sector_name = sector_benchmark(
+                        str(info.get("sector") or ""),
+                        ticker,
+                    )
+                    broad_market = reference_frame(broad_name)
+                    sector_market = reference_frame(sector_name)
+                    relative = None
+                    try:
+                        relative = evaluate_relative_strength(
+                            ticker,
+                            frame,
+                            broad_market,
+                            broad_name=broad_name,
+                            sector=sector_market,
+                            sector_name=sector_name,
+                        )
+                        if relative.score is None:
+                            data_notes.append("fuerza relativa parcial")
+                    except (KeyError, TypeError, ValueError):
+                        data_notes.append("fuerza relativa parcial")
+
                     growth = None
                     try:
                         growth = evaluate_growth_momentum(
                             ticker=ticker,
                             frame=frame,
                             info=info,
-                            relative=None,
+                            relative=relative,
                             risk=risk,
-                            broad_market=None,
+                            broad_market=broad_market,
                             config=growth_config,
                         )
                     except (KeyError, TypeError, ValueError):
                         data_notes.append("crecimiento parcial")
 
                     enhanced = None
+                    fundamental = None
+                    valuation = None
                     required_for_opportunity = {
                         "open",
                         "high",
@@ -344,8 +439,14 @@ def run_daily_alerts(
                                 fundamental_coverage=fundamental.coverage_pct,
                                 valuation_score=valuation.score,
                                 valuation_coverage=valuation.coverage_pct,
-                                relative_score=None,
-                                relative_coverage=0,
+                                relative_score=(
+                                    relative.score if relative is not None else None
+                                ),
+                                relative_coverage=(
+                                    relative.coverage_pct
+                                    if relative is not None
+                                    else 0
+                                ),
                                 risk_score=risk.score,
                                 risk_coverage=risk.coverage_pct,
                                 info=info,
@@ -437,6 +538,47 @@ def run_daily_alerts(
                             data_note=", ".join(dict.fromkeys(data_notes)),
                         )
                     overview_rows.append(overview_row)
+                    snapshot_key = (ticker, pd.Timestamp(signal.as_of).date())
+                    if (
+                        snapshot_key not in saved_snapshot_keys
+                        and enhanced is not None
+                        and hasattr(journal, "add_analysis_snapshot")
+                    ):
+                        try:
+                            journal.add_analysis_snapshot(
+                                ticker=ticker,
+                                analyzed_at=signal.as_of,
+                                price=price,
+                                opportunity_score=enhanced.opportunity_score,
+                                company_score=(
+                                    fundamental.score
+                                    if fundamental is not None
+                                    else None
+                                ),
+                                entry_score=signal.score,
+                                valuation_score=(
+                                    valuation.score
+                                    if valuation is not None
+                                    else None
+                                ),
+                                relative_score=(
+                                    relative.score if relative is not None else None
+                                ),
+                                risk_score=(risk.score if risk is not None else None),
+                                opportunity_label=enhanced.status_label,
+                                entry_label=signal.label,
+                                position_label=signal.position_label,
+                                sector=str(
+                                    (fundamental.sector if fundamental is not None else "")
+                                    or info.get("sector")
+                                    or ""
+                                ),
+                                explanation=enhanced.explanation,
+                                note="Actualización automática del radar diario",
+                            )
+                            saved_snapshot_keys.add(snapshot_key)
+                        except Exception:
+                            data_notes.append("historial no guardado")
                     if candidate is not None:
                         candidates.append(candidate)
                     evaluated.append(

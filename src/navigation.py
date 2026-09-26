@@ -118,6 +118,24 @@ def next_daily_review_batch(
     return pending[: max(int(limit), 1)]
 
 
+def next_daily_refresh_batch(
+    held_tickers: Iterable[object],
+    favorite_tickers: Iterable[object],
+    refreshed_tickers: Iterable[object],
+    *,
+    limit: int = 25,
+) -> list[str]:
+    """Planifica un lote pendiente, dando prioridad a la cartera actual.
+
+    ``refreshed_tickers`` contiene sólo descargas correctas. Tras un límite
+    del proveedor, el siguiente rerun conserva el avance y reintenta únicamente
+    los símbolos que continúan pendientes.
+    """
+
+    universe = merge_analysis_ticker_sources(held_tickers, favorite_tickers)
+    return next_daily_review_batch(universe, refreshed_tickers, limit=limit)
+
+
 def daily_refresh_due(
     last_refresh_date: object,
     *,

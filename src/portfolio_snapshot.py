@@ -502,19 +502,32 @@ def latest_portfolio_snapshot(
     latest["value_eur"] = pd.to_numeric(latest["value_eur"], errors="coerce").fillna(0.0)
 
     cost_values = pd.to_numeric(
-        latest.get("cost_estimate_eur", pd.Series(dtype=float)), errors="coerce"
+        latest.get("cost_estimate_eur", pd.Series(index=latest.index, dtype=float)),
+        errors="coerce",
     )
     gain_values = pd.to_numeric(
-        latest.get("gain_loss_eur", pd.Series(dtype=float)), errors="coerce"
+        latest.get("gain_loss_eur", pd.Series(index=latest.index, dtype=float)),
+        errors="coerce",
     )
-    cost = float(cost_values.sum()) if cost_values.notna().any() else None
-    gain = float(gain_values.sum()) if gain_values.notna().any() else None
+    asset_types = latest["asset_type"].fillna("").astype(str).str.casefold()
+    investment_mask = asset_types != "efectivo"
+    # Una suma parcial parece un resultado total y conduce a decisiones falsas.
+    # El efectivo no necesita coste, pero todas las inversiones sí deben tener
+    # coste y resultado antes de publicar un porcentaje agregado.
+    required_costs = cost_values.loc[investment_mask]
+    required_gains = gain_values.loc[investment_mask]
+    complete_result = bool(
+        investment_mask.any()
+        and required_costs.notna().all()
+        and required_gains.notna().all()
+    )
+    cost = float(cost_values.sum()) if complete_result else None
+    gain = float(gain_values.sum()) if complete_result else None
     return_pct = (
         gain / cost * 100.0
         if cost is not None and cost > 0 and gain is not None
         else None
     )
-    asset_types = latest["asset_type"].fillna("").astype(str).str.casefold()
     analyzable = latest.get(
         "analysis_ticker", pd.Series("", index=latest.index)
     ).fillna("").astype(str).str.strip()

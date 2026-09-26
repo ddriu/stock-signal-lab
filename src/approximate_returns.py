@@ -451,6 +451,11 @@ def build_approximate_return_report(
     )
     total_pnl = realized - realized_tax + unrealized - unrealized_tax
     denominator = closed_cost + open_cost
+    aggregate_is_complete = (
+        incomplete == 0
+        and not missing_prices
+        and not missing_currencies
+    )
     summary = ApproximateReturnSummary(
         year=selected_year,
         purchases_eur=purchases_year,
@@ -468,7 +473,9 @@ def build_approximate_return_report(
         unrealized_after_tax_eur=unrealized - unrealized_tax,
         approximate_total_pnl_eur=total_pnl,
         approximate_return_pct=(
-            total_pnl / denominator * 100.0 if denominator > 0 else None
+            total_pnl / denominator * 100.0
+            if denominator > 0 and aggregate_is_complete
+            else None
         ),
         incomplete_operations=incomplete,
         unpriced_positions=len(missing_prices),

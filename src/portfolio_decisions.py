@@ -104,7 +104,9 @@ def build_portfolio_decision_rows(
         quality = _number(source.get("Calidad empresa"))
         risk = _number(source.get("Riesgo controlado"))
         confidence = _number(source.get("Confianza datos"))
-        has_room = allocation is None or allocation <= max_add_allocation_pct
+        allocation_known = allocation is not None
+        has_room = allocation_known and allocation < max_add_allocation_pct
+        overweight = allocation_known and allocation > max_add_allocation_pct
         attractive_entry = (
             entry_label in STRONG_ENTRY_LABELS.union(CANDIDATE_ENTRY_LABELS)
             and opportunity is not None
@@ -112,25 +114,62 @@ def build_portfolio_decision_rows(
         )
         technical_reason = str(source.get("Motivo posición") or "").strip()
         reliable = confidence is not None and confidence >= 60.0
+        supported_for_add = (
+            reliable
+            and quality is not None
+            and quality >= 55.0
+            and risk is not None
+            and risk >= 50.0
+        )
         adverse_evidence = 1  # La propia señal técnica.
         adverse_evidence += int(opportunity is not None and opportunity <= 40.0)
         adverse_evidence += int(quality is not None and quality <= 45.0)
         adverse_evidence += int(risk is not None and risk <= 40.0)
+        thesis_invalidated = bool(source.get("Tesis invalidada")) or (
+            "ruptura de tesis confirmada" in technical_reason.casefold()
+        )
+        thesis_reason = str(source.get("Motivo tesis") or "").strip()
 
-        if position_label == "Vender":
+        if thesis_invalidated:
+            priority = "Alta"
+            decision = "Revisar posible salida"
+            confirmed_by_readings = (
+                position_label == "Vender" and reliable and adverse_evidence >= 3
+            )
+            decision_type = (
+                "Riesgo y tesis confirmados"
+                if confirmed_by_readings
+                else "Ruptura de tesis declarada"
+            )
+            reason = (
+                thesis_reason
+                or (technical_reason if confirmed_by_readings else "")
+                or "El usuario ha marcado una invalidación explícita de la tesis."
+            )
+            confirm = (
+                "Contrastar el hecho que cambió la tesis, resultados, guía, caja/deuda "
+                "y si el deterioro es permanente."
+            )
+            action_risk = (
+                "La señal aún puede ser ruido; confirma la tesis y el coste fiscal."
+                if confirmed_by_readings
+                else "Vender sin contrastar el motivo o mantener por inercia una tesis ya rota."
+            )
+            horizon = "Revisión inmediata"
+        elif position_label == "Vender":
             if reliable and adverse_evidence >= 3:
                 priority = "Alta"
-                decision = "Revisar posible salida"
-                decision_type = "Confluencia técnica y de riesgo"
+                decision = "Revisar exposición"
+                decision_type = "Riesgo técnico confirmado"
                 reason = (
                     technical_reason
-                    or "Coinciden deterioro técnico y varias señales adversas."
+                    or "Varias lecturas de precio son adversas, pero no existe una invalidación fundamental independiente."
                 )
-                confirm = "Resultados, guía, caja/deuda y posible ruptura de tesis."
-                action_risk = (
-                    "La señal aún puede ser ruido; confirma la tesis y el coste fiscal."
+                confirm = (
+                    "Resultados, guía y tesis; reducir sólo si el riesgo o el peso ya no encajan."
                 )
-                horizon = "Medio plazo"
+                action_risk = "Confundir señales de precio correlacionadas con una ruptura del negocio."
+                horizon = "Corto / medio"
             else:
                 priority = "Alta"
                 decision = "Esperar confirmación"
@@ -145,13 +184,13 @@ def build_portfolio_decision_rows(
                 action_risk = "Vender por ruido y perder una recuperación posterior."
                 horizon = "Corto / medio"
         elif position_label == "Reducir":
-            if not has_room or (reliable and adverse_evidence >= 2):
+            if overweight or (reliable and adverse_evidence >= 2):
                 priority = "Media-alta"
                 decision = "Revisar exposición"
                 decision_type = "Concentración o debilidad"
                 reason = (
                     "El peso es elevado y conviene revisar el riesgo."
-                    if not has_room
+                    if overweight
                     else technical_reason
                     or "La señal técnica se debilita y otra lectura adversa la acompaña."
                 )
@@ -165,7 +204,7 @@ def build_portfolio_decision_rows(
                 confirm = "Resultados y una segunda confirmación antes de reducir."
                 action_risk = "Reaccionar a volatilidad normal de la acción."
             horizon = "Corto / medio"
-        elif not has_room:
+        elif overweight:
             priority = "Media-alta"
             decision = "Revisar exposición"
             decision_type = "Concentración"
@@ -173,7 +212,12 @@ def build_portfolio_decision_rows(
             confirm = "Peso objetivo, correlación sectorial y tolerancia a una caída."
             action_risk = "Concentrar más capital aunque la empresa siga siendo atractiva."
             horizon = "Cartera"
-        elif position_label == "Mantener" and attractive_entry and has_room:
+        elif (
+            position_label == "Mantener"
+            and attractive_entry
+            and has_room
+            and supported_for_add
+        ):
             priority = "Oportunidad"
             decision = "Posible ampliar"
             decision_type = "Entrada con posición sana"
@@ -181,13 +225,29 @@ def build_portfolio_decision_rows(
             confirm = "Tamaño máximo, resultados próximos y precio límite."
             action_risk = "Aumentar exposición antes de una confirmación fundamental."
             horizon = "Medio / largo"
-        elif position_label == "Mantener" and attractive_entry:
+        elif (
+            position_label == "Mantener"
+            and attractive_entry
+            and allocation_known
+            and not has_room
+        ):
             priority = "Normal"
             decision = "Mantener"
             decision_type = "Posición completa"
             reason = "La entrada es atractiva, pero el peso actual aconseja no concentrar más."
             confirm = "No requiere acción salvo cambio de tesis."
             action_risk = "Sobreponderar una posición que ya tiene peso suficiente."
+            horizon = "Medio / largo"
+        elif position_label == "Mantener" and attractive_entry:
+            priority = "Datos pendientes"
+            decision = "Mantener sin ampliar"
+            decision_type = "Peso o evidencia incompletos"
+            reason = (
+                "La entrada parece atractiva, pero falta un peso fiable o evidencia "
+                "suficiente de calidad y riesgo para ampliar."
+            )
+            confirm = "Peso cotizado, calidad, riesgo y confianza antes de añadir capital."
+            action_risk = "Ampliar sin conocer la concentración o la calidad de los datos."
             horizon = "Medio / largo"
         else:
             priority = "Normal"

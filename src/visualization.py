@@ -19,6 +19,15 @@ COLORS = {
     "muted": "#73849A",
 }
 
+ROTATION_COLOR_HEX = {
+    "Azul": "#2776D2",
+    "Verde": "#16875A",
+    "Amarillo": "#D7A514",
+    "Naranja": "#E67E22",
+    "Rojo": "#C2413A",
+    "Gris": "#7C8798",
+}
+
 CHART_PERIODS = ("1 mes", "3 meses", "1 año", "5 años", "Máximo")
 
 
@@ -455,6 +464,59 @@ def portfolio_snapshot_assets_chart(
         plot_bgcolor="#FFFFFF",
         xaxis_title="Valor declarado (€)",
         yaxis_title="",
+    )
+    return _finalize_figure(figure)
+
+
+def rotation_allocation_chart(rows: list[dict[str, object]] | tuple[dict[str, object], ...]) -> go.Figure:
+    """Peso de la cartera cotizada con colores de acción accesibles."""
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        figure = go.Figure()
+        figure.add_annotation(
+            text="No hay posiciones cotizadas con peso disponible",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+        )
+        figure.update_layout(height=280, template="plotly_white")
+        return _finalize_figure(figure)
+
+    frame["Peso cotizado"] = pd.to_numeric(
+        frame.get("Peso cotizado"), errors="coerce"
+    ).fillna(0.0)
+    frame = frame.sort_values("Peso cotizado", ascending=True)
+    colors = frame.get("Color", pd.Series("Gris", index=frame.index)).map(
+        ROTATION_COLOR_HEX
+    ).fillna(ROTATION_COLOR_HEX["Gris"])
+    hover = [
+        f"{ticker}<br>{color}: {action}"
+        for ticker, color, action in zip(
+            frame["Ticker"], frame["Color"], frame["Acción"]
+        )
+    ]
+    figure = go.Figure(
+        go.Bar(
+            x=frame["Peso cotizado"],
+            y=frame["Ticker"],
+            orientation="h",
+            marker_color=colors,
+            text=frame["Peso cotizado"].map(lambda value: f"{value:.1f}%"),
+            textposition="outside",
+            customdata=hover,
+            hovertemplate="%{customdata}<br>Peso cotizado %{x:.1f}%<extra></extra>",
+        )
+    )
+    figure.update_layout(
+        title="Peso dentro de la cartera cotizada",
+        height=max(320, 42 * len(frame) + 120),
+        template="plotly_white",
+        xaxis_title="Peso cotizado (%)",
+        margin={"l": 35, "r": 70, "t": 65, "b": 45},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#FFFFFF",
+        showlegend=False,
     )
     return _finalize_figure(figure)
 
