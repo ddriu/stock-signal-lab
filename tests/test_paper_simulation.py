@@ -96,6 +96,25 @@ def _bars(**prices: float) -> dict[str, pd.DataFrame]:
     }
 
 
+class _LegacyPosition:
+    def __init__(self, *, valuation_mode: str | None = None) -> None:
+        self.ticker = "OLD"
+        self.quantity = 1.0
+        self.average_cost_eur = 90.0
+        self.last_price_eur = 100.0
+        self.sector = "Industrials"
+        if valuation_mode is not None:
+            self.valuation_mode = valuation_mode
+
+    @property
+    def market_value_eur(self) -> float:
+        return self.quantity * self.last_price_eur
+
+    @property
+    def cost_basis_eur(self) -> float:
+        return self.quantity * self.average_cost_eur
+
+
 def test_seed_is_eur_only_deterministic_and_preserves_a_buy_hold_baseline() -> None:
     state = _seed(cash=100)
 
@@ -145,6 +164,41 @@ def test_frozen_position_counts_in_nav_but_never_invents_market_return() -> None
     assert snapshot.buy_hold_nav_eur == 1_010
     assert snapshot.unrealized_pnl_eur == 60
     assert snapshot.data_coverage_pct == pytest.approx(110 / 1_010 * 100)
+
+
+def test_legacy_position_without_mode_keeps_the_previous_market_semantics() -> None:
+    base = _seed(cash=0)
+    legacy = _LegacyPosition()
+    state = replace(
+        base,
+        positions=(legacy,),
+        initial_positions=(legacy,),
+        initial_nav_eur=100,
+    )
+
+    snapshot = mark_to_market(state, {"OLD": 120}, 500, as_of="2026-09-28")
+
+    assert snapshot.holdings_eur == 120
+    assert snapshot.buy_hold_nav_eur == 120
+    assert snapshot.data_coverage_pct == 100
+
+
+def test_invalid_live_mode_fails_closed_as_frozen() -> None:
+    base = _seed(cash=0)
+    invalid = _LegacyPosition()
+    invalid.valuation_mode = None
+    state = replace(
+        base,
+        positions=(invalid,),
+        initial_positions=(invalid,),
+        initial_nav_eur=100,
+    )
+
+    snapshot = mark_to_market(state, {"OLD": 120}, 500, as_of="2026-09-28")
+
+    assert snapshot.holdings_eur == 100
+    assert snapshot.buy_hold_nav_eur == 100
+    assert snapshot.data_coverage_pct == 0
 
 
 def test_frozen_position_cannot_be_sold_even_with_a_quote_and_pending_order() -> None:

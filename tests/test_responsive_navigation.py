@@ -95,3 +95,25 @@ def test_day_one_rebuild_does_not_depend_on_a_fresh_cached_journal() -> None:
     assert "benchmark_price is not None" in rebuild_guard
     assert "journal.set_paper_simulation_status(" in source
     assert "except (JournalStorageError, ValueError, AttributeError)" in source
+
+
+def test_home_separates_real_portfolio_decisions_lab_and_navigation() -> None:
+    source = (ROOT / "app.py").read_text(encoding="utf-8")
+
+    assert '["Resumen", "Decisiones", "Laboratorio", "Accesos"]' in source
+    assert "with summary_tab:" in source
+    assert "with decisions_tab:" in source
+    assert "with laboratory_tab:" in source
+    assert "with access_tab:" in source
+    assert "Este es un ensayo con una copia virtual de tus dos cuentas" in source
+    assert "Patrimonio fuera del mapa de decisiones" in source
+
+
+def test_hot_deploy_reloads_the_paper_model_before_using_the_new_schema() -> None:
+    source = (ROOT / "app.py").read_text(encoding="utf-8")
+
+    assert '"valuation_mode" not in getattr(' in source
+    assert 'getattr(_paper_simulation_module, "PAPER_ENGINE_VERSION", "") != "paper-v2"' in source
+    assert 'hasattr(_paper_simulation_module, "_position_valuation_mode")' in source
+    assert "importlib.reload(_paper_simulation_module)" in source
+    assert 'st.error(f"No se pudo crear la temporada completa: {exc}")' not in source

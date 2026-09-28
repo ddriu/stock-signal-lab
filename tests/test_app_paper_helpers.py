@@ -12,6 +12,7 @@ from pathlib import Path
 from hashlib import sha256
 import json
 from math import isfinite
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -41,12 +42,15 @@ HELPER_NAMES = {
     "_paper_seed_payload",
     "_paper_seed_diagnostics",
     "_paper_assumptions_from_row",
+    "_paper_position_valuation_mode",
+    "_paper_position_to_mapping",
     "_paper_position_from_mapping",
     "_paper_order_from_mapping",
     "_paper_trade_from_mapping",
     "_paper_state_from_history",
     "_paper_snapshots_from_runs",
     "_paper_pending_orders",
+    "_paper_positions_for_storage",
 }
 
 
@@ -103,6 +107,32 @@ class _PaperTrackingJournal:
     def list_paper_daily_runs(self, simulation_id: int) -> pd.DataFrame:
         assert simulation_id == int(self._simulation["id"])
         return self._runs.copy()
+
+
+class _LegacyPaperPosition:
+    """Forma que permanecía viva en memoria antes de añadir valuation_mode."""
+
+    def __init__(
+        self,
+        ticker: str,
+        quantity: float,
+        average_cost_eur: float,
+        last_price_eur: float,
+        sector: str,
+    ) -> None:
+        self.ticker = ticker
+        self.quantity = quantity
+        self.average_cost_eur = average_cost_eur
+        self.last_price_eur = last_price_eur
+        self.sector = sector
+
+    @property
+    def market_value_eur(self) -> float:
+        return self.quantity * self.last_price_eur
+
+    @property
+    def cost_basis_eur(self) -> float:
+        return self.quantity * self.average_cost_eur
 
 
 def _paper_order(
@@ -416,6 +446,76 @@ def test_seed_includes_both_banks_and_manual_holdings_without_a_ticker() -> None
         "Revolut",
         "Trade Republic",
     }
+
+
+def test_storage_preserves_frozen_mode_from_seed_for_a_live_legacy_position() -> None:
+    legacy = _LegacyPaperPosition("MANUAL_FUND", 1, 900, 900, "Sin clasificar")
+    state = SimpleNamespace(positions=(legacy,))
+    seed_payload = [
+        {
+            "ticker": "MANUAL_FUND",
+            "valuation_mode": "frozen",
+            "source_accounts": "Trade Republic",
+            "display_name": "Fondo manual",
+        }
+    ]
+
+    stored = HELPERS["_paper_positions_for_storage"](state, seed_payload)
+
+    assert stored[0]["valuation_mode"] == "frozen"
+    assert stored[0]["value_eur"] == 900
+    assert stored[0]["source_accounts"] == "Trade Republic"
+    assert HELPERS["_paper_position_to_mapping"](
+        legacy,
+        seed_payload[0],
+    )["valuation_mode"] == "frozen"
+
+
+def test_legacy_daily_position_inherits_frozen_mode_from_initial_snapshot() -> None:
+    initial_positions = [
+        {
+            "ticker": "MANUAL_FUND",
+            "quantity": 1,
+            "price_eur": 900,
+            "value_eur": 900,
+            "cost_basis_eur": 850,
+            "sector": "Sin clasificar",
+            "valuation_mode": "frozen",
+        }
+    ]
+    simulation = {
+        "id": 9,
+        "start_date": "2026-09-25",
+        "initial_cash_eur": 0,
+        "initial_positions_json": json.dumps(initial_positions),
+        "assumptions_json": json.dumps(asdict(PaperAssumptions())),
+        "engine_version": PAPER_ENGINE_VERSION,
+    }
+    runs = pd.DataFrame(
+        [
+            {
+                "id": 1,
+                "market_date": "2026-09-26",
+                "positions_after_json": json.dumps(
+                    [
+                        {
+                            "ticker": "MANUAL_FUND",
+                            "quantity": 1,
+                            "average_cost_eur": 850,
+                            "last_price_eur": 900,
+                            "sector": "Sin clasificar",
+                        }
+                    ]
+                ),
+                "executed_actions_json": "[]",
+                "cash_eur": 0,
+            }
+        ]
+    )
+
+    state = HELPERS["_paper_state_from_history"](simulation, runs)
+
+    assert state.positions[0].valuation_mode == "frozen"
 
 
 def test_persisted_state_round_trip_restores_costs_tax_year_and_filled_orders() -> None:
