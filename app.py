@@ -8060,24 +8060,44 @@ def _render_paper_simulation_lab(
             f"{initial_state.initial_nav_eur:,.2f} € virtuales, cobertura "
             f"{float(seed_diagnostic.get('coverage_pct') or 0.0):.0f}% y comparación con SPY."
         )
+        start_simulation = False
         allow_partial_seed = not missing_seed
         if missing_seed:
             st.warning(
                 "No hay un precio verificable para: " + ", ".join(missing_seed) + ". "
                 "Si se inicia así, esas posiciones quedarán fuera de la comparación."
             )
-            allow_partial_seed = st.checkbox(
-                "Entiendo la exclusión y quiero iniciar una simulación parcial",
-                key="paper_accept_partial_seed",
+            # Keep the acknowledgement and its action in the same form.  On the
+            # deployed app a normal checkbox caused an immediate full rerun while
+            # the expensive market snapshot was being rebuilt; its value could be
+            # lost before the separately rendered (disabled) button became active.
+            # A form submits both values atomically and remains usable on mobile.
+            with st.form("paper_partial_seed_start_form", clear_on_submit=False):
+                allow_partial_seed = st.checkbox(
+                    "Entiendo la exclusión y quiero iniciar una simulación parcial",
+                    key="paper_accept_partial_seed",
+                )
+                start_simulation = st.form_submit_button(
+                    "Iniciar temporada virtual",
+                    type="primary",
+                    icon=":material/science:",
+                    width="stretch",
+                    key="paper_start_partial_simulation",
+                )
+            if start_simulation and not allow_partial_seed:
+                st.warning(
+                    "Confirma primero que aceptas iniciar la temporada sólo con "
+                    "las posiciones que tienen un precio verificable."
+                )
+        else:
+            start_simulation = st.button(
+                "Iniciar temporada virtual",
+                type="primary",
+                icon=":material/science:",
+                width="stretch",
+                key="paper_start_simulation",
             )
-        if st.button(
-            "Iniciar temporada virtual",
-            type="primary",
-            icon=":material/science:",
-            width="stretch",
-            key="paper_start_simulation",
-            disabled=not allow_partial_seed,
-        ):
+        if start_simulation and allow_partial_seed:
             assumptions = PaperAssumptions(
                 buy_fee_eur=max(0.0, buy_fee_eur),
                 sell_fee_eur=max(0.0, sell_fee_eur),
