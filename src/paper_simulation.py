@@ -28,7 +28,7 @@ from src.portfolio_rotation import (
 )
 
 
-PAPER_ENGINE_VERSION = "paper-v1"
+PAPER_ENGINE_VERSION = "paper-v2"
 
 
 def _as_date(value: object) -> date:
@@ -133,6 +133,23 @@ class PaperPosition:
     @property
     def cost_basis_eur(self) -> float:
         return self.quantity * self.average_cost_eur
+
+
+def _position_valuation_mode(position: object) -> str:
+    """Lee posiciones anteriores al campo ``valuation_mode`` sin hacerlas peligrosas.
+
+    Las posiciones creadas por versiones antiguas eran todas cotizadas, por lo que la
+    ausencia real del atributo equivale a ``market``. Un valor presente pero inválido,
+    en cambio, se inmoviliza: es preferible excluirlo de una rotación automática a
+    operar una línea cuya procedencia no entendemos.
+    """
+
+    missing_mode = object()
+    raw_mode = getattr(position, "valuation_mode", missing_mode)
+    if raw_mode is missing_mode:
+        return "market"
+    normalized = str(raw_mode).strip().lower()
+    return normalized if normalized in {"market", "frozen"} else "frozen"
 
 
 @dataclass(frozen=True)
@@ -282,7 +299,7 @@ def build_paper_rotation_dashboard(
     frozen = {
         position.ticker
         for position in state.positions
-        if position.valuation_mode == "frozen"
+        if _position_valuation_mode(position) == "frozen"
     }
     favorites = tuple(
         dict.fromkeys(
@@ -294,13 +311,13 @@ def build_paper_rotation_dashboard(
     held = tuple(
         position.ticker
         for position in state.positions
-        if position.valuation_mode == "market"
+        if _position_valuation_mode(position) == "market"
     )
     nav = _state_nav(state)
     allocations = {
         position.ticker: position.market_value_eur / nav * 100.0
         for position in state.positions
-        if nav > 0 and position.valuation_mode == "market"
+        if nav > 0 and _position_valuation_mode(position) == "market"
     }
 
     currencies = {
@@ -322,7 +339,7 @@ def build_paper_rotation_dashboard(
 
     recovery_hurdles: dict[tuple[str, str], dict[str, object]] = {}
     for position in state.positions:
-        if position.valuation_mode != "market":
+        if _position_valuation_mode(position) != "market":
             continue
         gross_value = position.market_value_eur
         origin_currency = currencies.get(position.ticker, "")
@@ -676,10 +693,10 @@ def _pair_orders(
     if (
         origin_position is None
         or origin_position.market_value_eur <= 0
-        or origin_position.valuation_mode != "market"
+        or _position_valuation_mode(origin_position) != "market"
         or (
             destination_position is not None
-            and destination_position.valuation_mode != "market"
+            and _position_valuation_mode(destination_position) != "market"
         )
     ):
         return ()
@@ -935,12 +952,12 @@ def fill_pending_orders(
         if (
             order.side == "Venta"
             and position_map.get(order.ticker) is not None
-            and position_map[order.ticker].valuation_mode != "market"
+            and _position_valuation_mode(position_map[order.ticker]) != "market"
         )
         or (
             order.side == "Compra"
             and position_map.get(order.ticker) is not None
-            and position_map[order.ticker].valuation_mode != "market"
+            and _position_valuation_mode(position_map[order.ticker]) != "market"
         )
     }
     selected = [
@@ -1031,7 +1048,7 @@ def fill_pending_orders(
             if (
                 current is None
                 or current.quantity <= 0
-                or current.valuation_mode != "market"
+                or _position_valuation_mode(current) != "market"
             ):
                 continue
             gross_target = min(gross_order_limit, current.quantity * price_eur)
@@ -1057,7 +1074,7 @@ def fill_pending_orders(
                 )
         else:
             current = positions.get(order.ticker)
-            if current is not None and current.valuation_mode != "market":
+            if current is not None and _position_valuation_mode(current) != "market":
                 continue
             current_value = current.quantity * price_eur if current else 0.0
             company_room = max(
@@ -1177,7 +1194,8 @@ def mark_to_market(
     liquidation_cost = 0.0
     for position in state.positions:
         has_market_price = (
-            position.valuation_mode == "market" and position.ticker in normalized
+            _position_valuation_mode(position) == "market"
+            and position.ticker in normalized
         )
         price = (
             normalized[position.ticker]
@@ -1189,7 +1207,7 @@ def mark_to_market(
         value = position.quantity * price
         holdings += value
         cost_basis += position.cost_basis_eur
-        if position.valuation_mode == "market":
+        if _position_valuation_mode(position) == "market":
             liquidation_cost += min(
                 value,
                 config.sell_fee_eur
@@ -1206,7 +1224,7 @@ def mark_to_market(
     for position in state.initial_positions:
         price = (
             normalized.get(position.ticker, position.last_price_eur)
-            if position.valuation_mode == "market"
+            if _position_valuation_mode(position) == "market"
             else position.last_price_eur
         )
         buy_hold += position.quantity * price
