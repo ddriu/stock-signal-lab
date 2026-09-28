@@ -64,3 +64,15 @@ def test_search_popovers_remain_scrollable_on_small_screens() -> None:
     assert "overflow-y: auto !important" in popover_rule
     assert "overscroll-behavior: contain" in popover_rule
     assert "touch-action: pan-y" in popover_rule
+
+
+def test_partial_paper_seed_is_confirmed_atomically() -> None:
+    source = (ROOT / "app.py").read_text(encoding="utf-8")
+
+    # The acknowledgement and start action must be submitted together.  Rendering
+    # a disabled button outside this form made the deployed checkbox lose its state
+    # during Streamlit's market-data rerun, so the laboratory could never start.
+    assert 'with st.form("paper_partial_seed_start_form", clear_on_submit=False)' in source
+    assert 'key="paper_accept_partial_seed"' in source
+    assert 'start_simulation = st.form_submit_button(' in source
+    assert "disabled=not allow_partial_seed" not in source
