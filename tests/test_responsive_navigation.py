@@ -75,3 +75,23 @@ def test_paper_seed_keeps_unpriced_capital_and_offers_day_one_rebuild() -> None:
     assert 'key="paper_rebuild_complete_portfolio"' in source
     assert "Corregir Día 1 con las dos cuentas" in source
     assert "paper_partial_seed_start_form" not in source
+
+
+def test_day_one_rebuild_does_not_depend_on_a_fresh_cached_journal() -> None:
+    source = (ROOT / "app.py").read_text(encoding="utf-8")
+    rebuild_guard = source[
+        source.index("        can_rebuild = (") : source.index(
+            "        rebuild = st.button(",
+            source.index("        can_rebuild = ("),
+        )
+    ]
+
+    # Streamlit puede conservar durante un despliegue una instancia de journal
+    # creada con la clase anterior. Eso no debe impedir crear primero la nueva
+    # temporada completa; el archivado de la parcial ya tiene un fallback seguro.
+    assert 'hasattr(journal, "set_paper_simulation_status")' not in rebuild_guard
+    assert "initial_state is not None" in rebuild_guard
+    assert "market_date is not None" in rebuild_guard
+    assert "benchmark_price is not None" in rebuild_guard
+    assert "journal.set_paper_simulation_status(" in source
+    assert "except (JournalStorageError, ValueError, AttributeError)" in source
