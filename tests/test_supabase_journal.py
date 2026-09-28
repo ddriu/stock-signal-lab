@@ -657,3 +657,27 @@ def test_supabase_alert_state_upsert_falls_back_to_legacy_schema(monkeypatch) ->
     assert "company_name" in calls[0]["json"][0]
     assert "company_name" not in calls[1]["json"][0]
     assert calls[1]["json"][0]["ticker"] == "TSM"
+
+
+def test_supabase_paper_status_change_is_owner_scoped(monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        return FakeResponse([{"id": 12, "status": "archived"}])
+
+    monkeypatch.setattr("src.supabase_journal.requests.request", fake_request)
+    journal = SupabaseTradingJournal(
+        "https://example.supabase.co",
+        "sb_secret_test",
+        "ddriu",
+    )
+
+    journal.set_paper_simulation_status(12, "archived")
+
+    assert calls[0]["method"] == "PATCH"
+    assert calls[0]["url"].endswith("/rest/v1/paper_simulations")
+    assert calls[0]["params"] == {"owner": "eq.ddriu", "id": "eq.12"}
+    assert calls[0]["json"]["status"] == "archived"
+    with pytest.raises(ValueError, match="estado"):
+        journal.set_paper_simulation_status(12, "deleted")

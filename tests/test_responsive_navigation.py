@@ -66,13 +66,12 @@ def test_search_popovers_remain_scrollable_on_small_screens() -> None:
     assert "touch-action: pan-y" in popover_rule
 
 
-def test_partial_paper_seed_is_confirmed_atomically() -> None:
+def test_paper_seed_keeps_unpriced_capital_and_offers_day_one_rebuild() -> None:
     source = (ROOT / "app.py").read_text(encoding="utf-8")
 
-    # The acknowledgement and start action must be submitted together.  Rendering
-    # a disabled button outside this form made the deployed checkbox lose its state
-    # during Streamlit's market-data rerun, so the laboratory could never start.
-    assert 'with st.form("paper_partial_seed_start_form", clear_on_submit=False)' in source
-    assert 'key="paper_accept_partial_seed"' in source
-    assert 'start_simulation = st.form_submit_button(' in source
-    assert "disabled=not allow_partial_seed" not in source
+    # La semilla ya no pide aceptar que desaparezcan posiciones: conserva el NAV
+    # completo y deja sin operar las líneas que sólo tienen valor declarado.
+    assert 'valuation_mode = "frozen"' in source
+    assert 'key="paper_rebuild_complete_portfolio"' in source
+    assert "Corregir Día 1 con las dos cuentas" in source
+    assert "paper_partial_seed_start_form" not in source
