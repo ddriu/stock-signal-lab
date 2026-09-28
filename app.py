@@ -6856,7 +6856,10 @@ def _paper_tracking_tickers(journal: object) -> list[str]:
             resolve_analysis_ticker(str(row.get("ticker") or ""))
             for payload in payloads
             for row in payload
-            if isinstance(row, dict) and str(row.get("ticker") or "").strip()
+            if isinstance(row, dict)
+            and str(row.get("ticker") or "").strip()
+            and str(row.get("valuation_mode") or "market").strip().lower()
+            != "frozen"
         )
     )
 
@@ -7501,16 +7504,53 @@ def _paper_eur_market_data(
     return prices, bars, benchmark_price
 
 
+def _paper_seed_identifier(row: pd.Series | dict[str, object]) -> str:
+    """Ticker real o identificador estable para una posición manual sin ticker."""
+
+    ticker = str(row.get("analysis_ticker") or "").strip().upper()
+    if ticker:
+        return resolve_analysis_ticker(ticker)
+    # Los fondos de inversión sin ticker (p. ej. la cuenta separada de
+    # MyInvestor) no forman parte del laboratorio de rotación bursátil. Los ETF
+    # y ETC sí: su tipo no contiene la palabra aislada "fondo" en la importación.
+    asset_type = str(row.get("asset_type") or "").strip().casefold()
+    if "fondo" in asset_type and "etf" not in asset_type and "etc" not in asset_type:
+        return ""
+    identity = "|".join(
+        (
+            str(row.get("platform") or "").strip().casefold(),
+            str(row.get("asset_name") or "").strip().casefold(),
+            str(row.get("asset_type") or "").strip().casefold(),
+        )
+    )
+    if not identity.replace("|", ""):
+        return ""
+    return "MANUAL_" + sha256(identity.encode("utf-8")).hexdigest()[:12].upper()
+
+
 def _paper_seed_payload(
     snapshot: pd.DataFrame,
     prices_eur: dict[str, float],
     summary: list[dict[str, object]],
 ) -> tuple[list[dict[str, object]], float]:
-    """Prepara sólo posiciones cotizadas y efectivo; excluye inversiones privadas."""
+    """Prepara toda la cartera cotizada y el efectivo, sin inventar precios.
+
+    Una posición con valor declarado pero sin cantidad ni cotización verificable
+    se conserva como ``frozen``. Cuenta en el NAV inicial, pero el motor no puede
+    revalorizarla ni operarla. Así una cuenta manual (por ejemplo Trade Republic)
+    no desaparece sólo porque otra cuenta aporte más detalle de sus posiciones.
+    """
 
     if snapshot.empty:
         return [], 0.0
     rows = _rotation_eligible_snapshot(snapshot)
+    row_names = rows.get("asset_name", pd.Series("", index=rows.index))
+    row_types = rows.get("asset_type", pd.Series("", index=rows.index))
+    row_cash_mask = (
+        row_names.fillna("").astype(str).str.casefold().str.contains("efectivo|cash")
+        | row_types.fillna("").astype(str).str.casefold().str.contains("efectivo|cash")
+    )
+    rows = rows.loc[~row_cash_mask].copy()
     sectors = {
         str(row.get("Ticker") or "").strip().upper(): str(
             row.get("Sector") or "Sin clasificar"
@@ -7519,25 +7559,37 @@ def _paper_seed_payload(
         if str(row.get("Ticker") or "").strip()
     }
     payload: list[dict[str, object]] = []
-    if not rows.empty and {"analysis_ticker", "value_eur"}.issubset(rows.columns):
+    if not rows.empty and "value_eur" in rows.columns:
         rows = rows.copy()
-        rows["analysis_ticker"] = (
-            rows["analysis_ticker"].fillna("").astype(str).str.strip().str.upper()
+        rows["paper_ticker"] = rows.apply(
+            _paper_seed_identifier,
+            axis=1,
         )
         rows["quantity"] = pd.to_numeric(rows.get("quantity"), errors="coerce")
         rows["value_eur"] = pd.to_numeric(rows["value_eur"], errors="coerce")
         rows["cost_estimate_eur"] = pd.to_numeric(
             rows.get("cost_estimate_eur"), errors="coerce"
         )
-        for ticker, group in rows.groupby("analysis_ticker"):
-            ticker = resolve_analysis_ticker(ticker) if ticker else ""
+        for ticker, group in rows.groupby("paper_ticker"):
             value = float(group["value_eur"].fillna(0.0).sum())
             quantity = float(group["quantity"].fillna(0.0).sum())
             price = prices_eur.get(ticker)
-            if not ticker or value <= 0 or price is None or price <= 0:
+            if not ticker or value <= 0:
                 continue
-            if quantity <= 0:
+
+            # Una cantidad declarada permite reconstruir el precio implícito de
+            # la fotografía sin fabricar unidades. Si tampoco hay cantidad, sólo
+            # una cotización reciente permite estimarla; en caso contrario la línea
+            # entra congelada con una unidad contable neutral.
+            if (price is None or price <= 0) and quantity > 0:
+                price = value / quantity
+            valuation_mode = "market"
+            if price is not None and price > 0 and quantity <= 0:
                 quantity = value / price
+            elif price is None or price <= 0:
+                valuation_mode = "frozen"
+                quantity = 1.0
+                price = value
             known_cost = group["cost_estimate_eur"].notna()
             # Si falta el coste de algún lote, ese lote empieza neutro en vez de
             # desaparecer de la base y fabricar una plusvalía ficticia.
@@ -7554,6 +7606,29 @@ def _paper_seed_payload(
                     "cost_basis_eur": max(cost_basis, 0.01),
                     "sector": sectors.get(ticker, "Sin clasificar"),
                     "currency": "EUR",
+                    "valuation_mode": valuation_mode,
+                    "source_accounts": ", ".join(
+                        sorted(
+                            {
+                                str(value).strip()
+                                for value in group.get(
+                                    "platform", pd.Series("", index=group.index)
+                                )
+                                if str(value).strip()
+                            }
+                        )
+                    ),
+                    "display_name": " / ".join(
+                        sorted(
+                            {
+                                str(value).strip()
+                                for value in group.get(
+                                    "asset_name", pd.Series("", index=group.index)
+                                )
+                                if str(value).strip()
+                            }
+                        )
+                    ),
                 }
             )
 
@@ -7577,45 +7652,118 @@ def _paper_seed_diagnostics(
     snapshot: pd.DataFrame,
     payload: list[dict[str, object]],
 ) -> dict[str, object]:
-    """Cobertura visible de la semilla; nunca excluye una posición en silencio."""
+    """Distingue capital incluido de capital con valoración de mercado."""
 
     rows = _rotation_eligible_snapshot(snapshot)
-    if rows.empty or not {"analysis_ticker", "value_eur"}.issubset(rows.columns):
-        return {"expected": [], "seeded": [], "missing": [], "coverage_pct": 0.0}
+    if not rows.empty:
+        row_names = rows.get("asset_name", pd.Series("", index=rows.index))
+        row_types = rows.get("asset_type", pd.Series("", index=rows.index))
+        row_cash_mask = (
+            row_names.fillna("")
+            .astype(str)
+            .str.casefold()
+            .str.contains("efectivo|cash")
+            | row_types.fillna("")
+            .astype(str)
+            .str.casefold()
+            .str.contains("efectivo|cash")
+        )
+        rows = rows.loc[~row_cash_mask].copy()
+    if rows.empty or "value_eur" not in rows.columns:
+        return {
+            "expected": [],
+            "seeded": [],
+            "missing": [],
+            "frozen": [],
+            "included_coverage_pct": 0.0,
+            "market_coverage_pct": 0.0,
+            "coverage_pct": 0.0,
+            "total_value_eur": 0.0,
+            "included_value_eur": 0.0,
+            "market_value_eur": 0.0,
+            "accounts": [],
+        }
     expected_rows = rows.copy()
-    expected_rows["analysis_ticker"] = (
-        expected_rows["analysis_ticker"]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-        .str.upper()
-        .map(lambda value: resolve_analysis_ticker(value) if value else "")
+    expected_rows["paper_ticker"] = expected_rows.apply(
+        _paper_seed_identifier,
+        axis=1,
     )
     expected_rows["value_eur"] = pd.to_numeric(
         expected_rows["value_eur"], errors="coerce"
     ).fillna(0.0)
     expected_rows = expected_rows.loc[
-        (expected_rows["analysis_ticker"] != "")
+        (expected_rows["paper_ticker"] != "")
         & (expected_rows["value_eur"] > 0)
     ]
     expected_values = (
-        expected_rows.groupby("analysis_ticker")["value_eur"].sum().to_dict()
+        expected_rows.groupby("paper_ticker")["value_eur"].sum().to_dict()
     )
     seeded = {
         str(row.get("ticker") or "").strip().upper()
         for row in payload
         if str(row.get("ticker") or "").strip()
     }
+    frozen = {
+        str(row.get("ticker") or "").strip().upper()
+        for row in payload
+        if str(row.get("ticker") or "").strip()
+        and str(row.get("valuation_mode") or "market").strip().lower() == "frozen"
+    }
     expected = set(expected_values)
     total_value = float(sum(expected_values.values()))
-    covered_value = float(
+    included_value = float(
         sum(value for ticker, value in expected_values.items() if ticker in seeded)
     )
+    market_value = float(
+        sum(
+            value
+            for ticker, value in expected_values.items()
+            if ticker in seeded and ticker not in frozen
+        )
+    )
+
+    account_rows: list[dict[str, object]] = []
+    if "platform" in expected_rows:
+        for platform, group in expected_rows.groupby("platform", dropna=False):
+            account_value = float(group["value_eur"].sum())
+            account_tickers = set(group["paper_ticker"])
+            account_included = float(
+                group.loc[group["paper_ticker"].isin(seeded), "value_eur"].sum()
+            )
+            account_market = float(
+                group.loc[
+                    group["paper_ticker"].isin(seeded - frozen), "value_eur"
+                ].sum()
+            )
+            account_rows.append(
+                {
+                    "platform": str(platform or "Sin plataforma"),
+                    "positions": len(account_tickers),
+                    "value_eur": account_value,
+                    "included_value_eur": min(account_value, account_included),
+                    "market_value_eur": min(account_value, account_market),
+                }
+            )
     return {
         "expected": sorted(expected),
         "seeded": sorted(seeded),
         "missing": sorted(expected - seeded),
-        "coverage_pct": (covered_value / total_value * 100.0 if total_value > 0 else 0.0),
+        "frozen": sorted(frozen & expected),
+        "included_coverage_pct": (
+            included_value / total_value * 100.0 if total_value > 0 else 0.0
+        ),
+        "market_coverage_pct": (
+            market_value / total_value * 100.0 if total_value > 0 else 0.0
+        ),
+        # Alias conservado para lectores legacy: ahora significa inclusión, no
+        # disponibilidad de una cotización fresca.
+        "coverage_pct": (
+            included_value / total_value * 100.0 if total_value > 0 else 0.0
+        ),
+        "total_value_eur": total_value,
+        "included_value_eur": included_value,
+        "market_value_eur": market_value,
+        "accounts": sorted(account_rows, key=lambda row: str(row["platform"])),
     }
 
 
@@ -7641,6 +7789,7 @@ def _paper_position_from_mapping(row: dict[str, object]) -> PaperPosition:
         average_cost_eur=float(row.get("average_cost_eur") or 0.0),
         last_price_eur=float(row.get("last_price_eur") or 0.0),
         sector=str(row.get("sector") or "Sin clasificar"),
+        valuation_mode=str(row.get("valuation_mode") or "market").strip().lower(),
     )
 
 
@@ -7882,8 +8031,10 @@ def _record_paper_session(
         positions=tuple(
             replace(
                 position,
-                last_price_eur=prices_eur.get(
-                    position.ticker, position.last_price_eur
+                last_price_eur=(
+                    prices_eur.get(position.ticker, position.last_price_eur)
+                    if position.valuation_mode == "market"
+                    else position.last_price_eur
                 ),
             )
             for position in state.positions
@@ -7980,6 +8131,88 @@ def _record_paper_session(
     )
 
 
+def _paper_source_snapshot_date(
+    snapshot: pd.DataFrame,
+    fallback: date,
+) -> date:
+    """Fecha real de la fotografía que origina la temporada."""
+
+    if snapshot.empty or "snapshot_date" not in snapshot:
+        return fallback
+    parsed = pd.to_datetime(snapshot["snapshot_date"], errors="coerce").dropna()
+    return parsed.max().date() if not parsed.empty else fallback
+
+
+def _paper_positions_for_storage(
+    state: PaperState,
+    seed_payload: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Conserva modo y procedencia sin alterar el modelo matemático."""
+
+    metadata = {
+        str(row.get("ticker") or "").strip().upper(): row
+        for row in seed_payload
+        if str(row.get("ticker") or "").strip()
+    }
+    stored: list[dict[str, object]] = []
+    for position in state.positions:
+        source = metadata.get(position.ticker, {})
+        stored.append(
+            {
+                "ticker": position.ticker,
+                "quantity": position.quantity,
+                "price_eur": position.last_price_eur,
+                "value_eur": position.market_value_eur,
+                "cost_basis_eur": position.cost_basis_eur,
+                "sector": position.sector,
+                "currency": "EUR",
+                "valuation_mode": position.valuation_mode,
+                "source_accounts": str(source.get("source_accounts") or ""),
+                "display_name": str(source.get("display_name") or position.ticker),
+            }
+        )
+    return stored
+
+
+def _create_paper_simulation_record(
+    journal: object,
+    *,
+    recorded_by: str,
+    market_date: date,
+    source_snapshot_date: date,
+    initial_state: PaperState,
+    initial_cash: float,
+    benchmark_price: float,
+    seed_payload: list[dict[str, object]],
+    assumptions: PaperAssumptions,
+    name: str,
+) -> int:
+    """Persiste una temporada reproducible con la cartera declarada completa."""
+
+    assumptions_payload = {
+        **asdict(assumptions),
+        "benchmark_initial_price_eur": benchmark_price,
+    }
+    return int(
+        journal.create_paper_simulation(
+            name=name,
+            start_date=market_date,
+            initial_nav_eur=initial_state.initial_nav_eur,
+            initial_cash_eur=initial_cash,
+            initial_positions=_paper_positions_for_storage(
+                initial_state,
+                seed_payload,
+            ),
+            assumptions=assumptions_payload,
+            source_snapshot_date=source_snapshot_date,
+            benchmark_ticker="SPY",
+            strategy_key="weekly_rotation_checked_daily_v2_full_nav",
+            engine_version=PAPER_ENGINE_VERSION,
+            recorded_by=recorded_by,
+        )
+    )
+
+
 def _render_paper_simulation_lab(
     user: AuthConfig,
     journal: object,
@@ -8006,6 +8239,9 @@ def _render_paper_simulation_lab(
         "ejecutan desde la primera apertura posterior. Nunca modifica tu cartera ni "
         "conecta con el bróker."
     )
+    rebuild_notice = st.session_state.pop("paper_rebuild_notice", "")
+    if rebuild_notice:
+        st.warning(str(rebuild_notice))
     required = (
         "create_paper_simulation",
         "list_paper_simulations",
@@ -8033,21 +8269,22 @@ def _render_paper_simulation_lab(
         use_snapshot_fallback=simulations.empty,
     )
     market_date = _paper_market_date(prepared, reference_data)
-
-    if simulations.empty:
-        seed_payload, initial_cash = _paper_seed_payload(
-            market_snapshot,
-            prices_eur,
-            summary,
-        )
-        seed_diagnostic = _paper_seed_diagnostics(market_snapshot, seed_payload)
-        missing_seed = list(seed_diagnostic.get("missing") or [])
-        if not seed_payload or market_date is None or benchmark_price is None:
-            st.info(
-                "Para iniciar hacen falta la cartera cotizada, un cierre reciente y "
-                "la referencia SPY convertida a euros. Actualiza precios primero."
-            )
-            return
+    seed_payload, initial_cash = _paper_seed_payload(
+        market_snapshot,
+        prices_eur,
+        summary,
+    )
+    seed_diagnostic = _paper_seed_diagnostics(market_snapshot, seed_payload)
+    assumptions = PaperAssumptions(
+        buy_fee_eur=max(0.0, buy_fee_eur),
+        sell_fee_eur=max(0.0, sell_fee_eur),
+        spread_pct=max(0.0, spread_pct),
+        slippage_pct=0.10,
+        fx_cost_pct=max(0.0, fx_cost_pct),
+        tax_reserve_rate_pct=max(0.0, tax_rate_pct),
+    )
+    initial_state: PaperState | None = None
+    if seed_payload and market_date is not None and benchmark_price is not None:
         initial_state = seed_paper_portfolio(
             seed_payload,
             cash_eur=initial_cash,
@@ -8055,86 +8292,74 @@ def _render_paper_simulation_lab(
             portfolio_id="preview",
             as_of=market_date,
         )
+
+    account_rows = list(seed_diagnostic.get("accounts") or [])
+    account_table = pd.DataFrame(account_rows)
+    if not account_table.empty:
+        account_table = account_table.rename(
+            columns={
+                "platform": "Cuenta",
+                "positions": "Posiciones",
+                "value_eur": "Valor declarado",
+                "included_value_eur": "Incluido en NAV",
+                "market_value_eur": "Valorable a mercado",
+            }
+        )
+
+    if simulations.empty:
+        if initial_state is None or market_date is None or benchmark_price is None:
+            st.info(
+                "Para iniciar hacen falta la cartera cotizada, un cierre reciente y "
+                "la referencia SPY convertida a euros. Actualiza precios primero."
+            )
+            return
         st.info(
             f"Semilla preparada: {len(initial_state.positions)} posiciones cotizadas, "
-            f"{initial_state.initial_nav_eur:,.2f} € virtuales, cobertura "
-            f"{float(seed_diagnostic.get('coverage_pct') or 0.0):.0f}% y comparación con SPY."
+            f"{initial_state.initial_nav_eur:,.2f} € virtuales y "
+            f"{float(seed_diagnostic.get('included_coverage_pct') or 0.0):.0f}% "
+            "del capital declarado incluido."
         )
-        start_simulation = False
-        allow_partial_seed = not missing_seed
-        if missing_seed:
-            st.warning(
-                "No hay un precio verificable para: " + ", ".join(missing_seed) + ". "
-                "Si se inicia así, esas posiciones quedarán fuera de la comparación."
-            )
-            # Keep the acknowledgement and its action in the same form.  On the
-            # deployed app a normal checkbox caused an immediate full rerun while
-            # the expensive market snapshot was being rebuilt; its value could be
-            # lost before the separately rendered (disabled) button became active.
-            # A form submits both values atomically and remains usable on mobile.
-            with st.form("paper_partial_seed_start_form", clear_on_submit=False):
-                allow_partial_seed = st.checkbox(
-                    "Entiendo la exclusión y quiero iniciar una simulación parcial",
-                    key="paper_accept_partial_seed",
-                )
-                start_simulation = st.form_submit_button(
-                    "Iniciar temporada virtual",
-                    type="primary",
-                    icon=":material/science:",
-                    width="stretch",
-                    key="paper_start_partial_simulation",
-                )
-            if start_simulation and not allow_partial_seed:
-                st.warning(
-                    "Confirma primero que aceptas iniciar la temporada sólo con "
-                    "las posiciones que tienen un precio verificable."
-                )
-        else:
-            start_simulation = st.button(
-                "Iniciar temporada virtual",
-                type="primary",
-                icon=":material/science:",
+        if not account_table.empty:
+            st.dataframe(
+                account_table,
+                hide_index=True,
                 width="stretch",
-                key="paper_start_simulation",
+                column_config={
+                    "Valor declarado": st.column_config.NumberColumn(format="%.2f €"),
+                    "Incluido en NAV": st.column_config.NumberColumn(format="%.2f €"),
+                    "Valorable a mercado": st.column_config.NumberColumn(format="%.2f €"),
+                },
             )
-        if start_simulation and allow_partial_seed:
-            assumptions = PaperAssumptions(
-                buy_fee_eur=max(0.0, buy_fee_eur),
-                sell_fee_eur=max(0.0, sell_fee_eur),
-                spread_pct=max(0.0, spread_pct),
-                slippage_pct=0.10,
-                fx_cost_pct=max(0.0, fx_cost_pct),
-                tax_reserve_rate_pct=max(0.0, tax_rate_pct),
+        frozen_seed = list(seed_diagnostic.get("frozen") or [])
+        if frozen_seed:
+            st.warning(
+                f"{len(frozen_seed)} posiciones se conservarán por su último valor "
+                "declarado. No se revalorizarán ni podrán rotarse hasta disponer "
+                "de cantidad y precio verificables."
             )
-            assumptions_payload = {
-                **asdict(assumptions),
-                "benchmark_initial_price_eur": benchmark_price,
-            }
-            initial_positions = [
-                {
-                    "ticker": position.ticker,
-                    "quantity": position.quantity,
-                    "price_eur": position.last_price_eur,
-                    "value_eur": position.market_value_eur,
-                    "cost_basis_eur": position.cost_basis_eur,
-                    "sector": position.sector,
-                    "currency": "EUR",
-                }
-                for position in initial_state.positions
-            ]
+        start_simulation = st.button(
+            "Iniciar temporada virtual",
+            type="primary",
+            icon=":material/science:",
+            width="stretch",
+            key="paper_start_simulation",
+        )
+        if start_simulation:
             try:
-                journal.create_paper_simulation(
-                    name=f"Método prudente · {market_date.isoformat()}",
-                    start_date=market_date,
-                    initial_nav_eur=initial_state.initial_nav_eur,
-                    initial_cash_eur=initial_cash,
-                    initial_positions=initial_positions,
-                    assumptions=assumptions_payload,
-                    source_snapshot_date=market_date,
-                    benchmark_ticker="SPY",
-                    strategy_key="weekly_rotation_checked_daily_v1",
-                    engine_version=PAPER_ENGINE_VERSION,
+                _create_paper_simulation_record(
+                    journal,
                     recorded_by=user.username,
+                    market_date=market_date,
+                    source_snapshot_date=_paper_source_snapshot_date(
+                        market_snapshot,
+                        market_date,
+                    ),
+                    initial_state=initial_state,
+                    initial_cash=initial_cash,
+                    benchmark_price=benchmark_price,
+                    seed_payload=seed_payload,
+                    assumptions=assumptions,
+                    name=f"Método prudente · {market_date.isoformat()}",
                 )
             except (JournalStorageError, ValueError, AttributeError) as exc:
                 st.error(f"No se pudo iniciar la temporada virtual: {exc}")
@@ -8143,6 +8368,90 @@ def _render_paper_simulation_lab(
         return
 
     simulation = simulations.sort_values(["start_date", "id"]).iloc[-1].to_dict()
+    stored_initial = _paper_json_value(simulation.get("initial_positions_json"), [])
+    stored_tickers = {
+        str(row.get("ticker") or "").strip().upper()
+        for row in (stored_initial if isinstance(stored_initial, list) else [])
+        if isinstance(row, dict) and str(row.get("ticker") or "").strip()
+    }
+    expected_tickers = set(seed_diagnostic.get("expected") or [])
+    absent_from_season = sorted(expected_tickers - stored_tickers)
+    if absent_from_season:
+        st.error(
+            "La temporada activa es parcial: no representa las dos cuentas. "
+            f"Faltan {len(absent_from_season)} posiciones y su saldo no debe usarse "
+            "para evaluar el método."
+        )
+        current_nav = float(simulation.get("initial_nav_eur") or 0.0)
+        expected_nav = initial_state.initial_nav_eur if initial_state is not None else 0.0
+        correction_metrics = st.columns(3)
+        correction_metrics[0].metric("Temporada parcial", f"{current_nav:,.2f} €")
+        correction_metrics[1].metric("Dos cuentas", f"{expected_nav:,.2f} €")
+        correction_metrics[2].metric(
+            "Diferencia no incluida",
+            f"{max(0.0, expected_nav - current_nav):,.2f} €",
+        )
+        if not account_table.empty:
+            st.dataframe(
+                account_table,
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "Valor declarado": st.column_config.NumberColumn(format="%.2f €"),
+                    "Incluido en NAV": st.column_config.NumberColumn(format="%.2f €"),
+                    "Valorable a mercado": st.column_config.NumberColumn(format="%.2f €"),
+                },
+            )
+        can_rebuild = (
+            initial_state is not None
+            and market_date is not None
+            and benchmark_price is not None
+            and hasattr(journal, "set_paper_simulation_status")
+        )
+        rebuild = st.button(
+            "Corregir Día 1 con las dos cuentas",
+            type="primary",
+            icon=":material/restart_alt:",
+            width="stretch",
+            disabled=not can_rebuild,
+            key="paper_rebuild_complete_portfolio",
+        )
+        if rebuild and can_rebuild and initial_state is not None:
+            try:
+                _create_paper_simulation_record(
+                    journal,
+                    recorded_by=user.username,
+                    market_date=market_date,
+                    source_snapshot_date=_paper_source_snapshot_date(
+                        market_snapshot,
+                        market_date,
+                    ),
+                    initial_state=initial_state,
+                    initial_cash=initial_cash,
+                    benchmark_price=float(benchmark_price),
+                    seed_payload=seed_payload,
+                    assumptions=assumptions,
+                    name=f"Método prudente completo · {market_date.isoformat()}",
+                )
+            except (JournalStorageError, ValueError, AttributeError) as exc:
+                st.error(f"No se pudo crear la temporada completa: {exc}")
+            else:
+                try:
+                    journal.set_paper_simulation_status(
+                        int(simulation["id"]),
+                        "archived",
+                    )
+                except (JournalStorageError, ValueError, AttributeError) as exc:
+                    # La temporada nueva ya es la de id más alto y será la
+                    # seleccionada. Evitamos repetir el alta y dejamos visible
+                    # que la cabecera antigua necesita archivarse después.
+                    st.session_state["paper_rebuild_notice"] = (
+                        "La temporada completa se creó, pero la anterior no pudo "
+                        f"archivarse automáticamente: {exc}"
+                    )
+                st.rerun()
+        return
+
     try:
         runs = journal.list_paper_daily_runs(int(simulation["id"]))
     except (JournalStorageError, ValueError, AttributeError) as exc:
@@ -8195,11 +8504,26 @@ def _render_paper_simulation_lab(
     )
     metrics[3].metric("Costes acumulados", f"{latest.costs_cumulative_eur:,.2f} €")
     st.caption(
-        f"{int(scorecard.get('sessions') or 0)} sesiones · cobertura "
-        f"{latest.data_coverage_pct:.0f}% · reserva fiscal estimada "
+        f"{int(scorecard.get('sessions') or 0)} sesiones · precios frescos sobre "
+        f"{latest.data_coverage_pct:.0f}% del valor total · reserva fiscal estimada "
         f"{latest.tax_reserve_eur:,.2f} € · drawdown máximo "
         f"{float(scorecard.get('maximum_drawdown_pct') or 0.0):.2f}%."
     )
+    frozen_initial = [
+        row
+        for row in (stored_initial if isinstance(stored_initial, list) else [])
+        if isinstance(row, dict)
+        and str(row.get("valuation_mode") or "market").strip().lower() == "frozen"
+    ]
+    if frozen_initial:
+        frozen_value = sum(
+            float(row.get("value_eur") or 0.0) for row in frozen_initial
+        )
+        st.info(
+            f"El saldo incluye {len(frozen_initial)} posiciones manuales por "
+            f"{frozen_value:,.2f} €. Permanecen congeladas: no generan rentabilidad, "
+            "impuestos ni propuestas de venta hasta tener datos verificables."
+        )
 
     latest_run = runs.sort_values(["market_date", "id"]).iloc[-1].to_dict()
     proposed = _paper_json_value(latest_run.get("proposed_actions_json"), [])
