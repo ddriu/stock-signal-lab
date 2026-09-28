@@ -8406,7 +8406,6 @@ def _render_paper_simulation_lab(
             initial_state is not None
             and market_date is not None
             and benchmark_price is not None
-            and hasattr(journal, "set_paper_simulation_status")
         )
         rebuild = st.button(
             "Corregir Día 1 con las dos cuentas",
