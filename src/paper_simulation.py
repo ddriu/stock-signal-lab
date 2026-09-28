@@ -116,12 +116,15 @@ class PaperPosition:
     average_cost_eur: float
     last_price_eur: float
     sector: str = "Sin clasificar"
+    valuation_mode: str = "market"
 
     def __post_init__(self) -> None:
         if not self.ticker or self.ticker != self.ticker.upper():
             raise ValueError("La posición paper necesita un ticker normalizado.")
         if self.quantity <= 0 or self.average_cost_eur <= 0 or self.last_price_eur <= 0:
             raise ValueError("Cantidad, coste y precio paper deben ser positivos.")
+        if self.valuation_mode not in {"market", "frozen"}:
+            raise ValueError("La valoración paper debe ser market o frozen.")
 
     @property
     def market_value_eur(self) -> float:
@@ -276,15 +279,28 @@ def build_paper_rotation_dashboard(
 
     config = assumptions or PaperAssumptions()
     summary_rows = tuple(dict(row) for row in live_summary)
+    frozen = {
+        position.ticker
+        for position in state.positions
+        if position.valuation_mode == "frozen"
+    }
     favorites = tuple(
-        dict.fromkeys(_ticker(value) for value in favorite_tickers if _ticker(value))
+        dict.fromkeys(
+            _ticker(value)
+            for value in favorite_tickers
+            if _ticker(value) and _ticker(value) not in frozen
+        )
     )
-    held = tuple(position.ticker for position in state.positions)
+    held = tuple(
+        position.ticker
+        for position in state.positions
+        if position.valuation_mode == "market"
+    )
     nav = _state_nav(state)
     allocations = {
         position.ticker: position.market_value_eur / nav * 100.0
         for position in state.positions
-        if nav > 0
+        if nav > 0 and position.valuation_mode == "market"
     }
 
     currencies = {
@@ -306,6 +322,8 @@ def build_paper_rotation_dashboard(
 
     recovery_hurdles: dict[tuple[str, str], dict[str, object]] = {}
     for position in state.positions:
+        if position.valuation_mode != "market":
+            continue
         gross_value = position.market_value_eur
         origin_currency = currencies.get(position.ticker, "")
         if gross_value <= 0 or not origin_currency:
@@ -441,8 +459,11 @@ def seed_paper_portfolio(
 
     Cada fila debe contener ticker y cantidad. El precio puede venir en
     ``prices_eur`` o en la propia fila. Si sólo se conoce ``value_eur``, la
-    cantidad se puede derivar del precio. El coste inicial usa ``cost_basis_eur``
-    cuando existe; de lo contrario parte del valor de mercado de la semilla.
+    cantidad se puede derivar del precio. Una fila marcada como ``frozen``
+    puede usar una unidad sintética cuando sólo se conoce ese valor declarado;
+    nunca se revaloriza ni se negocia hasta crear una semilla verificable nueva.
+    El coste inicial usa ``cost_basis_eur`` cuando existe; de lo contrario parte
+    del valor de mercado de la semilla.
     """
 
     if cash_eur < 0:
@@ -464,6 +485,11 @@ def seed_paper_portfolio(
             raise ValueError(
                 f"{ticker}: la semilla paper v1 necesita valor y precio convertidos a EUR."
             )
+        valuation_mode = str(
+            _value(source, "valuation_mode", "Modo valoración") or "market"
+        ).strip().lower()
+        if valuation_mode not in {"market", "frozen"}:
+            raise ValueError(f"{ticker}: el modo de valoración paper no es válido.")
         quantity = _number(_value(source, "quantity", "Cantidad"))
         value_eur = _number(
             _value(source, "value_eur", "Valor EUR", "Ahora vale", "market_value_eur")
@@ -471,7 +497,24 @@ def seed_paper_portfolio(
         row_price = _number(
             _value(source, "price_eur", "current_price_eur", "Precio EUR", "current_price")
         )
-        price = normalized_prices.get(ticker, row_price)
+        # Una línea ``frozen`` representa el último valor declarado por el
+        # bróker cuando no conocemos suficientes unidades/precio para seguirla.
+        # Una cotización externa posterior no debe reinterpretar esa unidad
+        # sintética ni fabricar una ganancia o pérdida.
+        price = (
+            row_price
+            if valuation_mode == "frozen"
+            else normalized_prices.get(ticker, row_price)
+        )
+        if (
+            valuation_mode == "frozen"
+            and quantity is None
+            and price is None
+            and value_eur is not None
+            and value_eur > 0
+        ):
+            quantity = 1.0
+            price = value_eur
         if quantity is None and value_eur is not None and price is not None and price > 0:
             quantity = value_eur / price
         if price is None and quantity is not None and quantity > 0 and value_eur is not None:
@@ -492,8 +535,18 @@ def seed_paper_portfolio(
         sector = str(_value(source, "sector", "Sector") or "Sin clasificar")
         target = grouped.setdefault(
             ticker,
-            {"quantity": 0.0, "cost_basis": 0.0, "value": 0.0, "sector": sector},
+            {
+                "quantity": 0.0,
+                "cost_basis": 0.0,
+                "value": 0.0,
+                "sector": sector,
+                "valuation_mode": valuation_mode,
+            },
         )
+        if target["valuation_mode"] != valuation_mode:
+            raise ValueError(
+                f"{ticker}: no se pueden mezclar lotes market y frozen en una posición."
+            )
         target["quantity"] = float(target["quantity"]) + quantity
         target["cost_basis"] = float(target["cost_basis"]) + cost_basis
         target["value"] = float(target["value"]) + market_value
@@ -505,6 +558,7 @@ def seed_paper_portfolio(
             average_cost_eur=float(values["cost_basis"]) / float(values["quantity"]),
             last_price_eur=float(values["value"]) / float(values["quantity"]),
             sector=str(values["sector"]),
+            valuation_mode=str(values["valuation_mode"]),
         )
         for ticker, values in sorted(grouped.items())
     )
@@ -618,7 +672,16 @@ def _pair_orders(
     reason: str,
 ) -> tuple[PaperOrder, ...]:
     origin_position = _position_map(state).get(origin)
-    if origin_position is None or origin_position.market_value_eur <= 0:
+    destination_position = _position_map(state).get(destination)
+    if (
+        origin_position is None
+        or origin_position.market_value_eur <= 0
+        or origin_position.valuation_mode != "market"
+        or (
+            destination_position is not None
+            and destination_position.valuation_mode != "market"
+        )
+    ):
         return ()
     nav = _state_nav(state)
     turnover_cap = nav * assumptions.max_daily_turnover_pct / 100.0
@@ -865,6 +928,24 @@ def fill_pending_orders(
             )
         selected_by_id.setdefault(order.id, order)
     selected = list(selected_by_id.values())
+    position_map = _position_map(state)
+    blocked_pairs = {
+        order.pair_id or order.id
+        for order in selected
+        if (
+            order.side == "Venta"
+            and position_map.get(order.ticker) is not None
+            and position_map[order.ticker].valuation_mode != "market"
+        )
+        or (
+            order.side == "Compra"
+            and position_map.get(order.ticker) is not None
+            and position_map[order.ticker].valuation_mode != "market"
+        )
+    }
+    selected = [
+        order for order in selected if (order.pair_id or order.id) not in blocked_pairs
+    ]
     selected.sort(
         key=lambda order: (
             order.signal_date,
@@ -947,7 +1028,11 @@ def fill_pending_orders(
 
         if order.side == "Venta":
             current = positions.get(order.ticker)
-            if current is None or current.quantity <= 0:
+            if (
+                current is None
+                or current.quantity <= 0
+                or current.valuation_mode != "market"
+            ):
                 continue
             gross_target = min(gross_order_limit, current.quantity * price_eur)
             quantity = min(current.quantity, gross_target / price_eur)
@@ -972,6 +1057,8 @@ def fill_pending_orders(
                 )
         else:
             current = positions.get(order.ticker)
+            if current is not None and current.valuation_mode != "market":
+                continue
             current_value = current.quantity * price_eur if current else 0.0
             company_room = max(
                 0.0,
@@ -1086,20 +1173,28 @@ def mark_to_market(
     }
     holdings = 0.0
     cost_basis = 0.0
-    covered = 0
+    covered_value = 0.0
     liquidation_cost = 0.0
     for position in state.positions:
-        price = normalized.get(position.ticker, position.last_price_eur)
-        if position.ticker in normalized:
-            covered += 1
+        has_market_price = (
+            position.valuation_mode == "market" and position.ticker in normalized
+        )
+        price = (
+            normalized[position.ticker]
+            if has_market_price
+            else position.last_price_eur
+        )
+        if has_market_price:
+            covered_value += position.quantity * price
         value = position.quantity * price
         holdings += value
         cost_basis += position.cost_basis_eur
-        liquidation_cost += min(
-            value,
-            config.sell_fee_eur
-            + value * (config.spread_pct + config.slippage_pct) / 100.0,
-        )
+        if position.valuation_mode == "market":
+            liquidation_cost += min(
+                value,
+                config.sell_fee_eur
+                + value * (config.spread_pct + config.slippage_pct) / 100.0,
+            )
     gross_nav = state.cash_eur + holdings
     tax_reserve = _current_tax_reserve(state, config)
     # Los costes ya ejecutados están descontados del efectivo. El coste de una
@@ -1109,7 +1204,11 @@ def mark_to_market(
 
     buy_hold = state.initial_cash_eur
     for position in state.initial_positions:
-        price = normalized.get(position.ticker, position.last_price_eur)
+        price = (
+            normalized.get(position.ticker, position.last_price_eur)
+            if position.valuation_mode == "market"
+            else position.last_price_eur
+        )
         buy_hold += position.quantity * price
     benchmark_nav: float | None = None
     if (
@@ -1123,9 +1222,7 @@ def mark_to_market(
             * float(benchmark_price_eur)
             / state.benchmark_initial_price_eur
         )
-    coverage = (
-        covered / len(state.positions) * 100.0 if state.positions else 100.0
-    )
+    coverage = covered_value / holdings * 100.0 if holdings > 0 else 100.0
     return PaperSnapshot(
         as_of=current_date,
         nav_gross_eur=gross_nav,

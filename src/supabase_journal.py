@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any
 
 import pandas as pd
@@ -369,6 +369,29 @@ class SupabaseTradingJournal:
             array_columns={"initial_positions_json"},
         )
         return frame.loc[:, PAPER_SIMULATION_COLUMNS]
+
+    def set_paper_simulation_status(self, simulation_id: int, status: str) -> None:
+        """Cambia el estado de una temporada paper sin tocar su historial."""
+
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status not in PAPER_SIMULATION_STATUSES:
+            raise ValueError("El estado de la simulación paper no es válido.")
+        response = self._request(
+            "PATCH",
+            endpoint=self.paper_simulations_endpoint,
+            params={
+                "owner": f"eq.{self.owner}",
+                "id": f"eq.{int(simulation_id)}",
+            },
+            json={
+                "status": normalized_status,
+                "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            },
+            headers={**self.headers, "Prefer": "return=representation"},
+        )
+        rows = response.json()
+        if not isinstance(rows, list) or len(rows) != 1:
+            raise ValueError("La simulación paper indicada no existe.")
 
     def upsert_paper_daily_run(
         self,

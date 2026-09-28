@@ -1357,6 +1357,25 @@ class TradingJournal:
                 params=parameters,
             )
 
+    def set_paper_simulation_status(self, simulation_id: int, status: str) -> None:
+        """Cambia sólo el estado de una temporada paper del propietario actual."""
+
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status not in PAPER_SIMULATION_STATUSES:
+            raise ValueError("El estado de la simulación paper no es válido.")
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE paper_simulations
+                SET status = ?, updated_at = ?
+                WHERE owner = ? AND id = ?
+                """,
+                (normalized_status, now, self.owner, int(simulation_id)),
+            )
+        if cursor.rowcount != 1:
+            raise ValueError("La simulación paper indicada no existe.")
+
     def upsert_paper_daily_run(
         self,
         *,
