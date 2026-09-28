@@ -6,14 +6,19 @@ Versión de estabilización auditada: 2026-09-26.
 
 from __future__ import annotations
 
+from dataclasses import asdict, fields, replace
 from datetime import date, datetime, timedelta
 import html
+from hashlib import sha256
+import json
+from math import isfinite
 
 import pandas as pd
 import streamlit as st
 
 from config import BacktestConfig, StrategyConfig
 from src.alerts import normalize_alert_preferences
+from src.analysis_snapshots import persist_analysis_batch_snapshots
 from src.approximate_returns import build_approximate_return_report
 from src.auth import (
     AuthConfig,
@@ -125,6 +130,21 @@ from src.navigation import (
     sanitize_favorite_selection,
 )
 from src.opportunity_catalog import build_opportunity_catalog
+from src.paper_simulation import (
+    PAPER_ENGINE_VERSION,
+    PaperAssumptions,
+    PaperOrder,
+    PaperPosition,
+    PaperSnapshot,
+    PaperState,
+    PaperTrade,
+    build_paper_rotation_dashboard,
+    compute_paper_scorecard,
+    fill_pending_orders,
+    mark_to_market,
+    propose_paper_orders,
+    seed_paper_portfolio,
+)
 from src.supabase_journal import JournalStorageError
 from src.storage import GROUP_PORTFOLIO_OWNER, create_journal
 from src.opportunity import (
@@ -165,6 +185,7 @@ from src.portfolio_decisions import (
     build_portfolio_decision_rows,
 )
 from src.portfolio_rotation import (
+    CANDIDATE_REJECTION_LABELS,
     HORIZON_POLICIES,
     ROTATION_COLORS,
     RotationDashboard,
@@ -172,6 +193,7 @@ from src.portfolio_rotation import (
     build_recovery_hurdles,
     build_rotation_priorities,
     build_rotation_dashboard,
+    summarize_candidate_eligibility,
 )
 from src.portfolio_thesis import (
     apply_thesis_invalidations,
@@ -1763,6 +1785,7 @@ def render_analysis(
                     analyzed_at=signal.as_of,
                     price=float(latest["close"]),
                     opportunity_score=opportunity.score,
+                    confidence_pct=opportunity.confidence_pct,
                     company_score=fundamentals.score,
                     entry_score=signal.score,
                     valuation_score=valuation.score,
@@ -1895,6 +1918,7 @@ def render_analysis(
                         analyzed_at=signal.as_of,
                         price=float(latest["close"]),
                         opportunity_score=opportunity.score,
+                        confidence_pct=opportunity.confidence_pct,
                         company_score=fundamentals.score,
                         entry_score=signal.score,
                         valuation_score=valuation.score,
@@ -6790,6 +6814,53 @@ def _portfolio_tracking_tickers(journal: object) -> list[str]:
     )
 
 
+def _paper_tracking_tickers(journal: object) -> list[str]:
+    """Mantiene valorables estrategia, referencia inicial y órdenes pendientes."""
+
+    required = ("list_paper_simulations", "list_paper_daily_runs")
+    if not all(hasattr(journal, method) for method in required):
+        return []
+    try:
+        simulations = journal.list_paper_simulations(status="active")
+        if simulations.empty:
+            return []
+        simulation = simulations.sort_values(["start_date", "id"]).iloc[-1].to_dict()
+        runs = journal.list_paper_daily_runs(int(simulation["id"]))
+        initial = _paper_json_value(simulation.get("initial_positions_json"), [])
+        payloads = [initial if isinstance(initial, list) else []]
+        if not runs.empty:
+            latest = runs.sort_values(["market_date", "id"]).iloc[-1].to_dict()
+            current = _paper_json_value(latest.get("positions_after_json"), [])
+            payloads.append(current if isinstance(current, list) else [])
+            filled_ids: set[str] = set()
+            for value in runs.get("executed_actions_json", []):
+                executed = _paper_json_value(value, [])
+                if not isinstance(executed, list):
+                    continue
+                filled_ids.update(
+                    str(item.get("order_id"))
+                    for item in executed
+                    if isinstance(item, dict) and item.get("order_id")
+                )
+            payloads.append(
+                [
+                    {"ticker": order.ticker}
+                    for order in _paper_pending_orders(runs)
+                    if order.status == "pending" and order.id not in filled_ids
+                ]
+            )
+    except (JournalStorageError, AttributeError, TypeError, ValueError, KeyError):
+        return []
+    return list(
+        dict.fromkeys(
+            resolve_analysis_ticker(str(row.get("ticker") or ""))
+            for payload in payloads
+            for row in payload
+            if isinstance(row, dict) and str(row.get("ticker") or "").strip()
+        )
+    )
+
+
 def _request_portfolio_market_refresh() -> None:
     """Solicita una descarga nueva desde Inicio o Cartera en el siguiente rerun."""
 
@@ -6902,6 +6973,7 @@ def _merge_saved_analysis_summary(
     relevant = set(relevant_tickers)
     mappings = {
         "opportunity_score": "Oportunidad",
+        "confidence_pct": "Confianza datos",
         "company_score": "Calidad empresa",
         "entry_score": "Momento entrada",
         "valuation_score": "Valoración",
@@ -6919,6 +6991,7 @@ def _merge_saved_analysis_summary(
             continue
         target = rows.setdefault(ticker, {"Ticker": ticker})
         used_saved = False
+        used_saved_scores = False
         for source_column, target_column in mappings.items():
             current = target.get(target_column)
             missing = current is None or (
@@ -6928,29 +7001,48 @@ def _merge_saved_analysis_summary(
             if missing and saved is not None and not pd.isna(saved) and saved != "":
                 target[target_column] = saved
                 used_saved = True
+                used_saved_scores = used_saved_scores or source_column in {
+                    "opportunity_score",
+                    "company_score",
+                    "entry_score",
+                    "valuation_score",
+                    "relative_score",
+                    "risk_score",
+                }
         if used_saved:
             analyzed_at = snapshot.get("analyzed_at_parsed")
-            target["Fecha"] = (
+            saved_date = (
                 pd.Timestamp(analyzed_at).date()
                 if analyzed_at is not None and not pd.isna(analyzed_at)
                 else None
             )
-            # El historial no almacena la confianza original. Un análisis canónico
-            # completo puede servir de respaldo mensual, pero no recibe una
-            # confianza alta inventada ni habilita por sí solo una rotación semanal.
-            snapshot_confidence = 70.0
-            current_confidence = pd.to_numeric(
-                pd.Series([target.get("Confianza datos")]), errors="coerce"
-            ).iloc[0]
-            target["Confianza datos"] = max(
-                float(current_confidence) if pd.notna(current_confidence) else 0.0,
-                snapshot_confidence,
-            )
+            target["Fecha análisis profundo"] = saved_date
+            if used_saved_scores:
+                # La fecha y la confianza de los factores rellenados deben ser las
+                # de la fotografía profunda, no las del último precio. Las filas
+                # históricas anteriores a confidence_pct conservan un 70 prudente.
+                target["Fecha"] = saved_date
+                saved_confidence = pd.to_numeric(
+                    pd.Series([snapshot.get("confidence_pct")]), errors="coerce"
+                ).iloc[0]
+                if pd.isna(saved_confidence):
+                    saved_confidence = 70.0
+                current_confidence = pd.to_numeric(
+                    pd.Series([target.get("Confianza datos")]), errors="coerce"
+                ).iloc[0]
+                target["Confianza datos"] = (
+                    min(float(current_confidence), float(saved_confidence))
+                    if pd.notna(current_confidence)
+                    else float(saved_confidence)
+                )
             target["Origen análisis"] = "Último análisis profundo guardado"
     return list(rows.values())
 
 
-def _render_rotation_dashboard(dashboard: RotationDashboard) -> None:
+def _render_rotation_dashboard(
+    dashboard: RotationDashboard,
+    candidate_diagnostic: dict[str, object] | None = None,
+) -> None:
     """Portada compacta: cartera, cambios que merecen estudio y favoritas."""
 
     st.markdown("### Mapa de cartera cotizada")
@@ -6992,10 +7084,117 @@ def _render_rotation_dashboard(dashboard: RotationDashboard) -> None:
         "Revisar",
         sum(row["Color"] in {"Naranja", "Rojo"} for row in position_rows),
     )
-    metrics[3].metric(
-        "Favoritas azules",
-        sum(row["Color"] == "Azul" for row in candidate_rows),
+    diagnostic = dict(candidate_diagnostic or {})
+    blue_total = int(
+        diagnostic.get("blue")
+        if diagnostic.get("blue") is not None
+        else sum(row["Color"] == "Azul" for row in candidate_rows)
     )
+    candidate_total = int(
+        diagnostic.get("candidate_total")
+        if diagnostic.get("candidate_total") is not None
+        else len(candidate_rows)
+    )
+    metrics[3].metric("Favoritas azules", f"{blue_total}/{candidate_total}")
+
+    if diagnostic and candidate_total:
+        primary_cause = str(diagnostic.get("primary_cause_label") or "").strip()
+        if blue_total == 0:
+            st.warning(
+                "Ahora mismo no hay una favorita azul, pero eso no significa que "
+                "ninguna empresa sea invertible. Significa que ninguna puede acreditar a la vez "
+                "frescura, cobertura, entrada, score, confianza, calidad y riesgo con "
+                f"este horizonte. Principal bloqueo: {primary_cause or 'varios filtros'}."
+            )
+        else:
+            st.success(
+                f"{blue_total} favoritas superan todos los guardarraíles del horizonte. "
+                "Azul permite estudiarlas; no equivale a una orden de compra."
+            )
+
+        with st.expander(
+            "Por qué llegan —o no— al azul",
+            expanded=blue_total == 0,
+            icon=":material/filter_alt:",
+        ):
+            funnel = st.columns(5)
+            funnel[0].metric("Fuera de cartera", candidate_total)
+            funnel[1].metric("Con análisis", int(diagnostic.get("analyzed") or 0))
+            funnel[2].metric("Vigentes", int(diagnostic.get("fresh") or 0))
+            funnel[3].metric("Completas", int(diagnostic.get("complete") or 0))
+            funnel[4].metric("Azules", blue_total)
+            st.caption(
+                "El embudo usa todas las favoritas, no sólo las 15 filas visibles. "
+                "Una empresa puede fallar varios controles; la tabla inferior muestra "
+                "la primera causa que debe resolverse."
+            )
+            primary_counts = dict(
+                diagnostic.get("primary_rejection_counts") or {}
+            )
+            reason_rows = [
+                {
+                    "Bloqueo principal": CANDIDATE_REJECTION_LABELS.get(
+                        reason, reason
+                    ),
+                    "Empresas": int(count or 0),
+                }
+                for reason, count in primary_counts.items()
+                if int(count or 0) > 0
+            ]
+            if reason_rows:
+                reason_frame = pd.DataFrame(reason_rows).sort_values(
+                    ["Empresas", "Bloqueo principal"],
+                    ascending=[False, True],
+                )
+                st.dataframe(reason_frame, hide_index=True, width="stretch")
+            if int(primary_counts.get("confidence_below") or 0) > 0:
+                st.caption(
+                    "Las fotografías antiguas que no guardaban confianza exacta se "
+                    "tratan con un 70% prudente. Al completar el análisis se sustituye "
+                    "por la confianza realmente calculada; no bajamos el umbral para "
+                    "fabricar candidatas azules."
+                )
+
+            near_misses = list(diagnostic.get("near_misses") or [])
+            if near_misses:
+                near_frame = pd.DataFrame(
+                    [
+                        {
+                            "Ticker": row.get("ticker"),
+                            "Le falta": row.get("primary_reason_label"),
+                            "Score": row.get("score"),
+                            "Confianza": row.get("confidence"),
+                            "Cobertura": row.get("coverage"),
+                        }
+                        for row in near_misses
+                    ]
+                )
+                st.markdown("**Más próximas al azul**")
+                render_ticker_dataframe(
+                    near_frame,
+                    key=f"home_rotation_near_misses_{dashboard.policy.label}",
+                    column_config={
+                        "Score": st.column_config.NumberColumn(format="%.1f"),
+                        "Confianza": st.column_config.NumberColumn(format="%.0f%%"),
+                        "Cobertura": st.column_config.NumberColumn(format="%.0f%%"),
+                    },
+                )
+            if (
+                int(diagnostic.get("gray") or 0) > 0
+                or int(diagnostic.get("complete") or 0) < candidate_total
+            ):
+                st.button(
+                    "Completar análisis de todas las favoritas",
+                    icon=":material/refresh:",
+                    width="stretch",
+                    key=f"home_rotation_refresh_favorites_{dashboard.policy.label}",
+                    on_click=_request_all_favorite_refresh,
+                    args=("Radar",),
+                    help=(
+                        "Abre el radar y revisa las favoritas en lotes pequeños para no "
+                        "superar los límites del proveedor de datos."
+                    ),
+                )
     st.markdown("#### Qué requiere atención")
     priority_rows = build_rotation_priorities(dashboard, limit=5)
     if priority_rows:
@@ -7125,6 +7324,970 @@ def _render_rotation_dashboard(dashboard: RotationDashboard) -> None:
                     ),
                 },
             )
+
+
+def _paper_json_value(value: object, fallback: object) -> object:
+    """Lee JSON persistido sin propagar una fila antigua o incompleta a la UI."""
+
+    if value is None:
+        return fallback
+    if isinstance(value, float) and pd.isna(value):
+        return fallback
+    if isinstance(value, (str, bytes)):
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return fallback
+    return value
+
+
+def _paper_orders_with_known_market_metadata(
+    orders: tuple[PaperOrder, ...],
+    bars_eur: dict[str, pd.DataFrame],
+) -> tuple[PaperOrder, ...]:
+    """Añade moneda sólo a parejas con aperturas y FX verificables.
+
+    Una pata sin metadatos invalida toda su pareja para impedir ventas huérfanas.
+    Los escenarios forman grupos distintos aunque una entrada externa reutilice
+    accidentalmente el mismo ``pair_id``.
+    """
+
+    resolved: list[tuple[PaperOrder, tuple[str, str], str]] = []
+    invalid_groups: set[tuple[str, str]] = set()
+    for order in orders:
+        group = (order.scenario, order.pair_id or order.id)
+        frame = bars_eur.get(order.ticker)
+        currency = ""
+        rate_to_eur: float | None = None
+        has_open = False
+        if frame is not None and not frame.empty and "open" in frame:
+            opens = pd.to_numeric(frame["open"], errors="coerce").dropna()
+            has_open = bool((opens > 0).any())
+            currency = str(frame.attrs.get("currency") or "").strip().upper()
+            try:
+                rate_to_eur = float(frame.attrs.get("rate_to_eur"))
+            except (TypeError, ValueError):
+                rate_to_eur = None
+        if (
+            not has_open
+            or len(currency) != 3
+            or not currency.isalpha()
+            or rate_to_eur is None
+            or not isfinite(rate_to_eur)
+            or rate_to_eur <= 0
+        ):
+            invalid_groups.add(group)
+        resolved.append((order, group, currency))
+    return tuple(
+        replace(order, currency=currency)
+        for order, group, currency in resolved
+        if group not in invalid_groups
+    )
+
+
+def _paper_market_date(
+    prepared: dict[str, pd.DataFrame],
+    reference_data: dict[str, pd.DataFrame] | None = None,
+) -> date | None:
+    """Fecha de sesión del laboratorio, anclada al benchmark cuando existe.
+
+    Usar el máximo de bolsas distintas puede inventar una sesión estadounidense
+    durante un festivo o fin de semana. SPY es también el benchmark del experimento,
+    por lo que su última sesión es el reloj coherente para propuestas y ejecuciones.
+    """
+
+    benchmark = (reference_data or {}).get("SPY")
+    if benchmark is not None and not benchmark.empty:
+        index = pd.to_datetime(benchmark.index, errors="coerce")
+        valid = index[~pd.isna(index)]
+        if len(valid):
+            return pd.Timestamp(valid.max()).date()
+    dates = [
+        pd.Timestamp(frame.index[-1]).date()
+        for frame in prepared.values()
+        if frame is not None and not frame.empty
+    ]
+    return max(dates) if dates else None
+
+
+def _paper_eur_market_data(
+    prepared: dict[str, pd.DataFrame],
+    reference_data: dict[str, pd.DataFrame],
+    fx_snapshot: FxSnapshot,
+    market_snapshot: pd.DataFrame,
+    *,
+    use_snapshot_fallback: bool = False,
+) -> tuple[dict[str, float], dict[str, pd.DataFrame], float | None]:
+    """Precios EUR para valorar y aperturas nativas para ejecutar con FX realista."""
+
+    prices: dict[str, float] = {}
+    bars: dict[str, pd.DataFrame] = {}
+    anchor_date = _paper_market_date(prepared, reference_data)
+    for ticker, frame in prepared.items():
+        if frame is None or frame.empty or "close" not in frame:
+            continue
+        frame_date = pd.Timestamp(frame.index[-1]).date()
+        if anchor_date is not None and (anchor_date - frame_date).days > 7:
+            # Un último precio antiguo no cuenta como cobertura diaria.
+            continue
+        currency = str(
+            frame.attrs.get("display_currency")
+            or frame.attrs.get("quote_currency")
+            or ""
+        ).upper()
+        if not currency:
+            continue
+        try:
+            rate_to_eur = convert_currency(
+                1.0,
+                currency,
+                "EUR",
+                fx_snapshot.rates_per_eur,
+            )
+        except ValueError:
+            continue
+        closes = pd.to_numeric(frame["close"], errors="coerce").dropna()
+        if closes.empty:
+            continue
+        prices[ticker] = float(closes.iloc[-1]) * rate_to_eur
+        if "open" in frame:
+            opens = pd.to_numeric(frame["open"], errors="coerce")
+            bars[ticker] = pd.DataFrame({"open": opens}, index=frame.index).dropna()
+            bars[ticker].attrs["currency"] = currency
+            bars[ticker].attrs["rate_to_eur"] = rate_to_eur
+
+    # La foto del bróker sólo permite crear la semilla. Una vez iniciado el
+    # experimento no puede simular una cotización actual ni inflar la cobertura.
+    if use_snapshot_fallback and not market_snapshot.empty and {
+        "analysis_ticker",
+        "quantity",
+        "value_eur",
+    }.issubset(market_snapshot.columns):
+        snapshot = market_snapshot.copy()
+        snapshot["analysis_ticker"] = (
+            snapshot["analysis_ticker"].fillna("").astype(str).str.strip().str.upper()
+        )
+        snapshot["quantity"] = pd.to_numeric(snapshot["quantity"], errors="coerce")
+        snapshot["value_eur"] = pd.to_numeric(snapshot["value_eur"], errors="coerce")
+        for ticker, rows in snapshot.groupby("analysis_ticker"):
+            quantity = float(rows["quantity"].fillna(0.0).sum())
+            value = float(rows["value_eur"].fillna(0.0).sum())
+            if ticker and quantity > 0 and value > 0:
+                prices.setdefault(resolve_analysis_ticker(ticker), value / quantity)
+
+    benchmark_price: float | None = None
+    benchmark = reference_data.get("SPY")
+    if benchmark is not None and not benchmark.empty and "close" in benchmark:
+        currency = str(
+            benchmark.attrs.get("display_currency")
+            or benchmark.attrs.get("quote_currency")
+            or "USD"
+        )
+        normalized = normalize_price_frame_units(benchmark, currency)
+        closes = pd.to_numeric(normalized["close"], errors="coerce").dropna()
+        if not closes.empty:
+            display_currency = str(
+                normalized.attrs.get("display_currency") or "USD"
+            ).upper()
+            try:
+                benchmark_price = convert_currency(
+                    float(closes.iloc[-1]),
+                    display_currency,
+                    "EUR",
+                    fx_snapshot.rates_per_eur,
+                )
+            except ValueError:
+                benchmark_price = None
+    return prices, bars, benchmark_price
+
+
+def _paper_seed_payload(
+    snapshot: pd.DataFrame,
+    prices_eur: dict[str, float],
+    summary: list[dict[str, object]],
+) -> tuple[list[dict[str, object]], float]:
+    """Prepara sólo posiciones cotizadas y efectivo; excluye inversiones privadas."""
+
+    if snapshot.empty:
+        return [], 0.0
+    rows = _rotation_eligible_snapshot(snapshot)
+    sectors = {
+        str(row.get("Ticker") or "").strip().upper(): str(
+            row.get("Sector") or "Sin clasificar"
+        )
+        for row in summary
+        if str(row.get("Ticker") or "").strip()
+    }
+    payload: list[dict[str, object]] = []
+    if not rows.empty and {"analysis_ticker", "value_eur"}.issubset(rows.columns):
+        rows = rows.copy()
+        rows["analysis_ticker"] = (
+            rows["analysis_ticker"].fillna("").astype(str).str.strip().str.upper()
+        )
+        rows["quantity"] = pd.to_numeric(rows.get("quantity"), errors="coerce")
+        rows["value_eur"] = pd.to_numeric(rows["value_eur"], errors="coerce")
+        rows["cost_estimate_eur"] = pd.to_numeric(
+            rows.get("cost_estimate_eur"), errors="coerce"
+        )
+        for ticker, group in rows.groupby("analysis_ticker"):
+            ticker = resolve_analysis_ticker(ticker) if ticker else ""
+            value = float(group["value_eur"].fillna(0.0).sum())
+            quantity = float(group["quantity"].fillna(0.0).sum())
+            price = prices_eur.get(ticker)
+            if not ticker or value <= 0 or price is None or price <= 0:
+                continue
+            if quantity <= 0:
+                quantity = value / price
+            known_cost = group["cost_estimate_eur"].notna()
+            # Si falta el coste de algún lote, ese lote empieza neutro en vez de
+            # desaparecer de la base y fabricar una plusvalía ficticia.
+            cost_basis = float(
+                group.loc[known_cost, "cost_estimate_eur"].sum()
+                + group.loc[~known_cost, "value_eur"].fillna(0.0).sum()
+            )
+            payload.append(
+                {
+                    "ticker": ticker,
+                    "quantity": quantity,
+                    "price_eur": price,
+                    "value_eur": value,
+                    "cost_basis_eur": max(cost_basis, 0.01),
+                    "sector": sectors.get(ticker, "Sin clasificar"),
+                    "currency": "EUR",
+                }
+            )
+
+    cash = 0.0
+    name_series = snapshot.get("asset_name", pd.Series("", index=snapshot.index))
+    type_series = snapshot.get("asset_type", pd.Series("", index=snapshot.index))
+    cash_mask = (
+        name_series.fillna("").astype(str).str.casefold().str.contains("efectivo|cash")
+        | type_series.fillna("").astype(str).str.casefold().str.contains("efectivo|cash")
+    )
+    if "value_eur" in snapshot:
+        cash = float(
+            pd.to_numeric(snapshot.loc[cash_mask, "value_eur"], errors="coerce")
+            .fillna(0.0)
+            .sum()
+        )
+    return payload, max(0.0, cash)
+
+
+def _paper_seed_diagnostics(
+    snapshot: pd.DataFrame,
+    payload: list[dict[str, object]],
+) -> dict[str, object]:
+    """Cobertura visible de la semilla; nunca excluye una posición en silencio."""
+
+    rows = _rotation_eligible_snapshot(snapshot)
+    if rows.empty or not {"analysis_ticker", "value_eur"}.issubset(rows.columns):
+        return {"expected": [], "seeded": [], "missing": [], "coverage_pct": 0.0}
+    expected_rows = rows.copy()
+    expected_rows["analysis_ticker"] = (
+        expected_rows["analysis_ticker"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .map(lambda value: resolve_analysis_ticker(value) if value else "")
+    )
+    expected_rows["value_eur"] = pd.to_numeric(
+        expected_rows["value_eur"], errors="coerce"
+    ).fillna(0.0)
+    expected_rows = expected_rows.loc[
+        (expected_rows["analysis_ticker"] != "")
+        & (expected_rows["value_eur"] > 0)
+    ]
+    expected_values = (
+        expected_rows.groupby("analysis_ticker")["value_eur"].sum().to_dict()
+    )
+    seeded = {
+        str(row.get("ticker") or "").strip().upper()
+        for row in payload
+        if str(row.get("ticker") or "").strip()
+    }
+    expected = set(expected_values)
+    total_value = float(sum(expected_values.values()))
+    covered_value = float(
+        sum(value for ticker, value in expected_values.items() if ticker in seeded)
+    )
+    return {
+        "expected": sorted(expected),
+        "seeded": sorted(seeded),
+        "missing": sorted(expected - seeded),
+        "coverage_pct": (covered_value / total_value * 100.0 if total_value > 0 else 0.0),
+    }
+
+
+def _paper_assumptions_from_row(row: dict[str, object]) -> tuple[PaperAssumptions, float | None]:
+    raw = _paper_json_value(row.get("assumptions_json"), {})
+    values = dict(raw) if isinstance(raw, dict) else {}
+    allowed = {item.name for item in fields(PaperAssumptions)}
+    assumptions = PaperAssumptions(
+        **{key: value for key, value in values.items() if key in allowed}
+    )
+    benchmark_initial = pd.to_numeric(
+        pd.Series([values.get("benchmark_initial_price_eur")]), errors="coerce"
+    ).iloc[0]
+    return assumptions, (
+        float(benchmark_initial) if pd.notna(benchmark_initial) else None
+    )
+
+
+def _paper_position_from_mapping(row: dict[str, object]) -> PaperPosition:
+    return PaperPosition(
+        ticker=str(row.get("ticker") or "").strip().upper(),
+        quantity=float(row.get("quantity") or 0.0),
+        average_cost_eur=float(row.get("average_cost_eur") or 0.0),
+        last_price_eur=float(row.get("last_price_eur") or 0.0),
+        sector=str(row.get("sector") or "Sin clasificar"),
+    )
+
+
+def _paper_order_from_mapping(row: dict[str, object]) -> PaperOrder | None:
+    try:
+        return PaperOrder(
+            id=str(row["id"]),
+            portfolio_id=str(row["portfolio_id"]),
+            signal_date=pd.Timestamp(row["signal_date"]).date(),
+            effective_after=pd.Timestamp(row["effective_after"]).date(),
+            ticker=str(row["ticker"]),
+            side=str(row["side"]),
+            target_value_eur=float(row["target_value_eur"]),
+            reason=str(row.get("reason") or ""),
+            engine_version=str(row.get("engine_version") or PAPER_ENGINE_VERSION),
+            status=str(row.get("status") or "pending"),
+            scenario=str(row.get("scenario") or "strict"),
+            pair_id=str(row.get("pair_id") or ""),
+            sector=str(row.get("sector") or "Sin clasificar"),
+            currency=str(row.get("currency") or "EUR"),
+            environment="paper",
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _paper_trade_from_mapping(row: dict[str, object]) -> PaperTrade | None:
+    """Reconstruye una ejecución paper; ignora fotografías legacy incompletas."""
+
+    try:
+        return PaperTrade(
+            ticker=str(row["ticker"]).strip().upper(),
+            side=str(row["side"]),
+            quantity=float(row["quantity"]),
+            price=float(row["price"]),
+            currency=str(row.get("currency") or "EUR").upper(),
+            fx_rate_to_eur=float(row.get("fx_rate_to_eur") or 1.0),
+            gross_eur=float(row["gross_eur"]),
+            fee_eur=float(row.get("fee_eur") or 0.0),
+            spread_eur=float(row.get("spread_eur") or 0.0),
+            slippage_eur=float(row.get("slippage_eur") or 0.0),
+            fx_cost_eur=float(row.get("fx_cost_eur") or 0.0),
+            net_cash_eur=float(row["net_cash_eur"]),
+            realized_pnl_eur=float(row.get("realized_pnl_eur") or 0.0),
+            filled_at=pd.Timestamp(row["filled_at"]).date(),
+            order_id=str(row["order_id"]),
+            scenario=str(row.get("scenario") or "strict"),
+            pair_id=str(row.get("pair_id") or ""),
+            environment="paper",
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _paper_state_from_history(
+    simulation: dict[str, object],
+    runs: pd.DataFrame,
+) -> PaperState:
+    initial_payload = _paper_json_value(
+        simulation.get("initial_positions_json"), []
+    )
+    initial_rows = initial_payload if isinstance(initial_payload, list) else []
+    assumptions, benchmark_initial = _paper_assumptions_from_row(simulation)
+    state = seed_paper_portfolio(
+        initial_rows,
+        cash_eur=float(simulation.get("initial_cash_eur") or 0.0),
+        benchmark_price_eur=benchmark_initial,
+        portfolio_id=str(simulation.get("id") or "paper"),
+        as_of=str(simulation.get("start_date")),
+        engine_version=str(simulation.get("engine_version") or PAPER_ENGINE_VERSION),
+    )
+    if runs.empty:
+        return state
+    ordered = runs.sort_values(["market_date", "id"], ascending=[True, True])
+    latest = ordered.iloc[-1].to_dict()
+    position_payload = _paper_json_value(latest.get("positions_after_json"), [])
+    positions = tuple(
+        _paper_position_from_mapping(dict(item))
+        for item in (position_payload if isinstance(position_payload, list) else [])
+        if isinstance(item, dict)
+    )
+    filled_ids: list[str] = []
+    trades: list[PaperTrade] = []
+    for value in ordered.get("executed_actions_json", []):
+        executed = _paper_json_value(value, [])
+        if not isinstance(executed, list):
+            continue
+        for item in executed:
+            if not isinstance(item, dict):
+                continue
+            if item.get("order_id"):
+                filled_ids.append(str(item["order_id"]))
+            trade = _paper_trade_from_mapping(item)
+            if trade is not None:
+                trades.append(trade)
+    realized_ytd = float(latest.get("realized_pnl_eur") or 0.0)
+    persisted_tax_reserve = float(latest.get("tax_reserve_eur") or 0.0)
+    current_year_reserve = (
+        max(0.0, realized_ytd) * assumptions.tax_reserve_rate_pct / 100.0
+    )
+    return PaperState(
+        portfolio_id=state.portfolio_id,
+        as_of=pd.Timestamp(latest["market_date"]).date(),
+        cash_eur=float(latest.get("cash_eur") or 0.0),
+        positions=positions,
+        initial_positions=state.initial_positions,
+        initial_cash_eur=state.initial_cash_eur,
+        initial_nav_eur=state.initial_nav_eur,
+        benchmark_initial_price_eur=state.benchmark_initial_price_eur,
+        realized_pnl_ytd_eur=realized_ytd,
+        realized_pnl_year=pd.Timestamp(latest["market_date"]).year,
+        prior_year_tax_reserve_eur=max(
+            0.0,
+            persisted_tax_reserve - current_year_reserve,
+        ),
+        costs_cumulative_eur=float(latest.get("cumulative_costs_eur") or 0.0),
+        filled_order_ids=tuple(dict.fromkeys(filled_ids)),
+        trades=tuple(trades),
+        engine_version=state.engine_version,
+    )
+
+
+def _paper_snapshots_from_runs(runs: pd.DataFrame) -> list[PaperSnapshot]:
+    snapshots: list[PaperSnapshot] = []
+    if runs.empty:
+        return snapshots
+    for row in runs.sort_values(["market_date", "id"]).to_dict("records"):
+        net = float(row.get("net_nav_eur") or 0.0)
+        cash = float(row.get("cash_eur") or 0.0)
+        tax = float(row.get("tax_reserve_eur") or 0.0)
+        benchmark = pd.to_numeric(
+            pd.Series([row.get("benchmark_nav_eur")]), errors="coerce"
+        ).iloc[0]
+        snapshots.append(
+            PaperSnapshot(
+                as_of=pd.Timestamp(row["market_date"]).date(),
+                nav_gross_eur=net + tax,
+                nav_net_eur=net,
+                cash_eur=cash,
+                holdings_eur=max(0.0, net + tax - cash),
+                realized_pnl_ytd_eur=float(row.get("realized_pnl_eur") or 0.0),
+                unrealized_pnl_eur=float(row.get("unrealized_pnl_eur") or 0.0),
+                tax_reserve_eur=tax,
+                liquidation_cost_eur=0.0,
+                costs_cumulative_eur=float(row.get("cumulative_costs_eur") or 0.0),
+                benchmark_nav_eur=(float(benchmark) if pd.notna(benchmark) else None),
+                buy_hold_nav_eur=float(row.get("hold_nav_eur") or 0.0),
+                data_coverage_pct=float(row.get("coverage_pct") or 0.0),
+            )
+        )
+    return snapshots
+
+
+def _paper_pending_orders(runs: pd.DataFrame) -> tuple[PaperOrder, ...]:
+    orders: list[PaperOrder] = []
+    if runs.empty:
+        return ()
+    for value in runs.sort_values(["market_date", "id"]).get(
+        "proposed_actions_json", []
+    ):
+        proposed = _paper_json_value(value, [])
+        if not isinstance(proposed, list):
+            continue
+        for item in proposed:
+            if isinstance(item, dict):
+                order = _paper_order_from_mapping(item)
+                if order is not None:
+                    orders.append(order)
+    return tuple(orders)
+
+
+def _paper_has_strict_signal_this_week(
+    runs: pd.DataFrame,
+    market_date: date,
+) -> bool:
+    """Evita convertir una regla semanal en cinco rotaciones consecutivas."""
+
+    if runs.empty:
+        return False
+    target_week = market_date.isocalendar()[:2]
+    for row in runs.to_dict("records"):
+        try:
+            run_date = pd.Timestamp(row.get("market_date")).date()
+        except (TypeError, ValueError):
+            continue
+        if run_date.isocalendar()[:2] != target_week:
+            continue
+        proposed = _paper_json_value(row.get("proposed_actions_json"), [])
+        if isinstance(proposed, list) and any(
+            isinstance(item, dict) and item.get("scenario") == "strict"
+            for item in proposed
+        ):
+            return True
+    return False
+
+
+def _record_paper_session(
+    journal: object,
+    simulation: dict[str, object],
+    runs: pd.DataFrame,
+    summary: list[dict[str, object]],
+    favorite_tickers: list[str],
+    prepared: dict[str, pd.DataFrame],
+    prices_eur: dict[str, float],
+    bars_eur: dict[str, pd.DataFrame],
+    benchmark_price_eur: float,
+    market_date: date,
+) -> None:
+    assumptions, _ = _paper_assumptions_from_row(simulation)
+    state = _paper_state_from_history(simulation, runs)
+    pending = _paper_pending_orders(runs)
+    fx_rates_to_eur: dict[str, float] = {}
+    for frame in bars_eur.values():
+        if frame is None or frame.empty:
+            continue
+        currency = str(frame.attrs.get("currency") or "").strip().upper()
+        try:
+            rate_to_eur = float(frame.attrs.get("rate_to_eur"))
+        except (TypeError, ValueError):
+            continue
+        if (
+            len(currency) == 3
+            and currency.isalpha()
+            and isfinite(rate_to_eur)
+            and rate_to_eur > 0
+        ):
+            fx_rates_to_eur[currency] = rate_to_eur
+    state, trades = fill_pending_orders(
+        state,
+        pending,
+        bars_eur,
+        fx_rates_to_eur=fx_rates_to_eur,
+        assumptions=assumptions,
+        as_of=market_date,
+        scenario="strict",
+    )
+    state = replace(
+        state,
+        positions=tuple(
+            replace(
+                position,
+                last_price_eur=prices_eur.get(
+                    position.ticker, position.last_price_eur
+                ),
+            )
+            for position in state.positions
+        ),
+    )
+    rotation_dashboard = build_paper_rotation_dashboard(
+        summary,
+        state,
+        favorite_tickers,
+        prepared,
+        assumptions,
+    )
+    orders = _paper_orders_with_known_market_metadata(
+        propose_paper_orders(
+            rotation_dashboard,
+            state,
+            assumptions,
+            as_of=market_date,
+            include_challenger=True,
+            pending_orders=pending,
+        ),
+        bars_eur,
+    )
+    weekly_guardrail = _paper_has_strict_signal_this_week(runs, market_date)
+    if weekly_guardrail:
+        orders = tuple(order for order in orders if order.scenario != "strict")
+    snapshot = mark_to_market(
+        state,
+        prices_eur,
+        benchmark_price_eur,
+        assumptions,
+        as_of=market_date,
+    )
+    warnings: list[str] = []
+    if snapshot.data_coverage_pct < 100:
+        warnings.append(
+            f"Sólo hay precio reciente para {snapshot.data_coverage_pct:.0f}% de las posiciones."
+        )
+    if not any(order.scenario == "strict" for order in orders):
+        warnings.append(
+            "El método estricto mantiene hoy: no hay salto validado o ya se "
+            "utilizó el cupo semanal."
+        )
+    bar_fingerprint = {
+        ticker: {
+            "currency": frame.attrs.get("currency", "EUR"),
+            "last_date": str(frame.index[-1]) if not frame.empty else None,
+            "last_open": (
+                float(pd.to_numeric(frame["open"], errors="coerce").dropna().iloc[-1])
+                if not frame.empty
+                and "open" in frame
+                and not pd.to_numeric(frame["open"], errors="coerce").dropna().empty
+                else None
+            ),
+        }
+        for ticker, frame in bars_eur.items()
+    }
+    digest_payload = {
+        "market_date": market_date.isoformat(),
+        "prices": sorted(prices_eur.items()),
+        "bars": bar_fingerprint,
+        "benchmark_price_eur": benchmark_price_eur,
+        "assumptions": asdict(assumptions),
+        "state_before_snapshot": asdict(state),
+        "pending_orders": [asdict(order) for order in pending],
+        "executed_trades": [asdict(trade) for trade in trades],
+        "orders": [asdict(order) for order in orders],
+        "engine": state.engine_version,
+    }
+    input_hash = sha256(
+        json.dumps(digest_payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    journal.upsert_paper_daily_run(
+        simulation_id=int(simulation["id"]),
+        market_date=market_date,
+        signal_as_of=pd.Timestamp(market_date),
+        input_hash=input_hash,
+        proposed_actions=[asdict(order) for order in orders],
+        executed_actions=[asdict(trade) for trade in trades],
+        positions_after=[asdict(position) for position in state.positions],
+        cash_eur=snapshot.cash_eur,
+        net_nav_eur=snapshot.nav_net_eur,
+        hold_nav_eur=snapshot.buy_hold_nav_eur,
+        benchmark_nav_eur=float(snapshot.benchmark_nav_eur or 0.0),
+        realized_pnl_eur=snapshot.realized_pnl_ytd_eur,
+        unrealized_pnl_eur=snapshot.unrealized_pnl_eur,
+        cumulative_costs_eur=snapshot.costs_cumulative_eur,
+        tax_reserve_eur=snapshot.tax_reserve_eur,
+        coverage_pct=snapshot.data_coverage_pct,
+        warnings=warnings,
+        rejected=([] if orders else ["Sin movimiento que supere los guardarraíles"]),
+        status="complete" if snapshot.data_coverage_pct >= 100 else "partial",
+        engine_version=state.engine_version,
+    )
+
+
+def _render_paper_simulation_lab(
+    user: AuthConfig,
+    journal: object,
+    prepared: dict[str, pd.DataFrame],
+    reference_data: dict[str, pd.DataFrame],
+    summary: list[dict[str, object]],
+    fx_snapshot: FxSnapshot,
+    market_snapshot: pd.DataFrame,
+    favorite_tickers: list[str],
+    *,
+    buy_fee_eur: float,
+    sell_fee_eur: float,
+    spread_pct: float,
+    fx_cost_pct: float,
+    tax_rate_pct: float,
+) -> None:
+    """Laboratorio persistente: propone y mide, pero nunca envía órdenes reales."""
+
+    st.markdown("### Simulación diaria · cartera virtual")
+    st.caption(
+        "El laboratorio copia la cartera cotizada y, al abrir Inicio con datos nuevos, "
+        "registra como máximo una valoración por sesión. Evalúa a diario, pero el "
+        "método estricto sólo puede iniciar un salto por semana. Las señales de T se "
+        "ejecutan desde la primera apertura posterior. Nunca modifica tu cartera ni "
+        "conecta con el bróker."
+    )
+    required = (
+        "create_paper_simulation",
+        "list_paper_simulations",
+        "upsert_paper_daily_run",
+        "list_paper_daily_runs",
+    )
+    if not all(hasattr(journal, method) for method in required):
+        st.info("El almacenamiento del laboratorio aún no está disponible.")
+        return
+
+    try:
+        simulations = journal.list_paper_simulations(status="active")
+    except (JournalStorageError, ValueError, AttributeError) as exc:
+        st.warning(
+            "No se pudo abrir el laboratorio. Aplica la migración de simulación "
+            f"paper en Supabase y vuelve a intentarlo: {exc}"
+        )
+        return
+
+    prices_eur, bars_eur, benchmark_price = _paper_eur_market_data(
+        prepared,
+        reference_data,
+        fx_snapshot,
+        market_snapshot,
+        use_snapshot_fallback=simulations.empty,
+    )
+    market_date = _paper_market_date(prepared, reference_data)
+
+    if simulations.empty:
+        seed_payload, initial_cash = _paper_seed_payload(
+            market_snapshot,
+            prices_eur,
+            summary,
+        )
+        seed_diagnostic = _paper_seed_diagnostics(market_snapshot, seed_payload)
+        missing_seed = list(seed_diagnostic.get("missing") or [])
+        if not seed_payload or market_date is None or benchmark_price is None:
+            st.info(
+                "Para iniciar hacen falta la cartera cotizada, un cierre reciente y "
+                "la referencia SPY convertida a euros. Actualiza precios primero."
+            )
+            return
+        initial_state = seed_paper_portfolio(
+            seed_payload,
+            cash_eur=initial_cash,
+            benchmark_price_eur=benchmark_price,
+            portfolio_id="preview",
+            as_of=market_date,
+        )
+        st.info(
+            f"Semilla preparada: {len(initial_state.positions)} posiciones cotizadas, "
+            f"{initial_state.initial_nav_eur:,.2f} € virtuales, cobertura "
+            f"{float(seed_diagnostic.get('coverage_pct') or 0.0):.0f}% y comparación con SPY."
+        )
+        allow_partial_seed = not missing_seed
+        if missing_seed:
+            st.warning(
+                "No hay un precio verificable para: " + ", ".join(missing_seed) + ". "
+                "Si se inicia así, esas posiciones quedarán fuera de la comparación."
+            )
+            allow_partial_seed = st.checkbox(
+                "Entiendo la exclusión y quiero iniciar una simulación parcial",
+                key="paper_accept_partial_seed",
+            )
+        if st.button(
+            "Iniciar temporada virtual",
+            type="primary",
+            icon=":material/science:",
+            width="stretch",
+            key="paper_start_simulation",
+            disabled=not allow_partial_seed,
+        ):
+            assumptions = PaperAssumptions(
+                buy_fee_eur=max(0.0, buy_fee_eur),
+                sell_fee_eur=max(0.0, sell_fee_eur),
+                spread_pct=max(0.0, spread_pct),
+                slippage_pct=0.10,
+                fx_cost_pct=max(0.0, fx_cost_pct),
+                tax_reserve_rate_pct=max(0.0, tax_rate_pct),
+            )
+            assumptions_payload = {
+                **asdict(assumptions),
+                "benchmark_initial_price_eur": benchmark_price,
+            }
+            initial_positions = [
+                {
+                    "ticker": position.ticker,
+                    "quantity": position.quantity,
+                    "price_eur": position.last_price_eur,
+                    "value_eur": position.market_value_eur,
+                    "cost_basis_eur": position.cost_basis_eur,
+                    "sector": position.sector,
+                    "currency": "EUR",
+                }
+                for position in initial_state.positions
+            ]
+            try:
+                journal.create_paper_simulation(
+                    name=f"Método prudente · {market_date.isoformat()}",
+                    start_date=market_date,
+                    initial_nav_eur=initial_state.initial_nav_eur,
+                    initial_cash_eur=initial_cash,
+                    initial_positions=initial_positions,
+                    assumptions=assumptions_payload,
+                    source_snapshot_date=market_date,
+                    benchmark_ticker="SPY",
+                    strategy_key="weekly_rotation_checked_daily_v1",
+                    engine_version=PAPER_ENGINE_VERSION,
+                    recorded_by=user.username,
+                )
+            except (JournalStorageError, ValueError, AttributeError) as exc:
+                st.error(f"No se pudo iniciar la temporada virtual: {exc}")
+            else:
+                st.rerun()
+        return
+
+    simulation = simulations.sort_values(["start_date", "id"]).iloc[-1].to_dict()
+    try:
+        runs = journal.list_paper_daily_runs(int(simulation["id"]))
+    except (JournalStorageError, ValueError, AttributeError) as exc:
+        st.warning(f"No se pudo leer el historial virtual: {exc}")
+        return
+
+    if market_date is not None and benchmark_price is not None:
+        last_date = (
+            pd.to_datetime(runs["market_date"], errors="coerce").max().date()
+            if not runs.empty
+            else None
+        )
+        if last_date is None or market_date > last_date:
+            try:
+                _record_paper_session(
+                    journal,
+                    simulation,
+                    runs,
+                    summary,
+                    favorite_tickers,
+                    prepared,
+                    prices_eur,
+                    bars_eur,
+                    benchmark_price,
+                    market_date,
+                )
+                runs = journal.list_paper_daily_runs(int(simulation["id"]))
+            except (JournalStorageError, ValueError, AttributeError) as exc:
+                st.warning(f"La sesión virtual no se pudo registrar: {exc}")
+
+    snapshots = _paper_snapshots_from_runs(runs)
+    scorecard = compute_paper_scorecard(snapshots)
+    if not snapshots:
+        st.info("La temporada está creada; falta una sesión de mercado valorable.")
+        return
+    latest = snapshots[-1]
+    metrics = st.columns(4)
+    metrics[0].metric("Virtual neto", f"{latest.nav_net_eur:,.2f} €")
+    metrics[1].metric(
+        "Frente a mantener",
+        "N/D"
+        if scorecard.get("excess_vs_hold_pct") is None
+        else f"{float(scorecard['excess_vs_hold_pct']):+.2f} pp",
+    )
+    metrics[2].metric(
+        "Frente a S&P 500",
+        "N/D"
+        if scorecard.get("excess_vs_benchmark_pct") is None
+        else f"{float(scorecard['excess_vs_benchmark_pct']):+.2f} pp",
+    )
+    metrics[3].metric("Costes acumulados", f"{latest.costs_cumulative_eur:,.2f} €")
+    st.caption(
+        f"{int(scorecard.get('sessions') or 0)} sesiones · cobertura "
+        f"{latest.data_coverage_pct:.0f}% · reserva fiscal estimada "
+        f"{latest.tax_reserve_eur:,.2f} € · drawdown máximo "
+        f"{float(scorecard.get('maximum_drawdown_pct') or 0.0):.2f}%."
+    )
+
+    latest_run = runs.sort_values(["market_date", "id"]).iloc[-1].to_dict()
+    proposed = _paper_json_value(latest_run.get("proposed_actions_json"), [])
+    executed = _paper_json_value(latest_run.get("executed_actions_json"), [])
+    strict = [
+        item for item in proposed if isinstance(item, dict) and item.get("scenario") == "strict"
+    ] if isinstance(proposed, list) else []
+    challenger = [
+        item for item in proposed if isinstance(item, dict) and item.get("scenario") == "challenger"
+    ] if isinstance(proposed, list) else []
+    if strict:
+        st.markdown("**Movimiento que el método pondría a prueba en la próxima apertura**")
+        st.dataframe(
+            pd.DataFrame(strict).rename(
+                columns={
+                    "ticker": "Ticker",
+                    "side": "Acción",
+                    "target_value_eur": "Importe virtual",
+                    "reason": "Motivo",
+                }
+            ).loc[:, ["Acción", "Ticker", "Importe virtual", "Motivo"]],
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Importe virtual": st.column_config.NumberColumn(format="%.2f €")
+            },
+        )
+    else:
+        st.success(
+            "Hoy el método estricto mantiene la cartera. No operar también es una "
+            "decisión y evita convertir ruido diario en comisiones."
+        )
+    if isinstance(executed, list) and executed:
+        st.markdown("**Movimientos virtuales ejecutados hoy**")
+        executed_frame = pd.DataFrame(
+            [item for item in executed if isinstance(item, dict)]
+        )
+        if not executed_frame.empty:
+            costs = pd.Series(0.0, index=executed_frame.index)
+            for column in ("fee_eur", "spread_eur", "slippage_eur", "fx_cost_eur"):
+                if column in executed_frame:
+                    costs = costs.add(
+                        pd.to_numeric(executed_frame[column], errors="coerce").fillna(0.0),
+                        fill_value=0.0,
+                    )
+            executed_frame["Costes"] = costs
+            executed_frame = executed_frame.rename(
+                columns={
+                    "side": "Acción",
+                    "ticker": "Ticker",
+                    "gross_eur": "Importe bruto",
+                    "realized_pnl_eur": "Resultado realizado",
+                    "filled_at": "Ejecución",
+                }
+            )
+            st.dataframe(
+                executed_frame.loc[
+                    :,
+                    [
+                        "Acción",
+                        "Ticker",
+                        "Importe bruto",
+                        "Costes",
+                        "Resultado realizado",
+                        "Ejecución",
+                    ],
+                ],
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "Importe bruto": st.column_config.NumberColumn(format="%.2f €"),
+                    "Costes": st.column_config.NumberColumn(format="%.2f €"),
+                    "Resultado realizado": st.column_config.NumberColumn(format="%+.2f €"),
+                },
+            )
+    if challenger:
+        with st.expander("Hipótesis challenger · se registra, no se ejecuta", expanded=False):
+            st.caption(
+                "Sirve para aprender si una regla algo menos estricta habría mejorado "
+                "el resultado. No altera ni siquiera la cartera virtual principal."
+            )
+            st.dataframe(
+                pd.DataFrame(challenger).rename(
+                    columns={
+                        "ticker": "Ticker",
+                        "side": "Acción",
+                        "target_value_eur": "Importe virtual",
+                        "reason": "Motivo",
+                    }
+                ).loc[:, ["Acción", "Ticker", "Importe virtual", "Motivo"]],
+                hide_index=True,
+                width="stretch",
+            )
+
+    history = pd.DataFrame(
+        {
+            "Fecha": [snapshot.as_of for snapshot in snapshots],
+            "Método neto": [snapshot.nav_net_eur for snapshot in snapshots],
+            "Mantener": [snapshot.buy_hold_nav_eur for snapshot in snapshots],
+            "S&P 500": [snapshot.benchmark_nav_eur for snapshot in snapshots],
+        }
+    ).set_index("Fecha")
+    st.line_chart(history, height=280)
+    st.caption(
+        "Objetivo del laboratorio: comprobar si las reglas mejoran después de costes, "
+        "impuestos estimados y riesgo. No promete beneficios diarios ni sustituye una "
+        "decisión personal de inversión."
+    )
 
 
 def _render_thesis_override(
@@ -7781,6 +8944,7 @@ def render_home(
     journal: object,
     group_journal: object,
     prepared: dict[str, pd.DataFrame],
+    reference_data: dict[str, pd.DataFrame],
     summary: list[dict[str, object]],
     fx_snapshot: FxSnapshot,
     private_favorites: pd.DataFrame,
@@ -7907,10 +9071,11 @@ def render_home(
         private_favorites,
         group_favorites,
     )
+    paper_rotation_tickers = _paper_tracking_tickers(journal)
     summary = _merge_saved_analysis_summary(
         summary,
         journal,
-        [*held_tickers, *favorite_rotation_tickers],
+        [*held_tickers, *paper_rotation_tickers, *favorite_rotation_tickers],
     )
     summary = apply_thesis_invalidations(summary, latest_snapshot)
 
@@ -8080,12 +9245,33 @@ def render_home(
             recovery_hurdles=recovery_hurdles,
             pair_correlations=pair_correlations,
         )
-        _render_rotation_dashboard(rotation_dashboard)
+        candidate_diagnostic = summarize_candidate_eligibility(
+            summary,
+            held_tickers,
+            favorite_rotation_tickers,
+            horizon=rotation_horizon,
+        )
+        _render_rotation_dashboard(rotation_dashboard, candidate_diagnostic)
         _render_thesis_override(
             journal,
             latest_snapshot,
             held_tickers,
             actor_username=user.username,
+        )
+        _render_paper_simulation_lab(
+            user,
+            journal,
+            prepared,
+            reference_data,
+            summary,
+            fx_snapshot,
+            market_snapshot,
+            favorite_rotation_tickers,
+            buy_fee_eur=buy_fee,
+            sell_fee_eur=sell_fee,
+            spread_pct=spread_pct,
+            fx_cost_pct=fx_cost_pct,
+            tax_rate_pct=tax_rate,
         )
         st.caption(
             "Civislend, Segofactoring, efectivo y partidas sin ticker se conservan en "
@@ -12309,6 +13495,9 @@ def main() -> None:
                 )
                 continue
             held_tickers.extend(_portfolio_tracking_tickers(owner_journal))
+        # La cartera del experimento puede divergir de la real con el tiempo.
+        # Sus posiciones siguen entrando en el refresco para no congelar su NAV.
+        held_tickers.extend(_paper_tracking_tickers(journal))
         held_tickers = list(dict.fromkeys(held_tickers))
         daily_favorite_tickers = [
             resolve_analysis_ticker(str(ticker))
@@ -12563,6 +13752,33 @@ def main() -> None:
         if raw_data
         else ({}, [], {}, {}, {}, {}, {})
     )
+    snapshot_batch_tickers = (
+        review_universe
+        if automatic_review_page and favorites_reviewed and growth_scan_tickers
+        else growth_scan_tickers
+    )
+    if snapshot_batch_tickers and prepared:
+        try:
+            batch_snapshot_result = persist_analysis_batch_snapshots(
+                journal,
+                snapshot_batch_tickers,
+                prepared,
+                fundamental_results,
+                valuation_results,
+                relative_results,
+                risk_results,
+                opportunity_results,
+                strategy,
+            )
+        except (JournalStorageError, AttributeError, ValueError) as exc:
+            st.session_state["_analysis_snapshot_batch_error"] = str(exc)
+        else:
+            st.session_state["_analysis_snapshot_batch_result"] = {
+                "saved": batch_snapshot_result.saved_count,
+                "existing": len(batch_snapshot_result.existing_tickers),
+                "failed": len(batch_snapshot_result.failures),
+            }
+            st.session_state.pop("_analysis_snapshot_batch_error", None)
     requested_focus_value = str(
         st.session_state.get("_requested_analysis_ticker", "")
     ).strip()
@@ -12587,6 +13803,7 @@ def main() -> None:
             journal,
             group_journal,
             prepared,
+            reference_data,
             summary,
             fx_snapshot,
             private_favorites,
