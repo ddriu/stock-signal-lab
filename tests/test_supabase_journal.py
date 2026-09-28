@@ -472,6 +472,7 @@ def test_supabase_analysis_history_uses_owner_and_separate_table(monkeypatch) ->
         analyzed_at="2026-07-29",
         price=151.5,
         opportunity_score=78,
+        confidence_pct=84,
         company_score=90,
         entry_score=64,
         valuation_score=55,
@@ -487,6 +488,7 @@ def test_supabase_analysis_history_uses_owner_and_separate_table(monkeypatch) ->
     assert history.iloc[0]["ticker"] == "TSM"
     assert all(call["url"].endswith("/rest/v1/analysis_snapshots") for call in calls)
     assert calls[0]["json"]["owner"] == "ddriu"
+    assert calls[0]["json"]["confidence_pct"] == 84
     assert calls[1]["params"]["owner"] == "eq.ddriu"
     assert calls[1]["params"]["ticker"] == "eq.TSM"
     assert calls[2]["params"] == {"id": "eq.12", "owner": "eq.ddriu"}

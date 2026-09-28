@@ -304,6 +304,7 @@ def test_analysis_snapshots_are_private_lightweight_history(tmp_path) -> None:
         analyzed_at="2026-07-29",
         price=151.5,
         opportunity_score=78,
+        confidence_pct=84,
         company_score=90,
         entry_score=64,
         valuation_score=55,
@@ -325,6 +326,7 @@ def test_analysis_snapshots_are_private_lightweight_history(tmp_path) -> None:
     assert snapshots.iloc[0]["id"] == snapshot_id
     assert snapshots.iloc[0]["ticker"] == "TSM"
     assert snapshots.iloc[0]["entry_score"] == 64
+    assert snapshots.iloc[0]["confidence_pct"] == 84
     assert snapshots.iloc[0]["note"] == "Revisar después de resultados."
 
     journal.delete_analysis_snapshot(snapshot_id)
