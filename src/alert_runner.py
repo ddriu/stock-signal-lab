@@ -550,6 +550,9 @@ def run_daily_alerts(
                                 analyzed_at=signal.as_of,
                                 price=price,
                                 opportunity_score=enhanced.opportunity_score,
+                                confidence_pct=getattr(
+                                    enhanced, "confidence_pct", None
+                                ),
                                 company_score=(
                                     fundamental.score
                                     if fundamental is not None

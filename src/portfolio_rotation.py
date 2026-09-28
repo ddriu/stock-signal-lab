@@ -28,6 +28,21 @@ ROTATION_COLORS: dict[str, dict[str, str]] = {
 }
 
 
+CANDIDATE_REJECTION_LABELS: dict[str, str] = {
+    "missing_summary": "Sin análisis comparable",
+    "stale": "Análisis antiguo",
+    "missing_quality_or_risk": "Faltan calidad empresarial o riesgo",
+    "missing_factor": "Falta algún factor del horizonte",
+    "invalid_entry": "La lectura técnica todavía no habilita una entrada",
+    "score_below": "El score del horizonte no alcanza el mínimo",
+    "confidence_below": "La confianza no alcanza el mínimo",
+    "quality_below": "La calidad empresarial no alcanza 55",
+    "risk_below": "El control de riesgo no alcanza 50",
+}
+
+_CANDIDATE_REASON_ORDER = tuple(CANDIDATE_REJECTION_LABELS)
+
+
 @dataclass(frozen=True)
 class HorizonPolicy:
     label: str
@@ -414,21 +429,76 @@ def _candidate_color(
     score: Mapping[str, object],
     policy: HorizonPolicy,
 ) -> tuple[str, str]:
+    color, action, _, _ = _candidate_assessment(source, score, policy)
+    return color, action
+
+
+def _candidate_assessment(
+    source: Mapping[str, object],
+    score: Mapping[str, object],
+    policy: HorizonPolicy,
+) -> tuple[str, str, tuple[str, ...], str | None]:
+    """Evalúa una candidata y explica sus bloqueos sin cambiar los umbrales.
+
+    El color y el texto conservan exactamente la semántica usada por el mapa.
+    Los motivos adicionales permiten construir un embudo global antes de truncar
+    la tabla visible de candidatas.
+    """
+
     entry = str(source.get("Lectura entrada") or "")
     effective = _number(score.get("Score horizonte"))
     confidence = _number(score.get("Confianza")) or 0.0
     quality = _number(source.get("Calidad empresa"))
     risk = _number(source.get("Riesgo controlado"))
     entry_is_valid = entry in {"Entrada fuerte", "Entrada interesante", "Entrada candidata"}
-    if bool(score.get("Datos antiguos")) or effective is None:
-        return "Gris", "Actualizar datos antes de considerar una entrada"
-    if quality is None or risk is None:
-        return "Gris", "Completar calidad y riesgo antes de considerar una entrada"
     missing_factors = [
         factor for factor in policy.weights if _number(source.get(factor)) is None
     ]
+
+    if bool(score.get("Datos antiguos")):
+        return (
+            "Gris",
+            "Actualizar datos antes de considerar una entrada",
+            ("stale",),
+            "stale",
+        )
+    if effective is None:
+        return (
+            "Gris",
+            "Actualizar datos antes de considerar una entrada",
+            ("missing_factor",),
+            "missing_factor",
+        )
+    if quality is None or risk is None:
+        return (
+            "Gris",
+            "Completar calidad y riesgo antes de considerar una entrada",
+            ("missing_quality_or_risk",),
+            "missing_quality_or_risk",
+        )
     if missing_factors:
-        return "Gris", "Completar todos los factores del horizonte antes de entrar"
+        return (
+            "Gris",
+            "Completar todos los factores del horizonte antes de entrar",
+            ("missing_factor",),
+            "missing_factor",
+        )
+
+    reasons: list[str] = []
+    if not entry_is_valid:
+        reasons.append("invalid_entry")
+    if effective < policy.candidate_score:
+        reasons.append("score_below")
+    if confidence < policy.minimum_confidence:
+        reasons.append("confidence_below")
+    if quality < 55:
+        reasons.append("quality_below")
+    if risk < 50:
+        reasons.append("risk_below")
+
+    # Mantener el mismo orden hace estable tanto la causa principal como los
+    # contadores de pruebas y evita que un set o un diccionario decidan la UI.
+    reasons = [reason for reason in _CANDIDATE_REASON_ORDER if reason in reasons]
     if (
         entry_is_valid
         and effective >= policy.candidate_score
@@ -436,8 +506,193 @@ def _candidate_color(
         and quality >= 55
         and risk >= 50
     ):
-        return "Azul", "Favorita que puede recibir capital; falta validar precio y tamaño"
-    return "Amarillo", "Favorita en vigilancia; todavía no cumple todos los filtros"
+        return (
+            "Azul",
+            "Favorita que puede recibir capital; falta validar precio y tamaño",
+            (),
+            None,
+        )
+    primary = next((reason for reason in _CANDIDATE_REASON_ORDER if reason in reasons), None)
+    return (
+        "Amarillo",
+        "Favorita en vigilancia; todavía no cumple todos los filtros",
+        tuple(reasons),
+        primary,
+    )
+
+
+def summarize_candidate_eligibility(
+    live_summary: Iterable[Mapping[str, object]],
+    held_tickers: Iterable[object],
+    favorite_tickers: Iterable[object],
+    *,
+    horizon: str = "Mensual",
+    today: date | None = None,
+    sample_limit: int = 10,
+    near_miss_limit: int = 10,
+) -> dict[str, object]:
+    """Resume por qué las favoritas llegan, o no, al estado azul.
+
+    El diagnóstico se calcula sobre *todas* las favoritas fuera de cartera, no
+    sobre las filas limitadas que se muestran en el dashboard. ``rejection_counts``
+    es multietiqueta (una empresa puede fallar varios controles), mientras que
+    ``primary_rejection_counts`` asigna cada empresa no azul a una sola causa.
+    Un ``near_miss`` dispone de datos completos y falla un único control de
+    entrada; nunca se convierte en azul por esta clasificación.
+    """
+
+    if horizon not in HORIZON_POLICIES:
+        raise ValueError(f"Horizonte no reconocido: {horizon}")
+    if sample_limit < 0 or near_miss_limit < 0:
+        raise ValueError("Los límites del diagnóstico no pueden ser negativos.")
+
+    policy = HORIZON_POLICIES[horizon]
+    summary = {
+        ticker: dict(row)
+        for row in live_summary
+        if (ticker := _ticker(row.get("Ticker")))
+    }
+    held = {_ticker(value) for value in held_tickers if _ticker(value)}
+    favorites = {_ticker(value) for value in favorite_tickers if _ticker(value)}
+    candidates = sorted(favorites.difference(held))
+    held_excluded = len(favorites.intersection(held))
+
+    rejection_counts = {reason: 0 for reason in _CANDIDATE_REASON_ORDER}
+    primary_rejection_counts = {reason: 0 for reason in _CANDIDATE_REASON_ORDER}
+    color_counts = {"Azul": 0, "Amarillo": 0, "Gris": 0}
+    analyzed = 0
+    fresh = 0
+    complete = 0
+    rejections: list[dict[str, object]] = []
+    near_misses: list[dict[str, object]] = []
+
+    for ticker in candidates:
+        source = summary.get(ticker)
+        if source is None:
+            score: dict[str, object] = {
+                "Score horizonte": None,
+                "Confianza": 0.0,
+                "Cobertura": 0.0,
+                "Fecha": None,
+                "Datos antiguos": True,
+            }
+            color = "Gris"
+            reasons = ("missing_summary",)
+            primary = "missing_summary"
+        else:
+            analyzed += 1
+            score = horizon_score(source, horizon, today=today)
+            is_fresh = not bool(score.get("Datos antiguos"))
+            if is_fresh:
+                fresh += 1
+            # ``complete`` es una etapa del embudo, no un atributo aislado:
+            # sólo puede contar análisis vigentes que además cubren el 100 % de
+            # los factores. Así se conserva analyzed >= fresh >= complete >= blue.
+            if is_fresh and (_number(score.get("Cobertura")) or 0.0) >= 100.0:
+                complete += 1
+            color, _, reasons, primary = _candidate_assessment(source, score, policy)
+
+        color_counts[color] = color_counts.get(color, 0) + 1
+        if color == "Azul":
+            continue
+        for reason in reasons:
+            rejection_counts[reason] += 1
+        if primary is not None:
+            primary_rejection_counts[primary] += 1
+
+        diagnostic = {
+            "ticker": ticker,
+            "color": color,
+            "primary_reason": primary,
+            "primary_reason_label": CANDIDATE_REJECTION_LABELS.get(
+                str(primary), str(primary or "")
+            ),
+            "reasons": list(reasons),
+            "score": score.get("Score horizonte"),
+            "confidence": score.get("Confianza"),
+            "coverage": score.get("Cobertura"),
+            "date": score.get("Fecha"),
+        }
+        rejections.append(diagnostic)
+
+        data_blockers = {
+            "missing_summary",
+            "stale",
+            "missing_quality_or_risk",
+            "missing_factor",
+        }
+        if len(reasons) == 1 and not data_blockers.intersection(reasons):
+            reason = reasons[0]
+            source_values = source or {}
+            gaps: dict[str, float] = {}
+            if reason == "score_below":
+                value = _number(score.get("Score horizonte"))
+                if value is not None:
+                    gaps[reason] = max(0.0, policy.candidate_score - value)
+            elif reason == "confidence_below":
+                value = _number(score.get("Confianza"))
+                if value is not None:
+                    gaps[reason] = max(0.0, policy.minimum_confidence - value)
+            elif reason == "quality_below":
+                value = _number(source_values.get("Calidad empresa"))
+                if value is not None:
+                    gaps[reason] = max(0.0, 55.0 - value)
+            elif reason == "risk_below":
+                value = _number(source_values.get("Riesgo controlado"))
+                if value is not None:
+                    gaps[reason] = max(0.0, 50.0 - value)
+            near_misses.append({**diagnostic, "gaps": gaps})
+
+    reason_rank = {reason: index for index, reason in enumerate(_CANDIDATE_REASON_ORDER)}
+    rejections.sort(
+        key=lambda row: (
+            reason_rank.get(str(row.get("primary_reason")), 99),
+            -float(row.get("score") or -1.0),
+            str(row.get("ticker") or ""),
+        )
+    )
+    near_misses.sort(
+        key=lambda row: (
+            sum(float(value) for value in dict(row.get("gaps") or {}).values()),
+            -float(row.get("score") or -1.0),
+            str(row.get("ticker") or ""),
+        )
+    )
+
+    primary_cause = max(
+        _CANDIDATE_REASON_ORDER,
+        key=lambda reason: (
+            primary_rejection_counts[reason],
+            -reason_rank[reason],
+        ),
+        default=None,
+    )
+    if primary_cause is not None and primary_rejection_counts[primary_cause] == 0:
+        primary_cause = None
+
+    return {
+        "horizon": horizon,
+        "total_favorites": len(favorites),
+        "held_excluded": held_excluded,
+        "candidate_total": len(candidates),
+        "candidates": len(candidates),
+        "analyzed": analyzed,
+        "fresh": fresh,
+        "complete": complete,
+        "blue": color_counts.get("Azul", 0),
+        "yellow": color_counts.get("Amarillo", 0),
+        "gray": color_counts.get("Gris", 0),
+        "primary_cause": primary_cause,
+        "primary_cause_label": (
+            CANDIDATE_REJECTION_LABELS[primary_cause]
+            if primary_cause is not None
+            else ""
+        ),
+        "rejection_counts": rejection_counts,
+        "primary_rejection_counts": primary_rejection_counts,
+        "near_misses": near_misses[:near_miss_limit],
+        "sample_rejections": rejections[:sample_limit],
+    }
 
 
 def _switch_label(

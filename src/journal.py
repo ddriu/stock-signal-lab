@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import math
 import sqlite3
 import os
 import sys
-from datetime import date, datetime
+from collections.abc import Mapping, Sequence
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -53,6 +56,7 @@ ANALYSIS_SNAPSHOT_COLUMNS = [
     "analyzed_at",
     "price",
     "opportunity_score",
+    "confidence_pct",
     "company_score",
     "entry_score",
     "valuation_score",
@@ -123,6 +127,62 @@ PORTFOLIO_SNAPSHOT_COLUMNS = [
     "created_at",
     "updated_at",
 ]
+PAPER_SIMULATION_COLUMNS = [
+    "id",
+    "name",
+    "status",
+    "base_currency",
+    "benchmark_ticker",
+    "strategy_key",
+    "engine_version",
+    "start_date",
+    "initial_nav_eur",
+    "initial_cash_eur",
+    "source_snapshot_date",
+    "assumptions_json",
+    "initial_positions_json",
+    "recorded_by",
+    "created_at",
+    "updated_at",
+]
+PAPER_DAILY_RUN_COLUMNS = [
+    "id",
+    "simulation_id",
+    "market_date",
+    "signal_as_of",
+    "input_hash",
+    "status",
+    "proposed_actions_json",
+    "executed_actions_json",
+    "positions_after_json",
+    "cash_eur",
+    "net_nav_eur",
+    "hold_nav_eur",
+    "benchmark_nav_eur",
+    "realized_pnl_eur",
+    "unrealized_pnl_eur",
+    "cumulative_costs_eur",
+    "tax_reserve_eur",
+    "coverage_pct",
+    "warnings_json",
+    "rejected_json",
+    "engine_version",
+    "created_at",
+    "updated_at",
+]
+PAPER_SIMULATION_STATUSES = ("active", "paused", "archived")
+PAPER_DAILY_RUN_STATUSES = ("complete", "partial", "failed")
+PAPER_SIMULATION_JSON_COLUMNS = (
+    "assumptions_json",
+    "initial_positions_json",
+)
+PAPER_DAILY_RUN_JSON_COLUMNS = (
+    "proposed_actions_json",
+    "executed_actions_json",
+    "positions_after_json",
+    "warnings_json",
+    "rejected_json",
+)
 DEFAULT_DDRIU_ACCOUNTS = (
     ("MyInvestor", "Bróker"),
     ("Trade Republic", "Bróker"),
@@ -148,6 +208,246 @@ def default_database_path() -> Path:
 
 
 DEFAULT_DATABASE = default_database_path()
+
+
+def _paper_json_default(value: object) -> object:
+    """Convierte sólo tipos escalares reproducibles para el diario paper."""
+
+    if isinstance(value, (date, datetime, pd.Timestamp)):
+        return pd.Timestamp(value).isoformat()
+    item = getattr(value, "item", None)
+    if callable(item):
+        return item()
+    raise TypeError(f"{type(value).__name__} no se puede guardar como JSON paper.")
+
+
+def serialize_stable_json(
+    value: object,
+    *,
+    expected: str,
+) -> str:
+    """Serializa JSON de forma canónica para hashes, SQLite y Supabase.
+
+    También acepta una cadena JSON ya serializada, pero la vuelve a codificar
+    para eliminar diferencias de espacios u orden de claves.
+    """
+
+    if expected not in {"object", "array"}:
+        raise ValueError("El tipo JSON esperado debe ser object o array.")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        parsed: object = {} if expected == "object" else []
+    elif isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("El contenido paper no es JSON válido.") from exc
+    else:
+        parsed = value
+
+    if expected == "object":
+        if not isinstance(parsed, Mapping):
+            raise ValueError("El contenido paper debe ser un objeto JSON.")
+        normalized: object = dict(parsed)
+    else:
+        if isinstance(parsed, (str, bytes)) or not isinstance(parsed, Sequence):
+            raise ValueError("El contenido paper debe ser una lista JSON.")
+        normalized = list(parsed)
+    try:
+        return json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+            default=_paper_json_default,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("El contenido paper no se puede serializar de forma estable.") from exc
+
+
+def _paper_date(value: date | datetime | str, label: str) -> str:
+    try:
+        parsed = pd.Timestamp(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"La {label} paper no es válida.") from exc
+    if pd.isna(parsed):
+        raise ValueError(f"La {label} paper no es válida.")
+    return parsed.date().isoformat()
+
+
+def _paper_datetime(value: date | datetime | str | None, label: str) -> str | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = pd.Timestamp(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"La {label} paper no es válida.") from exc
+    if pd.isna(parsed):
+        raise ValueError(f"La {label} paper no es válida.")
+    return parsed.isoformat()
+
+
+def _paper_number(
+    value: object,
+    label: str,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"El valor paper de {label} no es válido.") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"El valor paper de {label} debe ser finito.")
+    if minimum is not None and parsed < minimum:
+        raise ValueError(f"El valor paper de {label} no puede ser menor que {minimum}.")
+    if maximum is not None and parsed > maximum:
+        raise ValueError(f"El valor paper de {label} no puede superar {maximum}.")
+    return parsed
+
+
+def normalize_paper_simulation(
+    *,
+    name: str,
+    start_date: date | datetime | str,
+    initial_nav_eur: float,
+    initial_positions: object,
+    assumptions: object | None = None,
+    initial_cash_eur: float = 0.0,
+    source_snapshot_date: date | datetime | str | None = None,
+    status: str = "active",
+    base_currency: str = "EUR",
+    benchmark_ticker: str = "SPY",
+    strategy_key: str = "strict_rotation_v1",
+    engine_version: str = "paper-v1",
+) -> dict[str, object]:
+    """Valida la cabecera inmutable de una simulación aislada."""
+
+    normalized_name = str(name or "").strip()[:160]
+    if not normalized_name:
+        raise ValueError("La simulación paper necesita un nombre.")
+    normalized_status = str(status or "").strip().lower()
+    if normalized_status not in PAPER_SIMULATION_STATUSES:
+        raise ValueError("El estado de la simulación paper no es válido.")
+    currency = str(base_currency or "").strip().upper()
+    if len(currency) != 3:
+        raise ValueError("La moneda base paper debe tener tres letras.")
+    benchmark = str(benchmark_ticker or "").strip().upper()
+    strategy = str(strategy_key or "").strip()[:120]
+    version = str(engine_version or "").strip()[:120]
+    if not benchmark or not strategy or not version:
+        raise ValueError("Benchmark, estrategia y versión paper son obligatorios.")
+    nav = _paper_number(initial_nav_eur, "NAV inicial", minimum=0.0000001)
+    cash = _paper_number(initial_cash_eur, "efectivo inicial", minimum=0.0)
+    if cash > nav + 1e-9:
+        raise ValueError("El efectivo inicial no puede superar el NAV inicial.")
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return {
+        "name": normalized_name,
+        "status": normalized_status,
+        "base_currency": currency,
+        "benchmark_ticker": benchmark,
+        "strategy_key": strategy,
+        "engine_version": version,
+        "start_date": _paper_date(start_date, "fecha inicial"),
+        "initial_nav_eur": nav,
+        "initial_cash_eur": cash,
+        "source_snapshot_date": (
+            _paper_date(source_snapshot_date, "fecha de fotografía")
+            if source_snapshot_date not in {None, ""}
+            else None
+        ),
+        "assumptions_json": serialize_stable_json(
+            assumptions, expected="object"
+        ),
+        "initial_positions_json": serialize_stable_json(
+            initial_positions, expected="array"
+        ),
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def normalize_paper_daily_run(
+    *,
+    simulation_id: int,
+    market_date: date | datetime | str,
+    signal_as_of: date | datetime | str | None,
+    input_hash: str,
+    positions_after: object,
+    proposed_actions: object | None = None,
+    executed_actions: object | None = None,
+    warnings: object | None = None,
+    rejected: object | None = None,
+    cash_eur: float,
+    net_nav_eur: float,
+    hold_nav_eur: float,
+    benchmark_nav_eur: float,
+    realized_pnl_eur: float = 0.0,
+    unrealized_pnl_eur: float = 0.0,
+    cumulative_costs_eur: float = 0.0,
+    tax_reserve_eur: float = 0.0,
+    coverage_pct: float = 0.0,
+    status: str = "complete",
+    engine_version: str = "paper-v1",
+) -> dict[str, object]:
+    """Valida una fotografía diaria paper, idempotente por sesión y fecha."""
+
+    try:
+        normalized_simulation_id = int(simulation_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("La ejecución paper necesita una simulación válida.") from exc
+    if normalized_simulation_id <= 0:
+        raise ValueError("La ejecución paper necesita una simulación válida.")
+    normalized_hash = str(input_hash or "").strip()[:256]
+    version = str(engine_version or "").strip()[:120]
+    normalized_status = str(status or "").strip().lower()
+    if not normalized_hash or not version:
+        raise ValueError("El hash de entrada y la versión paper son obligatorios.")
+    if normalized_status not in PAPER_DAILY_RUN_STATUSES:
+        raise ValueError("El estado de la ejecución paper no es válido.")
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return {
+        "simulation_id": normalized_simulation_id,
+        "market_date": _paper_date(market_date, "fecha de mercado"),
+        "signal_as_of": _paper_datetime(signal_as_of, "fecha de señal"),
+        "input_hash": normalized_hash,
+        "status": normalized_status,
+        "proposed_actions_json": serialize_stable_json(
+            proposed_actions, expected="array"
+        ),
+        "executed_actions_json": serialize_stable_json(
+            executed_actions, expected="array"
+        ),
+        "positions_after_json": serialize_stable_json(
+            positions_after, expected="array"
+        ),
+        "cash_eur": _paper_number(cash_eur, "efectivo", minimum=0.0),
+        "net_nav_eur": _paper_number(net_nav_eur, "NAV neto", minimum=0.0),
+        "hold_nav_eur": _paper_number(hold_nav_eur, "NAV mantener", minimum=0.0),
+        "benchmark_nav_eur": _paper_number(
+            benchmark_nav_eur, "NAV del benchmark", minimum=0.0
+        ),
+        "realized_pnl_eur": _paper_number(realized_pnl_eur, "resultado realizado"),
+        "unrealized_pnl_eur": _paper_number(
+            unrealized_pnl_eur, "resultado latente"
+        ),
+        "cumulative_costs_eur": _paper_number(
+            cumulative_costs_eur, "costes acumulados", minimum=0.0
+        ),
+        "tax_reserve_eur": _paper_number(
+            tax_reserve_eur, "reserva fiscal", minimum=0.0
+        ),
+        "coverage_pct": _paper_number(
+            coverage_pct, "cobertura", minimum=0.0, maximum=100.0
+        ),
+        "warnings_json": serialize_stable_json(warnings, expected="array"),
+        "rejected_json": serialize_stable_json(rejected, expected="array"),
+        "engine_version": version,
+        "created_at": now,
+        "updated_at": now,
+    }
 
 
 def normalize_operation(
@@ -258,6 +558,7 @@ def normalize_analysis_snapshot(
     analyzed_at: date | datetime | str,
     price: float,
     opportunity_score: int,
+    confidence_pct: int | float | None = None,
     company_score: int | None,
     entry_score: int,
     valuation_score: int | None,
@@ -309,6 +610,10 @@ def normalize_analysis_snapshot(
         "analyzed_at": pd.Timestamp(analyzed_at).isoformat(),
         "price": float(price),
         "opportunity_score": checked_score(opportunity_score, "oportunidad"),
+        "confidence_pct": checked_score(
+            int(round(float(confidence_pct))) if confidence_pct is not None else None,
+            "confianza",
+        ),
         "company_score": checked_score(company_score, "empresa"),
         "entry_score": checked_score(entry_score, "entrada"),
         "valuation_score": checked_score(valuation_score, "valoración"),
@@ -652,6 +957,7 @@ class TradingJournal:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
     def _initialize(self) -> None:
@@ -729,6 +1035,8 @@ class TradingJournal:
                     price REAL NOT NULL CHECK (price > 0),
                     opportunity_score INTEGER NOT NULL
                         CHECK (opportunity_score BETWEEN 0 AND 100),
+                    confidence_pct INTEGER
+                        CHECK (confidence_pct BETWEEN 0 AND 100),
                     company_score INTEGER,
                     entry_score INTEGER NOT NULL
                         CHECK (entry_score BETWEEN 0 AND 100),
@@ -749,6 +1057,17 @@ class TradingJournal:
                 )
                 """
             )
+            analysis_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(analysis_snapshots)"
+                ).fetchall()
+            }
+            if "confidence_pct" not in analysis_columns:
+                connection.execute(
+                    "ALTER TABLE analysis_snapshots ADD COLUMN confidence_pct INTEGER "
+                    "CHECK (confidence_pct BETWEEN 0 AND 100)"
+                )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS analysis_snapshots_ticker_date_idx
@@ -884,6 +1203,268 @@ class TradingJournal:
                 CREATE INDEX IF NOT EXISTS portfolio_snapshots_date_platform_idx
                 ON portfolio_snapshots (snapshot_date DESC, platform, asset_name)
                 """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paper_simulations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active'
+                        CHECK (status IN ('active', 'paused', 'archived')),
+                    base_currency TEXT NOT NULL DEFAULT 'EUR'
+                        CHECK (length(base_currency) = 3),
+                    benchmark_ticker TEXT NOT NULL DEFAULT 'SPY',
+                    strategy_key TEXT NOT NULL,
+                    engine_version TEXT NOT NULL,
+                    start_date TEXT NOT NULL,
+                    initial_nav_eur REAL NOT NULL CHECK (initial_nav_eur > 0),
+                    initial_cash_eur REAL NOT NULL DEFAULT 0
+                        CHECK (initial_cash_eur >= 0),
+                    source_snapshot_date TEXT,
+                    assumptions_json TEXT NOT NULL DEFAULT '{}',
+                    initial_positions_json TEXT NOT NULL DEFAULT '[]',
+                    recorded_by TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    CHECK (initial_cash_eur <= initial_nav_eur),
+                    UNIQUE (owner, id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS paper_simulations_status_date_idx
+                ON paper_simulations (owner, status, start_date DESC, id DESC)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paper_daily_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner TEXT NOT NULL,
+                    simulation_id INTEGER NOT NULL,
+                    market_date TEXT NOT NULL,
+                    signal_as_of TEXT,
+                    input_hash TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'complete'
+                        CHECK (status IN ('complete', 'partial', 'failed')),
+                    proposed_actions_json TEXT NOT NULL DEFAULT '[]',
+                    executed_actions_json TEXT NOT NULL DEFAULT '[]',
+                    positions_after_json TEXT NOT NULL DEFAULT '[]',
+                    cash_eur REAL NOT NULL CHECK (cash_eur >= 0),
+                    net_nav_eur REAL NOT NULL CHECK (net_nav_eur >= 0),
+                    hold_nav_eur REAL NOT NULL CHECK (hold_nav_eur >= 0),
+                    benchmark_nav_eur REAL NOT NULL CHECK (benchmark_nav_eur >= 0),
+                    realized_pnl_eur REAL NOT NULL DEFAULT 0,
+                    unrealized_pnl_eur REAL NOT NULL DEFAULT 0,
+                    cumulative_costs_eur REAL NOT NULL DEFAULT 0
+                        CHECK (cumulative_costs_eur >= 0),
+                    tax_reserve_eur REAL NOT NULL DEFAULT 0
+                        CHECK (tax_reserve_eur >= 0),
+                    coverage_pct REAL NOT NULL DEFAULT 0
+                        CHECK (coverage_pct >= 0 AND coverage_pct <= 100),
+                    warnings_json TEXT NOT NULL DEFAULT '[]',
+                    rejected_json TEXT NOT NULL DEFAULT '[]',
+                    engine_version TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (owner, simulation_id)
+                        REFERENCES paper_simulations(owner, id)
+                        ON DELETE CASCADE,
+                    UNIQUE (owner, simulation_id, market_date)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS paper_daily_runs_simulation_date_idx
+                ON paper_daily_runs (owner, simulation_id, market_date DESC, id DESC)
+                """
+            )
+
+    def create_paper_simulation(
+        self,
+        *,
+        name: str,
+        start_date: date | datetime | str,
+        initial_nav_eur: float,
+        initial_positions: object,
+        assumptions: object | None = None,
+        initial_cash_eur: float = 0.0,
+        source_snapshot_date: date | datetime | str | None = None,
+        status: str = "active",
+        base_currency: str = "EUR",
+        benchmark_ticker: str = "SPY",
+        strategy_key: str = "strict_rotation_v1",
+        engine_version: str = "paper-v1",
+        recorded_by: str = "",
+    ) -> int:
+        """Crea una temporada paper sin modificar la cartera ni sus operaciones."""
+
+        simulation = normalize_paper_simulation(
+            name=name,
+            start_date=start_date,
+            initial_nav_eur=initial_nav_eur,
+            initial_positions=initial_positions,
+            assumptions=assumptions,
+            initial_cash_eur=initial_cash_eur,
+            source_snapshot_date=source_snapshot_date,
+            status=status,
+            base_currency=base_currency,
+            benchmark_ticker=benchmark_ticker,
+            strategy_key=strategy_key,
+            engine_version=engine_version,
+        )
+        values = {
+            "owner": self.owner,
+            **simulation,
+            "recorded_by": recorded_by.strip().lower(),
+        }
+        columns = [
+            "owner",
+            *(column for column in PAPER_SIMULATION_COLUMNS if column != "id"),
+        ]
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"""
+                INSERT INTO paper_simulations ({', '.join(columns)})
+                VALUES ({', '.join('?' for _ in columns)})
+                """,
+                tuple(values[column] for column in columns),
+            )
+            return int(cursor.lastrowid)
+
+    def list_paper_simulations(self, status: str | None = None) -> pd.DataFrame:
+        """Lista sólo las simulaciones del diario local de este usuario."""
+
+        where = " WHERE owner = ?"
+        parameters: tuple[object, ...] = (self.owner,)
+        if status is not None:
+            normalized_status = str(status).strip().lower()
+            if normalized_status not in PAPER_SIMULATION_STATUSES:
+                raise ValueError("El estado de la simulación paper no es válido.")
+            where += " AND status = ?"
+            parameters = (self.owner, normalized_status)
+        with self._connect() as connection:
+            return pd.read_sql_query(
+                f"""
+                SELECT {', '.join(PAPER_SIMULATION_COLUMNS)}
+                FROM paper_simulations{where}
+                ORDER BY start_date DESC, id DESC
+                """,
+                connection,
+                params=parameters,
+            )
+
+    def upsert_paper_daily_run(
+        self,
+        *,
+        simulation_id: int,
+        market_date: date | datetime | str,
+        signal_as_of: date | datetime | str | None,
+        input_hash: str,
+        positions_after: object,
+        proposed_actions: object | None = None,
+        executed_actions: object | None = None,
+        warnings: object | None = None,
+        rejected: object | None = None,
+        cash_eur: float,
+        net_nav_eur: float,
+        hold_nav_eur: float,
+        benchmark_nav_eur: float,
+        realized_pnl_eur: float = 0.0,
+        unrealized_pnl_eur: float = 0.0,
+        cumulative_costs_eur: float = 0.0,
+        tax_reserve_eur: float = 0.0,
+        coverage_pct: float = 0.0,
+        status: str = "complete",
+        engine_version: str = "paper-v1",
+    ) -> int:
+        """Inserta o reemplaza el único cierre paper de una sesión y fecha."""
+
+        run = normalize_paper_daily_run(
+            simulation_id=simulation_id,
+            market_date=market_date,
+            signal_as_of=signal_as_of,
+            input_hash=input_hash,
+            positions_after=positions_after,
+            proposed_actions=proposed_actions,
+            executed_actions=executed_actions,
+            warnings=warnings,
+            rejected=rejected,
+            cash_eur=cash_eur,
+            net_nav_eur=net_nav_eur,
+            hold_nav_eur=hold_nav_eur,
+            benchmark_nav_eur=benchmark_nav_eur,
+            realized_pnl_eur=realized_pnl_eur,
+            unrealized_pnl_eur=unrealized_pnl_eur,
+            cumulative_costs_eur=cumulative_costs_eur,
+            tax_reserve_eur=tax_reserve_eur,
+            coverage_pct=coverage_pct,
+            status=status,
+            engine_version=engine_version,
+        )
+        values = {"owner": self.owner, **run}
+        columns = [
+            "owner",
+            *(column for column in PAPER_DAILY_RUN_COLUMNS if column != "id"),
+        ]
+        mutable_columns = [
+            column
+            for column in columns
+            if column not in {"owner", "simulation_id", "market_date", "created_at"}
+        ]
+        with self._connect() as connection:
+            simulation = connection.execute(
+                "SELECT id FROM paper_simulations WHERE owner = ? AND id = ?",
+                (self.owner, int(run["simulation_id"])),
+            ).fetchone()
+            if simulation is None:
+                raise ValueError("La simulación paper indicada no existe.")
+            connection.execute(
+                f"""
+                INSERT INTO paper_daily_runs ({', '.join(columns)})
+                VALUES ({', '.join('?' for _ in columns)})
+                ON CONFLICT(owner, simulation_id, market_date) DO UPDATE SET
+                    {', '.join(f'{column} = excluded.{column}' for column in mutable_columns)}
+                """,
+                tuple(values[column] for column in columns),
+            )
+            row = connection.execute(
+                """
+                SELECT id FROM paper_daily_runs
+                WHERE owner = ? AND simulation_id = ? AND market_date = ?
+                """,
+                (self.owner, int(run["simulation_id"]), str(run["market_date"])),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("SQLite no devolvió la ejecución paper guardada.")
+        return int(row["id"])
+
+    def list_paper_daily_runs(
+        self,
+        simulation_id: int | None = None,
+    ) -> pd.DataFrame:
+        """Devuelve el historial paper sin mezclarlo con movimientos reales."""
+
+        where = " WHERE owner = ?"
+        parameters: tuple[object, ...] = (self.owner,)
+        if simulation_id is not None:
+            normalized_id = int(simulation_id)
+            if normalized_id <= 0:
+                raise ValueError("La simulación paper indicada no es válida.")
+            where += " AND simulation_id = ?"
+            parameters = (self.owner, normalized_id)
+        with self._connect() as connection:
+            return pd.read_sql_query(
+                f"""
+                SELECT {', '.join(PAPER_DAILY_RUN_COLUMNS)}
+                FROM paper_daily_runs{where}
+                ORDER BY market_date DESC, id DESC
+                """,
+                connection,
+                params=parameters,
             )
 
     def add_operation(

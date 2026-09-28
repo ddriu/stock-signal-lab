@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from typing import Any
 
@@ -21,6 +22,11 @@ from src.journal import (
     FAVORITE_COLUMNS,
     MAX_FAVORITES,
     OPERATION_COLUMNS,
+    PAPER_DAILY_RUN_COLUMNS,
+    PAPER_DAILY_RUN_JSON_COLUMNS,
+    PAPER_SIMULATION_COLUMNS,
+    PAPER_SIMULATION_JSON_COLUMNS,
+    PAPER_SIMULATION_STATUSES,
     PRIVATE_INVESTMENT_COLUMNS,
     PRIVATE_INVESTMENT_STATUSES,
     PORTFOLIO_ACCOUNT_COLUMNS,
@@ -29,9 +35,12 @@ from src.journal import (
     normalize_analysis_snapshot,
     normalize_favorite,
     normalize_operation,
+    normalize_paper_daily_run,
+    normalize_paper_simulation,
     normalize_private_investment,
     normalize_portfolio_account,
     normalize_portfolio_snapshot_position,
+    serialize_stable_json,
 )
 
 
@@ -69,6 +78,43 @@ RECONCILIATION_COLUMNS = {
     "fx_rate_to_eur",
 }
 EXTENDED_ALERT_STATE_COLUMNS = set(ALERT_STATE_COLUMNS[9:])
+LEGACY_ANALYSIS_SNAPSHOT_COLUMNS = [
+    column for column in ANALYSIS_SNAPSHOT_COLUMNS if column != "confidence_pct"
+]
+
+
+def _paper_jsonb_payload(
+    values: dict[str, object],
+    json_columns: tuple[str, ...],
+) -> dict[str, object]:
+    """Convierte el JSON canónico de la API Python en JSONB para PostgREST."""
+
+    payload = dict(values)
+    for column in json_columns:
+        payload[column] = json.loads(str(payload[column]))
+    return payload
+
+
+def _canonicalize_paper_json_columns(
+    frame: pd.DataFrame,
+    *,
+    object_columns: set[str],
+    array_columns: set[str],
+) -> pd.DataFrame:
+    """Mantiene el mismo contrato de cadenas JSON en SQLite y Supabase."""
+
+    result = frame.copy()
+    for column in object_columns:
+        if column in result:
+            result[column] = result[column].map(
+                lambda value: serialize_stable_json(value, expected="object")
+            )
+    for column in array_columns:
+        if column in result:
+            result[column] = result[column].map(
+                lambda value: serialize_stable_json(value, expected="array")
+            )
+    return result
 
 
 class SupabaseTradingJournal:
@@ -88,6 +134,8 @@ class SupabaseTradingJournal:
         private_investments_table: str = "private_investments",
         portfolio_accounts_table: str = "portfolio_accounts",
         portfolio_snapshots_table: str = "portfolio_snapshots",
+        paper_simulations_table: str = "paper_simulations",
+        paper_daily_runs_table: str = "paper_daily_runs",
         timeout: float = 20.0,
     ) -> None:
         normalized_url = url.strip().rstrip("/")
@@ -109,6 +157,10 @@ class SupabaseTradingJournal:
             raise JournalStorageError("El nombre de tabla de cuentas no es válido.")
         if not portfolio_snapshots_table.replace("_", "").isalnum():
             raise JournalStorageError("El nombre de tabla de fotografías no es válido.")
+        if not paper_simulations_table.replace("_", "").isalnum():
+            raise JournalStorageError("El nombre de tabla de simulaciones paper no es válido.")
+        if not paper_daily_runs_table.replace("_", "").isalnum():
+            raise JournalStorageError("El nombre de tabla del diario paper no es válido.")
         self.url = normalized_url
         self.secret_key = secret_key.strip()
         self.owner = owner.strip()
@@ -118,6 +170,8 @@ class SupabaseTradingJournal:
         self.private_investments_table = private_investments_table
         self.portfolio_accounts_table = portfolio_accounts_table
         self.portfolio_snapshots_table = portfolio_snapshots_table
+        self.paper_simulations_table = paper_simulations_table
+        self.paper_daily_runs_table = paper_daily_runs_table
         self.timeout = timeout
 
     @property
@@ -143,6 +197,14 @@ class SupabaseTradingJournal:
     @property
     def portfolio_snapshots_endpoint(self) -> str:
         return f"{self.url}/rest/v1/{self.portfolio_snapshots_table}"
+
+    @property
+    def paper_simulations_endpoint(self) -> str:
+        return f"{self.url}/rest/v1/{self.paper_simulations_table}"
+
+    @property
+    def paper_daily_runs_endpoint(self) -> str:
+        return f"{self.url}/rest/v1/{self.paper_daily_runs_table}"
 
     @property
     def alert_preferences_endpoint(self) -> str:
@@ -221,6 +283,213 @@ class SupabaseTradingJournal:
                 "limit": "1",
             },
         )
+
+    def create_paper_simulation(
+        self,
+        *,
+        name: str,
+        start_date: date | datetime | str,
+        initial_nav_eur: float,
+        initial_positions: object,
+        assumptions: object | None = None,
+        initial_cash_eur: float = 0.0,
+        source_snapshot_date: date | datetime | str | None = None,
+        status: str = "active",
+        base_currency: str = "EUR",
+        benchmark_ticker: str = "SPY",
+        strategy_key: str = "strict_rotation_v1",
+        engine_version: str = "paper-v1",
+        recorded_by: str = "",
+    ) -> int:
+        """Crea una simulación paper aislada de las operaciones reales."""
+
+        simulation = normalize_paper_simulation(
+            name=name,
+            start_date=start_date,
+            initial_nav_eur=initial_nav_eur,
+            initial_positions=initial_positions,
+            assumptions=assumptions,
+            initial_cash_eur=initial_cash_eur,
+            source_snapshot_date=source_snapshot_date,
+            status=status,
+            base_currency=base_currency,
+            benchmark_ticker=benchmark_ticker,
+            strategy_key=strategy_key,
+            engine_version=engine_version,
+        )
+        payload = _paper_jsonb_payload(
+            {
+                "owner": self.owner,
+                **simulation,
+                "recorded_by": recorded_by.strip().lower(),
+            },
+            PAPER_SIMULATION_JSON_COLUMNS,
+        )
+        response = self._request(
+            "POST",
+            endpoint=self.paper_simulations_endpoint,
+            json=payload,
+            headers={**self.headers, "Prefer": "return=representation"},
+        )
+        rows = response.json()
+        if not isinstance(rows, list) or not rows or "id" not in rows[0]:
+            raise JournalStorageError("Supabase guardó una simulación paper inesperada.")
+        return int(rows[0]["id"])
+
+    def list_paper_simulations(self, status: str | None = None) -> pd.DataFrame:
+        """Lista simulaciones paper del propietario autenticado."""
+
+        params: dict[str, str] = {
+            "owner": f"eq.{self.owner}",
+            "select": ",".join(PAPER_SIMULATION_COLUMNS),
+            "order": "start_date.desc,id.desc",
+        }
+        if status is not None:
+            normalized_status = str(status).strip().lower()
+            if normalized_status not in PAPER_SIMULATION_STATUSES:
+                raise ValueError("El estado de la simulación paper no es válido.")
+            params["status"] = f"eq.{normalized_status}"
+        response = self._request(
+            "GET",
+            endpoint=self.paper_simulations_endpoint,
+            params=params,
+        )
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise JournalStorageError("Supabase devolvió simulaciones paper inválidas.")
+        if not rows:
+            return pd.DataFrame(columns=PAPER_SIMULATION_COLUMNS)
+        frame = pd.DataFrame(rows)
+        for column in PAPER_SIMULATION_COLUMNS:
+            if column not in frame:
+                frame[column] = None
+        frame = _canonicalize_paper_json_columns(
+            frame,
+            object_columns={"assumptions_json"},
+            array_columns={"initial_positions_json"},
+        )
+        return frame.loc[:, PAPER_SIMULATION_COLUMNS]
+
+    def upsert_paper_daily_run(
+        self,
+        *,
+        simulation_id: int,
+        market_date: date | datetime | str,
+        signal_as_of: date | datetime | str | None,
+        input_hash: str,
+        positions_after: object,
+        proposed_actions: object | None = None,
+        executed_actions: object | None = None,
+        warnings: object | None = None,
+        rejected: object | None = None,
+        cash_eur: float,
+        net_nav_eur: float,
+        hold_nav_eur: float,
+        benchmark_nav_eur: float,
+        realized_pnl_eur: float = 0.0,
+        unrealized_pnl_eur: float = 0.0,
+        cumulative_costs_eur: float = 0.0,
+        tax_reserve_eur: float = 0.0,
+        coverage_pct: float = 0.0,
+        status: str = "complete",
+        engine_version: str = "paper-v1",
+    ) -> int:
+        """Guarda una única ejecución por simulación y fecha de mercado."""
+
+        run = normalize_paper_daily_run(
+            simulation_id=simulation_id,
+            market_date=market_date,
+            signal_as_of=signal_as_of,
+            input_hash=input_hash,
+            positions_after=positions_after,
+            proposed_actions=proposed_actions,
+            executed_actions=executed_actions,
+            warnings=warnings,
+            rejected=rejected,
+            cash_eur=cash_eur,
+            net_nav_eur=net_nav_eur,
+            hold_nav_eur=hold_nav_eur,
+            benchmark_nav_eur=benchmark_nav_eur,
+            realized_pnl_eur=realized_pnl_eur,
+            unrealized_pnl_eur=unrealized_pnl_eur,
+            cumulative_costs_eur=cumulative_costs_eur,
+            tax_reserve_eur=tax_reserve_eur,
+            coverage_pct=coverage_pct,
+            status=status,
+            engine_version=engine_version,
+        )
+        simulation_response = self._request(
+            "GET",
+            endpoint=self.paper_simulations_endpoint,
+            params={
+                "owner": f"eq.{self.owner}",
+                "id": f"eq.{int(run['simulation_id'])}",
+                "select": "id",
+                "limit": "1",
+            },
+        )
+        simulation_rows = simulation_response.json()
+        if not isinstance(simulation_rows, list) or not simulation_rows:
+            raise ValueError("La simulación paper indicada no existe.")
+        # PostgreSQL asigna ``created_at`` al insertar. Al omitirlo del upsert,
+        # PostgREST tampoco lo reemplaza cuando ya existe la fecha, de modo que
+        # la reejecución sigue siendo idempotente sin una lectura previa.
+        run.pop("created_at", None)
+        payload = _paper_jsonb_payload(
+            {"owner": self.owner, **run},
+            PAPER_DAILY_RUN_JSON_COLUMNS,
+        )
+        response = self._request(
+            "POST",
+            endpoint=self.paper_daily_runs_endpoint,
+            params={"on_conflict": "owner,simulation_id,market_date"},
+            json=payload,
+            headers={
+                **self.headers,
+                "Prefer": "resolution=merge-duplicates,return=representation",
+            },
+        )
+        rows = response.json()
+        if not isinstance(rows, list) or not rows or "id" not in rows[0]:
+            raise JournalStorageError("Supabase guardó una ejecución paper inesperada.")
+        return int(rows[0]["id"])
+
+    def list_paper_daily_runs(
+        self,
+        simulation_id: int | None = None,
+    ) -> pd.DataFrame:
+        """Devuelve el diario paper privado, nunca el diario de operaciones."""
+
+        params: dict[str, str] = {
+            "owner": f"eq.{self.owner}",
+            "select": ",".join(PAPER_DAILY_RUN_COLUMNS),
+            "order": "market_date.desc,id.desc",
+        }
+        if simulation_id is not None:
+            normalized_id = int(simulation_id)
+            if normalized_id <= 0:
+                raise ValueError("La simulación paper indicada no es válida.")
+            params["simulation_id"] = f"eq.{normalized_id}"
+        response = self._request(
+            "GET",
+            endpoint=self.paper_daily_runs_endpoint,
+            params=params,
+        )
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise JournalStorageError("Supabase devolvió un diario paper inválido.")
+        if not rows:
+            return pd.DataFrame(columns=PAPER_DAILY_RUN_COLUMNS)
+        frame = pd.DataFrame(rows)
+        for column in PAPER_DAILY_RUN_COLUMNS:
+            if column not in frame:
+                frame[column] = None
+        frame = _canonicalize_paper_json_columns(
+            frame,
+            object_columns=set(),
+            array_columns=set(PAPER_DAILY_RUN_JSON_COLUMNS),
+        )
+        return frame.loc[:, PAPER_DAILY_RUN_COLUMNS]
 
     def add_operation(
         self,
@@ -656,15 +925,30 @@ class SupabaseTradingJournal:
 
     def add_analysis_snapshot(self, **values: object) -> int:
         snapshot = normalize_analysis_snapshot(**values)  # type: ignore[arg-type]
-        response = self._request(
-            "POST",
-            endpoint=self.analysis_endpoint,
-            json={"owner": self.owner, **snapshot},
-            headers={
-                **self.headers,
-                "Prefer": "return=representation",
-            },
-        )
+        try:
+            response = self._request(
+                "POST",
+                endpoint=self.analysis_endpoint,
+                json={"owner": self.owner, **snapshot},
+                headers={
+                    **self.headers,
+                    "Prefer": "return=representation",
+                },
+            )
+        except JournalStorageError as exc:
+            if not self._is_missing_columns_error(exc, {"confidence_pct"}):
+                raise
+            legacy_snapshot = dict(snapshot)
+            legacy_snapshot.pop("confidence_pct", None)
+            response = self._request(
+                "POST",
+                endpoint=self.analysis_endpoint,
+                json={"owner": self.owner, **legacy_snapshot},
+                headers={
+                    **self.headers,
+                    "Prefer": "return=representation",
+                },
+            )
         rows = response.json()
         if not isinstance(rows, list) or not rows or "id" not in rows[0]:
             raise JournalStorageError(
@@ -680,11 +964,21 @@ class SupabaseTradingJournal:
         }
         if ticker:
             params["ticker"] = f"eq.{ticker.strip().upper()}"
-        response = self._request(
-            "GET",
-            endpoint=self.analysis_endpoint,
-            params=params,
-        )
+        try:
+            response = self._request(
+                "GET",
+                endpoint=self.analysis_endpoint,
+                params=params,
+            )
+        except JournalStorageError as exc:
+            if not self._is_missing_columns_error(exc, {"confidence_pct"}):
+                raise
+            params["select"] = ",".join(LEGACY_ANALYSIS_SNAPSHOT_COLUMNS)
+            response = self._request(
+                "GET",
+                endpoint=self.analysis_endpoint,
+                params=params,
+            )
         rows = response.json()
         if not isinstance(rows, list):
             raise JournalStorageError("Supabase devolvió un historial de análisis inválido.")
