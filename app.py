@@ -10,6 +10,7 @@ from dataclasses import asdict, fields, replace
 from datetime import date, datetime, timedelta
 import html
 from hashlib import sha256
+import importlib
 import json
 from math import isfinite
 
@@ -130,6 +131,24 @@ from src.navigation import (
     sanitize_favorite_selection,
 )
 from src.opportunity_catalog import build_opportunity_catalog
+import src.paper_simulation as _paper_simulation_module
+
+# Streamlit puede volver a ejecutar ``app.py`` sin invalidar módulos ya cargados.
+# Si el despliegue anterior aún conserva la dataclass de cinco campos, se recarga
+# el motor antes de importar sus símbolos. Así no se mezcla una interfaz nueva con
+# posiciones antiguas durante un hot deploy.
+if (
+    "valuation_mode"
+    not in getattr(
+        _paper_simulation_module.PaperPosition,
+        "__dataclass_fields__",
+        {},
+    )
+    or getattr(_paper_simulation_module, "PAPER_ENGINE_VERSION", "") != "paper-v2"
+    or not hasattr(_paper_simulation_module, "_position_valuation_mode")
+):
+    _paper_simulation_module = importlib.reload(_paper_simulation_module)
+
 from src.paper_simulation import (
     PAPER_ENGINE_VERSION,
     PaperAssumptions,
@@ -7782,6 +7801,44 @@ def _paper_assumptions_from_row(row: dict[str, object]) -> tuple[PaperAssumption
     )
 
 
+def _paper_position_valuation_mode(
+    position: object,
+    source: dict[str, object] | None = None,
+) -> str:
+    """Normaliza el modo y conserva el origen de una posición legacy.
+
+    ``source`` es la fotografía declarada y tiene prioridad: una línea manual
+    marcada como ``frozen`` nunca debe convertirse en negociable porque el worker
+    conserve temporalmente una versión anterior de ``PaperPosition``.
+    """
+
+    source_mode = str((source or {}).get("valuation_mode") or "").strip().lower()
+    if source_mode in {"market", "frozen"}:
+        return source_mode
+    missing_mode = object()
+    raw_mode = getattr(position, "valuation_mode", missing_mode)
+    if raw_mode is missing_mode:
+        return "market"
+    normalized = str(raw_mode).strip().lower()
+    return normalized if normalized in {"market", "frozen"} else "frozen"
+
+
+def _paper_position_to_mapping(
+    position: object,
+    source: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Serializa siempre el esquema completo, incluso desde una instancia antigua."""
+
+    return {
+        "ticker": str(getattr(position, "ticker", "")).strip().upper(),
+        "quantity": float(getattr(position, "quantity", 0.0)),
+        "average_cost_eur": float(getattr(position, "average_cost_eur", 0.0)),
+        "last_price_eur": float(getattr(position, "last_price_eur", 0.0)),
+        "sector": str(getattr(position, "sector", "Sin clasificar")),
+        "valuation_mode": _paper_position_valuation_mode(position, source),
+    }
+
+
 def _paper_position_from_mapping(row: dict[str, object]) -> PaperPosition:
     return PaperPosition(
         ticker=str(row.get("ticker") or "").strip().upper(),
@@ -7852,6 +7909,13 @@ def _paper_state_from_history(
         simulation.get("initial_positions_json"), []
     )
     initial_rows = initial_payload if isinstance(initial_payload, list) else []
+    initial_modes = {
+        str(item.get("ticker") or "").strip().upper(): str(
+            item.get("valuation_mode") or "market"
+        ).strip().lower()
+        for item in initial_rows
+        if isinstance(item, dict) and str(item.get("ticker") or "").strip()
+    }
     assumptions, benchmark_initial = _paper_assumptions_from_row(simulation)
     state = seed_paper_portfolio(
         initial_rows,
@@ -7866,11 +7930,16 @@ def _paper_state_from_history(
     ordered = runs.sort_values(["market_date", "id"], ascending=[True, True])
     latest = ordered.iloc[-1].to_dict()
     position_payload = _paper_json_value(latest.get("positions_after_json"), [])
-    positions = tuple(
-        _paper_position_from_mapping(dict(item))
-        for item in (position_payload if isinstance(position_payload, list) else [])
-        if isinstance(item, dict)
-    )
+    position_rows: list[dict[str, object]] = []
+    for item in position_payload if isinstance(position_payload, list) else []:
+        if not isinstance(item, dict):
+            continue
+        position_row = dict(item)
+        ticker = str(position_row.get("ticker") or "").strip().upper()
+        if not position_row.get("valuation_mode") and ticker in initial_modes:
+            position_row["valuation_mode"] = initial_modes[ticker]
+        position_rows.append(position_row)
+    positions = tuple(_paper_position_from_mapping(item) for item in position_rows)
     filled_ids: list[str] = []
     trades: list[PaperTrade] = []
     for value in ordered.get("executed_actions_json", []):
@@ -8033,7 +8102,7 @@ def _record_paper_session(
                 position,
                 last_price_eur=(
                     prices_eur.get(position.ticker, position.last_price_eur)
-                    if position.valuation_mode == "market"
+                    if _paper_position_valuation_mode(position) == "market"
                     else position.last_price_eur
                 ),
             )
@@ -8098,7 +8167,16 @@ def _record_paper_session(
         "bars": bar_fingerprint,
         "benchmark_price_eur": benchmark_price_eur,
         "assumptions": asdict(assumptions),
-        "state_before_snapshot": asdict(state),
+        "state_before_snapshot": {
+            **asdict(state),
+            "positions": [
+                _paper_position_to_mapping(position) for position in state.positions
+            ],
+            "initial_positions": [
+                _paper_position_to_mapping(position)
+                for position in state.initial_positions
+            ],
+        },
         "pending_orders": [asdict(order) for order in pending],
         "executed_trades": [asdict(trade) for trade in trades],
         "orders": [asdict(order) for order in orders],
@@ -8114,7 +8192,9 @@ def _record_paper_session(
         input_hash=input_hash,
         proposed_actions=[asdict(order) for order in orders],
         executed_actions=[asdict(trade) for trade in trades],
-        positions_after=[asdict(position) for position in state.positions],
+        positions_after=[
+            _paper_position_to_mapping(position) for position in state.positions
+        ],
         cash_eur=snapshot.cash_eur,
         net_nav_eur=snapshot.nav_net_eur,
         hold_nav_eur=snapshot.buy_hold_nav_eur,
@@ -8166,7 +8246,7 @@ def _paper_positions_for_storage(
                 "cost_basis_eur": position.cost_basis_eur,
                 "sector": position.sector,
                 "currency": "EUR",
-                "valuation_mode": position.valuation_mode,
+                "valuation_mode": _paper_position_valuation_mode(position, source),
                 "source_accounts": str(source.get("source_accounts") or ""),
                 "display_name": str(source.get("display_name") or position.ticker),
             }
@@ -8231,14 +8311,25 @@ def _render_paper_simulation_lab(
 ) -> None:
     """Laboratorio persistente: propone y mide, pero nunca envía órdenes reales."""
 
-    st.markdown("### Simulación diaria · cartera virtual")
+    st.markdown("### Cartera virtual")
     st.caption(
-        "El laboratorio copia la cartera cotizada y, al abrir Inicio con datos nuevos, "
-        "registra como máximo una valoración por sesión. Evalúa a diario, pero el "
-        "método estricto sólo puede iniciar un salto por semana. Las señales de T se "
-        "ejecutan desde la primera apertura posterior. Nunca modifica tu cartera ni "
-        "conecta con el bróker."
+        "Seguimiento diario de una copia de tus posiciones para comprobar el método "
+        "antes de plantear cambios reales."
     )
+    with st.expander("Cómo funciona el laboratorio", expanded=False):
+        st.caption(
+            "Al abrir Inicio con datos nuevos registra como máximo una valoración por "
+            "sesión. Evalúa a diario, pero el método estricto sólo puede iniciar un "
+            "salto por semana. Las señales se ejecutan virtualmente desde la primera "
+            "apertura posterior; nunca conecta con el bróker."
+        )
+    if "valuation_mode" not in getattr(PaperPosition, "__dataclass_fields__", {}):
+        st.error(
+            "El laboratorio está pausado porque el servidor aún conserva una versión "
+            "anterior del motor. Recarga la aplicación después del despliegue; no se "
+            "creará ni ejecutará ninguna operación virtual mientras tanto."
+        )
+        return
     rebuild_notice = st.session_state.pop("paper_rebuild_notice", "")
     if rebuild_notice:
         st.warning(str(rebuild_notice))
@@ -8433,7 +8524,12 @@ def _render_paper_simulation_lab(
                     name=f"Método prudente completo · {market_date.isoformat()}",
                 )
             except (JournalStorageError, ValueError, AttributeError) as exc:
-                st.error(f"No se pudo crear la temporada completa: {exc}")
+                st.error(
+                    "No se pudo reconstruir la temporada completa. No se ha modificado "
+                    "la cartera real ni se ha ejecutado ninguna orden."
+                )
+                with st.expander("Detalle técnico", expanded=False):
+                    st.code(str(exc))
             else:
                 try:
                     journal.set_paper_simulation_status(
@@ -9355,26 +9451,31 @@ def render_home(
             f"Hola, {user.display_name}. Tu situación y lo que merece atención · {update_text}.",
         )
 
-    refresh_a, refresh_b = st.columns([1.6, 1])
-    with refresh_a:
-        if snapshot_refresh is not None:
-            st.caption(
-                f"{snapshot_refresh.market_priced_count} posiciones con precio reciente · "
-                f"{snapshot_refresh.manual_count} valores manuales · "
-                f"{snapshot_refresh.pending_count} pendientes."
-            )
-        st.caption(
-            "Las cantidades y costes proceden de tu cartera. Los precios cotizados se "
-            "actualizan automáticamente una vez al día; fondos e inversiones sin ticker "
-            "conservan su último valor manual."
-        )
-    refresh_b.button(
-        "Actualizar precios ahora",
-        icon=":material/refresh:",
-        width="stretch",
-        key="home_refresh_portfolio",
-        on_click=_request_portfolio_market_refresh,
+    summary_tab, decisions_tab, laboratory_tab, access_tab = st.tabs(
+        ["Resumen", "Decisiones", "Laboratorio", "Accesos"]
     )
+
+    with summary_tab:
+        refresh_a, refresh_b = st.columns([1.6, 1])
+        with refresh_a:
+            if snapshot_refresh is not None:
+                st.caption(
+                    f"{snapshot_refresh.market_priced_count} posiciones con precio reciente · "
+                    f"{snapshot_refresh.manual_count} valores manuales · "
+                    f"{snapshot_refresh.pending_count} pendientes."
+                )
+            st.caption(
+                "Las cantidades y costes proceden de tu cartera. Los precios cotizados se "
+                "actualizan automáticamente una vez al día; fondos e inversiones sin ticker "
+                "conservan su último valor manual."
+            )
+        refresh_b.button(
+            "Actualizar precios ahora",
+            icon=":material/refresh:",
+            width="stretch",
+            key="home_refresh_portfolio",
+            on_click=_request_portfolio_market_refresh,
+        )
 
     try:
         private_dashboard, private_kpis = _portfolio_snapshot(
@@ -9422,9 +9523,7 @@ def render_home(
     )
     summary = apply_thesis_invalidations(summary, latest_snapshot)
 
-    if section in {"Resumen", "Hoy"} and (
-        snapshot_summary is not None or private_kpis is not None
-    ):
+    with summary_tab:
         display_summary, uses_market_estimate = preferred_portfolio_summary(
             snapshot_summary,
             market_summary,
@@ -9535,7 +9634,86 @@ def render_home(
                 f"resultado latente valorado {group_kpis.unrealized_pnl_eur:+,.2f} EUR."
             )
 
-    if section in {"Resumen", "Hoy", "Mi cartera"}:
+    tax_rate = float(st.session_state.get("private_real_result_tax", 20.0))
+    buy_fee = float(st.session_state.get("private_fixed_fee", 1.0))
+    sell_fee = float(st.session_state.get("private_real_result_sell_fee", buy_fee))
+    spread_pct = float(st.session_state.get("private_real_result_spread", 0.15))
+    fx_cost_pct = float(st.session_state.get("private_real_result_fx", 0.20))
+
+    with summary_tab:
+        st.markdown("#### Patrimonio fuera del mapa de decisiones")
+        st.caption(
+            "Aquí sólo cuadramos el patrimonio completo. Estas partidas no compiten "
+            "con acciones favoritas ni generan una propuesta de rotación."
+        )
+        if not latest_snapshot.empty and "analysis_ticker" in latest_snapshot:
+            blank_ticker = (
+                latest_snapshot["analysis_ticker"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                == ""
+            )
+            other_assets = latest_snapshot.loc[
+                blank_ticker | _rotation_excluded_asset_mask(latest_snapshot)
+            ].copy()
+            if not other_assets.empty:
+                other_value = float(
+                    pd.to_numeric(other_assets["value_eur"], errors="coerce")
+                    .fillna(0.0)
+                    .sum()
+                )
+                with st.expander(
+                    f"Ver partidas excluidas · {other_value:,.2f} €",
+                    expanded=False,
+                ):
+                    other_columns = [
+                        column
+                        for column in ["asset_name", "platform", "value_eur", "notes"]
+                        if column in other_assets
+                    ]
+                    st.dataframe(
+                        other_assets.loc[:, other_columns].rename(
+                            columns={
+                                "asset_name": "Activo",
+                                "platform": "Plataforma",
+                                "value_eur": "Valor guardado",
+                                "notes": "Notas",
+                            }
+                        ),
+                        hide_index=True,
+                        width="stretch",
+                        column_config={
+                            "Valor guardado": st.column_config.NumberColumn(format="%.2f €")
+                        },
+                    )
+            else:
+                st.caption("No hay partidas excluidas en la fotografía actual.")
+        else:
+            st.caption("Aún no hay una fotografía completa con partidas manuales.")
+
+    with decisions_tab:
+        st.markdown("### Decisiones de cartera")
+        st.caption(
+            "Primero protege las posiciones actuales; después compara sólo alternativas "
+            "que superen costes, impuestos, riesgo y calidad."
+        )
+        st.button(
+            "Revisar toda mi cartera y buscar oportunidades",
+            icon=":material/radar:",
+            width="stretch",
+            type="primary",
+            key="home_complete_review",
+            on_click=_request_complete_review,
+            help=(
+                "Actualiza posiciones y favoritas, aplica los filtros completos y "
+                "después explora un universo separado de small caps líquidas."
+            ),
+        )
+        st.caption(
+            "La revisión no envía órdenes al bróker: prepara datos y propuestas para "
+            "que puedas decidir."
+        )
         rotation_horizon = st.segmented_control(
             "Horizonte del mapa de decisiones",
             list(HORIZON_POLICIES),
@@ -9546,13 +9724,6 @@ def render_home(
                 "para estudiar rotaciones; anual revisa tesis y asignación."
             ),
         ) or "Mensual"
-        tax_rate = float(st.session_state.get("private_real_result_tax", 20.0))
-        buy_fee = float(st.session_state.get("private_fixed_fee", 1.0))
-        sell_fee = float(
-            st.session_state.get("private_real_result_sell_fee", buy_fee)
-        )
-        spread_pct = float(st.session_state.get("private_real_result_spread", 0.15))
-        fx_cost_pct = float(st.session_state.get("private_real_result_fx", 0.20))
         rotation_report = build_approximate_return_report(
             private_operations,
             latest_prices,
@@ -9601,6 +9772,20 @@ def render_home(
             held_tickers,
             actor_username=user.username,
         )
+        if not summary:
+            st.info(
+                "Abre «Analizar → Radar» y actualiza las empresas que sigues. Las "
+                "posiciones abiertas se añadirán automáticamente."
+            )
+        else:
+            with st.expander("Ver las tres empresas que más destacan en el radar"):
+                render_opportunity_cards(summary, limit=3)
+
+    with laboratory_tab:
+        st.info(
+            "Este es un ensayo con una copia virtual de tus dos cuentas. Nunca cambia "
+            "tu cartera real ni envía órdenes al bróker."
+        )
         _render_paper_simulation_lab(
             user,
             journal,
@@ -9617,78 +9802,20 @@ def render_home(
             tax_rate_pct=tax_rate,
         )
         st.caption(
-            "Civislend, Segofactoring, efectivo y partidas sin ticker se conservan en "
-            "el patrimonio guardado, pero quedan fuera de pesos, colores, benchmark y rotaciones."
+            "El laboratorio compara sólo activos cotizados. Civislend, Segofactoring, "
+            "efectivo y partidas sin ticker siguen en tu patrimonio real, pero no se operan aquí."
         )
-        if not latest_snapshot.empty and "analysis_ticker" in latest_snapshot:
-            blank_ticker = (
-                latest_snapshot["analysis_ticker"]
-                .fillna("")
-                .astype(str)
-                .str.strip()
-                == ""
-            )
-            other_assets = latest_snapshot.loc[
-                blank_ticker | _rotation_excluded_asset_mask(latest_snapshot)
-            ].copy()
-            if not other_assets.empty:
-                other_value = float(
-                    pd.to_numeric(other_assets["value_eur"], errors="coerce")
-                    .fillna(0.0)
-                    .sum()
-                )
-                with st.expander(
-                    f"Otros activos no comparables · {other_value:,.2f} €",
-                    expanded=False,
-                ):
-                    st.caption(
-                        "Sólo se muestran para cuadrar el patrimonio. No compiten con una "
-                        "acción favorita porque su liquidez, valoración y horizonte son distintos."
-                    )
-                    other_columns = [
-                        column
-                        for column in ["asset_name", "platform", "value_eur", "notes"]
-                        if column in other_assets
-                    ]
-                    st.dataframe(
-                        other_assets.loc[:, other_columns].rename(
-                            columns={
-                                "asset_name": "Activo",
-                                "platform": "Plataforma",
-                                "value_eur": "Valor guardado",
-                                "notes": "Notas",
-                            }
-                        ),
-                        hide_index=True,
-                        width="stretch",
-                        column_config={
-                            "Valor guardado": st.column_config.NumberColumn(format="%.2f €")
-                        },
-                    )
 
-    if section in {"Resumen", "Hoy"}:
-        st.button(
-            "Revisar toda mi cartera y buscar oportunidades",
-            icon=":material/radar:",
-            width="stretch",
-            type="primary",
-            key="home_complete_review",
-            on_click=_request_complete_review,
-            help=(
-                "Actualiza posiciones y favoritas, aplica los filtros completos y "
-                "después explora un universo separado de small caps líquidas."
-            ),
-        )
+    with access_tab:
+        st.markdown("### Accesos directos")
         st.caption(
-            "Primero protege lo que ya tienes; después busca entradas normales y "
-            "candidatas especulativas. No se envían órdenes al bróker."
+            "Elige una tarea. Aquí no se mezclan resultados ni propuestas de inversión."
         )
         action_a, action_b, action_c = st.columns(3)
         action_a.button(
             "Abrir análisis",
             icon=":material/monitoring:",
             width="stretch",
-            type="primary",
             on_click=_set_navigation,
             args=("Analizar",),
         )
@@ -9706,15 +9833,6 @@ def render_home(
             on_click=_set_navigation,
             args=("Carteras", "portfolio_navigation", "Privada"),
         )
-
-    if not summary:
-        st.info(
-            "Abre «Analizar → Radar» y actualiza las empresas que sigues. Las posiciones "
-            "abiertas se añadirán automáticamente."
-        )
-    elif summary:
-        with st.expander("Ver las tres empresas que más destacan en el radar"):
-            render_opportunity_cards(summary, limit=3)
 
 
 def render_opportunities_page(
