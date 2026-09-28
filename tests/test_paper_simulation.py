@@ -111,6 +111,122 @@ def test_seed_is_eur_only_deterministic_and_preserves_a_buy_hold_baseline() -> N
         )
 
 
+def test_frozen_position_counts_in_nav_but_never_invents_market_return() -> None:
+    state = seed_paper_portfolio(
+        [
+            {
+                "ticker": "MARKET",
+                "quantity": 1,
+                "price_eur": 100,
+                "value_eur": 100,
+            },
+            {
+                "ticker": "MANUAL_ABC",
+                "quantity": 1,
+                "price_eur": 900,
+                "value_eur": 900,
+                "cost_basis_eur": 850,
+                "valuation_mode": "frozen",
+            },
+        ],
+        benchmark_price_eur=500,
+        as_of="2026-09-25",
+    )
+
+    snapshot = mark_to_market(
+        state,
+        {"MARKET": 110, "MANUAL_ABC": 1},
+        500,
+        as_of="2026-09-28",
+    )
+
+    assert state.initial_nav_eur == 1_000
+    assert snapshot.holdings_eur == 1_010
+    assert snapshot.buy_hold_nav_eur == 1_010
+    assert snapshot.unrealized_pnl_eur == 60
+    assert snapshot.data_coverage_pct == pytest.approx(110 / 1_010 * 100)
+
+
+def test_frozen_position_cannot_be_sold_even_with_a_quote_and_pending_order() -> None:
+    state = seed_paper_portfolio(
+        [
+            {
+                "ticker": "MANUAL_ABC",
+                "quantity": 1,
+                "price_eur": 900,
+                "value_eur": 900,
+                "valuation_mode": "frozen",
+            }
+        ],
+        as_of="2026-09-25",
+    )
+    order = PaperOrder(
+        id="blocked-frozen-sale",
+        portfolio_id=state.portfolio_id,
+        signal_date=date(2026, 9, 25),
+        effective_after=date(2026, 9, 26),
+        ticker="MANUAL_ABC",
+        side="Venta",
+        target_value_eur=100,
+        reason="No debe ejecutarse",
+    )
+
+    advanced, trades = fill_pending_orders(
+        state,
+        [order],
+        _bars(MANUAL_ABC=900),
+        as_of="2026-09-28",
+    )
+
+    assert trades == ()
+    assert advanced.positions == state.positions
+    assert advanced.cash_eur == state.cash_eur
+
+
+def test_frozen_position_cannot_be_proposed_as_rotation_origin() -> None:
+    state = seed_paper_portfolio(
+        [
+            {
+                "ticker": "FROZEN",
+                "quantity": 1,
+                "price_eur": 500,
+                "valuation_mode": "frozen",
+            }
+        ],
+        as_of="2026-09-25",
+    )
+    dashboard = SimpleNamespace(
+        switches=(
+            {
+                "Origen": "FROZEN",
+                "Alternativa": "BLUE",
+                "Sector alternativa": "Technology",
+                "Lectura": "Prueba",
+            },
+        ),
+        positions=(
+            {"Ticker": "FROZEN", "Color": "Rojo", "Score horizonte": 5},
+        ),
+        candidates=(
+            {
+                "Ticker": "BLUE",
+                "Color": "Azul",
+                "Score horizonte": 90,
+                "Confianza": 95,
+                "Cobertura": 100,
+                "Sector": "Technology",
+            },
+        ),
+    )
+
+    assert propose_paper_orders(
+        dashboard,
+        state,
+        as_of="2026-09-28",
+        include_challenger=False,
+    ) == ()
+
+
 def test_assumptions_reject_impossible_or_negative_limits() -> None:
     with pytest.raises(ValueError, match="comisión"):
         PaperAssumptions(buy_fee_eur=-1)

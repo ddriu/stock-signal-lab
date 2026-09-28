@@ -9,10 +9,12 @@ from __future__ import annotations
 import ast
 from dataclasses import asdict, fields, replace
 from pathlib import Path
+from hashlib import sha256
 import json
 from math import isfinite
 
 import pandas as pd
+import pytest
 
 from src.data_loader import resolve_analysis_ticker
 from src.paper_simulation import (
@@ -35,6 +37,7 @@ HELPER_NAMES = {
     "_paper_json_value",
     "_paper_orders_with_known_market_metadata",
     "_paper_market_date",
+    "_paper_seed_identifier",
     "_paper_seed_payload",
     "_paper_seed_diagnostics",
     "_paper_assumptions_from_row",
@@ -68,6 +71,7 @@ def _load_helpers() -> dict[str, object]:
         "replace": replace,
         "isfinite": isfinite,
         "json": json,
+        "sha256": sha256,
         "pd": pd,
         "JournalStorageError": RuntimeError,
         "resolve_analysis_ticker": resolve_analysis_ticker,
@@ -289,6 +293,9 @@ def test_seed_payload_aggregates_listed_positions_and_keeps_cash_separate() -> N
             "cost_basis_eur": 270.0,
             "sector": "Technology",
             "currency": "EUR",
+            "valuation_mode": "market",
+            "source_accounts": "Broker",
+            "display_name": "Alpha lot 1 / Alpha lot 2",
         }
     ]
 
@@ -343,6 +350,72 @@ def test_seed_diagnostic_makes_excluded_ticker_and_value_coverage_visible() -> N
 
     assert result["missing"] == ["BBB"]
     assert result["coverage_pct"] == 75
+
+
+def test_seed_includes_both_banks_and_manual_holdings_without_a_ticker() -> None:
+    snapshot = pd.DataFrame(
+        [
+            {
+                "platform": "Revolut",
+                "asset_name": "AST SpaceMobile",
+                "asset_type": "Acción",
+                "analysis_ticker": "ASTS",
+                "quantity": 2,
+                "value_eur": 200,
+                "cost_estimate_eur": 180,
+            },
+            {
+                "platform": "Trade Republic",
+                "asset_name": "American Express",
+                "asset_type": "Acción",
+                "analysis_ticker": "AXP",
+                "quantity": None,
+                "value_eur": 800,
+                "cost_estimate_eur": 750,
+            },
+            {
+                "platform": "Trade Republic",
+                "asset_name": "MSCI Emerging Markets ex China",
+                "asset_type": "ETF",
+                "analysis_ticker": "",
+                "quantity": None,
+                "value_eur": 400,
+                "cost_estimate_eur": 390,
+            },
+            {
+                "platform": "Revolut",
+                "asset_name": "Efectivo",
+                "asset_type": "Efectivo",
+                "analysis_ticker": "",
+                "value_eur": 1.22,
+            },
+        ]
+    )
+
+    payload, cash = HELPERS["_paper_seed_payload"](
+        snapshot,
+        {"ASTS": 100},
+        [],
+    )
+    diagnostic = HELPERS["_paper_seed_diagnostics"](snapshot, payload)
+
+    assert cash == 1.22
+    assert len(payload) == 3
+    assert {row["source_accounts"] for row in payload} == {
+        "Revolut",
+        "Trade Republic",
+    }
+    frozen = [row for row in payload if row["valuation_mode"] == "frozen"]
+    assert len(frozen) == 2
+    assert any(str(row["ticker"]).startswith("MANUAL_") for row in frozen)
+    assert sum(float(row["value_eur"]) for row in payload) + cash == 1_401.22
+    assert diagnostic["missing"] == []
+    assert diagnostic["included_coverage_pct"] == 100
+    assert diagnostic["market_coverage_pct"] == pytest.approx(200 / 1_400 * 100)
+    assert {row["platform"] for row in diagnostic["accounts"]} == {
+        "Revolut",
+        "Trade Republic",
+    }
 
 
 def test_persisted_state_round_trip_restores_costs_tax_year_and_filled_orders() -> None:

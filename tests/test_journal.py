@@ -341,6 +341,37 @@ def test_frozen_windows_app_uses_private_local_app_data(tmp_path, monkeypatch) -
     assert default_database_path() == tmp_path / "StockSignalLab" / "trading_journal.db"
 
 
+def test_paper_simulation_status_change_is_owner_scoped(tmp_path) -> None:
+    database = tmp_path / "journal.db"
+    journal = TradingJournal(database, owner="ddriu")
+    simulation_id = journal.create_paper_simulation(
+        name="Temporada",
+        start_date="2026-09-28",
+        initial_nav_eur=100,
+        initial_positions=[
+            {
+                "ticker": "AAA",
+                "quantity": 1,
+                "price_eur": 100,
+                "value_eur": 100,
+            }
+        ],
+    )
+
+    journal.set_paper_simulation_status(simulation_id, "archived")
+
+    assert journal.list_paper_simulations(status="active").empty
+    archived = journal.list_paper_simulations(status="archived")
+    assert archived["id"].tolist() == [simulation_id]
+    with pytest.raises(ValueError, match="no existe"):
+        TradingJournal(database, owner="otro").set_paper_simulation_status(
+            simulation_id,
+            "archived",
+        )
+    with pytest.raises(ValueError, match="estado"):
+        journal.set_paper_simulation_status(simulation_id, "deleted")
+
+
 def test_email_alert_preferences_and_states_are_private(tmp_path) -> None:
     journal = TradingJournal(tmp_path / "journal.db", owner="luci")
     preferences = normalize_alert_preferences(
