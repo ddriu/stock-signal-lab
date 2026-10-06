@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pandas as pd
@@ -16,6 +16,7 @@ class FakeResponse:
     payload: Any
     status_code: int = 200
     text: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -192,6 +193,38 @@ def test_supabase_does_not_silently_lose_reconciliation_fields_before_migration(
         )
 
     assert len(calls) == 1
+
+
+def test_supabase_historical_closure_is_inserted_as_one_batch(monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+    responses = [FakeResponse([]), FakeResponse([{"id": 11}, {"id": 12}])]
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        return responses.pop(0)
+
+    monkeypatch.setattr("src.supabase_journal.requests.request", fake_request)
+    journal = SupabaseTradingJournal(
+        "https://example.supabase.co", "sb_secret_test", "demo-owner"
+    )
+
+    identifiers = journal.add_historical_closure(
+        ticker="TEST",
+        account_name="Demo",
+        quantity=1,
+        cost_basis_eur=100.0,
+        net_proceeds_eur=80.0,
+        sold_at="2025-01-15",
+        quality="Estimado",
+        recorded_by="demo-owner",
+    )
+
+    assert identifiers == (11, 12)
+    assert calls[0]["method"] == "GET"
+    assert calls[1]["method"] == "POST"
+    assert len(calls[1]["json"]) == 2
+    assert [row["side"] for row in calls[1]["json"]] == ["Compra", "Venta"]
+    assert all(row["owner"] == "demo-owner" for row in calls[1]["json"])
 
 
 def test_supabase_favorites_use_separate_table_and_owner(monkeypatch) -> None:
@@ -381,14 +414,14 @@ def test_supabase_portfolio_accounts_are_upserted_and_filtered_by_owner(monkeypa
     assert calls[1]["params"]["owner"] == "eq.ddriu"
 
 
-def test_supabase_complete_snapshot_replacement_deletes_same_date_first(
+def test_supabase_complete_snapshot_replacement_uses_one_atomic_rpc(
     monkeypatch,
 ) -> None:
     calls: list[dict[str, Any]] = []
 
     def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
         calls.append({"method": method, "url": url, **kwargs})
-        return FakeResponse(None, status_code=204)
+        return FakeResponse(1)
 
     monkeypatch.setattr("src.supabase_journal.requests.request", fake_request)
     journal = SupabaseTradingJournal(
@@ -413,13 +446,68 @@ def test_supabase_complete_snapshot_replacement_deletes_same_date_first(
     )
 
     assert count == 1
-    assert calls[0]["method"] == "DELETE"
-    assert calls[0]["params"] == {
-        "owner": "eq.ddriu",
-        "snapshot_date": "eq.2026-08-13",
-    }
-    assert calls[1]["method"] == "POST"
-    assert calls[1]["json"][0]["asset_name"] == "Oracle"
+    assert len(calls) == 1
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["url"].endswith("/rpc/replace_portfolio_snapshot")
+    assert calls[0]["json"]["p_owner"] == "ddriu"
+    assert calls[0]["json"]["p_snapshot_date"] == "2026-08-13"
+    assert calls[0]["json"]["p_positions"][0]["asset_name"] == "Oracle"
+
+
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
+def test_atomic_snapshot_validates_all_rows_before_any_remote_change(monkeypatch, value) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "src.supabase_journal.requests.request",
+        lambda method, *args, **kwargs: calls.append(method),
+    )
+    journal = SupabaseTradingJournal("https://example.supabase.co", "sb_secret_test", "ddriu")
+    rows = pd.DataFrame([
+        {"platform": "Broker", "asset_name": "Valid", "value_eur": 100},
+        {"platform": "Broker", "asset_name": "Invalid", "value_eur": value},
+    ])
+    with pytest.raises(ValueError):
+        journal.replace_portfolio_snapshot_positions(rows, snapshot_date="2026-10-02")
+    assert calls == []
+
+
+def test_atomic_snapshot_missing_migration_never_falls_back_to_delete(monkeypatch) -> None:
+    calls: list[str] = []
+    def fake_request(method, *args, **kwargs):
+        calls.append(method)
+        return FakeResponse({}, status_code=404, text="Could not find replace_portfolio_snapshot")
+    monkeypatch.setattr("src.supabase_journal.requests.request", fake_request)
+    journal = SupabaseTradingJournal("https://example.supabase.co", "sb_secret_test", "ddriu")
+    with pytest.raises(JournalStorageError, match="migration_atomic_portfolio_snapshot"):
+        journal.replace_portfolio_snapshot_positions(
+            pd.DataFrame([{"platform": "Broker", "asset_name": "AAPL", "value_eur": 100}]),
+            snapshot_date="2026-10-02",
+        )
+    assert calls == ["POST"]
+
+
+@pytest.mark.parametrize("method_name", [
+    "list_operations", "list_analysis_snapshots", "list_portfolio_snapshot_positions",
+])
+def test_supabase_reads_every_page_even_below_requested_server_limit(monkeypatch, method_name) -> None:
+    calls: list[dict[str, Any]] = []
+    total = 1_003
+    def fake_request(method, url, **kwargs):
+        calls.append({"method": method, "url": url, **kwargs})
+        offset = int(kwargs["params"]["offset"])
+        stop = min(offset + 250, total)
+        return FakeResponse(
+            [{"id": value, "ticker": "AAPL"} for value in range(offset, stop)],
+            headers={"Content-Range": f"{offset}-{stop - 1}/{total}"},
+        )
+    monkeypatch.setattr("src.supabase_journal.requests.request", fake_request)
+    journal = SupabaseTradingJournal("https://example.supabase.co", "sb_secret_test", "ddriu")
+    frame = getattr(journal, method_name)()
+    assert frame["id"].tolist() == list(range(total))
+    assert len(calls) == 5
+    assert [call["params"]["offset"] for call in calls] == ["0", "250", "500", "750", "1000"]
+    assert all(call["params"]["owner"] == "eq.ddriu" for call in calls)
+    assert all(call["headers"]["Prefer"] == "count=exact" for call in calls)
 
 
 def test_supabase_analysis_history_uses_owner_and_separate_table(monkeypatch) -> None:
@@ -681,3 +769,55 @@ def test_supabase_paper_status_change_is_owner_scoped(monkeypatch) -> None:
     assert calls[0]["json"]["status"] == "archived"
     with pytest.raises(ValueError, match="estado"):
         journal.set_paper_simulation_status(12, "deleted")
+
+
+def test_legacy_paper_comparator_coverage_is_unknown_until_migrated(monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+    responses = [
+        FakeResponse({}, status_code=400, text="column paper_daily_runs.hold_coverage_pct does not exist"),
+        FakeResponse([{"id": 7, "simulation_id": 1, "market_date": "2026-10-02"}]),
+    ]
+    def fake_request(method, url, **kwargs):
+        calls.append({"method": method, **kwargs})
+        return responses.pop(0)
+    monkeypatch.setattr("src.supabase_journal.requests.request", fake_request)
+    journal = SupabaseTradingJournal("https://example.supabase.co", "sb_secret_test", "ddriu")
+    frame = journal.list_paper_daily_runs(1)
+    assert len(calls) == 2
+    assert "hold_coverage_pct" in calls[0]["params"]["select"]
+    assert "hold_coverage_pct" not in calls[1]["params"]["select"]
+    assert frame.iloc[0]["hold_coverage_pct"] is None
+    assert frame.iloc[0]["benchmark_coverage_pct"] is None
+
+
+def test_paper_run_preserves_comparator_coverage_in_one_upsert(monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+    def fake_request(method, url, **kwargs):
+        calls.append({"method": method, **kwargs})
+        return FakeResponse([{"id": 1 if method == "GET" else 7}])
+    monkeypatch.setattr("src.supabase_journal.requests.request", fake_request)
+    journal = SupabaseTradingJournal("https://example.supabase.co", "sb_secret_test", "ddriu")
+    result = journal.upsert_paper_daily_run(
+        simulation_id=1, market_date="2026-10-02", signal_as_of="2026-10-01",
+        input_hash="test-hash", positions_after=[], cash_eur=100,
+        net_nav_eur=100, hold_nav_eur=100, benchmark_nav_eur=100,
+        coverage_pct=100, hold_coverage_pct=60, benchmark_coverage_pct=0,
+    )
+    assert result == 7
+    assert calls[-1]["json"]["hold_coverage_pct"] == 60
+    assert calls[-1]["json"]["benchmark_coverage_pct"] == 0
+
+
+def test_atomic_snapshot_rpc_failure_cannot_trigger_a_client_delete(monkeypatch) -> None:
+    calls: list[str] = []
+    def fake_request(method, *args, **kwargs):
+        calls.append(method)
+        return FakeResponse({}, status_code=500, text="transaction failed")
+    monkeypatch.setattr("src.supabase_journal.requests.request", fake_request)
+    journal = SupabaseTradingJournal("https://example.supabase.co", "sb_secret_test", "ddriu")
+    with pytest.raises(JournalStorageError):
+        journal.replace_portfolio_snapshot_positions(
+            pd.DataFrame([{"platform": "Broker", "asset_name": "AAPL", "value_eur": 100}]),
+            snapshot_date="2026-10-02",
+        )
+    assert calls == ["POST"]

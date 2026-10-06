@@ -32,6 +32,7 @@ from src.journal import (
     PORTFOLIO_ACCOUNT_COLUMNS,
     PORTFOLIO_SNAPSHOT_COLUMNS,
     calculate_open_positions,
+    historical_closure_operations,
     normalize_analysis_snapshot,
     normalize_favorite,
     normalize_operation,
@@ -81,6 +82,7 @@ EXTENDED_ALERT_STATE_COLUMNS = set(ALERT_STATE_COLUMNS[9:])
 LEGACY_ANALYSIS_SNAPSHOT_COLUMNS = [
     column for column in ANALYSIS_SNAPSHOT_COLUMNS if column != "confidence_pct"
 ]
+PAPER_COMPARATOR_COVERAGE_COLUMNS = {"hold_coverage_pct", "benchmark_coverage_pct"}
 
 
 def _paper_jsonb_payload(
@@ -256,6 +258,43 @@ class SupabaseTradingJournal:
                 response_body=response_body,
             ) from exc
 
+    def _list_rows(
+        self,
+        *,
+        endpoint: str | None = None,
+        params: dict[str, str],
+    ) -> list[dict[str, object]]:
+        """Lee todas las páginas, incluso si el servidor impone un cupo menor.
+
+        PostgREST limita las filas por respuesta. El recuento exacto permite
+        distinguir una última página de una respuesta recortada por ese límite.
+        Cada llamada conserva el filtro de propietario y el orden de la lista.
+        """
+
+        rows: list[dict[str, object]] = []
+        page_size = 1_000
+        while True:
+            response = self._request(
+                "GET",
+                endpoint=endpoint,
+                params={**params, "offset": str(len(rows)), "limit": str(page_size)},
+                headers={**self.headers, "Prefer": "count=exact"},
+            )
+            page = response.json()
+            if not isinstance(page, list) or any(not isinstance(row, dict) for row in page):
+                raise JournalStorageError("Supabase devolvió una página de datos inválida.")
+            content_range = str(getattr(response, "headers", {}).get("Content-Range", ""))
+            total_text = content_range.rsplit("/", 1)[-1]
+            total = int(total_text) if total_text.isdigit() else None
+            rows.extend(page)
+            if total is not None:
+                if len(rows) >= total:
+                    return rows
+                if not page:
+                    raise JournalStorageError("El historial de Supabase llegó incompleto.")
+            elif len(page) < page_size:
+                return rows
+
     @staticmethod
     def _is_missing_columns_error(
         error: JournalStorageError,
@@ -349,12 +388,10 @@ class SupabaseTradingJournal:
             if normalized_status not in PAPER_SIMULATION_STATUSES:
                 raise ValueError("El estado de la simulación paper no es válido.")
             params["status"] = f"eq.{normalized_status}"
-        response = self._request(
-            "GET",
+        rows = self._list_rows(
             endpoint=self.paper_simulations_endpoint,
             params=params,
         )
-        rows = response.json()
         if not isinstance(rows, list):
             raise JournalStorageError("Supabase devolvió simulaciones paper inválidas.")
         if not rows:
@@ -414,6 +451,8 @@ class SupabaseTradingJournal:
         cumulative_costs_eur: float = 0.0,
         tax_reserve_eur: float = 0.0,
         coverage_pct: float = 0.0,
+        hold_coverage_pct: float | None = None,
+        benchmark_coverage_pct: float | None = None,
         status: str = "complete",
         engine_version: str = "paper-v1",
     ) -> int:
@@ -438,6 +477,8 @@ class SupabaseTradingJournal:
             cumulative_costs_eur=cumulative_costs_eur,
             tax_reserve_eur=tax_reserve_eur,
             coverage_pct=coverage_pct,
+            hold_coverage_pct=hold_coverage_pct,
+            benchmark_coverage_pct=benchmark_coverage_pct,
             status=status,
             engine_version=engine_version,
         )
@@ -462,16 +503,26 @@ class SupabaseTradingJournal:
             {"owner": self.owner, **run},
             PAPER_DAILY_RUN_JSON_COLUMNS,
         )
-        response = self._request(
-            "POST",
-            endpoint=self.paper_daily_runs_endpoint,
-            params={"on_conflict": "owner,simulation_id,market_date"},
-            json=payload,
-            headers={
-                **self.headers,
-                "Prefer": "resolution=merge-duplicates,return=representation",
-            },
-        )
+        try:
+            response = self._request(
+                "POST",
+                endpoint=self.paper_daily_runs_endpoint,
+                params={"on_conflict": "owner,simulation_id,market_date"},
+                json=payload,
+                headers={
+                    **self.headers,
+                    "Prefer": "resolution=merge-duplicates,return=representation",
+                },
+            )
+        except JournalStorageError as exc:
+            if not self._is_missing_columns_error(exc, PAPER_COMPARATOR_COVERAGE_COLUMNS):
+                raise
+            raise JournalStorageError(
+                "Falta instalar supabase/migration_paper_comparator_coverage.sql. "
+                "La ejecución no se ha guardado sin su cobertura comparativa.",
+                status_code=exc.status_code,
+                response_body=exc.response_body,
+            ) from exc
         rows = response.json()
         if not isinstance(rows, list) or not rows or "id" not in rows[0]:
             raise JournalStorageError("Supabase guardó una ejecución paper inesperada.")
@@ -493,12 +544,24 @@ class SupabaseTradingJournal:
             if normalized_id <= 0:
                 raise ValueError("La simulación paper indicada no es válida.")
             params["simulation_id"] = f"eq.{normalized_id}"
-        response = self._request(
-            "GET",
-            endpoint=self.paper_daily_runs_endpoint,
-            params=params,
-        )
-        rows = response.json()
+        try:
+            rows = self._list_rows(
+                endpoint=self.paper_daily_runs_endpoint,
+                params=params,
+            )
+        except JournalStorageError as exc:
+            if not self._is_missing_columns_error(exc, PAPER_COMPARATOR_COVERAGE_COLUMNS):
+                raise
+            rows = self._list_rows(
+                endpoint=self.paper_daily_runs_endpoint,
+                params={
+                    **params,
+                    "select": ",".join(
+                        column for column in PAPER_DAILY_RUN_COLUMNS
+                        if column not in PAPER_COMPARATOR_COVERAGE_COLUMNS
+                    ),
+                },
+            )
         if not isinstance(rows, list):
             raise JournalStorageError("Supabase devolvió un diario paper inválido.")
         if not rows:
@@ -584,6 +647,73 @@ class SupabaseTradingJournal:
             raise JournalStorageError("Supabase guardó una respuesta inesperada.")
         return int(rows[0]["id"])
 
+    def add_historical_closure(
+        self,
+        *,
+        ticker: str,
+        account_name: str,
+        quantity: float,
+        cost_basis_eur: float,
+        net_proceeds_eur: float,
+        sold_at: date | datetime | str,
+        sale_fee_eur: float = 0.0,
+        quality: str = "Documentado",
+        notes: str = "",
+        recorded_by: str = "",
+    ) -> tuple[int, int]:
+        """Inserta el par contable de un cierre antiguo de forma atómica."""
+
+        closure_id, purchase, sale = historical_closure_operations(
+            ticker=ticker,
+            account_name=account_name,
+            quantity=quantity,
+            cost_basis_eur=cost_basis_eur,
+            net_proceeds_eur=net_proceeds_eur,
+            sold_at=sold_at,
+            sale_fee_eur=sale_fee_eur,
+            quality=quality,
+            notes=notes,
+        )
+        existing = self._request(
+            "GET",
+            params={
+                "owner": f"eq.{self.owner}",
+                "notes": f"like.*:{closure_id}]*",
+                "select": "id",
+                "limit": "1",
+            },
+        ).json()
+        if isinstance(existing, list) and existing:
+            raise ValueError("Este cierre histórico ya está registrado.")
+        actor = recorded_by.strip().lower()
+        payload = [
+            {"owner": self.owner, **operation, "recorded_by": actor}
+            for operation in (purchase, sale)
+        ]
+        try:
+            response = self._request(
+                "POST",
+                json=payload,
+                headers={**self.headers, "Prefer": "return=representation"},
+            )
+        except JournalStorageError as exc:
+            if not self._is_missing_columns_error(exc, RECONCILIATION_COLUMNS):
+                raise
+            raise JournalStorageError(
+                "La base de datos todavía no admite el cuadre de cierres en euros. "
+                "Ejecuta primero supabase/migration_operation_reconciliation.sql; "
+                "no se ha guardado ninguna parte del cierre.",
+                status_code=exc.status_code,
+                response_body=exc.response_body,
+            ) from exc
+        rows = response.json()
+        if not isinstance(rows, list) or len(rows) != 2:
+            raise JournalStorageError("Supabase guardó un cierre histórico inesperado.")
+        identifiers = [int(row["id"]) for row in rows if "id" in row]
+        if len(identifiers) != 2:
+            raise JournalStorageError("Supabase no devolvió los dos movimientos del cierre.")
+        return identifiers[0], identifiers[1]
+
     def list_operations(self) -> pd.DataFrame:
         params = {
             "owner": f"eq.{self.owner}",
@@ -591,15 +721,13 @@ class SupabaseTradingJournal:
             "order": "executed_at.desc,id.desc",
         }
         try:
-            response = self._request("GET", params=params)
+            rows = self._list_rows(params=params)
         except JournalStorageError as exc:
             if not self._is_missing_columns_error(exc, RECONCILIATION_COLUMNS):
                 raise
-            response = self._request(
-                "GET",
+            rows = self._list_rows(
                 params={**params, "select": ",".join(LEGACY_OPERATION_COLUMNS)},
             )
-        rows = response.json()
         if not isinstance(rows, list):
             raise JournalStorageError("Supabase devolvió un histórico inválido.")
         if not rows:
@@ -662,8 +790,7 @@ class SupabaseTradingJournal:
         return int(rows[0]["id"])
 
     def list_private_investments(self) -> pd.DataFrame:
-        response = self._request(
-            "GET",
+        rows = self._list_rows(
             endpoint=self.private_investments_endpoint,
             params={
                 "owner": f"eq.{self.owner}",
@@ -671,7 +798,6 @@ class SupabaseTradingJournal:
                 "order": "start_date.desc,id.desc",
             },
         )
-        rows = response.json()
         if not isinstance(rows, list):
             raise JournalStorageError("Supabase devolvió inversiones privadas inválidas.")
         if not rows:
@@ -748,8 +874,7 @@ class SupabaseTradingJournal:
         return int(rows[0]["id"])
 
     def list_portfolio_accounts(self) -> pd.DataFrame:
-        response = self._request(
-            "GET",
+        rows = self._list_rows(
             endpoint=self.portfolio_accounts_endpoint,
             params={
                 "owner": f"eq.{self.owner}",
@@ -757,7 +882,6 @@ class SupabaseTradingJournal:
                 "order": "account_name.asc",
             },
         )
-        rows = response.json()
         if not isinstance(rows, list):
             raise JournalStorageError("Supabase devolvió una lista de cuentas inválida.")
         if not rows:
@@ -828,35 +952,70 @@ class SupabaseTradingJournal:
     ) -> int:
         """Sustituye una foto remota para que también desaparezcan las ventas."""
 
-        target = pd.Timestamp(snapshot_date).date().isoformat()
+        target_timestamp = pd.Timestamp(snapshot_date)
+        if pd.isna(target_timestamp):
+            raise ValueError("La fecha de la fotografía no es válida.")
+        target = target_timestamp.date().isoformat()
         replacement = positions.copy()
         if replacement.empty:
             raise ValueError("La fotografía de cartera no puede quedar vacía.")
         replacement["snapshot_date"] = target
-        self._request(
-            "DELETE",
-            endpoint=self.portfolio_snapshots_endpoint,
-            params={
-                "owner": f"eq.{self.owner}",
-                "snapshot_date": f"eq.{target}",
-            },
-        )
-        return self.upsert_portfolio_snapshot_positions(
-            replacement,
-            recorded_by=recorded_by,
-        )
+        payload = [
+            normalize_portfolio_snapshot_position(
+                **{
+                    column: row[column]
+                    for column in PORTFOLIO_SNAPSHOT_COLUMNS
+                    if column in row
+                    and column not in {"id", "recorded_by", "created_at", "updated_at"}
+                }
+            )
+            for row in replacement.to_dict("records")
+        ]
+        identities = {(row["platform"], row["asset_name"]) for row in payload}
+        if len(identities) != len(payload):
+            raise ValueError("La fotografía contiene posiciones duplicadas.")
+        try:
+            json.dumps(payload, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("La fotografía contiene valores no finitos o inválidos.") from exc
+        if self.portfolio_snapshots_table != "portfolio_snapshots":
+            raise JournalStorageError("La sustitución atómica requiere la tabla portfolio_snapshots.")
+        try:
+            response = self._request(
+                "POST",
+                endpoint=f"{self.url}/rest/v1/rpc/replace_portfolio_snapshot",
+                json={
+                    "p_owner": self.owner,
+                    "p_snapshot_date": target,
+                    "p_positions": payload,
+                    "p_recorded_by": recorded_by.strip().lower(),
+                },
+            )
+        except JournalStorageError as exc:
+            if exc.status_code == 404 or self._is_missing_columns_error(
+                exc, {"replace_portfolio_snapshot"}
+            ):
+                raise JournalStorageError(
+                    "Falta instalar supabase/migration_atomic_portfolio_snapshot.sql. "
+                    "La fotografía anterior se conserva; no se ha borrado ninguna posición.",
+                    status_code=exc.status_code,
+                    response_body=exc.response_body,
+                ) from exc
+            raise
+        count = response.json()
+        if not isinstance(count, int) or isinstance(count, bool) or count != len(payload):
+            raise JournalStorageError("Supabase devolvió un recuento inesperado de la fotografía.")
+        return count
 
     def list_portfolio_snapshot_positions(self) -> pd.DataFrame:
-        response = self._request(
-            "GET",
+        rows = self._list_rows(
             endpoint=self.portfolio_snapshots_endpoint,
             params={
                 "owner": f"eq.{self.owner}",
                 "select": ",".join(PORTFOLIO_SNAPSHOT_COLUMNS),
-                "order": "snapshot_date.desc,platform.asc,value_eur.desc,asset_name.asc",
+                "order": "snapshot_date.desc,platform.asc,value_eur.desc,asset_name.asc,id.asc",
             },
         )
-        rows = response.json()
         if not isinstance(rows, list):
             raise JournalStorageError("Supabase devolvió fotografías de cartera inválidas.")
         if not rows:
@@ -904,8 +1063,7 @@ class SupabaseTradingJournal:
         return int(rows[0]["id"])
 
     def list_favorites(self) -> pd.DataFrame:
-        response = self._request(
-            "GET",
+        rows = self._list_rows(
             endpoint=self.favorites_endpoint,
             params={
                 "owner": f"eq.{self.owner}",
@@ -913,7 +1071,6 @@ class SupabaseTradingJournal:
                 "order": "name.asc,ticker.asc",
             },
         )
-        rows = response.json()
         if not isinstance(rows, list):
             raise JournalStorageError("Supabase devolvió una lista de favoritos inválida.")
         if not rows:
@@ -988,8 +1145,7 @@ class SupabaseTradingJournal:
         if ticker:
             params["ticker"] = f"eq.{ticker.strip().upper()}"
         try:
-            response = self._request(
-                "GET",
+            rows = self._list_rows(
                 endpoint=self.analysis_endpoint,
                 params=params,
             )
@@ -997,12 +1153,10 @@ class SupabaseTradingJournal:
             if not self._is_missing_columns_error(exc, {"confidence_pct"}):
                 raise
             params["select"] = ",".join(LEGACY_ANALYSIS_SNAPSHOT_COLUMNS)
-            response = self._request(
-                "GET",
+            rows = self._list_rows(
                 endpoint=self.analysis_endpoint,
                 params=params,
             )
-        rows = response.json()
         if not isinstance(rows, list):
             raise JournalStorageError("Supabase devolvió un historial de análisis inválido.")
         if not rows:
@@ -1059,8 +1213,7 @@ class SupabaseTradingJournal:
     def list_enabled_alert_preferences(self) -> list[AlertPreferences]:
         """Uso exclusivo del proceso servidor que prepara todos los resúmenes."""
 
-        response = self._request(
-            "GET",
+        rows = self._list_rows(
             endpoint=self.alert_preferences_endpoint,
             params={
                 "enabled": "eq.true",
@@ -1068,7 +1221,6 @@ class SupabaseTradingJournal:
                 "order": "owner.asc",
             },
         )
-        rows = response.json()
         if not isinstance(rows, list):
             raise JournalStorageError("Supabase devolvió preferencias de alertas inválidas.")
         return [
@@ -1084,8 +1236,7 @@ class SupabaseTradingJournal:
             "order": "ticker.asc",
         }
         try:
-            response = self._request(
-                "GET",
+            rows = self._list_rows(
                 endpoint=self.alert_states_endpoint,
                 params=params,
             )
@@ -1094,15 +1245,13 @@ class SupabaseTradingJournal:
                 exc, EXTENDED_ALERT_STATE_COLUMNS
             ):
                 raise
-            response = self._request(
-                "GET",
+            rows = self._list_rows(
                 endpoint=self.alert_states_endpoint,
                 params={
                     **params,
                     "select": ",".join(LEGACY_ALERT_STATE_COLUMNS),
                 },
             )
-        rows = response.json()
         if not isinstance(rows, list):
             raise JournalStorageError("Supabase devolvió estados de alertas inválidos.")
         if not rows:

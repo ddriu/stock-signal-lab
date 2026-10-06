@@ -10,6 +10,7 @@ import pytest
 from src.paper_simulation import (
     PaperAssumptions,
     PaperOrder,
+    PaperPosition,
     PaperSnapshot,
     build_paper_rotation_dashboard,
     can_rebalance_on_date,
@@ -164,6 +165,8 @@ def test_frozen_position_counts_in_nav_but_never_invents_market_return() -> None
     assert snapshot.buy_hold_nav_eur == 1_010
     assert snapshot.unrealized_pnl_eur == 60
     assert snapshot.data_coverage_pct == pytest.approx(110 / 1_010 * 100)
+    assert snapshot.buy_hold_coverage_pct == pytest.approx(110 / 1_010 * 100)
+    assert compute_paper_scorecard([snapshot])["status"] == "Referencia incompleta"
 
 
 def test_legacy_position_without_mode_keeps_the_previous_market_semantics() -> None:
@@ -633,6 +636,83 @@ def test_signal_cannot_fill_on_t_and_uses_first_open_after_t() -> None:
     assert filled.cash_eur >= 0
 
 
+@pytest.mark.parametrize("quoted_ticker", ["OLD", "BLUE"])
+def test_rotation_pair_waits_if_either_leg_has_no_valid_open(
+    quoted_ticker: str,
+) -> None:
+    state = _seed()
+    orders = propose_paper_orders(
+        _dashboard(), state, as_of="2026-09-25", include_challenger=False
+    )
+
+    advanced, trades = fill_pending_orders(
+        state,
+        orders,
+        _bars(**{quoted_ticker: 100}),
+        as_of="2026-09-28",
+    )
+
+    assert trades == ()
+    assert advanced.positions == state.positions
+    assert advanced.cash_eur == state.cash_eur
+    assert advanced.realized_pnl_ytd_eur == state.realized_pnl_ytd_eur
+    assert advanced.costs_cumulative_eur == state.costs_cumulative_eur
+    assert advanced.filled_order_ids == state.filled_order_ids
+
+
+def test_rotation_pair_uses_the_first_opening_date_shared_by_both_legs() -> None:
+    state = _seed()
+    orders = propose_paper_orders(
+        _dashboard(), state, as_of="2026-09-25", include_challenger=False
+    )
+    bars = {
+        "OLD": pd.DataFrame(
+            {"open": [100, 101]},
+            index=pd.to_datetime(["2026-09-28", "2026-09-29"]),
+        ),
+        "BLUE": pd.DataFrame(
+            {"open": [50]},
+            index=pd.to_datetime(["2026-09-29"]),
+        ),
+    }
+
+    _, trades = fill_pending_orders(
+        state,
+        orders,
+        bars,
+        as_of="2026-09-29",
+    )
+
+    assert len(trades) == 2
+    assert {trade.filled_at for trade in trades} == {date(2026, 9, 29)}
+    assert {trade.ticker: trade.price for trade in trades} == {
+        "OLD": 101,
+        "BLUE": 50,
+    }
+
+
+def test_rotation_sale_is_rolled_back_when_the_purchase_has_no_budget() -> None:
+    state = _seed()
+    orders = propose_paper_orders(
+        _dashboard(), state, as_of="2026-09-25", include_challenger=False
+    )
+
+    advanced, trades = fill_pending_orders(
+        state,
+        orders,
+        _bars(OLD=100, BLUE=50),
+        assumptions=PaperAssumptions(minimum_cash_pct=100),
+        as_of="2026-09-28",
+    )
+
+    assert trades == ()
+    assert advanced.positions == state.positions
+    assert advanced.cash_eur == state.cash_eur
+    assert advanced.realized_pnl_ytd_eur == state.realized_pnl_ytd_eur
+    assert advanced.costs_cumulative_eur == state.costs_cumulative_eur
+    assert advanced.filled_order_ids == state.filled_order_ids
+
+
 def test_pending_order_never_fills_at_or_before_the_persisted_state_date() -> None:
     state = replace(_seed(), as_of=date(2026, 9, 28))
     order = PaperOrder(
@@ -1027,3 +1107,126 @@ def test_scorecard_compares_net_strategy_with_hold_and_benchmark() -> None:
     assert result["excess_vs_benchmark_pct"] == pytest.approx(12)
     assert result["maximum_drawdown_pct"] == pytest.approx(-10)
     assert result["status"] == "Mejora ambas referencias"
+
+
+def test_missing_initial_holding_quote_cannot_manufacture_a_win() -> None:
+    state = _seed()
+    first = mark_to_market(state, {"OLD": 100, "KEEP": 100}, 500, as_of="2026-09-25")
+    rotated = replace(state, positions=(PaperPosition("NEW", 15, 100, 100),))
+    latest = mark_to_market(rotated, {"NEW": 120}, 510, as_of="2026-09-28")
+    result = compute_paper_scorecard([first, latest])
+
+    assert latest.data_coverage_pct == 100
+    assert latest.buy_hold_coverage_pct == 0
+    assert result["buy_hold_return_pct"] is None
+    assert result["excess_vs_hold_pct"] is None
+    assert result["status"] == "Referencia incompleta"
+
+
+def test_missing_strategy_or_benchmark_coverage_blocks_its_return() -> None:
+    first = _snapshot(25, strategy=100, hold=100, benchmark=100)
+    latest = replace(
+        _snapshot(28, strategy=150, hold=110, benchmark=120),
+        data_coverage_pct=50, benchmark_coverage_pct=0,
+    )
+    result = compute_paper_scorecard([first, latest])
+
+    assert result["strategy_return_pct"] is None
+    assert result["benchmark_return_pct"] is None
+    assert result["maximum_drawdown_pct"] is None
+    assert result["excess_vs_benchmark_pct"] is None
+    assert result["status"] == "Referencia incompleta"
+
+
+def test_non_finite_quotes_do_not_count_as_strategy_hold_or_index_coverage() -> None:
+    state = _seed()
+    snapshot = mark_to_market(
+        state, {"OLD": float("inf"), "KEEP": float("nan")}, float("inf"),
+        as_of="2026-09-28",
+    )
+
+    assert snapshot.nav_net_eur == state.initial_nav_eur
+    assert snapshot.data_coverage_pct == 0
+    assert snapshot.buy_hold_coverage_pct == 0
+    assert snapshot.benchmark_coverage_pct == 0
+    assert snapshot.benchmark_nav_eur is None
+    assert compute_paper_scorecard([snapshot])["strategy_return_pct"] is None
+
+
+def _international_pair():
+    state = _seed(cash=0)
+    orders = propose_paper_orders(_dashboard(), state, as_of="2026-09-25", include_challenger=False)
+    orders = tuple(replace(order, currency="USD" if order.side == "Venta" else "HKD") for order in orders)
+    bars = _bars(OLD=100, BLUE=50)
+    bars["OLD"].attrs["currency"] = "USD"
+    bars["BLUE"].attrs["currency"] = "HKD"
+    return state, orders, bars
+
+
+def test_international_pair_does_not_buy_before_the_financing_sale() -> None:
+    state, orders, bars = _international_pair()
+    bars["OLD"].attrs.update(exchange_timezone="America/New_York", market_open_time="09:30")
+    bars["BLUE"].attrs.update(exchange_timezone="Asia/Hong_Kong", market_open_time="09:30")
+    advanced, trades = fill_pending_orders(
+        state, orders, bars, {"USD": 0.9, "HKD": 0.1}, as_of="2026-09-28",
+    )
+
+    assert trades == ()
+    assert advanced.positions == state.positions
+    assert advanced.cash_eur == state.cash_eur
+
+
+def test_international_pair_with_unknown_opening_times_stays_pending() -> None:
+    state, orders, bars = _international_pair()
+    advanced, trades = fill_pending_orders(
+        state, orders, bars, {"USD": 0.9, "HKD": 0.1}, as_of="2026-09-28",
+    )
+
+    assert trades == ()
+    assert advanced.filled_order_ids == ()
+
+
+def test_verified_international_purchase_after_sale_can_execute_atomically() -> None:
+    state, orders, bars = _international_pair()
+    bars["OLD"]["open_timestamp"] = pd.to_datetime(["2026-09-25T01:30Z", "2026-09-28T01:30Z", "2026-09-29T01:30Z"])
+    bars["BLUE"]["open_timestamp"] = pd.to_datetime(["2026-09-25T13:30Z", "2026-09-28T13:30Z", "2026-09-29T13:30Z"])
+    advanced, trades = fill_pending_orders(
+        state, orders, bars, {"USD": 0.9, "HKD": 0.1}, as_of="2026-09-28",
+    )
+
+    assert len(trades) == 2
+    assert len(advanced.filled_order_ids) == 2
+
+
+def test_a_current_fx_snapshot_cannot_price_an_earlier_fill() -> None:
+    state = _seed()
+    order = replace(
+        propose_paper_orders(_dashboard(), state, as_of="2026-09-25", include_challenger=False)[0],
+        pair_id="", currency="USD",
+    )
+    bars = _bars(OLD=100)
+    bars["OLD"].attrs["currency"] = "USD"
+    advanced, trades = fill_pending_orders(
+        state, [order], bars, {"USD": 0.7}, as_of="2026-09-29",
+    )
+
+    assert trades == ()
+    assert advanced.filled_order_ids == ()
+
+
+def test_dated_fx_preserves_the_historical_fill_rate() -> None:
+    state = _seed()
+    order = replace(
+        propose_paper_orders(_dashboard(), state, as_of="2026-09-25", include_challenger=False)[0],
+        pair_id="", currency="USD",
+    )
+    bars = _bars(OLD=100)
+    bars["OLD"].attrs["currency"] = "USD"
+    _, trades = fill_pending_orders(
+        state, [order], bars, {"USD": 0.7}, as_of="2026-09-29",
+        fx_rates_to_eur_by_date={"2026-09-28": {"USD": 0.9}},
+    )
+
+    assert len(trades) == 1
+    assert trades[0].filled_at == date(2026, 9, 28)
+    assert trades[0].fx_rate_to_eur == 0.9

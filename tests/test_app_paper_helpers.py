@@ -655,6 +655,42 @@ def test_snapshots_rebuilt_from_runs_keep_the_three_comparable_nav_series() -> N
     assert snapshots[0].buy_hold_nav_eur == 1_005
     assert snapshots[0].benchmark_nav_eur == 1_010
     assert snapshots[0].data_coverage_pct == 95
+    assert snapshots[0].buy_hold_coverage_pct == 0
+    assert snapshots[0].benchmark_coverage_pct == 0
+
+
+def test_saved_reference_coverages_survive_paper_snapshot_reconstruction() -> None:
+    runs = pd.DataFrame(
+        [
+            {
+                "id": 1,
+                "market_date": "2026-09-25",
+                "net_nav_eur": 1_000,
+                "benchmark_nav_eur": 1_010,
+                "hold_nav_eur": 1_005,
+                "coverage_pct": 100,
+                "hold_coverage_pct": 75,
+                "benchmark_coverage_pct": 0,
+            },
+            {
+                "id": 2,
+                "market_date": "2026-09-28",
+                "net_nav_eur": 1_020,
+                "benchmark_nav_eur": 1_015,
+                "hold_nav_eur": 1_006,
+                "coverage_pct": 100,
+                "hold_coverage_pct": 100,
+                "benchmark_coverage_pct": 100,
+            },
+        ]
+    )
+
+    snapshots = HELPERS["_paper_snapshots_from_runs"](runs)
+
+    assert snapshots[0].buy_hold_coverage_pct == 75
+    assert snapshots[0].benchmark_coverage_pct == 0
+    assert snapshots[1].buy_hold_coverage_pct == 100
+    assert snapshots[1].benchmark_coverage_pct == 100
 
 
 def test_market_date_uses_latest_available_session_not_wall_clock() -> None:

@@ -56,7 +56,7 @@ def score_tier(score: float | int) -> str | None:
     return None
 
 
-def _wilson_interval(successes: int, samples: int) -> tuple[float, float]:
+def _wilson_interval(successes: float, samples: int) -> tuple[float, float]:
     """Intervalo Wilson del 95% para no presentar una tasa como certeza."""
 
     if samples <= 0:
@@ -207,6 +207,15 @@ def calibrate_score_returns(
         ["signal_date", "ticker"],
         ignore_index=True,
     )
+    # Muchas acciones pueden repetir el mismo movimiento de mercado. Agrupar
+    # por cohortes temporales de un horizonte evita multiplicar evidencia por
+    # añadir tickers correlacionados. Son bloques aproximados de días hábiles,
+    # no una afirmación de independencia entre regímenes bursátiles.
+    business_ordinals = np.busday_count(
+        np.datetime64("1970-01-01"),
+        events["entry_date"].to_numpy(dtype="datetime64[D]"),
+    )
+    events["temporal_block"] = business_ordinals // horizon_sessions
     summaries: list[dict[str, object]] = []
     groups: list[tuple[str, pd.DataFrame]] = [
         (label, events.loc[events["score_tier"] == label])
@@ -217,16 +226,22 @@ def calibrate_score_returns(
         if group.empty:
             continue
         samples = len(group)
-        civis_successes = int(group["beat_civislend"].sum())
-        confidence_low, confidence_high = _wilson_interval(
-            civis_successes,
-            samples,
+        period_rates = group.groupby("temporal_block")["beat_civislend"].mean()
+        temporal_blocks = len(period_rates)
+        # Cada periodo pesa una vez en la banda orientativa. Un solo periodo
+        # no permite estimar incertidumbre entre situaciones de mercado.
+        confidence_low, confidence_high = (
+            _wilson_interval(float(period_rates.sum()), temporal_blocks)
+            if temporal_blocks >= 2
+            else (0.0, 100.0)
         )
         summaries.append(
             {
                 "score_tier": label,
                 "samples": samples,
-                "enough_evidence": samples >= minimum_samples,
+                "unique_signal_dates": int(group["signal_date"].nunique()),
+                "temporal_blocks": temporal_blocks,
+                "enough_evidence": temporal_blocks >= minimum_samples,
                 "median_net_return_pct": float(group["net_return_pct"].median()),
                 "mean_net_return_pct": float(group["net_return_pct"].mean()),
                 "positive_rate_pct": float(group["positive"].mean() * 100.0),
@@ -234,6 +249,7 @@ def calibrate_score_returns(
                 "beat_civislend_rate_pct": float(
                     group["beat_civislend"].mean() * 100.0
                 ),
+                "beat_civislend_period_rate_pct": float(period_rates.mean() * 100.0),
                 "beat_civislend_ci_low_pct": confidence_low,
                 "beat_civislend_ci_high_pct": confidence_high,
                 "lower_quartile_pct": float(group["net_return_pct"].quantile(0.25)),

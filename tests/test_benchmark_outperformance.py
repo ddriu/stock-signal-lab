@@ -10,7 +10,9 @@ from src.benchmark_outperformance import (
 def _frame(daily_return: float, sessions: int = 1_320) -> pd.DataFrame:
     index = pd.bdate_range("2021-01-04", periods=sessions)
     close = 100.0 * np.cumprod(np.full(sessions, 1.0 + daily_return))
-    return pd.DataFrame({"close": close}, index=index)
+    frame = pd.DataFrame({"close": close}, index=index)
+    frame.attrs["display_currency"] = "USD"
+    return frame
 
 
 def _strong_evidence() -> dict[str, StrategyEvidence]:
@@ -93,3 +95,53 @@ def test_historical_beat_windows_are_non_overlapping() -> None:
     assert short.period_sessions == 63
     assert short.historical_windows == 20
     assert short.historical_beat_rate_pct == 100.0
+
+
+def test_different_native_currencies_cannot_claim_outperformance() -> None:
+    stock = _frame(0.0010)
+    stock.attrs["display_currency"] = "GBP"
+    result = evaluate_benchmark_outperformance(
+        ticker="UK.L", stock=stock, benchmark=_frame(0.0003),
+        strategies=_strong_evidence(),
+    )
+
+    assert result.best_horizon is None
+    assert result.comparison_currency is None
+    assert all(item.status == "Divisas no comparables" for item in result.horizons)
+    assert all(item.score is None and item.excess_return_pct is None for item in result.horizons)
+
+
+def test_a_declared_currency_does_not_override_conflicting_native_metadata() -> None:
+    stock = _frame(0.0010)
+    stock.attrs["display_currency"] = "GBP"
+    result = evaluate_benchmark_outperformance(
+        ticker="UK.L", stock=stock, benchmark=_frame(0.0003),
+        strategies=_strong_evidence(), comparison_currency="EUR",
+    )
+
+    assert all(item.status == "Divisas no comparables" for item in result.horizons)
+
+
+def test_historically_converted_series_can_use_a_common_currency() -> None:
+    stock, benchmark = _frame(0.0010), _frame(0.0003)
+    stock.attrs["comparison_currency"] = "EUR"
+    benchmark.attrs["comparison_currency"] = "EUR"
+    result = evaluate_benchmark_outperformance(
+        ticker="CONVERTED", stock=stock, benchmark=benchmark,
+        strategies=_strong_evidence(), comparison_currency="EUR",
+    )
+
+    assert result.comparison_currency == "EUR"
+    assert result.for_horizon("medium").status in {"Ventaja fuerte a validar", "Candidata a superar"}
+
+
+def test_unknown_currency_requires_verification_before_ranking() -> None:
+    stock = _frame(0.0010)
+    stock.attrs.clear()
+    result = evaluate_benchmark_outperformance(
+        ticker="UNKNOWN", stock=stock, benchmark=_frame(0.0003),
+        strategies=_strong_evidence(),
+    )
+
+    assert result.best_horizon is None
+    assert all(item.status == "Divisa sin verificar" for item in result.horizons)

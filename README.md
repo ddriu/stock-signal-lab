@@ -47,11 +47,12 @@ La instalación local solicita las credenciales guardadas en
 │   ├── portfolio_history.py  # Evolución diaria y resumen anual de cartera
 │   ├── portfolio_export.py   # Libro Excel con tablas y gráficos editables
 │   ├── portfolio_snapshot_import.py # Fotografías XLSX sin inventar operaciones
-│   ├── portfolio_snapshot.py # KPIs de la última fotografía sin mezclar fechas
+│   ├── portfolio_snapshot.py # Fotografías y reconciliación por cuenta y ticker
+│   ├── market_data_quality.py # Vigencia común de cotizaciones y cobertura
 │   ├── navigation.py         # Estado seguro entre favoritos y análisis directo
 │   ├── segofactoring_import.py # Importación idempotente del resumen XLSX
 │   ├── recommendations.py    # Entradas, retornos históricos y ventas parciales
-│   ├── return_calibration.py # Probabilidad histórica de superar objetivos a 30+ días
+│   ├── return_calibration.py # Frecuencias históricas por bloques temporales
 │   └── journal.py            # Diario SQLite y exportación mediante la UI
 └── tests/                    # Pruebas unitarias sin red
 ```
@@ -159,7 +160,7 @@ nunca se presenta como entrada completa hasta disponer de la revisión empresari
 ## Cartera y cambios
 
 El diario guarda compras y ventas con fecha, cantidad, precio, moneda y comisión. Reconstruye
-el coste medio incluyendo las comisiones, admite ventas parciales y calcula beneficio realizado
+los costes por lotes FIFO incluyendo las comisiones, admite ventas parciales y calcula beneficio realizado
 y beneficio neto si se vendiera al último cierre. Las posiciones guardadas se añaden
 automáticamente a la próxima descarga.
 
@@ -199,12 +200,27 @@ Cada favorita admite hasta cinco etiquetas visuales —por ejemplo Energía,
 Biotecnología, Tecnología, ETF, Fondo o Small cap— que pueden corregirse y utilizarse
 como filtro. La aplicación propone etiquetas a partir del tipo de instrumento, sector,
 industria y capitalización disponibles, pero la clasificación sigue siendo editable.
-La portada actualiza automáticamente posiciones y favoritas en lotes de 20, empezando
-por la cartera. En la misma sesión recuerda las descargas correctas: si el proveedor
-limita peticiones, el siguiente intento continúa sólo con las pendientes y no vuelve
-a empezar las 136 empresas. La revisión empresarial profunda continúa separada en
-lotes de 25 para no confundir un precio reciente con fundamentales completos. El
-historial de operaciones no tiene ese límite.
+Inicio prioriza los precios de las posiciones reales y las del laboratorio en lotes
+de 20 al cargar la aplicación. No descarga todas las favoritas por abrir el resumen:
+el barrido completo se solicita desde **Decisiones → Revisar toda mi cartera y buscar
+oportunidades** o desde el radar, y el proceso de correo tiene su revisión diaria
+independiente. En la misma sesión se conservan las descargas recientes correctas y
+se reintentan las pendientes; una cotización antigua no cuenta como actualizada.
+La revisión empresarial profunda continúa en lotes separados para no confundir un
+precio reciente con fundamentales completos. El historial de operaciones no tiene
+ese límite.
+
+Inicio separa cuatro vistas y sólo ejecuta la seleccionada: **Resumen** muestra
+saldos y cobertura; **Decisiones** presenta riesgos y alternativas; **Laboratorio**
+registra y compara simulaciones; **Accesos** abre las tareas habituales. Civislend,
+Segofactoring y otras partidas manuales conservan su valor declarado, pero no se
+mezclan con las propuestas de rotación de valores cotizados.
+
+El laboratorio no registra la barra de la sesión actual de SPY hasta las 16:30 de
+Nueva York, con ajuste de horario de verano y un margen prudente tras el cierre.
+Antes del umbral conserva el histórico y no inicia ni reconstruye temporadas.
+También rechaza fechas futuras o de fin de semana. Esta guardia no sustituye un
+calendario completo ni garantiza que el proveedor haya finalizado la cotización.
 
 La sección **Comparador sectorial** enfrenta de 2 a 10 empresas cargadas durante
 1, 3, 6 o 12 meses. Normaliza todas las cotizaciones a 100, calcula rentabilidad,
@@ -218,9 +234,12 @@ la posición durante 21, 42, 63, 126 o 252 sesiones. Descuenta 1 euro al comprar
 al vender y el deslizamiento configurado. Convierte las rentabilidades anuales elegidas
 para Segofactoring y Civislend al mismo horizonte y muestra por separado la frecuencia
 de acabar en positivo, superar Segofactoring y superar Civislend. La evidencia sólo se
-marca como suficiente desde 30 casos no solapados e incluye un intervalo de incertidumbre
-del 95%. La calibración utiliza el score técnico histórico; no aplica fundamentales
-actuales a fechas pasadas porque eso introduciría *look-ahead bias*.
+marca como suficiente desde 30 bloques temporales no solapados; varias empresas en
+la misma fecha no cuentan como periodos independientes. La banda orientativa del
+95% se calcula por bloques, no por número de tickers. Es una frecuencia descriptiva,
+no una probabilidad predictiva validada fuera de muestra. La calibración utiliza el
+score técnico histórico; no aplica fundamentales actuales a fechas pasadas porque
+eso introduciría *look-ahead bias*.
 
 Desde la ficha de una empresa se puede guardar una fotografía privada del análisis:
 precio, fecha, seis notas, lecturas, expectativa histórica y una nota personal. El

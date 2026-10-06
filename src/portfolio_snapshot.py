@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+import math
 
 import pandas as pd
 
 from src.data_sources import convert_currency
-from src.data_loader import resolve_analysis_ticker
+from src.instruments import resolve_analysis_ticker
+from src.market_data_quality import quote_freshness
 
 
 HOME_GROUPED_PLATFORMS = ("Civislend", "Segofactoring")
@@ -145,6 +147,7 @@ def refresh_portfolio_snapshot_prices(
     rates_per_eur: dict[str, float],
     *,
     price_dates: dict[str, object] | None = None,
+    reference_date: object | None = None,
 ) -> tuple[pd.DataFrame, PortfolioRefreshSummary]:
     """Revaloriza sólo las partidas con ticker y cantidad comprobables.
 
@@ -187,8 +190,18 @@ def refresh_portfolio_snapshot_prices(
             refreshed.at[index, "valuation_status"] = "Dato manual (sin cantidad)"
             manual += 1
             continue
-        if current_price is None or float(current_price) <= 0:
+        if current_price is None or not math.isfinite(float(current_price)) or float(current_price) <= 0:
             refreshed.at[index, "valuation_status"] = "Precio pendiente"
+            pending += 1
+            continue
+
+        freshness = quote_freshness(
+            price_dates.get(ticker), reference_date=reference_date
+        )
+        if not freshness.fresh:
+            refreshed.at[index, "valuation_status"] = freshness.status
+            if freshness.market_date is not None:
+                refreshed.at[index, "market_as_of"] = freshness.market_date.isoformat()
             pending += 1
             continue
 
@@ -253,43 +266,6 @@ def reconcile_current_portfolio(
         return snapshot.copy()
 
     frame = snapshot.copy()
-    relevant_operations = operations
-    if not frame.empty and "executed_at" in operations.columns:
-        snapshot_dates = pd.to_datetime(
-            frame.get("snapshot_date", pd.Series(dtype=object)), errors="coerce", utc=True
-        )
-        operation_dates = pd.to_datetime(
-            operations["executed_at"], errors="coerce", utc=True
-        )
-        if snapshot_dates.notna().any() and operation_dates.notna().any():
-            latest_snapshot_date = snapshot_dates.max().normalize()
-            relevant_mask = operation_dates.dt.normalize() > latest_snapshot_date
-            # Si la operación se registró después de subir la fotografía del mismo
-            # día, se considera posterior. Esto evita que una compra/venta nueva
-            # desaparezca hasta el día siguiente sin inventar el orden histórico.
-            if "updated_at" in frame.columns and "created_at" in operations.columns:
-                latest_rows = snapshot_dates.dt.normalize() == latest_snapshot_date
-                snapshot_updates = pd.to_datetime(
-                    frame.loc[latest_rows, "updated_at"], errors="coerce", utc=True
-                )
-                operation_created = pd.to_datetime(
-                    operations["created_at"], errors="coerce", utc=True
-                )
-                if snapshot_updates.notna().any() and operation_created.notna().any():
-                    same_day = operation_dates.dt.normalize() == latest_snapshot_date
-                    relevant_mask |= same_day & (
-                        operation_created > snapshot_updates.max()
-                    )
-            relevant_operations = operations.loc[relevant_mask]
-
-    operated_tickers = {
-        resolve_analysis_ticker(str(value).strip().upper())
-        for value in relevant_operations["ticker"].dropna().tolist()
-        if str(value).strip()
-    }
-    if not operated_tickers:
-        return frame
-
     if frame.empty:
         frame = pd.DataFrame(
             columns=[
@@ -306,15 +282,86 @@ def reconcile_current_portfolio(
     ).fillna("").astype(str).map(
         lambda value: resolve_analysis_ticker(value.strip().upper()) if value.strip() else ""
     )
-    templates = frame.loc[resolved_snapshot.isin(operated_tickers)].copy()
-    reconciled = frame.loc[~resolved_snapshot.isin(operated_tickers)].copy()
+    accounts = frame.get("platform", pd.Series("", index=frame.index)).fillna("").astype(str).str.strip()
+    snapshot_dates = pd.to_datetime(
+        frame.get("snapshot_date", pd.Series(index=frame.index, dtype=object)),
+        errors="coerce", utc=True,
+    )
+    default_snapshot_date = (
+        snapshot_dates.max().date().isoformat()
+        if snapshot_dates.notna().any()
+        else date.today().isoformat()
+    )
+
+    def effective_account(ticker: str, account: object) -> str | None:
+        value = "" if account is None or pd.isna(account) else str(account).strip()
+        if value and value != "Sin especificar":
+            return value
+        candidates = set(accounts.loc[resolved_snapshot == ticker])
+        if not candidates and not positions_dashboard.empty:
+            candidates = {
+                str(row.get("account_name") or "").strip()
+                for row in positions_dashboard.to_dict("records")
+                if resolve_analysis_ticker(str(row.get("ticker") or "").strip().upper()) == ticker
+            }
+        # Los diarios antiguos no guardaban cuenta. Sólo podemos adjudicarlos
+        # cuando existe una única cuenta; ante dos brókers conservamos la foto.
+        return next(iter(candidates)) if len(candidates) == 1 else ("" if not candidates else None)
+
+    operated_keys: set[tuple[str, str]] = set()
+    operation_dates: dict[tuple[str, str], str] = {}
+    for operation in operations.to_dict("records"):
+        raw_ticker = str(operation.get("ticker") or "").strip().upper()
+        if not raw_ticker:
+            continue
+        raw_account = operation.get("account_name")
+        account = "" if raw_account is None or pd.isna(raw_account) else str(raw_account).strip()
+        notes = str(operation.get("notes") or "")
+        if account.endswith(" · cierre histórico") or "[CIERRE_HISTORICO:" in notes.upper():
+            continue
+        ticker = resolve_analysis_ticker(raw_ticker)
+        account = effective_account(ticker, account)
+        if account is None:
+            continue
+        key = (ticker, account)
+        matching_mask = (resolved_snapshot == ticker) & (accounts == account)
+        baseline_mask = matching_mask if matching_mask.any() else accounts == account
+        baseline_dates = snapshot_dates.loc[baseline_mask]
+        baseline = baseline_dates.max() if baseline_dates.notna().any() else snapshot_dates.max()
+        executed = pd.to_datetime(operation.get("executed_at"), errors="coerce", utc=True)
+        if pd.notna(baseline) and "executed_at" in operations:
+            if pd.isna(executed) or executed.normalize() < baseline.normalize():
+                continue
+            if executed.normalize() == baseline.normalize():
+                updates = pd.to_datetime(
+                    frame.loc[baseline_mask].get("updated_at", pd.Series(dtype=object)),
+                    errors="coerce", utc=True,
+                )
+                created = pd.to_datetime(operation.get("created_at"), errors="coerce", utc=True)
+                if not updates.notna().any() or pd.isna(created) or created <= updates.max():
+                    continue
+        operated_keys.add(key)
+        if pd.notna(executed):
+            operation_dates[key] = max(operation_dates.get(key, ""), executed.date().isoformat())
+    if not operated_keys:
+        return frame
+
+    replacement_mask = pd.Series(
+        [(ticker, account) in operated_keys for ticker, account in zip(resolved_snapshot, accounts)],
+        index=frame.index, dtype=bool,
+    )
+    templates = frame.loc[replacement_mask].copy()
+    reconciled = frame.loc[~replacement_mask].copy()
 
     replacement_rows: list[dict[str, object]] = []
     if not positions_dashboard.empty:
         for position in positions_dashboard.to_dict("records"):
             raw_ticker = str(position.get("ticker") or "").strip().upper()
             ticker = resolve_analysis_ticker(raw_ticker) if raw_ticker else ""
-            if not ticker or ticker not in operated_tickers:
+            if not ticker:
+                continue
+            account_name = effective_account(ticker, position.get("account_name"))
+            if account_name is None or (ticker, account_name) not in operated_keys:
                 continue
 
             matching = templates.loc[
@@ -329,14 +376,11 @@ def reconcile_current_portfolio(
                 )
                 == ticker
             ]
-            account_name = str(position.get("account_name") or "").strip()
-            if account_name and not matching.empty and "platform" in matching:
-                account_match = matching.loc[
+            if not matching.empty and "platform" in matching:
+                matching = matching.loc[
                     matching["platform"].fillna("").astype(str).str.strip()
                     == account_name
                 ]
-                if not account_match.empty:
-                    matching = account_match
             row = matching.iloc[0].to_dict() if not matching.empty else {}
             if len(matching) > 1:
                 row["platform"] = "Varias cuentas"
@@ -347,7 +391,10 @@ def reconcile_current_portfolio(
             row.setdefault("asset_name", raw_ticker or ticker)
             row.setdefault("asset_type", "Acción / ETF")
             row.setdefault("portfolio_block", "Cartera actual")
-            row["snapshot_date"] = date.today().isoformat()
+            # Esta sigue siendo una vista de la misma fotografía completa. Una
+            # fecha nueva sólo en esta fila haría que Inicio descartase las demás.
+            row.setdefault("snapshot_date", default_snapshot_date)
+            row["operation_as_of"] = operation_dates.get((ticker, account_name), "")
             row["raw_identifier"] = raw_ticker or ticker
             row["analysis_ticker"] = ticker
             row["quantity"] = position.get("quantity")
@@ -377,8 +424,24 @@ def reconcile_current_portfolio(
                 fallback_value = (
                     float(fallback_values.sum()) if fallback_values.notna().any() else None
                 )
+                previous_quantities = pd.to_numeric(
+                    matching.get("quantity", pd.Series(dtype=float)), errors="coerce"
+                )
+                previous_quantity = (
+                    float(previous_quantities.sum())
+                    if not previous_quantities.empty and previous_quantities.notna().all()
+                    else None
+                )
+                new_quantity = pd.to_numeric(position.get("quantity"), errors="coerce")
+                can_scale = (
+                    fallback_value is not None and previous_quantity is not None
+                    and previous_quantity > 0 and pd.notna(new_quantity)
+                )
+                if can_scale:
+                    fallback_value *= float(new_quantity) / previous_quantity
                 row["value_eur"] = fallback_value
-                if fallback_value is not None and pd.notna(cost):
+                row["gain_loss_eur"] = row["return_pct"] = None
+                if can_scale and pd.notna(cost):
                     row["gain_loss_eur"] = fallback_value - float(cost)
                     row["return_pct"] = (
                         (fallback_value - float(cost)) / float(cost) * 100.0

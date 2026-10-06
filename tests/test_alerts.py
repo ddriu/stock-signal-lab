@@ -68,7 +68,7 @@ def test_buy_alert_is_only_for_unheld_candidate_above_threshold() -> None:
     )
 
 
-def test_position_alert_prioritizes_exit_over_entry_label() -> None:
+def test_isolated_technical_sale_never_becomes_a_sale_email() -> None:
     preferences = normalize_alert_preferences(
         owner="fer",
         email="fer@example.com",
@@ -81,9 +81,22 @@ def test_position_alert_prioritizes_exit_over_entry_label() -> None:
         preferences=preferences,
     )
 
+    assert candidate is None
+
+
+def test_confirmed_exposure_review_uses_shared_decision_without_sale_badge() -> None:
+    preferences = normalize_alert_preferences(owner="fer", email="fer@example.com", enabled=True)
+    candidate = build_alert_candidate(
+        make_signal(position_label="Vender"), price=90, held=True, preferences=preferences,
+        position_decision={"Decisión": "Revisar exposición", "Motivo": "Riesgo confirmado."},
+    )
     assert candidate is not None
-    assert candidate.kind == "Venta"
-    assert candidate.signature == "position:Vender"
+    assert candidate.kind == "Revisión de riesgo"
+    assert candidate.position_label == "Revisar exposición"
+    assert candidate.signature == "position:Revisar exposición"
+    _, plain, rendered = build_digest_content("Fermín", [candidate])
+    assert "Riesgo confirmado." in plain
+    assert "VENTA" not in rendered
 
 
 def test_repeated_signature_is_filtered_and_digest_has_disclaimer() -> None:
@@ -226,3 +239,31 @@ def test_daily_overview_combines_all_readings_and_keeps_missing_data_visible() -
     assert "Datos insuficientes" in plain
     assert html.count("Halozyme Therapeutics (HALO)") == 1
     assert "href=" not in html
+
+
+def test_daily_mail_shows_market_date_data_coverage_and_shared_holding_decision() -> None:
+    row = DailyOverviewRow(
+        ticker="MCD", company_name="McDonald's", held=True, price=100,
+        as_of="2026-10-02", technical_score=5, technical_label="Esperar",
+        position_label="Vender", fundamental_score=90, confidence_pct=80,
+        portfolio_decision="Esperar confirmación", decision_reason="La tesis sigue intacta.",
+        data_note="Última sesión disponible",
+    )
+    _, plain, rendered = build_daily_overview_content("David", [row])
+    assert "Esperar confirmación" in plain and "Esperar confirmación" in rendered
+    assert "Revisar posible salida" not in plain
+    assert "2026-10-02" in plain and "2026-10-02" in rendered
+    assert "80%" in plain and "80%" in rendered
+    assert "Última sesión disponible" in rendered
+
+
+def test_buyable_price_without_data_coverage_is_not_a_validated_entry() -> None:
+    row = DailyOverviewRow(
+        ticker="AAA", company_name="Empresa", held=False, price=100,
+        as_of="2026-10-02", technical_score=90, technical_label="Entrada fuerte",
+        position_label="Mantener", opportunity_score=90,
+        opportunity_status="🟢 COMPRABLE", confidence_pct=30,
+    )
+    _, plain, rendered = build_daily_overview_content("David", [row])
+    assert "Entradas validadas para revisar: 0" in plain
+    assert "Entrada validada para revisar" not in rendered

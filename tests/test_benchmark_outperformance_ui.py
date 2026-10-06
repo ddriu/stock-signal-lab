@@ -1,4 +1,6 @@
 from streamlit.testing.v1 import AppTest
+import pandas as pd
+import pytest
 
 
 def test_benchmark_page_renders_portfolio_and_favorites_in_one_table() -> None:
@@ -65,3 +67,55 @@ render_benchmark_outperformance_page(
         app.session_state["_requested_analysis_strategy_navigation"]
         == "Ventaja relativa"
     )
+
+
+@pytest.mark.parametrize("currency", ["USD", "EUR"])
+def test_benchmark_ui_requires_verified_common_quote_currency(currency: str) -> None:
+    script = '''
+import numpy as np
+import pandas as pd
+from app import prepare_data, render_benchmark_outperformance_page
+from config import StrategyConfig
+
+index = pd.bdate_range("2022-01-03", periods=900)
+def prices(rate):
+    close = 100 * np.cumprod(np.full(len(index), rate))
+    return pd.DataFrame({
+        "open": close * .999, "high": close * 1.01,
+        "low": close * .99, "close": close,
+        "volume": np.full(len(index), 2_000_000),
+    }, index=index)
+
+config = StrategyConfig()
+info = {"symbol": "TEST", "currency": "__CURRENCY__", "quoteType": "EQUITY"}
+spy = prices(1.0003)
+(prepared, _, _, valuations, relatives, risks, opportunities) = prepare_data(
+    {"TEST": prices(1.0010)}, {"TEST": info}, {"SPY": spy}, config,
+)
+class Journal:
+    def open_positions(self):
+        return pd.DataFrame([{"ticker": "TEST"}])
+    def list_portfolio_snapshot_positions(self):
+        return pd.DataFrame()
+
+render_benchmark_outperformance_page(
+    prepared, config, {"TEST": info}, {"SPY": spy}, valuations,
+    relatives, risks, opportunities, Journal(), ["TEST"], {"TEST": "Test Inc."},
+    pd.DataFrame([{"ticker": "TEST"}]),
+)
+'''.replace("__CURRENCY__", currency)
+    app = AppTest.from_string(script, default_timeout=30).run()
+
+    assert not app.exception
+    assert not app.error
+    table = next(item.value for item in app.dataframe if "Moneda de comparación" in item.value)
+    row = table.loc[table["Ticker"] == "TEST"].iloc[0]
+    if currency == "USD":
+        assert row["Moneda de comparación"] == "USD"
+        assert row["Lectura"] not in {"Divisa sin verificar", "Divisas no comparables"}
+        assert pd.notna(row["Ventaja vs S&P"])
+    else:
+        assert row["Moneda de comparación"] == "Sin verificar"
+        assert row["Lectura"] == "Divisas no comparables"
+        assert pd.isna(row["Ventaja vs S&P"])
+        assert pd.isna(row["Puntuación"])

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import sqlite3
 import os
 import sys
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -21,6 +22,7 @@ from src.alerts import (
     preferences_from_mapping,
 )
 from src.favorite_tags import serialize_favorite_tags
+from src.data_sources import convert_currency
 
 
 OPERATION_COLUMNS = [
@@ -40,6 +42,9 @@ OPERATION_COLUMNS = [
     "recorded_by",
     "created_at",
 ]
+
+HISTORICAL_CLOSURE_QUALITIES = ("Documentado", "Estimado")
+HISTORICAL_CLOSURE_ACCOUNT_SUFFIX = " · cierre histórico"
 
 FAVORITE_COLUMNS = [
     "id",
@@ -164,6 +169,8 @@ PAPER_DAILY_RUN_COLUMNS = [
     "cumulative_costs_eur",
     "tax_reserve_eur",
     "coverage_pct",
+    "hold_coverage_pct",
+    "benchmark_coverage_pct",
     "warnings_json",
     "rejected_json",
     "engine_version",
@@ -389,6 +396,8 @@ def normalize_paper_daily_run(
     cumulative_costs_eur: float = 0.0,
     tax_reserve_eur: float = 0.0,
     coverage_pct: float = 0.0,
+    hold_coverage_pct: float | None = None,
+    benchmark_coverage_pct: float | None = None,
     status: str = "complete",
     engine_version: str = "paper-v1",
 ) -> dict[str, object]:
@@ -442,6 +451,14 @@ def normalize_paper_daily_run(
         "coverage_pct": _paper_number(
             coverage_pct, "cobertura", minimum=0.0, maximum=100.0
         ),
+        "hold_coverage_pct": (
+            _paper_number(hold_coverage_pct, "cobertura de mantener", minimum=0.0, maximum=100.0)
+            if hold_coverage_pct is not None else None
+        ),
+        "benchmark_coverage_pct": (
+            _paper_number(benchmark_coverage_pct, "cobertura del benchmark", minimum=0.0, maximum=100.0)
+            if benchmark_coverage_pct is not None else None
+        ),
         "warnings_json": serialize_stable_json(warnings, expected="array"),
         "rejected_json": serialize_stable_json(rejected, expected="array"),
         "engine_version": version,
@@ -471,6 +488,8 @@ def normalize_operation(
         raise ValueError("La operación necesita un ticker.")
     if side not in {"Compra", "Venta"}:
         raise ValueError("El tipo debe ser Compra o Venta.")
+    if not all(math.isfinite(float(value)) for value in (quantity, price, fees)):
+        raise ValueError("Cantidad, precio y comisiones deben ser números finitos.")
     if quantity <= 0 or price <= 0 or fees < 0:
         raise ValueError("Cantidad/precio deben ser positivos y las comisiones no negativas.")
     normalized_currency = currency.strip().upper()
@@ -490,11 +509,11 @@ def normalize_operation(
         if fx_rate_to_eur is not None and pd.notna(fx_rate_to_eur)
         else None
     )
-    if normalized_settlement is not None and normalized_settlement <= 0:
+    if normalized_settlement is not None and (not math.isfinite(normalized_settlement) or normalized_settlement <= 0):
         raise ValueError("El importe liquidado en euros debe ser positivo.")
-    if normalized_fee_eur is not None and normalized_fee_eur < 0:
+    if normalized_fee_eur is not None and (not math.isfinite(normalized_fee_eur) or normalized_fee_eur < 0):
         raise ValueError("La comisión en euros no puede ser negativa.")
-    if normalized_fx is not None and normalized_fx <= 0:
+    if normalized_fx is not None and (not math.isfinite(normalized_fx) or normalized_fx <= 0):
         raise ValueError("El tipo de cambio a euros debe ser positivo.")
 
     local_settlement = (
@@ -530,6 +549,92 @@ def normalize_operation(
         "currency": normalized_currency,
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
+
+
+def historical_closure_operations(
+    *,
+    ticker: str,
+    account_name: str,
+    quantity: float,
+    cost_basis_eur: float,
+    net_proceeds_eur: float,
+    sold_at: date | datetime | str,
+    sale_fee_eur: float = 0.0,
+    quality: str = "Documentado",
+    notes: str = "",
+) -> tuple[str, dict[str, object], dict[str, object]]:
+    """Construye un cierre antiguo sin fingir el precio o el cambio originales.
+
+    Se guardan dos movimientos compensados en una cuenta técnica separada. Así el
+    resultado realizado entra en el FIFO, pero nunca altera una posición abierta del
+    mismo ticker. Los precios son importes contables en EUR por unidad; la procedencia
+    exacta o estimada queda marcada tanto en las notas como en la tabla de resultados.
+    """
+
+    normalized_quality = str(quality).strip().capitalize()
+    if normalized_quality not in HISTORICAL_CLOSURE_QUALITIES:
+        raise ValueError("La calidad del cierre debe ser Documentado o Estimado.")
+    if quantity <= 0:
+        raise ValueError("La cantidad cerrada debe ser positiva.")
+    if cost_basis_eur <= 0 or net_proceeds_eur <= 0:
+        raise ValueError("El coste y el neto recibido deben ser positivos.")
+    if sale_fee_eur < 0:
+        raise ValueError("La comisión de venta no puede ser negativa.")
+
+    normalized_ticker = ticker.strip().upper()
+    normalized_account = account_name.strip() or "Sin especificar"
+    sale_time = pd.Timestamp(sold_at)
+    if pd.isna(sale_time):
+        raise ValueError("La fecha del cierre no es válida.")
+    purchase_time = sale_time - timedelta(seconds=1)
+    fingerprint = "|".join(
+        (
+            normalized_ticker,
+            normalized_account.casefold(),
+            f"{float(quantity):.9f}",
+            f"{float(cost_basis_eur):.6f}",
+            f"{float(net_proceeds_eur):.6f}",
+            sale_time.isoformat(),
+        )
+    )
+    closure_id = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:16]
+    tag = f"[CIERRE_HISTORICO:{normalized_quality.upper()}:{closure_id}]"
+    detail = notes.strip()
+    common_note = (
+        f"{tag} Cierre reconstruido como {'documentado' if normalized_quality == 'Documentado' else 'estimado'}."
+        + (f" {detail}" if detail else "")
+    )
+    technical_account = (
+        normalized_account[: 120 - len(HISTORICAL_CLOSURE_ACCOUNT_SUFFIX)]
+        + HISTORICAL_CLOSURE_ACCOUNT_SUFFIX
+    )
+    purchase = normalize_operation(
+        normalized_ticker,
+        "Compra",
+        float(quantity),
+        float(cost_basis_eur) / float(quantity),
+        0.0,
+        purchase_time,
+        common_note,
+        currency="EUR",
+        account_name=technical_account,
+        settlement_amount_eur=float(cost_basis_eur),
+        fee_eur=0.0,
+    )
+    sale = normalize_operation(
+        normalized_ticker,
+        "Venta",
+        float(quantity),
+        (float(net_proceeds_eur) + float(sale_fee_eur)) / float(quantity),
+        float(sale_fee_eur),
+        sale_time,
+        common_note,
+        currency="EUR",
+        account_name=technical_account,
+        settlement_amount_eur=float(net_proceeds_eur),
+        fee_eur=float(sale_fee_eur),
+    )
+    return closure_id, purchase, sale
 
 
 def normalize_favorite(
@@ -800,12 +905,98 @@ def normalize_portfolio_snapshot_position(
     }
 
 
+def operation_settlement_eur(
+    operation: object,
+    rates_per_eur: dict[str, float] | None = None,
+    *,
+    fx_cost_pct: float = 0.0,
+) -> tuple[float | None, str]:
+    """Un único criterio de liquidación para diario, resultados e histórico."""
+
+    recorded = pd.to_numeric(getattr(operation, "settlement_amount_eur", None), errors="coerce")
+    if pd.notna(recorded) and math.isfinite(float(recorded)) and recorded > 0:
+        return float(recorded), "Liquidación del bróker"
+    quantity = pd.to_numeric(getattr(operation, "quantity", None), errors="coerce")
+    price = pd.to_numeric(getattr(operation, "price", None), errors="coerce")
+    fee = pd.to_numeric(getattr(operation, "fees", 0), errors="coerce")
+    if pd.isna(quantity) or pd.isna(price) or quantity <= 0 or price <= 0:
+        return None, "Estimación incompleta"
+    fee = float(fee) if pd.notna(fee) else 0.0
+    side = str(getattr(operation, "side", ""))
+    local = float(quantity) * float(price) + fee if side == "Compra" else float(quantity) * float(price) - fee
+    if side not in {"Compra", "Venta"} or not math.isfinite(local) or local <= 0:
+        return None, "Estimación incompleta"
+    currency = str(getattr(operation, "currency", "EUR") or "EUR").upper()
+    fx = pd.to_numeric(getattr(operation, "fx_rate_to_eur", None), errors="coerce")
+    if pd.notna(fx) and math.isfinite(float(fx)) and fx > 0:
+        return local * float(fx), "Estimación con cambio registrado"
+    if currency == "EUR":
+        return local, "Importe en EUR calculado"
+    try:
+        converted = float(convert_currency(local, currency, "EUR", rates_per_eur or {}))
+    except (TypeError, ValueError):
+        return None, "Estimación incompleta"
+    factor = 1 + fx_cost_pct / 100 if side == "Compra" else 1 - fx_cost_pct / 100
+    return max(0.0, converted * factor), "Estimación con cambio actual"
+
+
+def operation_fee_eur(
+    operation: object, rates_per_eur: dict[str, float] | None = None
+) -> float | None:
+    recorded = pd.to_numeric(getattr(operation, "fee_eur", None), errors="coerce")
+    if pd.notna(recorded) and math.isfinite(float(recorded)):
+        return float(recorded)
+    fee = pd.to_numeric(getattr(operation, "fees", 0), errors="coerce")
+    if pd.isna(fee) or fee == 0:
+        return 0.0
+    currency = str(getattr(operation, "currency", "EUR") or "EUR").upper()
+    fx = pd.to_numeric(getattr(operation, "fx_rate_to_eur", None), errors="coerce")
+    if pd.notna(fx) and math.isfinite(float(fx)) and fx > 0:
+        return float(fee) * float(fx)
+    if currency == "EUR":
+        return float(fee)
+    try:
+        return float(convert_currency(float(fee), currency, "EUR", rates_per_eur or {}))
+    except (TypeError, ValueError):
+        return None
+
+
+def consume_fifo_lots(
+    lots: list[dict[str, object]], quantity: float, *, cost_fields: tuple[str, ...]
+) -> tuple[dict[str, float | None], list[dict[str, object]]]:
+    """Consume costes proporcionales del lote más antiguo, conservando su origen."""
+
+    removed: dict[str, float | None] = {field: 0.0 for field in cost_fields}
+    consumed_lots: list[dict[str, object]] = []
+    remaining = quantity
+    while remaining > 1e-9 and lots:
+        lot = lots[0]
+        lot_quantity = float(lot["quantity"])
+        consumed = min(remaining, lot_quantity)
+        consumed_lots.append(lot.copy())
+        for field in cost_fields:
+            value = lot.get(field)
+            if value is None or pd.isna(value):
+                removed[field] = None
+            else:
+                allocated = float(value) * consumed / lot_quantity
+                if removed[field] is not None:
+                    removed[field] = float(removed[field]) + allocated
+                lot[field] = max(0.0, float(value) - allocated)
+        lot["quantity"] = lot_quantity - consumed
+        remaining -= consumed
+        if float(lot["quantity"]) <= 1e-9:
+            lots.pop(0)
+    return removed, consumed_lots
+
+
 def calculate_position_states(
     operations: pd.DataFrame,
     *,
     include_closed: bool = True,
+    rates_per_eur: dict[str, float] | None = None,
 ) -> pd.DataFrame:
-    """Reconstruye el estado de cada posición, incluidas las ya cerradas."""
+    """Reconstruye cantidades, coste FIFO y resultado por cuenta y moneda."""
 
     columns = [
         "ticker",
@@ -820,6 +1011,7 @@ def calculate_position_states(
         "realized_pnl_eur",
         "paid_fees_eur",
         "eur_values_complete",
+        "cost_basis_source",
     ]
     if operations.empty:
         return pd.DataFrame(columns=columns)
@@ -843,25 +1035,14 @@ def calculate_position_states(
                 "cost_basis_eur": 0.0,
                 "realized_pnl_eur": 0.0,
                 "paid_fees_eur": 0.0,
+                "lots": [],
             },
         )
         quantity = float(operation.quantity)
         price = float(operation.price)
         fee = float(operation.fees)
-        settlement_eur = pd.to_numeric(
-            getattr(operation, "settlement_amount_eur", None), errors="coerce"
-        )
-        fee_eur = pd.to_numeric(
-            getattr(operation, "fee_eur", None), errors="coerce"
-        )
-        if pd.isna(settlement_eur) and currency == "EUR":
-            settlement_eur = (
-                quantity * price + fee
-                if operation.side == "Compra"
-                else quantity * price - fee
-            )
-        if pd.isna(fee_eur) and currency == "EUR":
-            fee_eur = fee
+        settlement_eur, source = operation_settlement_eur(operation, rates_per_eur)
+        fee_eur = operation_fee_eur(operation, rates_per_eur)
         state["paid_fees"] = float(state["paid_fees"]) + fee
         if pd.isna(fee_eur):
             state["paid_fees_eur"] = None
@@ -869,26 +1050,32 @@ def calculate_position_states(
             state["paid_fees_eur"] = float(state["paid_fees_eur"]) + float(fee_eur)
         if operation.side == "Compra":
             state["quantity"] = float(state["quantity"]) + quantity
-            state["cost_basis"] = float(state["cost_basis"]) + quantity * price + fee
-            if pd.isna(settlement_eur):
-                state["cost_basis_eur"] = None
-            elif state["cost_basis_eur"] is not None:
-                state["cost_basis_eur"] = float(state["cost_basis_eur"]) + float(
-                    settlement_eur
-                )
+            native_cost = settlement_eur if currency == "EUR" and settlement_eur is not None else quantity * price + fee
+            state["lots"].append({"quantity": quantity, "cost_basis": native_cost,
+                                  "cost_basis_eur": settlement_eur, "source": source})
+            state["cost_basis"] = sum(float(lot["cost_basis"]) for lot in state["lots"])
+            state["cost_basis_eur"] = (
+                sum(float(lot["cost_basis_eur"]) for lot in state["lots"])
+                if all(lot["cost_basis_eur"] is not None for lot in state["lots"])
+                else None
+            )
             continue
 
         available = float(state["quantity"])
         sold = min(quantity, available)
         if sold <= 0:
             continue
-        average_cost = float(state["cost_basis"]) / available
         allocated_fee = fee * (sold / quantity)
-        proceeds = sold * price - allocated_fee
-        removed_cost = average_cost * sold
-        removed_cost_eur: float | None = None
-        if state["cost_basis_eur"] is not None:
-            removed_cost_eur = float(state["cost_basis_eur"]) / available * sold
+        proceeds = (
+            settlement_eur * sold / quantity
+            if currency == "EUR" and settlement_eur is not None
+            else sold * price - allocated_fee
+        )
+        removed, _ = consume_fifo_lots(
+            state["lots"], sold, cost_fields=("cost_basis", "cost_basis_eur")
+        )
+        removed_cost = float(removed["cost_basis"])
+        removed_cost_eur = removed["cost_basis_eur"]
         state["realized_pnl"] = float(state["realized_pnl"]) + proceeds - removed_cost
         if (
             removed_cost_eur is None
@@ -898,14 +1085,15 @@ def calculate_position_states(
             state["realized_pnl_eur"] = None
         else:
             state["realized_pnl_eur"] = float(state["realized_pnl_eur"]) + float(
-                settlement_eur
+                settlement_eur * sold / quantity
             ) - removed_cost_eur
         state["quantity"] = available - sold
-        state["cost_basis"] = max(0.0, float(state["cost_basis"]) - removed_cost)
-        if removed_cost_eur is not None:
-            state["cost_basis_eur"] = max(
-                0.0, float(state["cost_basis_eur"]) - removed_cost_eur
-            )
+        state["cost_basis"] = sum(float(lot["cost_basis"]) for lot in state["lots"])
+        state["cost_basis_eur"] = (
+            sum(float(lot["cost_basis_eur"]) for lot in state["lots"])
+            if all(lot["cost_basis_eur"] is not None for lot in state["lots"])
+            else None
+        )
 
     rows: list[dict[str, object]] = []
     for state in states.values():
@@ -916,6 +1104,11 @@ def calculate_position_states(
         rows.append(
             {
                 **state,
+                "cost_basis_source": (
+                    "Liquidación del bróker"
+                    if all(lot["source"] == "Liquidación del bróker" for lot in state["lots"])
+                    else "Coste FIFO con alguna estimación"
+                ),
                 "average_cost": cost_basis / quantity if quantity > 1e-9 else 0.0,
                 "eur_values_complete": all(
                     state.get(field) is not None
@@ -1264,6 +1457,10 @@ class TradingJournal:
                         CHECK (tax_reserve_eur >= 0),
                     coverage_pct REAL NOT NULL DEFAULT 0
                         CHECK (coverage_pct >= 0 AND coverage_pct <= 100),
+                    hold_coverage_pct REAL
+                        CHECK (hold_coverage_pct >= 0 AND hold_coverage_pct <= 100),
+                    benchmark_coverage_pct REAL
+                        CHECK (benchmark_coverage_pct >= 0 AND benchmark_coverage_pct <= 100),
                     warnings_json TEXT NOT NULL DEFAULT '[]',
                     rejected_json TEXT NOT NULL DEFAULT '[]',
                     engine_version TEXT NOT NULL,
@@ -1276,6 +1473,15 @@ class TradingJournal:
                 )
                 """
             )
+            paper_run_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(paper_daily_runs)")
+            }
+            for coverage_column in ("hold_coverage_pct", "benchmark_coverage_pct"):
+                if coverage_column not in paper_run_columns:
+                    connection.execute(
+                        f"ALTER TABLE paper_daily_runs ADD COLUMN {coverage_column} REAL "
+                        f"CHECK ({coverage_column} >= 0 AND {coverage_column} <= 100)"
+                    )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS paper_daily_runs_simulation_date_idx
@@ -1397,6 +1603,8 @@ class TradingJournal:
         cumulative_costs_eur: float = 0.0,
         tax_reserve_eur: float = 0.0,
         coverage_pct: float = 0.0,
+        hold_coverage_pct: float | None = None,
+        benchmark_coverage_pct: float | None = None,
         status: str = "complete",
         engine_version: str = "paper-v1",
     ) -> int:
@@ -1421,6 +1629,8 @@ class TradingJournal:
             cumulative_costs_eur=cumulative_costs_eur,
             tax_reserve_eur=tax_reserve_eur,
             coverage_pct=coverage_pct,
+            hold_coverage_pct=hold_coverage_pct,
+            benchmark_coverage_pct=benchmark_coverage_pct,
             status=status,
             engine_version=engine_version,
         )
@@ -1555,6 +1765,56 @@ class TradingJournal:
                 ),
             )
             return int(cursor.lastrowid)
+
+    def add_historical_closure(
+        self,
+        *,
+        ticker: str,
+        account_name: str,
+        quantity: float,
+        cost_basis_eur: float,
+        net_proceeds_eur: float,
+        sold_at: date | datetime | str,
+        sale_fee_eur: float = 0.0,
+        quality: str = "Documentado",
+        notes: str = "",
+        recorded_by: str = "",
+    ) -> tuple[int, int]:
+        """Guarda compra contable y venta de un cierre antiguo en una transacción."""
+
+        closure_id, purchase, sale = historical_closure_operations(
+            ticker=ticker,
+            account_name=account_name,
+            quantity=quantity,
+            cost_basis_eur=cost_basis_eur,
+            net_proceeds_eur=net_proceeds_eur,
+            sold_at=sold_at,
+            sale_fee_eur=sale_fee_eur,
+            quality=quality,
+            notes=notes,
+        )
+        columns = [column for column in OPERATION_COLUMNS if column != "id"]
+        actor = recorded_by.strip().lower()
+        rows = [
+            {**operation, "recorded_by": actor}
+            for operation in (purchase, sale)
+        ]
+        with self._connect() as connection:
+            duplicate = connection.execute(
+                "SELECT 1 FROM operations WHERE notes LIKE ? LIMIT 1",
+                (f"%:{closure_id}]%",),
+            ).fetchone()
+            if duplicate is not None:
+                raise ValueError("Este cierre histórico ya está registrado.")
+            identifiers: list[int] = []
+            for row in rows:
+                cursor = connection.execute(
+                    f"INSERT INTO operations ({', '.join(columns)}) "
+                    f"VALUES ({', '.join('?' for _ in columns)})",
+                    tuple(row[column] for column in columns),
+                )
+                identifiers.append(int(cursor.lastrowid))
+        return identifiers[0], identifiers[1]
 
     def list_operations(self) -> pd.DataFrame:
         with self._connect() as connection:

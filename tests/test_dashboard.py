@@ -83,6 +83,24 @@ def test_dashboard_keeps_unpriced_position_visible() -> None:
     assert pd.isna(dashboard.iloc[0]["current_price"])
     assert kpis.invested_eur == pytest.approx(10.0)
     assert kpis.priced_positions_count == 0
+    assert not kpis.coverage_complete
+    assert pd.isna(kpis.unrealized_pnl_eur)
+    assert pd.isna(kpis.unrealized_return_pct)
+    assert pd.isna(dashboard.iloc[0]["allocation_pct"])
+
+
+def test_dashboard_and_approximate_results_share_fifo() -> None:
+    from src.approximate_returns import build_approximate_return_report
+    operations = pd.DataFrame([
+        {"id": index, "ticker": "ABC", "account_name": "Revolut", "currency": "EUR",
+         "side": side, "quantity": 1, "price": price, "fees": 0,
+         "executed_at": f"2026-01-0{index}"}
+        for index, side, price in [(1, "Compra", 100), (2, "Compra", 200), (3, "Venta", 150)]
+    ])
+    dashboard, kpis = build_position_dashboard(operations, calculate_open_positions(operations), {"ABC": 150}, {"EUR": 1}, sell_fee_eur=0)
+    report = build_approximate_return_report(operations, {"ABC": 150}, {"EUR": 1}, tax_rate_pct=0, sell_fee_eur=0, spread_pct=0, fx_cost_pct=0)
+    assert kpis.realized_pnl_eur == report.summary.realized_pnl_eur == 50
+    assert dashboard.iloc[0]["cost_basis_eur"] == report.summary.open_cost_eur == 200
 
 
 def test_dashboard_uses_analysis_alias_for_broker_ticker() -> None:

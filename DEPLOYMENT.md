@@ -70,9 +70,26 @@ No pegues la contraseña en GitHub y no subas el archivo local de secretos.
 1. Crea un proyecto gratuito en Supabase.
 2. Abre **SQL Editor**, pega `supabase/schema.sql` y ejecútalo. Es seguro volver
    a ejecutarlo al actualizar: añade las columnas nuevas sin borrar operaciones.
-   Para la versión de estabilización también puedes ejecutar únicamente
-   `supabase/migration_operation_reconciliation.sql`: añade cuenta de bróker,
-   liquidación real en euros y las notas del último análisis enviado por correo.
+   Si actualizas una base existente, conserva las migraciones anteriores y aplica
+   las que falten antes de desplegar el código. La estabilización de octubre añade:
+
+   - `supabase/migration_atomic_portfolio_snapshot.sql`: reemplaza cada fotografía
+     mediante una única transacción. Sin esta función RPC, la aplicación rechaza
+     el reemplazo y conserva la fotografía anterior; no utiliza borrado seguido
+     de inserciones independientes.
+   - `supabase/migration_paper_comparator_coverage.sql`: añade cobertura de cartera
+     original e índice a las sesiones del laboratorio. Los registros antiguos
+     quedan con cobertura desconocida, no se convierten en comparaciones completas.
+
+   Si todavía falta `supabase/migration_operation_reconciliation.sql`, aplícala
+   también: añade cuenta de bróker, liquidación real en euros y las notas del último
+   análisis enviado por correo. Prueba las migraciones primero en una base de ensayo
+   o con respaldo; el análisis sintáctico y las pruebas con dobles de Supabase no
+   sustituyen su ejecución real en PostgreSQL.
+   Para instalar juntas las dos migraciones de octubre puedes ejecutar completo
+   `supabase/release_stabilization_20261005.sql`: comprueba primero las tablas base,
+   agrupa el cambio en una transacción, verifica los permisos y solicita la recarga
+   del esquema de PostgREST. No modifica fotografías ni operaciones existentes.
 3. Copia la **Project URL** y una clave secreta `sb_secret_*`.
 4. Añádelas al bloque `[supabase]` de los Secrets de Streamlit.
 5. Reinicia la aplicación.
@@ -94,6 +111,23 @@ por lo que la tabla visible en la aplicación coincide con el correo diario.
 
 Sin `[supabase]`, la instalación local continúa usando SQLite. En Community Cloud,
 `persistent_journal = false` mantiene el diario desactivado para evitar pérdidas.
+
+### Ensayo reproducible de migraciones
+
+El workflow **Pruebas y estabilidad** también ejecuta las migraciones en una base
+PostgreSQL temporal mediante PGlite. No utiliza claves ni accede a producción.
+Para repetirlo localmente, con Node 20 o superior:
+
+```bash
+npm install --prefix . --no-save --no-package-lock --ignore-scripts --no-audit --no-fund @electric-sql/pglite@0.5.8
+node scripts/validate_migrations.mjs .
+```
+
+Comprueba idempotencia, rollback ante errores, aislamiento por propietario y fecha,
+roles públicos sin permiso, preservación del histórico y el archivo SQL de publicación.
+El entorno WASM monoproceso no verifica contención entre conexiones simultáneas ni
+la API REST de Supabase. Tras aplicar el SQL en producción todavía debe comprobarse
+allí la disponibilidad de la RPC y las columnas nuevas antes de desplegar el código.
 
 ## 5. Activar las alertas gratuitas por Gmail
 

@@ -143,6 +143,7 @@ def test_one_invalid_ticker_does_not_cancel_the_user_digest(monkeypatch) -> None
         lambda **kwargs: SimpleNamespace(
             timing=SimpleNamespace(score=75),
             opportunity_score=80,
+            confidence_pct=80,
             status_code=STATUS_BUYABLE,
             status_label="🟢 COMPRABLE",
             zones=SimpleNamespace(preferred_entry=SimpleNamespace(label="98–100")),
@@ -227,6 +228,7 @@ def test_buy_email_waits_until_the_full_opportunity_is_buyable(monkeypatch) -> N
         lambda **kwargs: SimpleNamespace(
             timing=SimpleNamespace(score=45),
             opportunity_score=60,
+            confidence_pct=80,
             status_code=STATUS_WAIT_PRICE,
             status_label="🟡 ESPERAR PRECIO",
             zones=SimpleNamespace(preferred_entry=SimpleNamespace(label="85–90")),
@@ -352,6 +354,7 @@ def test_daily_snapshots_use_cached_broad_and_sector_relative_strength(
         return SimpleNamespace(
             timing=SimpleNamespace(score=65),
             opportunity_score=72,
+            confidence_pct=80,
             status_code=STATUS_WAIT_PRICE,
             status_label="🟡 ESPERAR PRECIO",
             zones=SimpleNamespace(preferred_entry=SimpleNamespace(label="95–100")),
@@ -401,3 +404,61 @@ def test_daily_snapshots_use_cached_broad_and_sector_relative_strength(
         (expected_scores["AAA"], 100),
         (expected_scores["BBB"], 100),
     ]
+
+
+def test_stale_daily_prices_do_not_create_alerts_or_mutate_signal_states(monkeypatch) -> None:
+    group = FakeGroupJournal()
+    user = FakeJournal(tickers=("OLD",))
+    sent: list[tuple[object, ...]] = []
+    frame = pd.DataFrame({"close": [100]}, index=pd.DatetimeIndex(["2026-07-28"]))
+    monkeypatch.setattr("src.alert_runner.add_indicators", lambda raw, config: raw)
+    monkeypatch.setattr("src.alert_runner.evaluate_latest_signal", lambda *args, **kwargs: SignalResult(
+        ticker="OLD", as_of=frame.index[-1], score=5, label="Esperar",
+        position_label="Vender", explanation="Precio antiguo.", positive_factors=(), risk_factors=(),
+    ))
+    summary = run_daily_alerts(
+        journal_factory=lambda owner: group if owner == GROUP_PORTFOLIO_OWNER else user,
+        downloader=lambda *args, **kwargs: frame,
+        fundamental_downloader=lambda ticker: (_ for _ in ()).throw(AssertionError("No consultar datos antiguos")),
+        sender=lambda *args: sent.append(args), today=date(2026, 10, 3),
+    )
+    assert summary.alerts_sent == 0
+    assert summary.tickers_with_fresh_prices == 0
+    assert user.saved_states == []
+    assert len(sent) == 1
+    assert "Actualizar datos" in sent[0][2]
+    assert "2026-07-28" in sent[0][3]
+    assert summary.errors
+
+
+def test_daily_holding_email_uses_confirmations_instead_of_raw_sell_label(monkeypatch) -> None:
+    group = FakeGroupJournal()
+    user = FakeJournal(tickers=("MCD",))
+    user.open_positions = lambda: pd.DataFrame([{"ticker": "MCD", "average_cost": 100, "quantity": 1}])
+    sent: list[tuple[object, ...]] = []
+    frame = pd.DataFrame({
+        "open": [100], "high": [101], "low": [99], "close": [100], "atr_14": [2],
+    }, index=pd.DatetimeIndex(["2026-10-02"]))
+    monkeypatch.setattr("src.alert_runner.add_indicators", lambda raw, config: raw)
+    monkeypatch.setattr("src.alert_runner.evaluate_latest_signal", lambda *args, **kwargs: SignalResult(
+        ticker="MCD", as_of=frame.index[-1], score=5, label="Esperar",
+        position_label="Vender", explanation="Debilidad de precio aislada.", positive_factors=(), risk_factors=(),
+    ))
+    monkeypatch.setattr("src.alert_runner.evaluate_fundamentals", lambda *args: SimpleNamespace(score=90, coverage_pct=90, sector="", country="US"))
+    monkeypatch.setattr("src.alert_runner.evaluate_valuation", lambda *args: SimpleNamespace(score=80, coverage_pct=90))
+    monkeypatch.setattr("src.alert_runner.evaluate_risk", lambda *args: SimpleNamespace(score=90, coverage_pct=100))
+    monkeypatch.setattr("src.alert_runner.evaluate_entry_opportunity", lambda **kwargs: SimpleNamespace(
+        opportunity_score=80, confidence_pct=90, status_code=STATUS_WAIT_PRICE,
+        status_label="ESPERAR PRECIO", explanation="Análisis conjunto.",
+    ))
+    summary = run_daily_alerts(
+        journal_factory=lambda owner: group if owner == GROUP_PORTFOLIO_OWNER else user,
+        downloader=lambda *args, **kwargs: frame,
+        fundamental_downloader=lambda ticker: {"symbol": ticker},
+        sender=lambda *args: sent.append(args), today=date(2026, 10, 3),
+    )
+    assert summary.alerts_sent == 0
+    assert len(sent) == 1
+    assert "Esperar confirmación" in sent[0][2]
+    assert "90%" in sent[0][3]
+    assert user.saved_states[0].signature == "position:Esperar confirmación"
