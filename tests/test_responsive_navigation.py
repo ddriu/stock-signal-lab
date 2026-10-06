@@ -101,12 +101,12 @@ def test_home_separates_real_portfolio_decisions_lab_and_navigation() -> None:
     source = (ROOT / "app.py").read_text(encoding="utf-8")
 
     assert '["Resumen", "Decisiones", "Laboratorio", "Accesos"]' in source
-    assert "with summary_tab:" in source
-    assert "with decisions_tab:" in source
-    assert "with laboratory_tab:" in source
-    assert "with access_tab:" in source
-    assert "Este es un ensayo con una copia virtual de tus dos cuentas" in source
-    assert "Patrimonio fuera del mapa de decisiones" in source
+    # Conditional routing prevents Streamlit's eager tabs from computing all
+    # sections (and recording a paper day) on every home visit.
+    for view in ("Resumen", "Decisiones", "Laboratorio", "Accesos"):
+        assert f'if home_view == "{view}":' in source
+    assert "Seguimiento diario de una copia de tus posiciones" in source
+    assert "Otros activos ·" in source
 
 
 def test_hot_deploy_reloads_the_paper_model_before_using_the_new_schema() -> None:

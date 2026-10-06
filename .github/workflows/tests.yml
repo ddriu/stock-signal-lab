@@ -34,3 +34,24 @@ jobs:
 
       - name: Ejecutar pruebas
         run: python -m pytest -q
+
+  migration-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+
+      - name: Configurar Node para la base temporal
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Instalar PostgreSQL WASM sólo para las pruebas
+        run: npm install --prefix "$GITHUB_WORKSPACE" --no-save --no-package-lock --ignore-scripts --no-audit --no-fund @electric-sql/pglite@0.5.8
+
+      - name: Validar migraciones, permisos y rollback sin producción
+        run: node scripts/validate_migrations.mjs "$GITHUB_WORKSPACE"

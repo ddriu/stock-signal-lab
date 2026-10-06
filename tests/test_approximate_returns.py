@@ -261,6 +261,52 @@ def test_combined_return_uses_closed_and_open_cost_without_double_counting() -> 
     assert report.summary.approximate_return_pct == pytest.approx(40 / 300 * 100)
 
 
+def test_historical_closures_show_documented_or_estimated_origin() -> None:
+    documented = "[CIERRE_HISTORICO:DOCUMENTADO:abc123] Ticket"
+    estimated = "[CIERRE_HISTORICO:ESTIMADO:def456] Foto previa"
+    report = build_approximate_return_report(
+        _operations(
+            {
+                "ticker": "ORCL",
+                "account_name": "Revolut · cierre histórico",
+                "settlement_amount_eur": 200,
+                "notes": documented,
+            },
+            {
+                "ticker": "ORCL",
+                "account_name": "Revolut · cierre histórico",
+                "side": "Venta",
+                "settlement_amount_eur": 260,
+                "executed_at": "2026-08-20",
+                "notes": documented,
+            },
+            {
+                "ticker": "NKE",
+                "account_name": "Trade Republic · cierre histórico",
+                "settlement_amount_eur": 250,
+                "notes": estimated,
+            },
+            {
+                "ticker": "NKE",
+                "account_name": "Trade Republic · cierre histórico",
+                "side": "Venta",
+                "settlement_amount_eur": 230,
+                "executed_at": "2026-08-20",
+                "notes": estimated,
+            },
+        ),
+        {},
+        {"EUR": 1.0},
+        year=2026,
+    )
+
+    closed = report.closed_operations.set_index("Ticker")
+    assert closed.loc["ORCL", "Cuenta"] == "Revolut"
+    assert closed.loc["ORCL", "Origen"] == "Cierre histórico documentado"
+    assert closed.loc["NKE", "Origen"] == "Cierre histórico estimado"
+    assert report.summary.realized_pnl_eur == pytest.approx(40)
+
+
 def test_invalid_assumptions_are_rejected() -> None:
     with pytest.raises(ValueError, match="impuesto"):
         build_approximate_return_report(

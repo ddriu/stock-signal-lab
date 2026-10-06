@@ -7,6 +7,9 @@ from dataclasses import dataclass
 import pandas as pd
 
 from src.data_sources import convert_currency
+from src.approximate_returns import build_approximate_return_report
+from src.instruments import resolve_analysis_ticker
+from src.journal import calculate_position_states, operation_fee_eur, operation_settlement_eur
 
 
 HISTORY_COLUMNS = [
@@ -21,6 +24,7 @@ ANNUAL_COLUMNS = [
     "Aportación neta EUR",
     "Comisiones EUR",
     "Resultado realizado EUR",
+    "Resultado del año EUR",
     "Valor al cierre EUR",
     "Resultado acumulado EUR",
     "Resultado acumulado %",
@@ -34,6 +38,7 @@ class PortfolioHistoryResult:
     annual: pd.DataFrame
     missing_tickers: tuple[str, ...] = ()
     missing_currencies: tuple[str, ...] = ()
+    incomplete_operations: int = 0
 
 
 def _to_eur(
@@ -58,37 +63,18 @@ def _realized_result_by_year(
     operations: pd.DataFrame,
     rates_per_eur: dict[str, float],
 ) -> dict[int, float]:
-    """Calcula el beneficio realizado por coste medio en cada año."""
+    """Utiliza el mismo FIFO y las liquidaciones EUR del resultado aproximado."""
 
-    states: dict[tuple[str, str], dict[str, float]] = {}
-    results: dict[int, float] = {}
-    ordered = operations.sort_values(["executed_at", "id"])
-    for operation in ordered.itertuples(index=False):
-        ticker = str(operation.ticker).upper()
-        currency = str(getattr(operation, "currency", "EUR") or "EUR").upper()
-        key = (ticker, currency)
-        state = states.setdefault(key, {"quantity": 0.0, "cost_basis": 0.0})
-        quantity = float(operation.quantity)
-        price = float(operation.price)
-        fees = float(operation.fees)
-        if str(operation.side) == "Compra":
-            state["quantity"] += quantity
-            state["cost_basis"] += quantity * price + fees
-            continue
-        available = state["quantity"]
-        sold = min(quantity, available)
-        if sold <= 0:
-            continue
-        average_cost = state["cost_basis"] / available
-        sale_fee = fees * sold / quantity
-        realized = sold * price - sale_fee - average_cost * sold
-        realized_eur = _to_eur(realized, currency, rates_per_eur)
-        if realized_eur is not None:
-            year = pd.Timestamp(operation.executed_at).year
-            results[year] = results.get(year, 0.0) + realized_eur
-        state["quantity"] -= sold
-        state["cost_basis"] = max(0.0, state["cost_basis"] - average_cost * sold)
-    return results
+    report = build_approximate_return_report(
+        operations, {}, rates_per_eur, tax_rate_pct=0,
+        sell_fee_eur=0, spread_pct=0, fx_cost_pct=0,
+    )
+    if report.closed_operations.empty:
+        return {}
+    return {
+        int(year): float(value)
+        for year, value in report.closed_operations.groupby("Año")["Ganancia antes de impuestos"].sum().items()
+    }
 
 
 def build_portfolio_history(
@@ -105,6 +91,11 @@ def build_portfolio_history(
     if operations.empty:
         return _empty_result()
     operations = operations.copy()
+    accounting_report = build_approximate_return_report(
+        operations, {}, rates_per_eur, tax_rate_pct=0,
+        sell_fee_eur=0, spread_pct=0, fx_cost_pct=0,
+    )
+    incomplete_operations = accounting_report.summary.incomplete_operations
     operations["executed_at"] = pd.to_datetime(
         operations["executed_at"], errors="coerce"
     ).dt.tz_localize(None).dt.normalize()
@@ -116,6 +107,8 @@ def build_portfolio_history(
     missing_tickers: set[str] = set()
     for ticker in operations["ticker"].astype(str).str.upper().unique():
         frame = price_history.get(ticker)
+        if frame is None:
+            frame = price_history.get(resolve_analysis_ticker(ticker))
         if frame is None or frame.empty or "close" not in frame:
             missing_tickers.add(ticker)
             continue
@@ -129,16 +122,20 @@ def build_portfolio_history(
 
     last_price_date = max((series.index.max() for series in usable_prices.values()), default=None)
     if last_price_date is None:
+        annual = _annual_summary(
+            operations, pd.DataFrame(columns=HISTORY_COLUMNS), rates_per_eur
+        )
+        if incomplete_operations:
+            annual[["Resultado realizado EUR", "Resultado del año EUR", "Resultado acumulado EUR", "Resultado acumulado %"]] = float("nan")
         return PortfolioHistoryResult(
             daily=pd.DataFrame(columns=HISTORY_COLUMNS),
-            annual=_annual_summary(
-                operations,
-                pd.DataFrame(columns=HISTORY_COLUMNS),
-                rates_per_eur,
-            ),
+            annual=annual,
             missing_tickers=tuple(sorted(missing_tickers)),
+            missing_currencies=accounting_report.missing_currencies,
+            incomplete_operations=incomplete_operations,
         )
     start_date = min(operations["executed_at"].min(), min(s.index.min() for s in usable_prices.values()))
+    last_price_date = max(last_price_date, operations["executed_at"].max())
     index = pd.date_range(start_date, last_price_date, freq="D")
     market_value = pd.Series(0.0, index=index)
     missing_currencies: set[str] = set()
@@ -147,8 +144,6 @@ def build_portfolio_history(
         [operations["ticker"].astype(str).str.upper(), operations["currency"].fillna("EUR").astype(str).str.upper()]
     ):
         close = usable_prices.get(str(ticker))
-        if close is None:
-            continue
         quantity_changes = pd.Series(0.0, index=index)
         for operation in ticker_operations.itertuples(index=False):
             executed = pd.Timestamp(operation.executed_at).normalize()
@@ -157,45 +152,52 @@ def build_portfolio_history(
             direction = 1.0 if str(operation.side) == "Compra" else -1.0
             quantity_changes.loc[executed] += direction * float(operation.quantity)
         quantities = quantity_changes.cumsum().clip(lower=0)
-        aligned_close = close.reindex(index).ffill().bfill()
+        # Una cotización futura no puede rellenar los días anteriores a su
+        # primera observación. Un activo sin precio tampoco equivale a valor cero.
+        aligned_close = close.reindex(index).ffill() if close is not None else pd.Series(float("nan"), index=index)
         native_values = quantities * aligned_close
+        native_values.loc[quantities <= 1e-9] = 0.0
         converted = _to_eur(1.0, str(currency), rates_per_eur)
         if converted is None:
             missing_currencies.add(str(currency))
+            market_value.loc[quantities > 1e-9] = float("nan")
             continue
-        market_value = market_value.add(native_values * converted, fill_value=0.0)
+        market_value = market_value.add(native_values * converted)
 
     cash_flows = pd.Series(0.0, index=index)
     for operation in operations.itertuples(index=False):
         currency = str(getattr(operation, "currency", "EUR") or "EUR").upper()
-        gross = float(operation.quantity) * float(operation.price)
-        native_flow = (
-            gross + float(operation.fees)
-            if str(operation.side) == "Compra"
-            else -(gross - float(operation.fees))
-        )
-        flow_eur = _to_eur(native_flow, currency, rates_per_eur)
+        flow_eur, _ = operation_settlement_eur(operation, rates_per_eur)
         if flow_eur is None:
             missing_currencies.add(currency)
+            executed = pd.Timestamp(operation.executed_at).normalize()
+            cash_flows.loc[cash_flows.index >= executed] = float("nan")
             continue
+        if str(operation.side) == "Venta":
+            flow_eur = -flow_eur
         executed = pd.Timestamp(operation.executed_at).normalize()
         if executed in cash_flows.index:
             cash_flows.loc[executed] += flow_eur
 
     daily = pd.DataFrame(index=index)
     daily["market_value_eur"] = market_value
-    daily["net_contributions_eur"] = cash_flows.cumsum()
+    daily["net_contributions_eur"] = cash_flows.cumsum(skipna=False)
     daily["accumulated_result_eur"] = (
         daily["market_value_eur"] - daily["net_contributions_eur"]
     )
+    if incomplete_operations:
+        daily["accumulated_result_eur"] = float("nan")
     # Evita mostrar el periodo anterior a la primera operación como parte del historial.
     daily = daily.loc[operations["executed_at"].min() :]
     annual = _annual_summary(operations, daily, rates_per_eur)
+    if incomplete_operations:
+        annual["Resultado realizado EUR"] = float("nan")
     return PortfolioHistoryResult(
         daily=daily,
         annual=annual,
         missing_tickers=tuple(sorted(missing_tickers)),
         missing_currencies=tuple(sorted(missing_currencies)),
+        incomplete_operations=incomplete_operations,
     )
 
 
@@ -206,20 +208,30 @@ def _annual_summary(
 ) -> pd.DataFrame:
     realized_by_year = _realized_result_by_year(operations, rates_per_eur)
     rows: list[dict[str, float | int]] = []
-    for year, annual_operations in operations.groupby(operations["executed_at"].dt.year):
+    first_year = int(operations["executed_at"].dt.year.min())
+    last_year = int(operations["executed_at"].dt.year.max())
+    if not daily.empty:
+        last_year = max(last_year, int(daily.index.year.max()))
+    previous_result = 0.0
+    for year in range(first_year, last_year + 1):
+        annual_operations = operations.loc[operations["executed_at"].dt.year == year]
         buys = sales = fees = 0.0
         for operation in annual_operations.itertuples(index=False):
-            currency = str(getattr(operation, "currency", "EUR") or "EUR").upper()
-            gross = float(operation.quantity) * float(operation.price)
-            converted_gross = _to_eur(gross, currency, rates_per_eur)
-            converted_fee = _to_eur(float(operation.fees), currency, rates_per_eur)
+            converted_gross, _ = operation_settlement_eur(operation, rates_per_eur)
+            converted_fee = operation_fee_eur(operation, rates_per_eur)
             if converted_gross is not None:
                 if str(operation.side) == "Compra":
                     buys += converted_gross
                 else:
                     sales += converted_gross
+            elif str(operation.side) == "Compra":
+                buys = float("nan")
+            else:
+                sales = float("nan")
             if converted_fee is not None:
                 fees += converted_fee
+            else:
+                fees = float("nan")
         year_daily = daily.loc[daily.index.year == int(year)] if not daily.empty else daily
         ending_value = (
             float(year_daily["market_value_eur"].iloc[-1]) if not year_daily.empty else 0.0
@@ -227,14 +239,17 @@ def _annual_summary(
         accumulated_result = (
             float(year_daily["accumulated_result_eur"].iloc[-1])
             if not year_daily.empty
-            else realized_by_year.get(int(year), 0.0)
+            else sum(result for operation_year, result in realized_by_year.items() if operation_year <= year)
         )
-        total_buys_to_year = sum(
-            _to_eur(
-                float(row.quantity) * float(row.price),
-                str(getattr(row, "currency", "EUR") or "EUR"),
-                rates_per_eur,
+        if year_daily.empty:
+            states = calculate_position_states(
+                operations.loc[operations["executed_at"].dt.year <= year],
+                include_closed=False, rates_per_eur=rates_per_eur,
             )
+            if not states.empty:
+                ending_value = accumulated_result = float("nan")
+        total_buys_to_year = sum(
+            operation_settlement_eur(row, rates_per_eur)[0]
             or 0.0
             for row in operations.loc[
                 (operations["executed_at"].dt.year <= int(year))
@@ -246,17 +261,19 @@ def _annual_summary(
                 "Año": int(year),
                 "Compras EUR": buys,
                 "Ventas EUR": sales,
-                "Aportación neta EUR": buys - sales + fees,
+                "Aportación neta EUR": buys - sales,
                 "Comisiones EUR": fees,
                 "Resultado realizado EUR": realized_by_year.get(int(year), 0.0),
+                "Resultado del año EUR": accumulated_result - previous_result,
                 "Valor al cierre EUR": ending_value,
                 "Resultado acumulado EUR": accumulated_result,
                 "Resultado acumulado %": (
                     accumulated_result / total_buys_to_year * 100
-                    if total_buys_to_year > 0
-                    else 0.0
+                    if total_buys_to_year > 0 and pd.notna(accumulated_result)
+                    else float("nan")
                 ),
                 "Operaciones": int(len(annual_operations)),
             }
         )
+        previous_result = accumulated_result
     return pd.DataFrame(rows, columns=ANNUAL_COLUMNS).sort_values("Año", ignore_index=True)

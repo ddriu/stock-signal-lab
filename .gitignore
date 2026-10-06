@@ -5,10 +5,12 @@ __pycache__/
 !.streamlit/secrets.toml.example
 .venv/
 .venv-win/
+node_modules/
 build/
 dist/
 dist_installer/
 *.py[cod]
 data/*.db
 data/*.db-*
+data/private-backups/
 .DS_Store

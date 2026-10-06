@@ -21,6 +21,7 @@ from src.signal_engine import (
     SignalResult,
 )
 from src.entry_opportunity import non_linking_ticker_text
+from src.portfolio_decisions import build_portfolio_decision_rows
 
 
 ALERT_PREFERENCE_COLUMNS = [
@@ -119,6 +120,9 @@ class DailyOverviewRow:
     previous_state: str = ""
     current_state: str = ""
     data_note: str = ""
+    portfolio_decision: str = ""
+    decision_reason: str = ""
+    confidence_pct: int | None = None
 
 
 @dataclass(frozen=True)
@@ -301,26 +305,29 @@ def build_alert_candidate(
     event_label: str = "",
     fundamental_filter_score: int | None = None,
     fundamental_filter_label: str = "",
+    position_decision: dict[str, object] | None = None,
 ) -> AlertCandidate | None:
     """Aplica las preferencias a una señal ya calculada."""
 
     signature = signal_signature(signal, held=held)
     kind = ""
     title = ""
-    if (
-        held
-        and signal.position_label == LABEL_SELL
-        and preferences.alert_sell
-    ):
-        kind = "Venta"
-        title = "Revisar posible salida"
-    elif (
-        held
-        and signal.position_label == LABEL_REDUCE
-        and preferences.alert_reduce
-    ):
-        kind = "Reducción"
-        title = "Revisar el riesgo de la posición"
+    decision_label = signal.position_label
+    if held:
+        decision = position_decision or build_portfolio_decision_rows(
+            [{"Ticker": signal.ticker, "Si ya la tienes": signal.position_label}],
+            [signal.ticker],
+        )[0]
+        decision_label = str(decision.get("Decisión") or "Esperar confirmación")
+        signature = f"position:{decision_label}"
+        if decision_label == "Revisar posible salida" and preferences.alert_sell:
+            kind = "Revisión de tesis"
+            title = decision_label
+        elif decision_label == "Revisar exposición" and (
+            preferences.alert_reduce or preferences.alert_sell
+        ):
+            kind = "Revisión de riesgo"
+            title = decision_label
     elif (
         not held
         and signal.label in {LABEL_BUY, LABEL_STRONG}
@@ -341,10 +348,14 @@ def build_alert_candidate(
         title=title,
         entry_score=signal.score,
         entry_label=signal.label,
-        position_label=signal.position_label,
+        position_label=decision_label,
         price=float(price),
         as_of=signal.as_of.date().isoformat(),
-        explanation=signal.explanation,
+        explanation=(
+            str(position_decision.get("Motivo") or signal.explanation)
+            if held and position_decision is not None
+            else signal.explanation
+        ),
         signature=signature,
         held=held,
         company_name=company_name.strip(),
@@ -374,6 +385,7 @@ def build_alert_state(
     opportunity_score: int | None = None,
     opportunity_status: str = "",
     data_note: str = "",
+    position_label: str | None = None,
 ) -> AlertState:
     now = evaluated_at or datetime.now().astimezone().isoformat(timespec="seconds")
     return AlertState(
@@ -382,7 +394,7 @@ def build_alert_state(
         signature=signature or signal_signature(signal, held=held),
         entry_score=int(signal.score),
         entry_label=signal.label,
-        position_label=signal.position_label,
+        position_label=position_label or signal.position_label,
         price=float(price),
         evaluated_at=now,
         # Conserva la última entrega real. De lo contrario, una revisión sin
@@ -479,6 +491,8 @@ def build_digest_content(
         "Compra": "#16835b",
         "Reducción": "#b7791f",
         "Venta": "#c53030",
+        "Revisión de riesgo": "#b7791f",
+        "Revisión de tesis": "#c53030",
     }
     for candidate in rows:
         label = display_label(candidate)
@@ -612,6 +626,8 @@ def _overview_display_label(row: DailyOverviewRow) -> str:
 def _overview_decision(row: DailyOverviewRow) -> str:
     """Resume la lectura sin convertir una puntuación aislada en una orden."""
 
+    if row.portfolio_decision:
+        return row.portfolio_decision
     if (
         row.technical_score is None
         and row.growth_score is None
@@ -619,16 +635,24 @@ def _overview_decision(row: DailyOverviewRow) -> str:
         and row.opportunity_score is None
     ):
         return "Datos insuficientes"
-    position = row.position_label.strip().casefold()
     if row.held:
-        if "vender" in position:
-            return "Revisar posible salida"
-        if "reduc" in position:
-            return "Revisar / reducir"
-        if "esper" in position:
-            return "Esperar y vigilar"
-        return "Mantener / revisar protección"
-    if "comprable" in row.opportunity_status.casefold():
+        decision = build_portfolio_decision_rows(
+            [{
+                "Ticker": row.ticker,
+                "Si ya la tienes": row.position_label,
+                "Lectura entrada": row.technical_label,
+                "Oportunidad": row.opportunity_score,
+                "Calidad empresa": row.fundamental_score,
+                "Confianza datos": row.confidence_pct,
+            }],
+            [row.ticker],
+        )[0]
+        return str(decision["Decisión"])
+    if (
+        "comprable" in row.opportunity_status.casefold()
+        and row.confidence_pct is not None
+        and row.confidence_pct >= 60
+    ):
         return "Entrada validada para revisar"
     if (
         row.growth_score is not None
@@ -647,7 +671,7 @@ def _overview_priority(row: DailyOverviewRow) -> tuple[int, int, str]:
     decision = _overview_decision(row)
     if decision == "Revisar posible salida":
         priority = 0
-    elif decision == "Revisar / reducir":
+    elif decision == "Revisar exposición":
         priority = 1
     elif decision == "Entrada validada para revisar":
         priority = 2
@@ -691,12 +715,10 @@ def build_daily_overview_content(
 
     values = sorted(list(rows), key=_overview_priority)
     total = len(values)
-    buyable = sum(
-        "comprable" in row.opportunity_status.casefold() for row in values
-    )
+    buyable = sum(_overview_decision(row) == "Entrada validada para revisar" for row in values)
     portfolio_reviews = sum(
         row.held
-        and _overview_decision(row) in {"Revisar posible salida", "Revisar / reducir"}
+        and _overview_decision(row) in {"Revisar posible salida", "Revisar exposición"}
         for row in values
     )
     changed = sum(row.changed for row in values)
@@ -748,8 +770,12 @@ def build_daily_overview_content(
             [
                 _overview_display_label(row),
                 f"{scores} · {_overview_decision(row)}",
+                f"Fecha del precio: {row.as_of or 'N/D'} · Cobertura de datos: "
+                f"{str(row.confidence_pct) + '%' if row.confidence_pct is not None else 'N/D'}",
             ]
         )
+        if row.decision_reason:
+            plain_lines.append(f"Motivo: {row.decision_reason}")
         if marker:
             plain_lines.append(marker)
         if row.data_note:
@@ -765,12 +791,17 @@ def build_daily_overview_content(
           <td style="padding:9px 7px;min-width:150px">
             <strong>{html.escape(_overview_display_label(row))}</strong>
             {f'<br><span style="color:#b7791f;font-size:11px">{html.escape(_overview_change_label(row))}</span>' if _overview_change_label(row) else ''}
+            {f'<br><span style="color:#64748b">{html.escape(row.data_note)}</span>' if row.data_note else ''}
           </td>
+          <td style="padding:9px 7px">{html.escape(row.as_of or 'N/D')}</td>
           <td style="padding:9px 7px;text-align:center">{score_cell(row.technical_score)}</td>
           <td style="padding:9px 7px;text-align:center">{score_cell(row.growth_score)}</td>
           <td style="padding:9px 7px;text-align:center">{score_cell(row.fundamental_score)}</td>
           <td style="padding:9px 7px;text-align:center">{score_cell(row.opportunity_score)}</td>
-          <td style="padding:9px 7px;min-width:170px">{html.escape(_overview_decision(row))}</td>
+          <td style="padding:9px 7px;text-align:center">{str(row.confidence_pct) + '%' if row.confidence_pct is not None else 'N/D'}</td>
+          <td style="padding:9px 7px;min-width:170px">{html.escape(_overview_decision(row))}
+            {f'<br><span style="color:#64748b">{html.escape(row.decision_reason)}</span>' if row.decision_reason else ''}
+          </td>
         </tr>
         """
         for row in values
@@ -807,10 +838,12 @@ def build_daily_overview_content(
           <thead>
             <tr style="background:#e8f4ef;color:#0f5132">
               <th style="padding:9px 7px;text-align:left">Empresa</th>
+              <th style="padding:9px 7px">Fecha precio</th>
               <th style="padding:9px 7px">Técnica</th>
               <th style="padding:9px 7px">Crecimiento</th>
               <th style="padding:9px 7px">Fundamental</th>
               <th style="padding:9px 7px">Oportunidad</th>
+              <th style="padding:9px 7px">Cobertura datos</th>
               <th style="padding:9px 7px;text-align:left">Lectura</th>
             </tr>
           </thead>

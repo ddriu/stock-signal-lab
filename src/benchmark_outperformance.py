@@ -61,6 +61,7 @@ class BenchmarkAssessment:
     horizons: tuple[HorizonAssessment, ...]
     best_horizon: str | None
     best_score: int | None
+    comparison_currency: str | None = None
 
     def for_horizon(self, key: str) -> HorizonAssessment:
         for assessment in self.horizons:
@@ -171,6 +172,20 @@ def _aligned_closes(
         axis=1,
         join="inner",
     ).dropna()
+
+
+def _comparison_currency(frame: pd.DataFrame | None) -> str | None:
+    if frame is None:
+        return None
+    attrs = frame.attrs
+    raw = (
+        attrs.get("comparison_currency")
+        or attrs.get("display_currency")
+        or attrs.get("quote_currency")
+        or attrs.get("currency")
+    )
+    value = str(raw or "").strip().upper()
+    return value if len(value) == 3 and value.isalpha() else None
 
 
 def _return(values: pd.Series, sessions: int) -> float | None:
@@ -339,10 +354,30 @@ def evaluate_benchmark_outperformance(
     benchmark: pd.DataFrame | None,
     strategies: Mapping[str, StrategyEvidence],
     benchmark_name: str = "S&P 500 (SPY)",
+    comparison_currency: str | None = None,
 ) -> BenchmarkAssessment:
-    """Evalúa tres horizontes con las mismas reglas para toda la lista."""
+    """Evalúa tres horizontes sobre precios expresados en una misma moneda.
 
-    aligned = _aligned_closes(stock, benchmark)
+    El llamador puede convertir ambas series con FX histórico y declarar la
+    moneda mediante ``comparison_currency`` o los atributos de cada frame.
+    Un cambio escalar de hoy no convierte la rentabilidad histórica.
+    """
+
+    declared_currency = str(comparison_currency or "").strip().upper() or None
+    stock_currency = _comparison_currency(stock) or declared_currency
+    benchmark_currency = _comparison_currency(benchmark) or declared_currency
+    mismatch = bool(stock_currency and benchmark_currency and stock_currency != benchmark_currency)
+    unknown_currency = not stock_currency or not benchmark_currency
+    declared_mismatch = bool(
+        declared_currency
+        and (stock_currency != declared_currency or benchmark_currency != declared_currency)
+    )
+    invalid_currency = mismatch or unknown_currency or declared_mismatch
+    aligned = (
+        pd.DataFrame(columns=["stock", "benchmark"])
+        if invalid_currency
+        else _aligned_closes(stock, benchmark)
+    )
     assessments: list[HorizonAssessment] = []
     for definition in HORIZONS:
         (
@@ -370,7 +405,15 @@ def evaluate_benchmark_outperformance(
             excess_return,
             len(favorable),
         )
-        if excess_return is None:
+        if invalid_currency and benchmark is not None:
+            score = None
+            coverage = 0
+            favorable = ()
+            status = "Divisas no comparables" if mismatch or declared_mismatch else "Divisa sin verificar"
+            explanation = (
+                "Convierte acción e índice a una misma moneda con FX histórico antes de comparar."
+            )
+        elif excess_return is None:
             explanation = "Falta histórico comparable con el S&P 500."
         elif status in {"Ventaja fuerte a validar", "Candidata a superar"}:
             explanation = (
@@ -420,4 +463,5 @@ def evaluate_benchmark_outperformance(
         horizons=tuple(assessments),
         best_horizon=best.label if best is not None else None,
         best_score=best.score if best is not None else None,
+        comparison_currency=stock_currency if not invalid_currency else None,
     )

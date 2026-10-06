@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from hashlib import sha256
-from math import sqrt
+from math import isfinite, sqrt
 from typing import Iterable, Mapping, Sequence
 
 import pandas as pd
@@ -46,7 +46,8 @@ def _number(value: object) -> float | None:
     try:
         if value is None or pd.isna(value):
             return None
-        return float(value)
+        parsed = float(value)
+        return parsed if isfinite(parsed) else None
     except (TypeError, ValueError):
         return None
 
@@ -243,6 +244,8 @@ class PaperSnapshot:
     benchmark_nav_eur: float | None
     buy_hold_nav_eur: float
     data_coverage_pct: float
+    buy_hold_coverage_pct: float = 100.0
+    benchmark_coverage_pct: float = 100.0
 
 
 @dataclass(frozen=True)
@@ -401,6 +404,7 @@ def build_paper_rotation_dashboard(
         max_company_weight_pct=config.max_position_pct,
         max_sector_weight_pct=config.max_sector_pct,
         require_costs=True,
+        today=state.as_of,
     )
 
 
@@ -865,30 +869,46 @@ def propose_paper_orders(
     return tuple(results)
 
 
+def _openings_by_date(
+    source: object,
+    *,
+    after: date,
+    through: date,
+) -> dict[date, float]:
+    if isinstance(source, pd.DataFrame):
+        if source.empty or "open" not in source.columns:
+            return {}
+        values = pd.to_numeric(source["open"], errors="coerce").dropna()
+    elif isinstance(source, pd.Series):
+        values = pd.to_numeric(source, errors="coerce").dropna()
+    else:
+        return {}
+    if values.empty:
+        return {}
+    index = pd.to_datetime(values.index, errors="coerce")
+    valid = pd.Series(values.to_numpy(), index=index).dropna().sort_index()
+    valid = valid.loc[
+        (valid.index.date > after) & (valid.index.date <= through)
+    ]
+    openings: dict[date, float] = {}
+    for timestamp, value in valid.items():
+        if pd.isna(timestamp):
+            continue
+        openings.setdefault(timestamp.date(), float(value))
+    return openings
+
+
 def _next_open(
     source: object,
     *,
     after: date,
     through: date,
 ) -> tuple[date, float] | None:
-    if isinstance(source, pd.DataFrame):
-        if source.empty or "open" not in source.columns:
-            return None
-        values = pd.to_numeric(source["open"], errors="coerce").dropna()
-    elif isinstance(source, pd.Series):
-        values = pd.to_numeric(source, errors="coerce").dropna()
-    else:
+    openings = _openings_by_date(source, after=after, through=through)
+    if not openings:
         return None
-    if values.empty:
-        return None
-    index = pd.to_datetime(values.index, errors="coerce")
-    valid = pd.Series(values.to_numpy(), index=index).dropna().sort_index()
-    valid = valid.loc[
-        (valid.index.date > after) & (valid.index.date <= through)
-    ]
-    if valid.empty:
-        return None
-    return valid.index[0].date(), float(valid.iloc[0])
+    first_date = min(openings)
+    return first_date, openings[first_date]
 
 
 def _fx_to_eur(
@@ -898,7 +918,55 @@ def _fx_to_eur(
     if currency.upper() == "EUR":
         return 1.0
     value = _number((fx_rates_to_eur or {}).get(currency.upper()))
-    return value if value is not None and value > 0 else None
+    return value if value is not None and pd.notna(value) and value > 0 and value < float("inf") else None
+
+
+def _opening_timestamp(source: object, opening_date: date) -> pd.Timestamp | None:
+    """Lee una apertura verificable; una fecha OHLC diaria no basta para inferirla."""
+
+    if isinstance(source, pd.DataFrame) and "open_timestamp" in source:
+        for timestamp, raw in source["open_timestamp"].items():
+            if pd.Timestamp(timestamp).date() != opening_date or pd.isna(raw):
+                continue
+            try:
+                parsed = pd.Timestamp(raw)
+            except (TypeError, ValueError):
+                continue
+            if parsed.tzinfo is not None:
+                return parsed.tz_convert("UTC")
+    attrs = getattr(source, "attrs", {})
+    timezone = attrs.get("exchange_timezone")
+    opening_time = attrs.get("market_open_time")
+    if not timezone or not opening_time:
+        return None
+    try:
+        return pd.Timestamp(f"{opening_date.isoformat()} {opening_time}").tz_localize(
+            str(timezone), ambiguous="raise", nonexistent="raise"
+        ).tz_convert("UTC")
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def _execution_fx_to_eur(
+    currency: str,
+    filled_at: date,
+    as_of: date,
+    current_rates: Mapping[str, float] | None,
+    dated_rates: Mapping[object, Mapping[str, float]] | None,
+    current_rates_as_of: date | datetime | str | None,
+) -> float | None:
+    if currency.upper() == "EUR":
+        return 1.0
+    for raw_date, rates in (dated_rates or {}).items():
+        try:
+            rate_date = _as_date(raw_date)
+        except (TypeError, ValueError):
+            continue
+        if rate_date == filled_at:
+            return _fx_to_eur(currency, rates)
+    # Un tipo escalar sólo describe su sesión, nunca una apertura anterior.
+    rate_date = _as_date(current_rates_as_of) if current_rates_as_of is not None else as_of
+    return _fx_to_eur(currency, current_rates) if rate_date == filled_at else None
 
 
 def fill_pending_orders(
@@ -910,12 +978,16 @@ def fill_pending_orders(
     *,
     as_of: date | datetime | str,
     scenario: str = "strict",
+    fx_rates_to_eur_by_date: Mapping[object, Mapping[str, float]] | None = None,
+    fx_rates_as_of: date | datetime | str | None = None,
 ) -> tuple[PaperState, tuple[PaperTrade, ...]]:
     """Rellena al primer ``open`` posterior a T, con costes explícitos.
 
-    La misma orden no puede ejecutarse dos veces. Las ventas se procesan antes
-    que las compras del mismo escenario para que una rotación pueda financiarse
-    sin inventar efectivo.
+    La misma orden no puede ejecutarse dos veces. Una venta y una compra con el
+    mismo ``pair_id`` forman una transacción: ambas usan la primera sesión con
+    aperturas válidas para los dos activos y sólo se confirman si las dos patas
+    pueden ejecutarse. Si falta una pata, una cotización, FX o presupuesto, la
+    pareja se conserva pendiente sin alterar la cartera.
     """
 
     if scenario not in {"strict", "challenger"}:
@@ -995,34 +1067,103 @@ def fill_pending_orders(
         key = trade.pair_id or trade.order_id
         turnover_by_pair[key] = max(turnover_by_pair.get(key, 0.0), trade.gross_eur)
 
-    for order in selected:
-        if order.id in filled_id_set:
-            continue
-        source = bars.get(order.ticker)
-        source_currency = str(
-            getattr(source, "attrs", {}).get("currency") or ""
-        ).strip().upper()
-        if source_currency and source_currency != order.currency.upper():
-            # Una orden legacy con moneda asumida no puede reinterpretar una
-            # apertura nativa como EUR. Se conserva pendiente hasta expirar.
-            continue
-        execution_cutoff = max(
+    def _execution_cutoff(order: PaperOrder) -> date:
+        return max(
             order.signal_date,
             state.as_of,
             order.effective_after - timedelta(days=1),
         )
-        opening = _next_open(
+
+    def _source_currency_matches(order: PaperOrder, source: object) -> bool:
+        source_currency = str(
+            getattr(source, "attrs", {}).get("currency") or ""
+        ).strip().upper()
+        return not source_currency or source_currency == order.currency.upper()
+
+    def _common_pair_openings(
+        pair: Sequence[PaperOrder],
+    ) -> dict[str, tuple[date, float]] | None:
+        openings_by_order: dict[str, dict[date, float]] = {}
+        common_dates: set[date] | None = None
+        for order in pair:
+            source = bars.get(order.ticker)
+            if not _source_currency_matches(order, source):
+                return None
+            openings = {
+                opening_date: native_price
+                for opening_date, native_price in _openings_by_date(
+                    source,
+                    after=_execution_cutoff(order),
+                    through=current_date,
+                ).items()
+                if native_price > 0
+                and _execution_fx_to_eur(
+                    order.currency, opening_date, current_date,
+                    fx_rates_to_eur, fx_rates_to_eur_by_date, fx_rates_as_of,
+                ) is not None
+            }
+            if not openings:
+                return None
+            openings_by_order[order.id] = openings
+            dates = set(openings)
+            common_dates = dates if common_dates is None else common_dates & dates
+        if not common_dates:
+            return None
+        sale, purchase = sorted(pair, key=lambda item: item.side != "Venta")
+        sale_source, purchase_source = bars.get(sale.ticker), bars.get(purchase.ticker)
+        sale_zone = getattr(sale_source, "attrs", {}).get("exchange_timezone")
+        purchase_zone = getattr(purchase_source, "attrs", {}).get("exchange_timezone")
+        international = (
+            sale.currency.upper() != purchase.currency.upper()
+            or bool(sale_zone and purchase_zone and sale_zone != purchase_zone)
+        )
+        eligible_dates: list[date] = []
+        for opening_date in sorted(common_dates):
+            sale_time = _opening_timestamp(sale_source, opening_date)
+            purchase_time = _opening_timestamp(purchase_source, opening_date)
+            if sale_time is not None and purchase_time is not None:
+                if purchase_time >= sale_time:
+                    eligible_dates.append(opening_date)
+            elif not international:
+                eligible_dates.append(opening_date)
+        if not eligible_dates:
+            return None
+        filled_at = eligible_dates[0]
+        return {
+            order.id: (filled_at, openings_by_order[order.id][filled_at])
+            for order in pair
+        }
+
+    def _execute_order(
+        order: PaperOrder,
+        opening: tuple[date, float] | None = None,
+    ) -> bool:
+        nonlocal cash, realized, costs_cumulative
+
+        if order.id in filled_id_set:
+            return False
+        source = bars.get(order.ticker)
+        if not _source_currency_matches(order, source):
+            # Una orden legacy con moneda asumida no puede reinterpretar una
+            # apertura nativa como EUR. Se conserva pendiente hasta expirar.
+            return False
+        resolved_opening = opening or _next_open(
             source,
-            after=execution_cutoff,
+            after=_execution_cutoff(order),
             through=current_date,
         )
-        fx_rate = _fx_to_eur(order.currency, fx_rates_to_eur)
-        if opening is None or fx_rate is None:
-            continue
-        filled_at, native_price = opening
+        if resolved_opening is None:
+            return False
+        filled_at, native_price = resolved_opening
+        fx_rate = _execution_fx_to_eur(
+            order.currency, filled_at, current_date,
+            fx_rates_to_eur, fx_rates_to_eur_by_date, fx_rates_as_of,
+        )
+        if fx_rate is None:
+            return False
         price_eur = native_price * fx_rate
         if price_eur <= 0:
-            continue
+            return False
         turnover_key = order.pair_id or order.id
         if order.scenario == "strict" and not can_rebalance_on_date(
             replace(state, trades=state.trades + tuple(trades)),
@@ -1031,13 +1172,13 @@ def fill_pending_orders(
             scenario="strict",
             pair_id=turnover_key,
         ):
-            continue
+            return False
         other_turnover = sum(
             value for key, value in turnover_by_pair.items() if key != turnover_key
         )
         turnover_room = max(0.0, turnover_cap - other_turnover)
         if turnover_room <= 0:
-            continue
+            return False
         gross_order_limit = min(order.target_value_eur, turnover_room)
         variable_rate = (config.spread_pct + config.slippage_pct) / 100.0
         fx_rate_cost = config.fx_cost_pct / 100.0 if order.currency != "EUR" else 0.0
@@ -1050,10 +1191,12 @@ def fill_pending_orders(
                 or current.quantity <= 0
                 or _position_valuation_mode(current) != "market"
             ):
-                continue
+                return False
             gross_target = min(gross_order_limit, current.quantity * price_eur)
             quantity = min(current.quantity, gross_target / price_eur)
             gross = quantity * price_eur
+            if gross <= 0:
+                return False
             spread = gross * config.spread_pct / 100.0
             slippage = gross * config.slippage_pct / 100.0
             fx_cost = gross * fx_rate_cost
@@ -1075,7 +1218,7 @@ def fill_pending_orders(
         else:
             current = positions.get(order.ticker)
             if current is not None and _position_valuation_mode(current) != "market":
-                continue
+                return False
             current_value = current.quantity * price_eur if current else 0.0
             company_room = max(
                 0.0,
@@ -1101,7 +1244,7 @@ def fill_pending_orders(
             affordable_gross = max(0.0, (available_cash - fee) / denominator)
             gross = min(gross_order_limit, company_room, sector_room, affordable_gross)
             if gross <= 0:
-                continue
+                return False
             quantity = gross / price_eur
             spread = gross * config.spread_pct / 100.0
             slippage = gross * config.slippage_pct / 100.0
@@ -1155,6 +1298,54 @@ def fill_pending_orders(
         )
         filled_ids.append(order.id)
         filled_id_set.add(order.id)
+        return True
+
+    execution_groups: dict[str, list[PaperOrder]] = {}
+    for order in selected:
+        execution_groups.setdefault(order.pair_id or order.id, []).append(order)
+
+    for grouped_orders in execution_groups.values():
+        if not grouped_orders[0].pair_id:
+            _execute_order(grouped_orders[0])
+            continue
+
+        pair = sorted(grouped_orders, key=lambda item: item.side != "Venta")
+        if len(pair) != 2 or {order.side for order in pair} != {"Venta", "Compra"}:
+            # No se puede inferir ni ejecutar parcialmente una pareja incompleta
+            # o mal formada. Ningún id se marca como relleno, por lo que queda
+            # pendiente hasta que llegue la pareja válida o expire.
+            continue
+        pair_openings = _common_pair_openings(pair)
+        if pair_openings is None:
+            continue
+
+        saved_positions = positions.copy()
+        saved_cash = cash
+        saved_realized = realized
+        saved_costs = costs_cumulative
+        saved_trades_count = len(trades)
+        saved_filled_count = len(filled_ids)
+        saved_filled_ids = filled_id_set.copy()
+        saved_turnover = turnover_by_pair.copy()
+
+        completed = all(
+            _execute_order(order, pair_openings[order.id])
+            for order in pair
+        )
+        if completed:
+            continue
+
+        positions.clear()
+        positions.update(saved_positions)
+        cash = saved_cash
+        realized = saved_realized
+        costs_cumulative = saved_costs
+        del trades[saved_trades_count:]
+        del filled_ids[saved_filled_count:]
+        filled_id_set.clear()
+        filled_id_set.update(saved_filled_ids)
+        turnover_by_pair.clear()
+        turnover_by_pair.update(saved_turnover)
 
     new_state = replace(
         state,
@@ -1221,24 +1412,32 @@ def mark_to_market(
     net_nav = max(0.0, gross_nav - tax_reserve)
 
     buy_hold = state.initial_cash_eur
+    hold_value = 0.0
+    hold_covered_value = 0.0
     for position in state.initial_positions:
         price = (
             normalized.get(position.ticker, position.last_price_eur)
             if _position_valuation_mode(position) == "market"
             else position.last_price_eur
         )
-        buy_hold += position.quantity * price
+        value = position.quantity * price
+        buy_hold += value
+        hold_value += value
+        if _position_valuation_mode(position) == "market" and position.ticker in normalized:
+            hold_covered_value += value
     benchmark_nav: float | None = None
+    current_benchmark_price = _number(benchmark_price_eur)
+    initial_benchmark_price = _number(state.benchmark_initial_price_eur)
     if (
-        benchmark_price_eur is not None
-        and benchmark_price_eur > 0
-        and state.benchmark_initial_price_eur is not None
-        and state.benchmark_initial_price_eur > 0
+        current_benchmark_price is not None
+        and current_benchmark_price > 0
+        and initial_benchmark_price is not None
+        and initial_benchmark_price > 0
     ):
         benchmark_nav = (
             state.initial_nav_eur
-            * float(benchmark_price_eur)
-            / state.benchmark_initial_price_eur
+            * current_benchmark_price
+            / initial_benchmark_price
         )
     coverage = covered_value / holdings * 100.0 if holdings > 0 else 100.0
     return PaperSnapshot(
@@ -1255,6 +1454,8 @@ def mark_to_market(
         benchmark_nav_eur=benchmark_nav,
         buy_hold_nav_eur=buy_hold,
         data_coverage_pct=coverage,
+        buy_hold_coverage_pct=(hold_covered_value / hold_value * 100.0 if hold_value > 0 else 100.0),
+        benchmark_coverage_pct=100.0 if benchmark_nav is not None else 0.0,
     )
 
 
@@ -1282,9 +1483,12 @@ def compute_paper_scorecard(
             "status": "Sin datos",
         }
     first, latest = ordered[0], ordered[-1]
-    strategy_return = _return_pct(latest.nav_net_eur, first.nav_net_eur)
-    hold_return = _return_pct(latest.buy_hold_nav_eur, first.buy_hold_nav_eur)
-    benchmark_return = _return_pct(latest.benchmark_nav_eur, first.benchmark_nav_eur)
+    strategy_complete = min(first.data_coverage_pct, latest.data_coverage_pct) >= 100.0 - 1e-9
+    hold_complete = min(first.buy_hold_coverage_pct, latest.buy_hold_coverage_pct) >= 100.0 - 1e-9
+    benchmark_complete = min(first.benchmark_coverage_pct, latest.benchmark_coverage_pct) >= 100.0 - 1e-9
+    strategy_return = _return_pct(latest.nav_net_eur, first.nav_net_eur) if strategy_complete else None
+    hold_return = _return_pct(latest.buy_hold_nav_eur, first.buy_hold_nav_eur) if hold_complete else None
+    benchmark_return = _return_pct(latest.benchmark_nav_eur, first.benchmark_nav_eur) if benchmark_complete else None
     peak = ordered[0].nav_net_eur
     maximum_drawdown = 0.0
     returns: list[float] = []
@@ -1316,6 +1520,9 @@ def compute_paper_scorecard(
     )
     comparisons = [value for value in (excess_hold, excess_benchmark) if value is not None]
     status = (
+        "Referencia incompleta"
+        if strategy_return is None or hold_return is None or benchmark_return is None
+        else
         "Mejora ambas referencias"
         if len(comparisons) == 2 and all(value > 0 for value in comparisons)
         else "No mejora ambas referencias"
@@ -1331,10 +1538,12 @@ def compute_paper_scorecard(
         "benchmark_return_pct": benchmark_return,
         "excess_vs_hold_pct": excess_hold,
         "excess_vs_benchmark_pct": excess_benchmark,
-        "maximum_drawdown_pct": maximum_drawdown,
-        "annualized_volatility_pct": volatility,
+        "maximum_drawdown_pct": maximum_drawdown if all(item.data_coverage_pct >= 100.0 - 1e-9 for item in ordered) else None,
+        "annualized_volatility_pct": volatility if all(item.data_coverage_pct >= 100.0 - 1e-9 for item in ordered) else None,
         "costs_cumulative_eur": latest.costs_cumulative_eur,
         "data_coverage_pct": latest.data_coverage_pct,
+        "buy_hold_coverage_pct": latest.buy_hold_coverage_pct,
+        "benchmark_coverage_pct": latest.benchmark_coverage_pct,
         "status": status,
     }
 

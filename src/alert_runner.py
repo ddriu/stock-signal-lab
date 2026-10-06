@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -40,6 +41,8 @@ from src.opportunity import (
     evaluate_valuation,
 )
 from src.portfolio_snapshot import latest_portfolio_snapshot
+from src.portfolio_decisions import build_portfolio_decision_rows
+from src.market_data_quality import quote_freshness
 from src.signal_engine import evaluate_latest_signal
 from src.storage import GROUP_PORTFOLIO_OWNER, create_journal
 
@@ -52,6 +55,7 @@ class AlertRunSummary:
     alerts_sent: int
     errors: tuple[str, ...]
     tickers_with_prices: int = 0
+    tickers_with_fresh_prices: int = 0
 
 
 def _favorite_names(journal: object) -> dict[str, str]:
@@ -156,7 +160,7 @@ def run_daily_alerts(
 ) -> AlertRunSummary:
     """Ejecuta el radar de todas las preferencias activas del backend."""
 
-    resolved_today = today or date.today()
+    resolved_today = today or datetime.now(ZoneInfo("Europe/Madrid")).date()
     group_journal = journal_factory(GROUP_PORTFOLIO_OWNER)
     if not hasattr(group_journal, "list_enabled_alert_preferences"):
         raise RuntimeError(
@@ -253,6 +257,7 @@ def run_daily_alerts(
     fundamental_failures: dict[str, str] = {}
     emails_sent = 0
     alerts_sent = 0
+    fresh_tickers: set[str] = set()
 
     for owner, (preference, journal, scope, positions, names) in scopes.items():
         try:
@@ -334,15 +339,26 @@ def run_daily_alerts(
                         ticker=ticker,
                         entry_price=positions.get(ticker),
                     )
+                    freshness = quote_freshness(signal.as_of, reference_date=resolved_today)
+                    if not freshness.fresh:
+                        overview_rows.append(DailyOverviewRow(
+                            ticker=ticker,
+                            company_name=names.get(ticker, ticker),
+                            held=held,
+                            price=float(frame["close"].iloc[-1]),
+                            as_of=str(signal.as_of.date()),
+                            technical_score=None,
+                            technical_label="Datos antiguos",
+                            position_label="Actualizar datos",
+                            portfolio_decision="Actualizar datos",
+                            data_note=freshness.status,
+                        ))
+                        errors.append(f"{owner} / {ticker}: {freshness.status}.")
+                        continue
+                    fresh_tickers.add(ticker)
                     price = float(frame["close"].iloc[-1])
                     state_signature = signal_signature(signal, held=held)
-                    candidate = build_alert_candidate(
-                        signal,
-                        price=price,
-                        held=held,
-                        preferences=preference,
-                        company_name=names.get(ticker, ""),
-                    )
+                    candidate = None
                     if ticker not in fundamental_cache:
                         try:
                             fundamental_cache[ticker] = fundamental_downloader(ticker)
@@ -363,6 +379,8 @@ def run_daily_alerts(
                     data_notes: list[str] = []
                     if ticker in fundamental_failures:
                         data_notes.append("fundamentales no disponibles")
+                    elif info.get("_warnings"):
+                        data_notes.append("fundamentales parciales: alguna fuente no pudo verificar las cuentas")
 
                     quick_fundamental = None
                     try:
@@ -462,6 +480,37 @@ def run_daily_alerts(
                     else:
                         data_notes.append("oportunidad sin histórico suficiente")
 
+                    confidence = (
+                        getattr(enhanced, "confidence_pct", None)
+                        if enhanced is not None
+                        else None
+                    )
+                    position_decision = None
+                    if held:
+                        position_decision = build_portfolio_decision_rows(
+                            [{
+                                "Ticker": ticker,
+                                "Si ya la tienes": signal.position_label,
+                                "Lectura entrada": signal.label,
+                                "Oportunidad": getattr(enhanced, "opportunity_score", None),
+                                "Calidad empresa": getattr(fundamental, "score", None),
+                                "Riesgo controlado": getattr(risk, "score", None),
+                                "Confianza datos": confidence,
+                                "Motivo posición": signal.explanation,
+                                "Fecha": str(signal.as_of.date()),
+                            }],
+                            [ticker],
+                        )[0]
+                        state_signature = f"position:{position_decision['Decisión']}"
+                    candidate = build_alert_candidate(
+                        signal,
+                        price=price,
+                        held=held,
+                        preferences=preference,
+                        company_name=company_name,
+                        position_decision=position_decision,
+                    )
+
                     if candidate is not None:
                         candidate = replace(candidate, company_name=company_name)
                     if candidate is not None and candidate.kind == "Compra":
@@ -493,8 +542,14 @@ def run_daily_alerts(
                                 ),
                             )
                             state_signature = candidate.signature
-                            if enhanced.status_code != STATUS_BUYABLE:
+                            if (
+                                enhanced.status_code != STATUS_BUYABLE
+                                or confidence is None
+                                or float(confidence) < 60.0
+                            ):
                                 candidate = None
+                                if enhanced.status_code == STATUS_BUYABLE:
+                                    state_signature = f"entry:{signal.label}:DATOS_INSUFICIENTES"
                     changed, change_kind, previous_state, current_state = (
                         describe_state_change(
                             previous_signatures.get(ticker),
@@ -536,6 +591,15 @@ def run_daily_alerts(
                             previous_state=previous_state,
                             current_state=current_state,
                             data_note=", ".join(dict.fromkeys(data_notes)),
+                            portfolio_decision=(
+                                str(position_decision["Decisión"])
+                                if position_decision is not None else ""
+                            ),
+                            decision_reason=(
+                                str(position_decision["Motivo"])
+                                if position_decision is not None else ""
+                            ),
+                            confidence_pct=confidence,
                         )
                     overview_rows.append(overview_row)
                     snapshot_key = (ticker, pd.Timestamp(signal.as_of).date())
@@ -582,6 +646,11 @@ def run_daily_alerts(
                             saved_snapshot_keys.add(snapshot_key)
                         except Exception:
                             data_notes.append("historial no guardado")
+                            overview_row = replace(
+                                overview_row,
+                                data_note=", ".join(dict.fromkeys(data_notes)),
+                            )
+                            overview_rows[-1] = overview_row
                     if candidate is not None:
                         candidates.append(candidate)
                     evaluated.append(
@@ -681,6 +750,7 @@ def run_daily_alerts(
                     opportunity_score=overview.opportunity_score,
                     opportunity_status=overview.opportunity_status,
                     data_note=overview.data_note,
+                    position_label=overview.portfolio_decision or None,
                 )
                 for signal, price, held, signature, overview in evaluated
             ]
@@ -696,4 +766,5 @@ def run_daily_alerts(
         alerts_sent=alerts_sent,
         errors=tuple(errors),
         tickers_with_prices=len(frames),
+        tickers_with_fresh_prices=len(fresh_tickers),
     )

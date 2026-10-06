@@ -79,7 +79,49 @@ def test_calibration_groups_scores_and_marks_evidence_threshold() -> None:
     aggregate = result.by_score.loc[
         result.by_score["score_tier"] == "Todas las entradas · 65+"
     ].iloc[0]
-    assert bool(aggregate["enough_evidence"])
+    assert not bool(aggregate["enough_evidence"])
+    assert aggregate["temporal_blocks"] == 3
     assert aggregate["beat_civislend_rate_pct"] == 100
     assert calibration_for_score(result, 80) is not None
     assert calibration_for_score(result, 55) is None
+
+
+def test_thirty_correlated_tickers_on_one_date_are_not_thirty_periods() -> None:
+    frame = _frame_with_signals(periods=30, signal_positions=(0,))
+    result = calibrate_score_returns(
+        {f"CLONE_{number}": frame for number in range(30)},
+        horizon_sessions=21, minimum_samples=30,
+    )
+    aggregate = result.by_score.iloc[-1]
+
+    assert aggregate["samples"] == 30
+    assert aggregate["unique_signal_dates"] == 1
+    assert aggregate["temporal_blocks"] == 1
+    assert not bool(aggregate["enough_evidence"])
+    assert aggregate["beat_civislend_ci_low_pct"] == 0
+    assert aggregate["beat_civislend_ci_high_pct"] == 100
+
+
+def test_temporally_spread_events_can_reach_the_evidence_threshold() -> None:
+    frame = _frame_with_signals(
+        periods=940, signal_positions=tuple(range(0, 900, 30)),
+    )
+    result = calibrate_score_returns(
+        {"HISTORY": frame}, horizon_sessions=21, minimum_samples=30,
+    )
+    aggregate = result.by_score.iloc[-1]
+
+    assert aggregate["samples"] == 30
+    assert aggregate["temporal_blocks"] == 30
+    assert bool(aggregate["enough_evidence"])
+
+
+def test_cloning_the_universe_cannot_narrow_the_period_confidence_band() -> None:
+    frame = _frame_with_signals(periods=100, signal_positions=(0, 30, 60))
+    one = calibrate_score_returns({"ONE": frame}, horizon_sessions=21).by_score.iloc[-1]
+    cloned = calibrate_score_returns(
+        {f"CLONE_{number}": frame for number in range(30)}, horizon_sessions=21,
+    ).by_score.iloc[-1]
+
+    assert cloned["beat_civislend_ci_low_pct"] == pytest.approx(one["beat_civislend_ci_low_pct"])
+    assert cloned["beat_civislend_ci_high_pct"] == pytest.approx(one["beat_civislend_ci_high_pct"])

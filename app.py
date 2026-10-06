@@ -1,7 +1,7 @@
 """Interfaz Streamlit de Stock Signal Lab.
 
 Ejecutar con: ``streamlit run app.py``
-Versión de estabilización auditada: 2026-09-26.
+Versión de estabilización auditada: 2026-10-03.
 """
 
 from __future__ import annotations
@@ -63,6 +63,7 @@ from src.data_loader import (
 )
 from src.price_units import format_quote_price, normalize_price_frame_units, resolve_quote_unit
 from src.market_analysis import InstrumentReport, build_instrument_report
+from src.market_data_quality import quote_freshness, recent_market_prices, us_daily_session_is_closed
 from src.data_sources import (
     ExternalDataError,
     FxSnapshot,
@@ -146,6 +147,12 @@ if (
     )
     or getattr(_paper_simulation_module, "PAPER_ENGINE_VERSION", "") != "paper-v2"
     or not hasattr(_paper_simulation_module, "_position_valuation_mode")
+    or "buy_hold_coverage_pct" not in getattr(
+        _paper_simulation_module.PaperSnapshot, "__dataclass_fields__", {}
+    )
+    or "benchmark_coverage_pct" not in getattr(
+        _paper_simulation_module.PaperSnapshot, "__dataclass_fields__", {}
+    )
 ):
     _paper_simulation_module = importlib.reload(_paper_simulation_module)
 
@@ -2766,16 +2773,19 @@ def render_long_horizon_calibration(
         "Superó Civislend",
         f"{float(aggregate['beat_civislend_rate_pct']):.1f}%",
     )
-    if int(aggregate["samples"]) < MINIMUM_RELIABLE_SAMPLES:
+    if not bool(aggregate["enough_evidence"]):
         st.warning(
-            f"Sólo hay {int(aggregate['samples'])} casos. La cifra todavía es orientativa; "
-            f"se necesitan al menos {MINIMUM_RELIABLE_SAMPLES} señales no solapadas."
+            f"{int(aggregate['samples'])} señales corresponden a "
+            f"{int(aggregate['temporal_blocks'])} periodos temporales. La cifra es descriptiva; "
+            f"se necesitan al menos {MINIMUM_RELIABLE_SAMPLES} periodos no solapados. "
+            "Muchas empresas del mismo día no equivalen a pruebas independientes."
         )
     else:
         st.info(
-            "La frecuencia de superar Civislend tiene un intervalo de incertidumbre del "
+            "La frecuencia de superar Civislend por periodos tiene una banda orientativa del "
             f"95% entre {float(aggregate['beat_civislend_ci_low_pct']):.1f}% y "
-            f"{float(aggregate['beat_civislend_ci_high_pct']):.1f}%. No es una garantía."
+            f"{float(aggregate['beat_civislend_ci_high_pct']):.1f}%. "
+            "No es una probabilidad de ganar validada fuera de muestra."
         )
 
     st.plotly_chart(
@@ -2787,7 +2797,9 @@ def render_long_horizon_calibration(
         columns={
             "score_tier": "Nivel de entrada",
             "samples": "Casos",
-            "enough_evidence": "30+ casos",
+            "enough_evidence": "30+ periodos",
+            "temporal_blocks": "Periodos",
+            "unique_signal_dates": "Fechas distintas",
             "median_net_return_pct": "Mediana neta",
             "positive_rate_pct": "Positivos",
             "beat_sego_rate_pct": "Supera Sego",
@@ -2798,7 +2810,7 @@ def render_long_horizon_calibration(
             "worst_decile_drawdown_pct": "Caída del 10% peor",
         }
     )
-    visible_calibration["30+ casos"] = visible_calibration["30+ casos"].map(
+    visible_calibration["30+ periodos"] = visible_calibration["30+ periodos"].map(
         {True: "Sí", False: "Todavía no"}
     )
     st.dataframe(
@@ -2807,7 +2819,9 @@ def render_long_horizon_calibration(
             [
                 "Nivel de entrada",
                 "Casos",
-                "30+ casos",
+                "Periodos",
+                "Fechas distintas",
+                "30+ periodos",
                 "Mediana neta",
                 "Positivos",
                 "Supera Sego",
@@ -3329,6 +3343,177 @@ def render_approximate_returns(
         "Estimación orientativa basada en las operaciones registradas. No sustituye "
         "el cálculo fiscal del bróker o de un asesor."
     )
+
+
+def render_historical_closure_form(
+    journal: object,
+    fx_snapshot: FxSnapshot,
+    *,
+    view_key: str,
+    recorded_by: str,
+) -> None:
+    """Registra ventas antiguas que una fotografía de cartera no puede reconstruir."""
+
+    if not hasattr(journal, "add_historical_closure"):
+        return
+    with st.expander("¿Falta una venta anterior? Añadir cierre histórico"):
+        st.caption(
+            "Una posición que desaparece de una fotografía no demuestra cuánto "
+            "ganaste o perdiste. Introduce el coste total de lo vendido y el neto "
+            "recibido: se guardarán juntos y no alterarán ninguna posición abierta."
+        )
+        st.caption(
+            "Si el cierre está en USD u otra divisa, se conserva el importe original "
+            "en las notas y se fija una conversión EUR aproximada con el cambio BCE "
+            "disponible al registrarlo."
+        )
+        account_options = ["Trade Republic", "Revolut", "MyInvestor", "Otro"]
+        with st.form(f"{view_key}_historical_closure_form", clear_on_submit=False):
+            identity_col, account_col, currency_col, date_col = st.columns(
+                [1, 1.25, 0.8, 1]
+            )
+            ticker = identity_col.text_input(
+                "Ticker",
+                placeholder="ORCL, NOW, NKE…",
+            )
+            account_name = account_col.selectbox(
+                "Cuenta donde se vendió",
+                account_options,
+            )
+            closure_currency = currency_col.selectbox(
+                "Moneda",
+                ["EUR", "USD", "GBP", "CHF", "JPY", "CAD", "AUD"],
+            )
+            sold_on = date_col.date_input("Fecha de venta", value=date.today())
+            quantity_col, quality_col = st.columns(2)
+            quantity = quantity_col.number_input(
+                "Cantidad vendida",
+                min_value=0.000001,
+                value=1.0,
+                format="%.6f",
+                help=(
+                    "Si no recuerdas las unidades, usa 1 como lote completo. El resultado "
+                    "en euros seguirá siendo correcto, pero la cantidad quedará estimada."
+                ),
+            )
+            quality_label = quality_col.selectbox(
+                "Calidad del dato",
+                ["Documentado por el bróker", "Estimado desde una fotografía"],
+            )
+            cost_col, proceeds_col, fee_col = st.columns(3)
+            cost_text = cost_col.text_input(
+                "Coste total (moneda elegida)",
+                placeholder="100,00",
+                help="Incluye las comisiones de compra si ya forman parte del coste.",
+            )
+            proceeds_text = proceeds_col.text_input(
+                "Neto recibido (moneda elegida)",
+                placeholder="110,00",
+                help="Importe abonado después de la comisión de venta.",
+            )
+            fee_text = fee_col.text_input(
+                "Comisión incluida (moneda elegida)",
+                value="0",
+                help="Es informativa: no se descuenta otra vez del neto recibido.",
+            )
+            closure_notes = st.text_area(
+                "Fuente o notas",
+                placeholder="Ej.: ticket del bróker o fotografía de la cartera",
+            )
+            submitted = st.form_submit_button(
+                "Guardar cierre sin alterar la cartera abierta",
+                type="primary",
+            )
+        if not submitted:
+            return
+
+        def required_decimal(raw: str, label: str, *, allow_zero: bool = False) -> float:
+            cleaned = raw.strip().replace(" ", "").replace(",", ".")
+            try:
+                value = float(cleaned)
+            except ValueError as exc:
+                raise ValueError(f"{label} debe ser un número válido.") from exc
+            minimum_ok = value >= 0 if allow_zero else value > 0
+            if not minimum_ok:
+                qualifier = "cero o positivo" if allow_zero else "positivo"
+                raise ValueError(f"{label} debe ser {qualifier}.")
+            return value
+
+        try:
+            if not ticker.strip():
+                raise ValueError("El ticker es obligatorio.")
+            cost_basis_eur = required_decimal(cost_text, "El coste total")
+            net_proceeds_eur = required_decimal(proceeds_text, "El neto recibido")
+            sale_fee_eur = required_decimal(
+                fee_text, "La comisión", allow_zero=True
+            )
+            source_amounts = (
+                f"Importes originales: coste {cost_basis_eur:.6f} "
+                f"{closure_currency}; neto {net_proceeds_eur:.6f} "
+                f"{closure_currency}; comisión {sale_fee_eur:.6f} "
+                f"{closure_currency}."
+            )
+            if closure_currency != "EUR":
+                cost_basis_eur = float(
+                    convert_currency(
+                        cost_basis_eur,
+                        closure_currency,
+                        "EUR",
+                        fx_snapshot.rates_per_eur,
+                    )
+                )
+                net_proceeds_eur = float(
+                    convert_currency(
+                        net_proceeds_eur,
+                        closure_currency,
+                        "EUR",
+                        fx_snapshot.rates_per_eur,
+                    )
+                )
+                sale_fee_eur = float(
+                    convert_currency(
+                        sale_fee_eur,
+                        closure_currency,
+                        "EUR",
+                        fx_snapshot.rates_per_eur,
+                    )
+                )
+            journal.add_historical_closure(
+                ticker=ticker,
+                account_name=(
+                    account_name if account_name != "Otro" else "Sin especificar"
+                ),
+                quantity=float(quantity),
+                cost_basis_eur=cost_basis_eur,
+                net_proceeds_eur=net_proceeds_eur,
+                sold_at=datetime.combine(sold_on, datetime.max.time()),
+                sale_fee_eur=sale_fee_eur,
+                quality=(
+                    "Documentado"
+                    if quality_label == "Documentado por el bróker"
+                    and closure_currency == "EUR"
+                    else "Estimado"
+                ),
+                notes=(
+                    f"{source_amounts} {closure_notes}".strip()
+                    + (
+                        " Conversión aproximada con el cambio BCE disponible al "
+                        "registrar el cierre, no con el cambio fiscal de la venta."
+                        if closure_currency != "EUR"
+                        else ""
+                    )
+                ),
+                recorded_by=recorded_by,
+            )
+        except (ValueError, JournalStorageError) as exc:
+            st.error(str(exc))
+        else:
+            result = net_proceeds_eur - cost_basis_eur
+            st.session_state[f"_{view_key}_journal_flash"] = (
+                f"Cierre de {ticker.strip().upper()} guardado: "
+                f"resultado {result:+,.2f} €."
+            )
+            st.rerun()
 
 
 def _sync_accounts_from_complete_snapshot(
@@ -4131,16 +4316,7 @@ def render_private_investments(
         latest_value = float(latest_positions["value_eur"].sum())
         latest_cost = float(latest_positions["cost_estimate_eur"].sum())
         latest_pnl = float(latest_positions["gain_loss_eur"].sum())
-        latest_prices = {
-            ticker: float(frame["close"].iloc[-1])
-            for ticker, frame in prepared.items()
-            if not frame.empty
-        }
-        price_dates = {
-            ticker: pd.Timestamp(frame.index[-1])
-            for ticker, frame in prepared.items()
-            if not frame.empty
-        }
+        latest_prices, price_dates = recent_market_prices(prepared)
         market_positions, market_refresh = refresh_portfolio_snapshot_prices(
             latest_positions,
             latest_prices,
@@ -4695,6 +4871,11 @@ def render_portfolio_evolution(
             + ", ".join(result.missing_currencies)
             + "."
         )
+    if result.incomplete_operations:
+        st.warning(
+            "Hay ventas sin compras suficientes registradas. El resultado agregado "
+            "queda pendiente: recibir dinero por una venta no equivale a ganarlo."
+        )
     if not result.daily.empty:
         st.plotly_chart(
             portfolio_evolution_chart(result.daily),
@@ -4719,12 +4900,17 @@ def render_portfolio_evolution(
                 "Resultado realizado EUR": st.column_config.NumberColumn(format="%+.2f €"),
                 "Valor al cierre EUR": st.column_config.NumberColumn(format="%.2f €"),
                 "Resultado acumulado EUR": st.column_config.NumberColumn(format="%+.2f €"),
-                "Resultado acumulado %": st.column_config.NumberColumn(format="%+.2f%%"),
+                "Resultado del año EUR": st.column_config.NumberColumn(format="%+.2f €"),
+                "Resultado acumulado %": st.column_config.NumberColumn(
+                    "Resultado / compras acumuladas", format="%+.2f%%"
+                ),
             },
         )
     st.caption(
-        "Estimación de seguimiento: emplea cierres de mercado ajustados y el tipo de cambio "
-        "actual del BCE para todos los años. No sustituye el extracto del bróker ni el cálculo fiscal."
+        "Estimación: compras y ventas usan la liquidación registrada cuando existe; "
+        "los valores históricos sin FX fechado usan el cambio actual. El resultado "
+        "del año se expresa en euros. El ratio sobre compras acumuladas no es la "
+        "rentabilidad anual de la cuenta ni incluye aportaciones y retiradas externas."
     )
     try:
         workbook = build_portfolio_excel(
@@ -4807,11 +4993,7 @@ def render_journal(
     )
     operations = journal.list_operations()
     positions = journal.open_positions()
-    latest_prices = {
-        ticker: float(frame["close"].iloc[-1])
-        for ticker, frame in prepared.items()
-        if not frame.empty
-    }
+    latest_prices, _ = recent_market_prices(prepared)
     positions_dashboard, portfolio_kpis = build_position_dashboard(
         operations,
         positions,
@@ -4851,6 +5033,12 @@ def render_journal(
             fx_snapshot,
             view_key=view_key,
             default_sell_fee_eur=float(fixed_fee),
+        )
+        render_historical_closure_form(
+            journal,
+            fx_snapshot,
+            view_key=view_key,
+            recorded_by=actor_username,
         )
 
     with register_tab:
@@ -5119,12 +5307,12 @@ def render_journal(
                 "Resultado latente",
                 (
                     f"{portfolio_kpis.unrealized_pnl_eur:+,.2f} EUR"
-                    if portfolio_kpis.priced_positions_count
+                    if portfolio_kpis.coverage_complete
                     else "N/D"
                 ),
                 delta=(
                     f"{portfolio_kpis.unrealized_return_pct:+.2f}%"
-                    if portfolio_kpis.priced_positions_count
+                    if portfolio_kpis.coverage_complete
                     else None
                 ),
                 help="Beneficio o pérdida si se cerrasen ahora las posiciones valoradas.",
@@ -5565,11 +5753,7 @@ def render_admin_panel(
         format="%.2f",
         key="admin_fixed_fee",
     )
-    latest_prices = {
-        ticker: float(frame["close"].iloc[-1])
-        for ticker, frame in prepared.items()
-        if not frame.empty
-    }
+    latest_prices, _ = recent_market_prices(prepared)
     snapshots: dict[str, dict[str, object]] = {}
     summary_rows: list[dict[str, object]] = []
 
@@ -5654,7 +5838,7 @@ def render_admin_panel(
     admin_cols[3].metric("Posiciones abiertas", total_positions)
     admin_cols[4].metric(
         "Resultado latente conjunto",
-        f"{total_unrealized:+,.2f} EUR",
+        f"{total_unrealized:+,.2f} EUR" if isfinite(total_unrealized) else "N/D",
         help=f"Sobre {total_invested:,.2f} EUR de capital pendiente convertible.",
     )
 
@@ -6700,11 +6884,7 @@ def _portfolio_snapshot(
 ) -> tuple[pd.DataFrame, object]:
     operations = journal.list_operations()
     positions = calculate_open_positions(operations)
-    latest_prices = {
-        ticker: float(frame["close"].iloc[-1])
-        for ticker, frame in prepared.items()
-        if not frame.empty
-    }
+    latest_prices, _ = recent_market_prices(prepared)
     return build_position_dashboard(
         operations,
         positions,
@@ -7449,8 +7629,12 @@ def _paper_eur_market_data(
         if frame is None or frame.empty or "close" not in frame:
             continue
         frame_date = pd.Timestamp(frame.index[-1]).date()
-        if anchor_date is not None and (anchor_date - frame_date).days > 7:
+        if (
+            not quote_freshness(frame_date).fresh
+            or (anchor_date is not None and frame_date != anchor_date)
+        ):
             # Un último precio antiguo no cuenta como cobertura diaria.
+            # A daily relative return also needs the SAME session on both sides.
             continue
         currency = str(
             frame.attrs.get("display_currency")
@@ -7477,6 +7661,16 @@ def _paper_eur_market_data(
             bars[ticker] = pd.DataFrame({"open": opens}, index=frame.index).dropna()
             bars[ticker].attrs["currency"] = currency
             bars[ticker].attrs["rate_to_eur"] = rate_to_eur
+            bars[ticker].attrs["fx_rate_as_of"] = (
+                fx_snapshot.as_of.isoformat() if fx_snapshot.as_of is not None else None
+            )
+            # Preserve explicit provider metadata; unknown market hours must not
+            # be guessed from the currency (USD can trade on several exchanges).
+            for key in ("exchange_timezone", "market_open_time"):
+                if frame.attrs.get(key):
+                    bars[ticker].attrs[key] = frame.attrs[key]
+            if "open_timestamp" in frame:
+                bars[ticker]["open_timestamp"] = frame["open_timestamp"]
 
     # La foto del bróker sólo permite crear la semilla. Una vez iniciado el
     # experimento no puede simular una cotización actual ni inflar la cobertura.
@@ -7499,7 +7693,10 @@ def _paper_eur_market_data(
 
     benchmark_price: float | None = None
     benchmark = reference_data.get("SPY")
-    if benchmark is not None and not benchmark.empty and "close" in benchmark:
+    if (
+        benchmark is not None and not benchmark.empty and "close" in benchmark
+        and quote_freshness(benchmark.index[-1]).fresh
+    ):
         currency = str(
             benchmark.attrs.get("display_currency")
             or benchmark.attrs.get("quote_currency")
@@ -8007,6 +8204,14 @@ def _paper_snapshots_from_runs(runs: pd.DataFrame) -> list[PaperSnapshot]:
                 benchmark_nav_eur=(float(benchmark) if pd.notna(benchmark) else None),
                 buy_hold_nav_eur=float(row.get("hold_nav_eur") or 0.0),
                 data_coverage_pct=float(row.get("coverage_pct") or 0.0),
+                buy_hold_coverage_pct=(
+                    float(row["hold_coverage_pct"])
+                    if pd.notna(row.get("hold_coverage_pct")) else 0.0
+                ),
+                benchmark_coverage_pct=(
+                    float(row["benchmark_coverage_pct"])
+                    if pd.notna(row.get("benchmark_coverage_pct")) else 0.0
+                ),
             )
         )
     return snapshots
@@ -8067,10 +8272,16 @@ def _record_paper_session(
     benchmark_price_eur: float,
     market_date: date,
 ) -> None:
+    if not us_daily_session_is_closed(market_date):
+        raise ValueError(
+            "La barra diaria de SPY aún no es registrable: el laboratorio espera "
+            "hasta las 16:30 de Nueva York y rechaza fechas futuras o de fin de semana."
+        )
     assumptions, _ = _paper_assumptions_from_row(simulation)
     state = _paper_state_from_history(simulation, runs)
     pending = _paper_pending_orders(runs)
-    fx_rates_to_eur: dict[str, float] = {}
+    fx_rates_to_eur: dict[str, float] = {"EUR": 1.0}
+    dated_fx_rates: dict[date, dict[str, float]] = {}
     for frame in bars_eur.values():
         if frame is None or frame.empty:
             continue
@@ -8085,7 +8296,12 @@ def _record_paper_session(
             and isfinite(rate_to_eur)
             and rate_to_eur > 0
         ):
-            fx_rates_to_eur[currency] = rate_to_eur
+            raw_fx_date = frame.attrs.get("fx_rate_as_of")
+            parsed_fx_date = pd.to_datetime(raw_fx_date, errors="coerce")
+            if pd.notna(parsed_fx_date):
+                dated_fx_rates.setdefault(pd.Timestamp(parsed_fx_date).date(), {})[
+                    currency
+                ] = rate_to_eur
     state, trades = fill_pending_orders(
         state,
         pending,
@@ -8094,6 +8310,7 @@ def _record_paper_session(
         assumptions=assumptions,
         as_of=market_date,
         scenario="strict",
+        fx_rates_to_eur_by_date=dated_fx_rates,
     )
     state = replace(
         state,
@@ -8141,6 +8358,15 @@ def _record_paper_session(
     if snapshot.data_coverage_pct < 100:
         warnings.append(
             f"Sólo hay precio reciente para {snapshot.data_coverage_pct:.0f}% de las posiciones."
+        )
+    if snapshot.buy_hold_coverage_pct < 100 or snapshot.benchmark_coverage_pct < 100:
+        warnings.append(
+            "Comparación pendiente: faltan precios de la cartera original o del índice."
+        )
+    if pending and not trades:
+        warnings.append(
+            "Las órdenes siguen pendientes si faltan aperturas, horarios de mercado "
+            "o cambio de divisa de la fecha de ejecución; no se inventan operaciones."
         )
     if not any(order.scenario == "strict" for order in orders):
         warnings.append(
@@ -8204,9 +8430,17 @@ def _record_paper_session(
         cumulative_costs_eur=snapshot.costs_cumulative_eur,
         tax_reserve_eur=snapshot.tax_reserve_eur,
         coverage_pct=snapshot.data_coverage_pct,
+        hold_coverage_pct=snapshot.buy_hold_coverage_pct,
+        benchmark_coverage_pct=snapshot.benchmark_coverage_pct,
         warnings=warnings,
         rejected=([] if orders else ["Sin movimiento que supere los guardarraíles"]),
-        status="complete" if snapshot.data_coverage_pct >= 100 else "partial",
+        status=(
+            "complete" if min(
+                snapshot.data_coverage_pct,
+                snapshot.buy_hold_coverage_pct,
+                snapshot.benchmark_coverage_pct,
+            ) >= 100 else "partial"
+        ),
         engine_version=state.engine_version,
     )
 
@@ -8311,17 +8545,22 @@ def _render_paper_simulation_lab(
 ) -> None:
     """Laboratorio persistente: propone y mide, pero nunca envía órdenes reales."""
 
-    st.markdown("### Cartera virtual")
+    st.markdown("### Laboratorio virtual")
+    st.info(
+        "**SIMULACIÓN** · No conecta con tu bróker, no modifica tu cartera real y "
+        "no convierte una puntuación técnica en una orden de venta."
+    )
     st.caption(
         "Seguimiento diario de una copia de tus posiciones para comprobar el método "
         "antes de plantear cambios reales."
     )
     with st.expander("Cómo funciona el laboratorio", expanded=False):
         st.caption(
-            "Al abrir Inicio con datos nuevos registra como máximo una valoración por "
+            "Al abrir Laboratorio con datos nuevos registra como máximo una valoración por "
             "sesión. Evalúa a diario, pero el método estricto sólo puede iniciar un "
             "salto por semana. Las señales se ejecutan virtualmente desde la primera "
-            "apertura posterior; nunca conecta con el bróker."
+            "apertura posterior; nunca conecta con el bróker. Una lectura débil de "
+            "entrada significa «no comprar ahora», no «vender automáticamente»."
         )
     if "valuation_mode" not in getattr(PaperPosition, "__dataclass_fields__", {}):
         st.error(
@@ -8360,6 +8599,17 @@ def _render_paper_simulation_lab(
         use_snapshot_fallback=simulations.empty,
     )
     market_date = _paper_market_date(prepared, reference_data)
+    session_closed = (
+        market_date is not None and us_daily_session_is_closed(market_date)
+    )
+    if market_date is not None and not session_closed:
+        st.warning(
+            f"La barra de SPY del {market_date.isoformat()} todavía no se puede "
+            "registrar como cierre diario. El laboratorio espera hasta las 16:30 "
+            "de Nueva York; tampoco acepta fechas futuras ni de fin de semana. "
+            "Se conserva el último registro: no se inicia ni reconstruye una "
+            "temporada y no se ejecutan operaciones virtuales con esta barra."
+        )
     seed_payload, initial_cash = _paper_seed_payload(
         market_snapshot,
         prices_eur,
@@ -8375,7 +8625,7 @@ def _render_paper_simulation_lab(
         tax_reserve_rate_pct=max(0.0, tax_rate_pct),
     )
     initial_state: PaperState | None = None
-    if seed_payload and market_date is not None and benchmark_price is not None:
+    if seed_payload and session_closed and market_date is not None and benchmark_price is not None:
         initial_state = seed_paper_portfolio(
             seed_payload,
             cash_eur=initial_cash,
@@ -8553,7 +8803,7 @@ def _render_paper_simulation_lab(
         st.warning(f"No se pudo leer el historial virtual: {exc}")
         return
 
-    if market_date is not None and benchmark_price is not None:
+    if session_closed and market_date is not None and benchmark_price is not None:
         last_date = (
             pd.to_datetime(runs["market_date"], errors="coerce").max().date()
             if not runs.empty
@@ -8584,7 +8834,10 @@ def _render_paper_simulation_lab(
         return
     latest = snapshots[-1]
     metrics = st.columns(4)
-    metrics[0].metric("Virtual neto", f"{latest.nav_net_eur:,.2f} €")
+    metrics[0].metric(
+        "Virtual neto" if latest.data_coverage_pct >= 100 else "Virtual neto (parcial)",
+        f"{latest.nav_net_eur:,.2f} €",
+    )
     metrics[1].metric(
         "Frente a mantener",
         "N/D"
@@ -8598,12 +8851,28 @@ def _render_paper_simulation_lab(
         else f"{float(scorecard['excess_vs_benchmark_pct']):+.2f} pp",
     )
     metrics[3].metric("Costes acumulados", f"{latest.costs_cumulative_eur:,.2f} €")
+    drawdown_text = (
+        f"{float(scorecard['maximum_drawdown_pct']):.2f}%"
+        if scorecard.get("maximum_drawdown_pct") is not None else "N/D"
+    )
     st.caption(
+        f"Último registro: {latest.as_of.isoformat()} · "
         f"{int(scorecard.get('sessions') or 0)} sesiones · precios frescos sobre "
         f"{latest.data_coverage_pct:.0f}% del valor total · reserva fiscal estimada "
         f"{latest.tax_reserve_eur:,.2f} € · drawdown máximo "
-        f"{float(scorecard.get('maximum_drawdown_pct') or 0.0):.2f}%."
+        f"{drawdown_text}."
     )
+    st.caption(
+        f"Cobertura: estrategia {latest.data_coverage_pct:.0f}% · "
+        f"mantener {latest.buy_hold_coverage_pct:.0f}% · "
+        f"índice {latest.benchmark_coverage_pct:.0f}%. "
+        "Las sesiones antiguas sin cobertura registrada no acreditan una mejora."
+    )
+    if scorecard.get("status") == "Referencia incompleta":
+        st.warning(
+            "La comparación está incompleta. El saldo conserva las últimas valoraciones "
+            "conocidas, pero no acredita rentabilidad ni ventaja frente a las referencias."
+        )
     frozen_initial = [
         row
         for row in (stored_initial if isinstance(stored_initial, list) else [])
@@ -8629,17 +8898,65 @@ def _render_paper_simulation_lab(
     challenger = [
         item for item in proposed if isinstance(item, dict) and item.get("scenario") == "challenger"
     ] if isinstance(proposed, list) else []
+    strict_sells = [
+        item
+        for item in strict
+        if str(item.get("side") or "").strip().casefold() in {"venta", "sell"}
+    ]
+    strict_buys = [
+        item
+        for item in strict
+        if str(item.get("side") or "").strip().casefold() in {"compra", "buy"}
+    ]
+    decision_columns = st.columns(3)
+    with decision_columns[0]:
+        st.markdown("**Entrada nueva**")
+        if strict_buys:
+            st.write(
+                "Estudiar "
+                + ", ".join(
+                    str(item.get("ticker") or "").strip()
+                    for item in strict_buys
+                    if str(item.get("ticker") or "").strip()
+                )
+            )
+        else:
+            st.write("Esperar")
+    with decision_columns[1]:
+        st.markdown("**Posición existente**")
+        if strict_sells:
+            st.write(
+                "Revisar "
+                + ", ".join(
+                    str(item.get("ticker") or "").strip()
+                    for item in strict_sells
+                    if str(item.get("ticker") or "").strip()
+                )
+            )
+        else:
+            st.write("Sin salida propuesta")
+    with decision_columns[2]:
+        st.markdown("**Acción simulada**")
+        st.write(
+            "Orden virtual para próxima apertura"
+            if strict
+            else "Ninguna · mantener"
+        )
+    st.caption(
+        "Primero se evalúa si la posición sigue sana; después, por separado, si "
+        "existe una alternativa suficientemente mejor tras costes e impuestos."
+    )
     if strict:
-        st.markdown("**Movimiento que el método pondría a prueba en la próxima apertura**")
+        st.markdown("**Rotación virtual que se pondría a prueba en la próxima apertura**")
         st.dataframe(
             pd.DataFrame(strict).rename(
                 columns={
                     "ticker": "Ticker",
-                    "side": "Acción",
+                    "side": "Acción virtual",
                     "target_value_eur": "Importe virtual",
                     "reason": "Motivo",
                 }
-            ).loc[:, ["Acción", "Ticker", "Importe virtual", "Motivo"]],
+            ).loc[:, ["Acción virtual", "Ticker", "Importe virtual", "Motivo"]],
             hide_index=True,
             width="stretch",
             column_config={
@@ -8648,11 +8965,18 @@ def _render_paper_simulation_lab(
         )
     else:
         st.success(
-            "Hoy el método estricto mantiene la cartera. No operar también es una "
+            "En la última sesión registrada el método estricto mantiene la cartera. "
+            "No operar también es una "
             "decisión y evita convertir ruido diario en comisiones."
         )
+    if strict_sells:
+        st.warning(
+            "Alerta técnica, no orden real. La simulación sólo estudia la salida si "
+            "la tesis se deteriora o existe una alternativa claramente mejor; una "
+            "mala puntuación de entrada, por sí sola, no obliga a vender."
+        )
     if isinstance(executed, list) and executed:
-        st.markdown("**Movimientos virtuales ejecutados hoy**")
+        st.markdown("**Movimientos virtuales de la última sesión**")
         executed_frame = pd.DataFrame(
             [item for item in executed if isinstance(item, dict)]
         )
@@ -8716,9 +9040,18 @@ def _render_paper_simulation_lab(
     history = pd.DataFrame(
         {
             "Fecha": [snapshot.as_of for snapshot in snapshots],
-            "Método neto": [snapshot.nav_net_eur for snapshot in snapshots],
-            "Mantener": [snapshot.buy_hold_nav_eur for snapshot in snapshots],
-            "S&P 500": [snapshot.benchmark_nav_eur for snapshot in snapshots],
+            "Método neto": [
+                snapshot.nav_net_eur if snapshot.data_coverage_pct >= 100 else None
+                for snapshot in snapshots
+            ],
+            "Mantener": [
+                snapshot.buy_hold_nav_eur if snapshot.buy_hold_coverage_pct >= 100 else None
+                for snapshot in snapshots
+            ],
+            "S&P 500": [
+                snapshot.benchmark_nav_eur if snapshot.benchmark_coverage_pct >= 100 else None
+                for snapshot in snapshots
+            ],
         }
     ).set_index("Fecha")
     st.line_chart(history, height=280)
@@ -9404,16 +9737,7 @@ def render_home(
         except (JournalStorageError, ValueError) as exc:
             st.warning(f"No se pudo leer la fotografía de cartera: {exc}")
 
-    latest_prices = {
-        ticker: float(frame["close"].iloc[-1])
-        for ticker, frame in prepared.items()
-        if not frame.empty
-    }
-    price_dates = {
-        ticker: pd.Timestamp(frame.index[-1])
-        for ticker, frame in prepared.items()
-        if not frame.empty
-    }
+    latest_prices, price_dates = recent_market_prices(prepared)
     market_snapshot = latest_snapshot.copy()
     market_summary = snapshot_summary
     if not market_snapshot.empty:
@@ -9427,7 +9751,13 @@ def render_home(
 
     update_dates = list(price_dates.values())
     if update_dates:
-        update_text = f"precios de mercado {max(update_dates).date().isoformat()}"
+        oldest_date = min(timestamp.date() for timestamp in update_dates)
+        newest_date = max(timestamp.date() for timestamp in update_dates)
+        update_text = (
+            f"precios de mercado {oldest_date.isoformat()}"
+            if oldest_date == newest_date
+            else f"precios entre {oldest_date.isoformat()} y {newest_date.isoformat()}"
+        )
     elif snapshot_summary is not None:
         update_text = f"cartera valorada el {snapshot_summary.snapshot_date}"
     else:
@@ -9451,11 +9781,13 @@ def render_home(
             f"Hola, {user.display_name}. Tu situación y lo que merece atención · {update_text}.",
         )
 
-    summary_tab, decisions_tab, laboratory_tab, access_tab = st.tabs(
-        ["Resumen", "Decisiones", "Laboratorio", "Accesos"]
+    home_view = render_subnavigation(
+        "Qué quieres ver en Inicio",
+        ["Resumen", "Decisiones", "Laboratorio", "Accesos"],
+        key="home_view_navigation",
     )
 
-    with summary_tab:
+    if home_view == "Resumen":
         refresh_a, refresh_b = st.columns([1.6, 1])
         with refresh_a:
             if snapshot_refresh is not None:
@@ -9465,8 +9797,9 @@ def render_home(
                     f"{snapshot_refresh.pending_count} pendientes."
                 )
             st.caption(
-                "Las cantidades y costes proceden de tu cartera. Los precios cotizados se "
-                "actualizan automáticamente una vez al día; fondos e inversiones sin ticker "
+                "Las cantidades y costes proceden de tu cartera. Los precios cotizados "
+                "se revisan al cargar la aplicación; el correo tiene su proceso diario. "
+                "Fondos e inversiones sin ticker "
                 "conservan su último valor manual."
             )
         refresh_b.button(
@@ -9508,22 +9841,23 @@ def render_home(
     if not market_snapshot.empty:
         market_snapshot, market_summary = latest_portfolio_snapshot(market_snapshot)
 
-    rotation_snapshot = _rotation_eligible_snapshot(market_snapshot)
-    held_tickers = _current_rotation_tickers(private_dashboard, market_snapshot)
-    allocations = _portfolio_allocations(private_dashboard, rotation_snapshot)
-    favorite_rotation_tickers = _favorite_rotation_tickers(
-        private_favorites,
-        group_favorites,
-    )
-    paper_rotation_tickers = _paper_tracking_tickers(journal)
-    summary = _merge_saved_analysis_summary(
-        summary,
-        journal,
-        [*held_tickers, *paper_rotation_tickers, *favorite_rotation_tickers],
-    )
-    summary = apply_thesis_invalidations(summary, latest_snapshot)
+    if home_view in {"Decisiones", "Laboratorio"}:
+        rotation_snapshot = _rotation_eligible_snapshot(market_snapshot)
+        held_tickers = _current_rotation_tickers(private_dashboard, market_snapshot)
+        allocations = _portfolio_allocations(private_dashboard, rotation_snapshot)
+        favorite_rotation_tickers = _favorite_rotation_tickers(
+            private_favorites,
+            group_favorites,
+        )
+        paper_rotation_tickers = _paper_tracking_tickers(journal)
+        summary = _merge_saved_analysis_summary(
+            summary,
+            journal,
+            [*held_tickers, *paper_rotation_tickers, *favorite_rotation_tickers],
+        )
+        summary = apply_thesis_invalidations(summary, latest_snapshot)
 
-    with summary_tab:
+    if home_view == "Resumen":
         display_summary, uses_market_estimate = preferred_portfolio_summary(
             snapshot_summary,
             market_summary,
@@ -9561,18 +9895,18 @@ def render_home(
             result_label = "Resultado latente"
             value_text = (
                 f"{private_kpis.current_net_value_eur:,.0f} €"
-                if private_kpis and private_kpis.priced_positions_count
+                if private_kpis and private_kpis.coverage_complete
                 else "Sin actualizar"
             )
             result_text = (
                 f"{private_kpis.unrealized_pnl_eur:+,.0f} €"
-                if private_kpis and private_kpis.priced_positions_count
-                else "—"
+                if private_kpis and private_kpis.coverage_complete
+                else "N/D"
             )
             result_detail = (
                 f"{private_kpis.unrealized_return_pct:+.2f}% sobre posiciones valoradas"
-                if private_kpis and private_kpis.priced_positions_count
-                else "Actualiza para conocer el resultado"
+                if private_kpis and private_kpis.coverage_complete
+                else "Resultado incompleto: faltan precios o conversiones"
             )
             positions_text = private_kpis.open_positions_count if private_kpis else 0
             positions_detail = (
@@ -9631,7 +9965,11 @@ def render_home(
         if group_kpis is not None and group_kpis.open_positions_count:
             st.caption(
                 f"Cartera del grupo: {group_kpis.open_positions_count} posiciones · "
-                f"resultado latente valorado {group_kpis.unrealized_pnl_eur:+,.2f} EUR."
+                + (
+                    f"resultado latente {group_kpis.unrealized_pnl_eur:+,.2f} EUR."
+                    if group_kpis.coverage_complete
+                    else "resultado pendiente de valoración completa."
+                )
             )
 
     tax_rate = float(st.session_state.get("private_real_result_tax", 20.0))
@@ -9640,12 +9978,7 @@ def render_home(
     spread_pct = float(st.session_state.get("private_real_result_spread", 0.15))
     fx_cost_pct = float(st.session_state.get("private_real_result_fx", 0.20))
 
-    with summary_tab:
-        st.markdown("#### Patrimonio fuera del mapa de decisiones")
-        st.caption(
-            "Aquí sólo cuadramos el patrimonio completo. Estas partidas no compiten "
-            "con acciones favoritas ni generan una propuesta de rotación."
-        )
+    if home_view == "Resumen":
         if not latest_snapshot.empty and "analysis_ticker" in latest_snapshot:
             blank_ticker = (
                 latest_snapshot["analysis_ticker"]
@@ -9664,9 +9997,13 @@ def render_home(
                     .sum()
                 )
                 with st.expander(
-                    f"Ver partidas excluidas · {other_value:,.2f} €",
+                    f"Otros activos · {other_value:,.2f} € (sin propuestas de rotación)",
                     expanded=False,
                 ):
+                    st.caption(
+                        "Se conservan en el patrimonio. No se comparan con favoritas "
+                        "ni se operan en el laboratorio."
+                    )
                     other_columns = [
                         column
                         for column in ["asset_name", "platform", "value_eur", "notes"]
@@ -9692,7 +10029,7 @@ def render_home(
         else:
             st.caption("Aún no hay una fotografía completa con partidas manuales.")
 
-    with decisions_tab:
+    if home_view == "Decisiones":
         st.markdown("### Decisiones de cartera")
         st.caption(
             "Primero protege las posiciones actuales; después compara sólo alternativas "
@@ -9781,11 +10118,7 @@ def render_home(
             with st.expander("Ver las tres empresas que más destacan en el radar"):
                 render_opportunity_cards(summary, limit=3)
 
-    with laboratory_tab:
-        st.info(
-            "Este es un ensayo con una copia virtual de tus dos cuentas. Nunca cambia "
-            "tu cartera real ni envía órdenes al bróker."
-        )
+    if home_view == "Laboratorio":
         _render_paper_simulation_lab(
             user,
             journal,
@@ -9806,7 +10139,7 @@ def render_home(
             "efectivo y partidas sin ticker siguen en tu patrimonio real, pero no se operan aquí."
         )
 
-    with access_tab:
+    if home_view == "Accesos":
         st.markdown("### Accesos directos")
         st.caption(
             "Elige una tarea. Aquí no se mezclan resultados ni propuestas de inversión."
@@ -11457,6 +11790,15 @@ def render_benchmark_outperformance_page(
         )
     selected_horizon = str(selected_horizon or "medium")
     benchmark_frame = reference_data.get("SPY")
+    if benchmark_frame is not None and not benchmark_frame.empty:
+        # SPY's quote currency is USD. This annotation does not convert its
+        # historical returns to EUR or license comparisons with other currencies.
+        benchmark_frame = normalize_price_frame_units(benchmark_frame, "USD")
+    st.caption(
+        "Comparación en la moneda de cotización verificada. Sin FX histórico "
+        "común, las acciones en una divisa distinta de SPY no reciben un ranking "
+        "de ventaja. La rentabilidad en euros puede ser diferente."
+    )
     favorite_names = _favorite_company_names(favorite_labels)
     assessments: dict[str, object] = {}
     base_rows: dict[str, dict[str, object]] = {}
@@ -11550,9 +11892,13 @@ def render_benchmark_outperformance_page(
                 risk.coverage_pct if risk is not None else 0,
             ),
         }
+        comparison_frame = frame
+        currency_hint = str(info.get("currency") or "").strip()
+        if currency_hint:
+            comparison_frame = normalize_price_frame_units(frame, currency_hint)
         assessment = evaluate_benchmark_outperformance(
             ticker=ticker,
-            stock=frame,
+            stock=comparison_frame,
             benchmark=benchmark_frame,
             strategies=strategy_evidence,
         )
@@ -11646,6 +11992,7 @@ def render_benchmark_outperformance_page(
             ),
             "Si ya la tienes": signal.position_label if signal is not None else "Revisar",
             "Periodo comparado": period_label,
+            "Moneda de comparación": assessment.comparison_currency or "Sin verificar",
             "Datos hasta": pd.Timestamp(frame.index[-1]).date(),
         }
 
@@ -11661,7 +12008,7 @@ def render_benchmark_outperformance_page(
     )
     summary_cols = st.columns(4)
     summary_cols[0].metric("Universo", len(universe), "cartera + favoritas privadas")
-    summary_cols[1].metric("Con datos actuales", loaded_count, f"de {len(universe)}")
+    summary_cols[1].metric("Con histórico", loaded_count, f"de {len(universe)}")
     summary_cols[2].metric("Candidatas", selected_candidates)
     summary_cols[3].metric("En vigilancia", selected_watch)
 
@@ -11673,7 +12020,7 @@ def render_benchmark_outperformance_page(
     )
     reading_filter = filter_b.selectbox(
         "Nivel mínimo",
-        ["Candidatas", "Candidatas y vigilancia", "Todas, incluidas pendientes"],
+        ["Todas, incluidas pendientes", "Candidatas", "Candidatas y vigilancia"],
         key="benchmark_reading_filter",
     )
     visible_rows = list(base_rows.values())
@@ -11806,10 +12153,9 @@ def render_benchmark_outperformance_page(
             """
         )
         st.warning(
-            "La comparación usa precios ajustados, pero no corrige el efecto histórico "
-            "de divisa de cotizaciones no denominadas en dólares, ni impuestos, spreads "
-            "o comisiones. En acciones de Londres, Europa o Asia la rentabilidad real en "
-            "euros puede diferir."
+            "Monedas distintas o sin verificar quedan pendientes: no se interpreta "
+            "el retorno local de una acción como ventaja en euros frente al índice. "
+            "Los retornos comparables tampoco incluyen impuestos, spreads o comisiones."
         )
 
 
@@ -13494,8 +13840,9 @@ def render_methodology() -> None:
           rentabilidad garantizada.
         - **Resultado posterior:** frecuencia histórica con la que una nueva señal,
           mantenida durante todo el periodo, terminó en positivo o superó la tasa
-          anual equivalente de Segofactoring y Civislend. Exige 30 casos para
-          considerar suficiente la muestra.
+          anual equivalente de Segofactoring y Civislend. Exige 30
+          periodos temporales no solapados, no 30 acciones del mismo día. Sigue
+          siendo una descripción histórica, no una predicción validada.
         - **Crecimiento y momentum:** estrategia para una parte del dinero
           mensual nuevo. Mantiene separadas las notas de crecimiento empresarial,
           fortaleza del precio y contexto de mercado/riesgo. Adapta el tamaño y las
@@ -13520,8 +13867,9 @@ def render_methodology() -> None:
         - El backtest incluye comisión, deslizamiento y gaps a través del stop.
         - Las estimaciones de retorno usan eventos no solapados y no se muestran
           con menos de ocho casos comparables.
-        - La calibración de 30+ días compra en la apertura siguiente, descuenta
-          comisiones fijas y muestra un intervalo de incertidumbre del 95%.
+        - La calibración compra en la apertura siguiente y descuenta comisiones.
+          Exige 30+ periodos y calcula una banda orientativa por bloques temporales;
+          no demuestra independencia entre regímenes ni éxito fuera de muestra.
 
         **Limitaciones que siguen abiertas**
 
@@ -13960,11 +14308,10 @@ def main() -> None:
         # Sus posiciones siguen entrando en el refresco para no congelar su NAV.
         held_tickers.extend(_paper_tracking_tickers(journal))
         held_tickers = list(dict.fromkeys(held_tickers))
-        daily_favorite_tickers = [
-            resolve_analysis_ticker(str(ticker))
-            for ticker in favorite_tickers
-            if str(ticker).strip()
-        ]
+        # Home refreshes the real and paper books. Scanning every favorite on
+        # each home visit delayed the balance behind many reruns; the full
+        # universe has its explicit review button and the daily email job.
+        daily_favorite_tickers: list[str] = []
         automatic_daily_batch: list[str] = []
         if portfolio_refresh_cycle:
             if (
@@ -14032,7 +14379,7 @@ def main() -> None:
                     ),
                 }
                 if load_clicked or pending_analysis_ticker or growth_scan_tickers
-                else set(held_tickers[:25])
+                else set(held_tickers)
             )
             force_new_prices = bool(
                 load_clicked
@@ -14062,6 +14409,10 @@ def main() -> None:
                 price_refresh_token=price_refresh_token,
             )
         if loading_daily_batch:
+            recent_prices, _ = recent_market_prices(
+                st.session_state.get("market_data", {})
+            )
+            refreshed_tickers.intersection_update(recent_prices)
             completed_daily = merge_analysis_ticker_sources(
                 st.session_state.get(auto_refreshed_key, []) or [],
                 [

@@ -251,6 +251,7 @@ def test_snapshot_refreshes_listed_assets_and_keeps_manual_investments() -> None
         {"MA": 600.0},
         {"EUR": 1.0, "USD": 1.2},
         price_dates={"MA": "2026-08-07"},
+        reference_date="2026-08-07",
     )
 
     mastercard = refreshed.loc[refreshed["analysis_ticker"] == "MA"].iloc[0]
@@ -333,6 +334,7 @@ def test_snapshot_refresh_resolves_broker_market_aliases() -> None:
         {"CEBS.DE": 10.25},
         {"EUR": 1.0},
         price_dates={"CEBS.DE": "2026-08-11"},
+        reference_date="2026-08-11",
     )
 
     assert refreshed.iloc[0]["value_eur"] == pytest.approx(7.14 * 10.25)
@@ -537,3 +539,78 @@ def test_same_day_operation_after_snapshot_is_reconciled() -> None:
     assert set(reconciled["analysis_ticker"]) == {"ORCL", "MRNA"}
     moderna = reconciled.loc[reconciled["analysis_ticker"] == "MRNA"].iloc[0]
     assert moderna["platform"] == "Revolut"
+
+
+def _two_account_snapshot() -> pd.DataFrame:
+    return pd.DataFrame([
+        {"snapshot_date": "2026-09-01", "platform": account, "asset_name": name,
+         "analysis_ticker": ticker, "asset_type": "Acción", "currency": "EUR",
+         "quantity": 10, "value_eur": value, "cost_estimate_eur": value, "gain_loss_eur": 0}
+        for account, name, ticker, value in [
+            ("Revolut", "Sony", "SONY", 100),
+            ("Trade Republic", "Sony", "SONY", 50),
+            ("Revolut", "Microsoft", "MSFT", 200),
+        ]
+    ])
+
+
+def test_sale_does_not_remove_same_ticker_at_other_broker() -> None:
+    operations = pd.DataFrame([{"ticker": "SONY", "account_name": "Trade Republic",
+                                "side": "Venta", "executed_at": "2026-09-02"}])
+    result = reconcile_current_portfolio(_two_account_snapshot(), operations, pd.DataFrame())
+    assert set(zip(result["platform"], result["analysis_ticker"])) == {("Revolut", "SONY"), ("Revolut", "MSFT")}
+    assert result["value_eur"].sum() == 300
+
+
+def test_legacy_operation_with_ambiguous_account_preserves_snapshot() -> None:
+    operations = pd.DataFrame([{"ticker": "SONY", "side": "Venta", "executed_at": "2026-09-02"}])
+    result = reconcile_current_portfolio(_two_account_snapshot(), operations, pd.DataFrame())
+    assert result["value_eur"].sum() == 350
+
+
+def test_historical_closure_does_not_modify_current_positions() -> None:
+    operations = pd.DataFrame([
+        {"ticker": "SONY", "account_name": "Revolut · cierre histórico", "side": side,
+         "executed_at": "2026-09-02", "notes": "[CIERRE_HISTORICO:DOCUMENTADO:abc123]"}
+        for side in ["Compra", "Venta"]
+    ])
+    result = reconcile_current_portfolio(_two_account_snapshot(), operations, pd.DataFrame())
+    assert result["value_eur"].sum() == 350
+
+
+def test_reconciled_snapshot_keeps_all_rows_in_home_summary() -> None:
+    operations = pd.DataFrame([{"ticker": "SONY", "account_name": "Revolut",
+                                "side": "Venta", "executed_at": "2026-09-02"}])
+    dashboard = pd.DataFrame([{"ticker": "SONY", "account_name": "Revolut", "currency": "EUR",
+                               "quantity": 9, "cost_basis_eur": 90, "net_value_eur": 90,
+                               "net_pnl_eur": 0, "net_return_pct": 0}])
+    result = reconcile_current_portfolio(_two_account_snapshot(), operations, dashboard)
+    latest, summary = latest_portfolio_snapshot(result)
+    assert len(latest) == 3
+    assert summary.value_eur == 340
+    assert set(latest["snapshot_date"]) == {"2026-09-01"}
+
+
+@pytest.mark.parametrize("price_date", [None, "2026-08-01", "2026-11-01"])
+def test_stale_undated_or_future_quotes_keep_declared_value(price_date) -> None:
+    snapshot = _two_account_snapshot().iloc[:1].copy()
+    result, coverage = refresh_portfolio_snapshot_prices(
+        snapshot, {"SONY": 15}, {"EUR": 1},
+        price_dates={"SONY": price_date}, reference_date="2026-10-03",
+    )
+    assert result.iloc[0]["value_eur"] == 100
+    assert result.iloc[0]["valuation_status"] != "Precio actualizado"
+    assert coverage.market_priced_count == 0
+    assert coverage.pending_count == 1
+
+
+def test_pending_price_after_partial_sale_scales_last_declared_value() -> None:
+    operations = pd.DataFrame([{"ticker": "SONY", "account_name": "Revolut",
+                                "side": "Venta", "executed_at": "2026-09-02"}])
+    dashboard = pd.DataFrame([{"ticker": "SONY", "account_name": "Revolut", "currency": "EUR",
+                               "quantity": 9, "cost_basis_eur": 90,
+                               "net_value_eur": None, "net_pnl_eur": None}])
+    result = reconcile_current_portfolio(_two_account_snapshot(), operations, dashboard)
+    sony = result.loc[(result["analysis_ticker"] == "SONY") & (result["platform"] == "Revolut")].iloc[0]
+    assert sony["value_eur"] == 90
+    assert sony["gain_loss_eur"] == 0

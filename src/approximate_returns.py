@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+import re
+import math
 from typing import Any
 
 import pandas as pd
 
-from src.data_loader import resolve_analysis_ticker
+from src.instruments import resolve_analysis_ticker
 from src.data_sources import convert_currency
+from src.journal import consume_fifo_lots, operation_fee_eur, operation_settlement_eur
 
 
 OPEN_COLUMNS = [
@@ -44,6 +47,12 @@ CLOSED_COLUMNS = [
     "Comisión informativa",
     "Origen",
 ]
+
+_HISTORICAL_CLOSURE_RE = re.compile(
+    r"\[CIERRE_HISTORICO:(DOCUMENTADO|ESTIMADO):[0-9a-f]+\]",
+    flags=re.IGNORECASE,
+)
+_HISTORICAL_ACCOUNT_SUFFIX = " · cierre histórico"
 
 
 @dataclass(frozen=True)
@@ -81,9 +90,21 @@ def _number(value: Any) -> float | None:
     try:
         if value is None or pd.isna(value):
             return None
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else None
     except (TypeError, ValueError):
         return None
+
+
+def _historical_closure_quality(notes: Any) -> str | None:
+    match = _HISTORICAL_CLOSURE_RE.search(str(notes or ""))
+    return match.group(1).capitalize() if match else None
+
+
+def _display_account(account: str) -> str:
+    if account.endswith(_HISTORICAL_ACCOUNT_SUFFIX):
+        return account[: -len(_HISTORICAL_ACCOUNT_SUFFIX)] or "Sin especificar"
+    return account or "Sin especificar"
 
 
 def _convert_to_eur(
@@ -105,53 +126,16 @@ def _operation_settlement_eur(
 ) -> tuple[float | None, str]:
     """Devuelve el neto de la operación sin volver a sumar una comisión incluida."""
 
-    recorded = _number(getattr(operation, "settlement_amount_eur", None))
-    if recorded is not None and recorded > 0:
-        return recorded, "Liquidación del bróker"
-
-    quantity = _number(getattr(operation, "quantity", None))
-    price = _number(getattr(operation, "price", None))
-    fee = _number(getattr(operation, "fees", None)) or 0.0
-    side = str(getattr(operation, "side", ""))
-    currency = str(getattr(operation, "currency", "EUR") or "EUR").upper()
-    if quantity is None or price is None or quantity <= 0 or price <= 0:
-        return None, "Estimación incompleta"
-    local = quantity * price + fee if side == "Compra" else quantity * price - fee
-    if local <= 0:
-        return None, "Estimación incompleta"
-
-    recorded_fx = _number(getattr(operation, "fx_rate_to_eur", None))
-    if recorded_fx is not None and recorded_fx > 0:
-        return local * recorded_fx, "Estimación con cambio registrado"
-
-    converted = _convert_to_eur(local, currency, rates_per_eur)
-    if converted is None:
-        return None, "Estimación incompleta"
-    if currency != "EUR" and fx_cost_pct > 0:
-        factor = (
-            1.0 + fx_cost_pct / 100.0
-            if side == "Compra"
-            else 1.0 - fx_cost_pct / 100.0
-        )
-        converted *= factor
-    return max(0.0, converted), "Estimación con cambio actual"
+    return operation_settlement_eur(
+        operation, rates_per_eur, fx_cost_pct=fx_cost_pct
+    )
 
 
 def _operation_fee_eur(
     operation: Any,
     rates_per_eur: dict[str, float],
 ) -> float | None:
-    recorded = _number(getattr(operation, "fee_eur", None))
-    if recorded is not None:
-        return recorded
-    fee = _number(getattr(operation, "fees", None))
-    if fee is None:
-        return 0.0
-    currency = str(getattr(operation, "currency", "EUR") or "EUR").upper()
-    recorded_fx = _number(getattr(operation, "fx_rate_to_eur", None))
-    if recorded_fx is not None and recorded_fx > 0:
-        return fee * recorded_fx
-    return _convert_to_eur(fee, currency, rates_per_eur)
+    return operation_fee_eur(operation, rates_per_eur)
 
 
 def _empty_report(year: int) -> ApproximateReturnReport:
@@ -287,6 +271,9 @@ def build_approximate_return_report(
                     "quantity": quantity,
                     "cost_eur": settlement,
                     "source": settlement_source,
+                    "historical_quality": _historical_closure_quality(
+                        getattr(operation, "notes", "")
+                    ),
                 }
             )
             continue
@@ -300,36 +287,33 @@ def build_approximate_return_report(
             incomplete += 1
         sale_fraction = sold / quantity
         net_proceeds = settlement * sale_fraction
-        remaining = sold
-        removed_cost = 0.0
-        cost_sources: list[str] = []
-        while remaining > 1e-9 and lots:
-            lot = lots[0]
-            lot_quantity = float(lot["quantity"])
-            consumed = min(remaining, lot_quantity)
-            unit_cost = float(lot["cost_eur"]) / lot_quantity
-            consumed_cost = unit_cost * consumed
-            removed_cost += consumed_cost
-            cost_sources.append(str(lot["source"]))
-            lot["quantity"] = lot_quantity - consumed
-            lot["cost_eur"] = max(0.0, float(lot["cost_eur"]) - consumed_cost)
-            remaining -= consumed
-            if float(lot["quantity"]) <= 1e-9:
-                lots.pop(0)
+        removed, consumed_lots = consume_fifo_lots(lots, sold, cost_fields=("cost_eur",))
+        removed_cost = float(removed["cost_eur"])
+        cost_sources = [str(lot["source"]) for lot in consumed_lots]
+        historical_qualities = [str(lot["historical_quality"]) for lot in consumed_lots if lot.get("historical_quality")]
 
         realized = net_proceeds - removed_cost
         tax = max(0.0, realized) * tax_rate_pct / 100.0
-        source = (
-            "Liquidaciones del bróker · FIFO"
-            if settlement_source == "Liquidación del bróker"
-            and cost_sources
-            and all(item == "Liquidación del bróker" for item in cost_sources)
-            else "FIFO con alguna estimación"
-        )
+        sale_quality = _historical_closure_quality(getattr(operation, "notes", ""))
+        if sale_quality or historical_qualities:
+            qualities = [*historical_qualities, *([sale_quality] if sale_quality else [])]
+            source = (
+                "Cierre histórico documentado"
+                if qualities and all(item == "Documentado" for item in qualities)
+                else "Cierre histórico estimado"
+            )
+        else:
+            source = (
+                "Liquidaciones del bróker · FIFO"
+                if settlement_source == "Liquidación del bróker"
+                and cost_sources
+                and all(item == "Liquidación del bróker" for item in cost_sources)
+                else "FIFO con alguna estimación"
+            )
         closed_rows.append(
             {
                 "Ticker": ticker,
-                "Cuenta": account or "Sin especificar",
+                "Cuenta": _display_account(account),
                 "Fecha": (
                     operation_date.date().isoformat()
                     if pd.notna(operation_date)

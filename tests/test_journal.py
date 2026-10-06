@@ -62,7 +62,7 @@ def test_existing_sqlite_database_is_migrated_without_losing_operations(tmp_path
     assert "opportunity_score" in states.columns
 
 
-def test_journal_reconstructs_average_cost_and_realized_pnl(tmp_path) -> None:
+def test_journal_reconstructs_fifo_cost_and_realized_pnl(tmp_path) -> None:
     journal = TradingJournal(tmp_path / "journal.db")
     journal.add_operation("ABC", "Compra", 10, 100, 1, "2025-01-01", currency="EUR")
     journal.add_operation("ABC", "Compra", 10, 120, 1, "2025-02-01", currency="EUR")
@@ -70,10 +70,55 @@ def test_journal_reconstructs_average_cost_and_realized_pnl(tmp_path) -> None:
 
     position = journal.open_positions().iloc[0]
     assert position["quantity"] == 15
-    assert position["average_cost"] == pytest.approx(110.1)
-    assert position["cost_basis"] == pytest.approx(1_651.5)
-    assert position["realized_pnl"] == pytest.approx(98.5)
+    assert position["average_cost"] == pytest.approx(1_701.5 / 15)
+    assert position["cost_basis"] == pytest.approx(1_701.5)
+    assert position["realized_pnl"] == pytest.approx(148.5)
     assert position["paid_fees"] == 3
+
+
+def test_journal_native_eur_result_prefers_broker_liquidations(tmp_path) -> None:
+    journal = TradingJournal(tmp_path / "journal.db")
+    journal.add_operation("ABC", "Compra", 1, 100, 0, "2026-01-01", settlement_amount_eur=120)
+    journal.add_operation("ABC", "Venta", 1, 110, 0, "2026-02-01", settlement_amount_eur=100)
+    from src.journal import calculate_position_states
+    state = calculate_position_states(journal.list_operations()).iloc[0]
+    assert state["realized_pnl"] == pytest.approx(-20)
+    assert state["realized_pnl_eur"] == pytest.approx(-20)
+
+
+def test_paper_reference_coverage_is_persisted_and_legacy_unknown(tmp_path) -> None:
+    database = tmp_path / "journal.db"
+    journal = TradingJournal(database)
+    simulation_id = journal.create_paper_simulation(
+        name="Cobertura", start_date="2026-10-01", initial_nav_eur=100, initial_positions=[]
+    )
+    journal.upsert_paper_daily_run(
+        simulation_id=simulation_id, market_date="2026-10-01", signal_as_of=None,
+        input_hash="run1", positions_after=[], cash_eur=100, net_nav_eur=100,
+        hold_nav_eur=100, benchmark_nav_eur=100, coverage_pct=100,
+        hold_coverage_pct=80, benchmark_coverage_pct=100,
+    )
+    row = journal.list_paper_daily_runs().iloc[0]
+    assert row["hold_coverage_pct"] == 80
+    assert row["benchmark_coverage_pct"] == 100
+    with sqlite3.connect(database) as connection:
+        connection.execute("ALTER TABLE paper_daily_runs DROP COLUMN hold_coverage_pct")
+        connection.execute("ALTER TABLE paper_daily_runs DROP COLUMN benchmark_coverage_pct")
+    migrated = TradingJournal(database)
+    row = migrated.list_paper_daily_runs().iloc[0]
+    assert row["net_nav_eur"] == 100
+    assert pd.isna(row["hold_coverage_pct"])
+    assert pd.isna(row["benchmark_coverage_pct"])
+
+
+@pytest.mark.parametrize("field", ["hold_coverage_pct", "benchmark_coverage_pct"])
+def test_paper_reference_coverage_rejects_invalid_percentages(field) -> None:
+    from src.journal import normalize_paper_daily_run
+    arguments = dict(simulation_id=1, market_date="2026-10-01", signal_as_of=None,
+                     input_hash="run1", positions_after=[], cash_eur=100, net_nav_eur=100,
+                     hold_nav_eur=100, benchmark_nav_eur=100)
+    with pytest.raises(ValueError):
+        normalize_paper_daily_run(**arguments, **{field: 101})
 
 
 def test_journal_rejects_sale_larger_than_position(tmp_path) -> None:
@@ -140,6 +185,48 @@ def test_journal_records_who_added_an_operation(tmp_path) -> None:
     )
 
     assert journal.list_operations().iloc[0]["recorded_by"] == "luci"
+
+
+def test_historical_closure_is_atomic_idempotent_and_does_not_open_position(
+    tmp_path,
+) -> None:
+    journal = TradingJournal(tmp_path / "journal.db", owner="demo-owner")
+
+    identifiers = journal.add_historical_closure(
+        ticker="test",
+        account_name="Demo",
+        quantity=10,
+        cost_basis_eur=100.0,
+        net_proceeds_eur=120.0,
+        sold_at="2025-01-15",
+        sale_fee_eur=1.0,
+        quality="Documentado",
+        notes="Ticket del bróker",
+        recorded_by="demo-owner",
+    )
+
+    operations = journal.list_operations().sort_values("executed_at")
+    assert len(identifiers) == 2
+    assert operations["side"].tolist() == ["Compra", "Venta"]
+    assert operations["settlement_amount_eur"].tolist() == pytest.approx(
+        [100.0, 120.0]
+    )
+    assert operations["account_name"].str.endswith("cierre histórico").all()
+    assert journal.open_positions().empty
+    states = journal.portfolio_summary()
+    assert states.empty
+
+    with pytest.raises(ValueError, match="ya está registrado"):
+        journal.add_historical_closure(
+            ticker="TEST",
+            account_name="Demo",
+            quantity=10,
+            cost_basis_eur=100.0,
+            net_proceeds_eur=120.0,
+            sold_at="2025-01-15",
+            sale_fee_eur=1.0,
+            quality="Documentado",
+        )
 
 
 def test_favorites_are_saved_without_duplicates(tmp_path) -> None:

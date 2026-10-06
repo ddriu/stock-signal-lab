@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import pandas as pd
 
 from src.data_sources import convert_currency
-from src.data_loader import resolve_analysis_ticker
+from src.instruments import resolve_analysis_ticker
 from src.journal import calculate_position_states
 from src.portfolio import value_holding
 
@@ -25,6 +26,7 @@ class PortfolioKpis:
     realized_pnl_eur: float
     fees_eur: float
     latest_activity: str | None
+    coverage_complete: bool = True
 
 
 def _to_eur(
@@ -54,6 +56,13 @@ def build_position_dashboard(
     current_net_value_eur = 0.0
     unrealized_pnl_eur = 0.0
     priced_positions = 0
+    valued_states = calculate_position_states(
+        operations, include_closed=True, rates_per_eur=rates_per_eur
+    )
+    state_by_position = {
+        (str(row.ticker), str(row.currency).upper(), str(row.account_name)) : row
+        for row in valued_states.itertuples(index=False)
+    }
 
     for position in positions.itertuples(index=False):
         ticker = str(position.ticker)
@@ -63,6 +72,9 @@ def build_position_dashboard(
         recorded_cost_eur = pd.to_numeric(
             getattr(position, "cost_basis_eur", None), errors="coerce"
         )
+        reconstructed = state_by_position.get((ticker, currency, account_name))
+        if reconstructed is not None:
+            recorded_cost_eur = pd.to_numeric(reconstructed.cost_basis_eur, errors="coerce")
         has_recorded_cost = pd.notna(recorded_cost_eur)
         cost_eur = (
             float(recorded_cost_eur)
@@ -77,7 +89,7 @@ def build_position_dashboard(
         net_value_eur: float | None = None
         net_pnl_eur: float | None = None
         net_return_pct: float | None = None
-        if current_price is not None and float(current_price) > 0:
+        if current_price is not None and math.isfinite(float(current_price)) and float(current_price) > 0:
             try:
                 sell_fee = convert_currency(
                     float(sell_fee_eur),
@@ -125,7 +137,7 @@ def build_position_dashboard(
                     cost_eur if cost_eur is not None else float("nan")
                 ),
                 "cost_basis_source": (
-                    "Liquidación del bróker"
+                    str(getattr(reconstructed, "cost_basis_source", "Liquidación del bróker"))
                     if has_recorded_cost
                     else "Estimación con cambio actual"
                 ),
@@ -146,14 +158,15 @@ def build_position_dashboard(
         )
 
     dashboard = pd.DataFrame(rows)
-    if not dashboard.empty and current_net_value_eur > 0:
+    coverage_complete = priced_positions == len(positions)
+    if not dashboard.empty and current_net_value_eur > 0 and coverage_complete:
         dashboard["allocation_pct"] = (
             dashboard["net_value_eur"] / current_net_value_eur * 100
         )
 
     realized_pnl_eur = 0.0
     fees_eur = 0.0
-    states = calculate_position_states(operations, include_closed=True)
+    states = valued_states
     for state in states.itertuples(index=False):
         currency = str(state.currency).upper()
         recorded_realized = pd.to_numeric(
@@ -174,8 +187,12 @@ def build_position_dashboard(
         )
         if realized is not None:
             realized_pnl_eur += realized
+        else:
+            realized_pnl_eur = float("nan")
         if fees is not None:
             fees_eur += fees
+        else:
+            fees_eur = float("nan")
 
     latest_activity: str | None = None
     if not operations.empty and "executed_at" in operations:
@@ -186,6 +203,8 @@ def build_position_dashboard(
     unrealized_return_pct = (
         unrealized_pnl_eur / priced_cost_eur * 100 if priced_cost_eur > 0 else 0.0
     )
+    if not coverage_complete:
+        unrealized_pnl_eur = unrealized_return_pct = float("nan")
     kpis = PortfolioKpis(
         operations_count=len(operations),
         open_positions_count=len(positions),
@@ -198,5 +217,6 @@ def build_position_dashboard(
         realized_pnl_eur=realized_pnl_eur,
         fees_eur=fees_eur,
         latest_activity=latest_activity,
+        coverage_complete=coverage_complete,
     )
     return dashboard, kpis
