@@ -11,6 +11,7 @@ from src.analysis_snapshots import (
     persist_analysis_batch_snapshots,
 )
 from src.signal_engine import SignalResult
+from src.analysis_policy import build_policy_snapshot, decode_policy_note, encode_policy_note
 
 
 class FakeJournal:
@@ -196,3 +197,45 @@ def test_batch_snapshot_reports_missing_results_without_blocking_other_tickers(
         ),
     )
     assert [snapshot["ticker"] for snapshot in journal.snapshots] == ["GOOD"]
+
+
+def test_versioned_policy_is_saved_once_without_overwriting_legacy(monkeypatch) -> None:
+    journal = FakeJournal([{"ticker": "AAA", "analyzed_at": "2026-09-26", "note": "Nota antigua"}])
+    monkeypatch.setattr("src.analysis_snapshots.evaluate_latest_signal",
+                        lambda frame, config, *, ticker: _signal(ticker))
+    policy = build_policy_snapshot({"Ticker": "AAA", "Fecha": "2026-09-26"}, config={"risk_pct": 0.5})
+    args = (journal, ["AAA"], _prepared("AAA"), *_results("AAA"), StrategyConfig())
+    first = persist_analysis_batch_snapshots(*args, policy_snapshots={"AAA": policy})
+    second = persist_analysis_batch_snapshots(*args, policy_snapshots={"AAA": policy})
+    assert first.saved_tickers == ("AAA",)
+    assert second.existing_tickers == ("AAA",)
+    assert len(journal.snapshots) == 2
+    assert journal.snapshots[0]["note"] == "Nota antigua"
+    assert decode_policy_note(journal.snapshots[1]["note"]) == policy
+    changed = build_policy_snapshot({"Ticker": "AAA", "Fecha": "2026-09-26"}, config={"risk_pct": 0.25})
+    third = persist_analysis_batch_snapshots(*args, policy_snapshots={"AAA": changed})
+    assert third.saved_tickers == ("AAA",)
+    assert len(journal.snapshots) == 3
+
+
+def test_storage_preserves_complete_policy_and_long_plan(tmp_path) -> None:
+    from src.journal import TradingJournal, normalize_analysis_snapshot, normalize_portfolio_snapshot_position
+    from src.portfolio_thesis import POSITION_PLAN_MARKER
+    import json
+    policy = build_policy_snapshot({"Ticker": "AAA"}, position_context={"thesis": "tesis " * 350}, held=True)
+    note = encode_policy_note("Análisis versionado", policy)
+    normalized = normalize_analysis_snapshot(ticker="AAA", analyzed_at="2026-09-26", price=120,
+        opportunity_score=60, company_score=80, entry_score=70, valuation_score=65,
+        relative_score=60, risk_score=70, opportunity_label="Revisar", entry_label="Vigilar",
+        position_label="Mantener", note=note)
+    assert len(normalized["note"]) > 1000
+    assert decode_policy_note(normalized["note"]) == policy
+    journal = TradingJournal(tmp_path / "policies.db", owner="test-policy")
+    journal.add_analysis_snapshot(**{key: value for key, value in normalized.items() if key != "created_at"})
+    loaded = journal.list_analysis_snapshots()
+    assert decode_policy_note(loaded.iloc[0]["note"]) == policy
+    comments = "Comentario anterior\n" + POSITION_PLAN_MARKER + " " + json.dumps({
+        "strategy": "Crecimiento y momentum", "horizon": "Medio plazo", "thesis": "tesis " * 350})
+    position = normalize_portfolio_snapshot_position(snapshot_date="2026-09-26", platform="Broker",
+        asset_name="Empresa", analysis_ticker="AAA", value_eur=100, comments=comments)
+    assert position["comments"] == comments

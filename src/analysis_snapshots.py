@@ -19,6 +19,7 @@ from src.opportunity import (
     ValuationResult,
 )
 from src.signal_engine import evaluate_latest_signal
+from src.analysis_policy import decode_policy_note, encode_policy_note
 
 
 DEFAULT_BATCH_SNAPSHOT_NOTE = "Seguimiento automático del análisis por lote"
@@ -112,6 +113,7 @@ def persist_analysis_batch_snapshots(
     strategy: StrategyConfig,
     *,
     note: str = DEFAULT_BATCH_SNAPSHOT_NOTE,
+    policy_snapshots: Mapping[str, Mapping[str, object]] | None = None,
 ) -> BatchAnalysisSnapshotResult:
     """Guarda como máximo una fotografía completa por ticker y sesión.
 
@@ -138,7 +140,16 @@ def persist_analysis_batch_snapshots(
     risks_by_ticker = _results_by_ticker(risk_results)
     opportunities_by_ticker = _results_by_ticker(opportunity_results)
 
-    existing_keys = _existing_snapshot_keys(journal.list_analysis_snapshots())
+    stored_snapshots = journal.list_analysis_snapshots()
+    existing_keys = _existing_snapshot_keys(stored_snapshots)
+    policies = _results_by_ticker(policy_snapshots or {})
+    versioned_keys: set[tuple[str, date, str]] = set()
+    for row in stored_snapshots.to_dict("records"):
+        policy = decode_policy_note(row.get("note"))
+        analyzed_date = _snapshot_date(row.get("analyzed_at"))
+        if policy and analyzed_date is not None and policy.get("snapshot_id"):
+            versioned_keys.add((str(row.get("ticker") or "").strip().upper(),
+                                analyzed_date, str(policy["snapshot_id"])))
     saved: list[str] = []
     existing: list[str] = []
     failures: list[AnalysisSnapshotFailure] = []
@@ -174,7 +185,11 @@ def persist_analysis_batch_snapshots(
             signal = evaluate_latest_signal(frame, strategy, ticker=ticker)
             analyzed_date = pd.Timestamp(signal.as_of).date()
             snapshot_key = (ticker, analyzed_date)
-            if snapshot_key in existing_keys:
+            policy = policies.get(ticker)
+            identity = str(policy.get("snapshot_id") or "") if policy else ""
+            versioned_key = (ticker, analyzed_date, identity)
+            duplicate = (versioned_key in versioned_keys) if identity else (snapshot_key in existing_keys)
+            if duplicate:
                 existing.append(ticker)
                 continue
 
@@ -198,7 +213,7 @@ def persist_analysis_batch_snapshots(
                 horizon_days=None,
                 sector=fundamentals.sector or "",
                 explanation=opportunity.explanation,
-                note=note,
+                note=encode_policy_note(note, policy) if policy else note,
             )
         except Exception as exc:
             failures.append(
@@ -207,6 +222,8 @@ def persist_analysis_batch_snapshots(
             continue
 
         existing_keys.add(snapshot_key)
+        if identity:
+            versioned_keys.add(versioned_key)
         saved.append(ticker)
 
     return BatchAnalysisSnapshotResult(

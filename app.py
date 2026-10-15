@@ -18,7 +18,17 @@ import pandas as pd
 import streamlit as st
 
 from config import BacktestConfig, StrategyConfig
+from src.analysis_policy import (
+    COMPARATIVE_STRATEGY_ID,
+    PRIMARY_STRATEGY_ID,
+    build_policy_snapshot,
+    decode_policy_note,
+    encode_policy_note,
+    enrich_analysis_rows,
+    position_contexts_from_snapshot,
+)
 from src.alerts import normalize_alert_preferences
+from src.alert_runner import run_daily_alerts
 from src.analysis_snapshots import persist_analysis_batch_snapshots
 from src.approximate_returns import build_approximate_return_report
 from src.auth import (
@@ -90,6 +100,7 @@ from src.growth_momentum import (
     next_growth_analysis_batch,
     quote_price_to_eur,
 )
+from src.growth_candidates import build_growth_candidate_rows
 from src.email_sender import (
     EmailConfigurationError,
     EmailDeliveryError,
@@ -223,6 +234,7 @@ from src.portfolio_rotation import (
 )
 from src.portfolio_thesis import (
     apply_thesis_invalidations,
+    build_position_plan_update_rows,
     build_thesis_update_rows,
     thesis_invalidations,
 )
@@ -300,8 +312,8 @@ ANALYSIS_LABELS = {
 }
 COMPANY_OPTIONS = ["Análisis individual", "Comparar empresas"]
 STRATEGY_OPTIONS = [
-    "Calidad fundamental",
     "Crecimiento y momentum",
+    "Calidad fundamental",
     "Ventaja relativa",
     "Especulativas",
 ]
@@ -312,22 +324,23 @@ VALIDATION_OPTIONS = [
 ]
 ANALYSIS_VIEW_DESCRIPTIONS = {
     "Radar": (
-        "Ordena todas tus favoritas y te dice cuáles merecen atención, cuáles están "
-        "en espera y cuáles necesitan datos."
+        "Lectura comparativa: ordena tus favoritas por calidad, valoración, entrada "
+        "y riesgo; conserva las empresas en espera o pendientes de datos."
     ),
     "Oportunidades": (
         "Filtra el radar por precio actual: distingue una entrada posible hoy de una "
         "buena empresa que llega tarde, está cara o tiene un evento próximo."
     ),
     "Análisis individual": (
-        "Reúne decisión, negocio, valoración, entrada, gestión y riesgos de una empresa."
+        "Lectura complementaria de negocio, valoración, entrada, gestión y riesgo. "
+        "Sus notas no se mezclan con las de crecimiento y momentum."
     ),
     "Comparar empresas": (
         "Compara de dos a diez empresas semejantes sin confundir precio nominal con valor."
     ),
     "Crecimiento y momentum": (
-        "Busca futuros líderes combinando crecimiento del negocio, fortaleza del precio, "
-        "sector y riesgo para dimensionar una entrada."
+        "Enfoque principal: crecimiento del negocio y fortaleza del precio, con contexto "
+        "de mercado y riesgo. El contexto cíclico/estacional requiere evidencia validable."
     ),
     "Calidad fundamental": (
         "Comprueba valoración, rentabilidad, crecimiento, deuda y márgenes. Sirve para "
@@ -1748,6 +1761,7 @@ def render_analysis(
     journal: object | None = None,
     peer_opportunities: dict[str, OpportunityResult] | None = None,
     peer_fundamentals: dict[str, FundamentalResult] | None = None,
+    policy_snapshot: dict[str, object] | None = None,
 ) -> None:
     with st.expander("Si ya tienes esta acción"):
         entry_price = st.number_input(
@@ -1786,6 +1800,11 @@ def render_analysis(
         if study.reliable and study.median_return_pct is not None
         else None
     )
+    automatic_snapshot_note = _analysis_snapshot_note(
+        "Seguimiento automático al abrir el análisis",
+        policy_snapshot,
+        COMPARATIVE_STRATEGY_ID,
+    )
     auto_snapshot_saved = False
     if journal is not None:
         try:
@@ -1804,7 +1823,17 @@ def render_analysis(
                     same_entry = pd.to_numeric(
                         same_day.get("entry_score"), errors="coerce"
                     ).eq(float(signal.score))
-                    already_recorded = bool((same_opportunity & same_entry).any())
+                    same_method = ~same_day.get(
+                        "position_label", pd.Series("", index=same_day.index)
+                    ).fillna("").astype(str).str.casefold().eq("plan mensual")
+                    if policy_snapshot is not None and "note" in same_day:
+                        target_policy = decode_policy_note(automatic_snapshot_note)
+                        same_policy = same_day["note"].map(
+                            lambda note: (decode_policy_note(note) or {}).get("snapshot_id")
+                        ).eq((target_policy or {}).get("snapshot_id"))
+                        already_recorded = bool(same_policy.any())
+                    else:
+                        already_recorded = bool((same_opportunity & same_entry & same_method).any())
             if not already_recorded:
                 journal.add_analysis_snapshot(
                     ticker=ticker,
@@ -1830,7 +1859,7 @@ def render_analysis(
                     horizon_days=study.horizon_days if study.reliable else None,
                     sector=fundamentals.sector or "",
                     explanation=opportunity.explanation,
-                    note="Seguimiento automático al abrir el análisis",
+                    note=automatic_snapshot_note,
                 )
                 auto_snapshot_saved = True
         except (JournalStorageError, ValueError, KeyError, AttributeError):
@@ -1965,7 +1994,9 @@ def render_analysis(
                         ),
                         sector=fundamentals.sector or "",
                         explanation=opportunity.explanation,
-                        note=personal_note,
+                        note=_analysis_snapshot_note(
+                            personal_note, policy_snapshot, COMPARATIVE_STRATEGY_ID
+                        ),
                     )
                 except (JournalStorageError, ValueError) as exc:
                     st.error(str(exc))
@@ -1982,7 +2013,9 @@ def render_analysis(
                 if recent_snapshots.empty:
                     st.caption("Todavía no has guardado análisis anteriores de esta empresa.")
                 else:
-                    recent = recent_snapshots.head(8).copy()
+                    recent = _analysis_history_method_rows(
+                        recent_snapshots, COMPARATIVE_STRATEGY_ID
+                    ).reindex(columns=recent_snapshots.columns).head(8).copy()
                     recent["Cambio entrada"] = pd.to_numeric(
                         recent["entry_score"], errors="coerce"
                     ) - pd.to_numeric(
@@ -6588,6 +6621,10 @@ def render_analysis_view_guide() -> None:
         icon=":material/help_outline:",
         width="stretch",
     ):
+        st.caption(
+            "Principal: crecimiento y momentum. Complementario: calidad, valoración, "
+            "riesgo y tesis. Cada método conserva sus notas y su fecha; no se promedian."
+        )
         st.markdown(
             f"**Mi radar**  \n{ANALYSIS_VIEW_DESCRIPTIONS['Radar']}"
         )
@@ -6603,6 +6640,226 @@ def render_analysis_view_guide() -> None:
         st.markdown(
             f"**Validar método**  \n{ANALYSIS_VIEW_DESCRIPTIONS['Resultado posterior']}"
         )
+
+
+def render_analysis_approach_overview() -> None:
+    """Hace visible la política sin ejecutar análisis ni escribir posiciones."""
+
+    st.markdown("### Dos enfoques complementarios")
+    st.caption(
+        "Principal: crecimiento y momentum para estudiar nuevas entradas. "
+        "Complementario: calidad, valoración, riesgo y tesis para contrastar y gestionar. "
+        "Cada uno conserva sus notas: no hay score mezclado."
+    )
+    primary, comparative = st.columns(2)
+    primary.button(
+        "Abrir crecimiento y momentum",
+        icon=":material/trending_up:",
+        width="stretch",
+        type="primary",
+        key="dual_approach_open_primary",
+        on_click=_request_analysis_page,
+        args=("Crecimiento y momentum",),
+    )
+    comparative.button(
+        "Abrir análisis complementario",
+        icon=":material/compare_arrows:",
+        width="stretch",
+        key="dual_approach_open_comparative",
+        on_click=_request_analysis_page,
+        args=("Empresa",),
+    )
+    st.caption(
+        "Una entrada poco atractiva hoy no implica vender una posición existente. "
+        "La gestión sigue su estrategia, horizonte y tesis documentados. El contexto "
+        "cíclico/estacional no es una señal por calendario: requiere evidencia validable."
+    )
+
+
+def _position_strategy_rows(snapshot: pd.DataFrame) -> pd.DataFrame:
+    """Lee asignaciones guardadas sin inferir una nueva estrategia ni tesis."""
+
+    if snapshot.empty or "analysis_ticker" not in snapshot:
+        return pd.DataFrame()
+    rows: list[dict[str, object]] = []
+    for source in snapshot.to_dict("records"):
+        contexts = position_contexts_from_snapshot([source])
+        for ticker, context in contexts.items():
+            rows.append({
+                "Ticker": ticker,
+                "Activo": source.get("asset_name") or ticker,
+                "Plataforma": source.get("platform") or "No documentada",
+                "Estrategia asignada": context.get("strategy_label") or "No documentada",
+                "Horizonte asignado": context.get("horizon") or "No documentado",
+                "Tesis guardada": context.get("thesis") or "No documentada",
+                "Tesis invalidada": "Sí" if context.get("invalidated") else "No declarada",
+            })
+    return pd.DataFrame(rows)
+
+
+def _analysis_snapshot_note(
+    note: str,
+    policy: dict[str, object] | None,
+    method: str | None = None,
+) -> str:
+    """Conserva la identidad dual: la pantalla no cambia el snapshot canónico.
+
+    ``method`` se admite por compatibilidad con los accesos existentes. Los
+    factores de ambos motores ya se conservan dentro de la misma política.
+    """
+
+    if policy is None:
+        return note
+    return encode_policy_note(note, policy)
+
+
+def _human_analysis_note(note: object) -> str:
+    if note is None or isinstance(note, float) and not isfinite(note):
+        return ""
+    return "\n".join(
+        line for line in str(note).splitlines()
+        if not line.strip().startswith("[[SSL_ANALYSIS_POLICY]]")
+    ).strip()
+
+
+def _analysis_history_method_rows(snapshots: pd.DataFrame, method: str) -> pd.DataFrame:
+    """Reconstruye una única metodología; nunca cruza scores de motores distintos."""
+
+    def history_score(value: object) -> float | None:
+        if isinstance(value, bool):
+            return None
+        numeric = _numeric_score(value)
+        return numeric if numeric is not None and isfinite(numeric) and 0 <= numeric <= 100 else None
+
+    records: list[dict[str, object]] = []
+    for source in snapshots.to_dict("records"):
+        row = dict(source)
+        policy = decode_policy_note(row.get("note"))
+        legacy_growth = (
+            str(row.get("position_label") or "").casefold() == "plan mensual"
+            or str(row.get("opportunity_label") or "").casefold().startswith("dinámica")
+        )
+        if policy is None:
+            if legacy_growth != (method == PRIMARY_STRATEGY_ID):
+                continue
+            row["policy_version"] = "Legacy · sin metadata de política"
+            row["data_status"] = "Cobertura no documentada"
+            row["method_coverage_pct"] = None
+            row["data_issue"] = None
+            row["snapshot_id"] = None
+            row["position_strategy"] = "No documentada"
+            row["position_horizon"] = "No documentado"
+        else:
+            source_method = str(policy.get("snapshot_method") or "")
+            if source_method in {PRIMARY_STRATEGY_ID, COMPARATIVE_STRATEGY_ID}:
+                legacy_growth = source_method == PRIMARY_STRATEGY_ID
+            position = policy["position"]
+            row["policy_version"] = policy["policy_version"]
+            row["snapshot_id"] = policy.get("snapshot_id")
+            row["position_strategy"] = position.get("strategy_label")
+            row["position_horizon"] = position.get("horizon")
+            if method == PRIMARY_STRATEGY_ID:
+                primary = policy["primary"]
+                if history_score(primary.get("score")) is None:
+                    continue
+                row.update(
+                    opportunity_score=history_score(primary.get("score")),
+                    company_score=history_score(primary.get("growth_score")),
+                    entry_score=history_score(primary.get("momentum_score")),
+                    risk_score=history_score(primary.get("context_score")),
+                    valuation_score=None,
+                    relative_score=None,
+                    confidence_pct=history_score(primary.get("confidence_pct")),
+                    opportunity_label=primary.get("status"),
+                    entry_label=primary.get("entry_reading"),
+                    analyzed_at=primary.get("as_of") or row.get("analyzed_at"),
+                    data_status=primary.get("data_status"),
+                    method_coverage_pct=history_score(primary.get("confidence_pct")),
+                    data_issue=primary.get("data_error"),
+                )
+            else:
+                comparative = policy["comparative"]
+                row.update(
+                    company_score=history_score(comparative.get("quality_score")),
+                    valuation_score=history_score(comparative.get("valuation_score")),
+                    risk_score=history_score(comparative.get("risk_score")),
+                    opportunity_label=comparative.get("reading"),
+                    data_status=comparative.get("data_status"),
+                    method_coverage_pct=history_score(comparative.get("quality_coverage_pct")),
+                    data_issue=comparative.get("data_error"),
+                )
+                if legacy_growth:
+                    # El total y la entrada legacy de un plan mensual pertenecen
+                    # al motor principal, no a calidad/valoración/riesgo.
+                    row.update(opportunity_score=None, entry_score=None, entry_label=None)
+        row["note"] = _human_analysis_note(row.get("note"))
+        records.append(row)
+    return pd.DataFrame(records)
+
+
+def _enrich_current_analysis_policy(
+    summary: list[dict[str, object]],
+    prepared: dict[str, pd.DataFrame],
+    raw_fundamentals: dict[str, dict[str, object]],
+    reference_data: dict[str, pd.DataFrame],
+    relative_results: dict[str, RelativeStrengthResult],
+    risk_results: dict[str, RiskResult],
+    *,
+    strategy: StrategyConfig | None = None,
+    position_snapshot: pd.DataFrame | None = None,
+    held_tickers: list[str] | tuple[str, ...] = (),
+) -> list[dict[str, object]]:
+    """Enriquece copias; los fallos dejan cobertura pendiente, no una compra."""
+
+    growth_results: dict[str, GrowthMomentumResult] = {}
+    fundamental_filters: dict[str, FundamentalFilterResult] = {}
+    growth_failures: dict[str, str] = {}
+    comparative_failures: dict[str, str] = {}
+    growth_config = GrowthMomentumConfig()
+    for ticker, frame in prepared.items():
+        try:
+            growth_results[ticker] = evaluate_growth_momentum(
+                ticker=ticker,
+                frame=frame,
+                info=raw_fundamentals.get(ticker, {}),
+                relative=relative_results.get(ticker),
+                risk=risk_results.get(ticker),
+                broad_market=reference_data.get(benchmark_for_ticker(ticker)),
+                config=growth_config,
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            growth_failures[ticker] = str(exc) or type(exc).__name__
+        try:
+            fundamental_filters[ticker] = evaluate_fundamental_filter(
+                raw_fundamentals.get(ticker, {}),
+                ticker,
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            comparative_failures[ticker] = str(exc) or type(exc).__name__
+    contexts = position_contexts_from_snapshot(
+        position_snapshot.to_dict("records")
+        if position_snapshot is not None and not position_snapshot.empty
+        else []
+    )
+    return enrich_analysis_rows(
+        [
+            {
+                **row,
+                "Fuente": row.get("Fuente") or "Yahoo Finance / yfinance · cierre diario",
+                "Incidencia principal": growth_failures.get(str(row.get("Ticker") or "")),
+                "Incidencia comparativa": comparative_failures.get(str(row.get("Ticker") or "")),
+            }
+            for row in summary
+        ],
+        growth_results=growth_results,
+        fundamental_filters=fundamental_filters,
+        position_contexts=contexts,
+        held_tickers=held_tickers,
+        config={
+            "growth": asdict(growth_config),
+            "technical": asdict(strategy or StrategyConfig()),
+        },
+    )
 
 
 def render_automatic_review_status(username: str) -> None:
@@ -6957,21 +7214,23 @@ def _current_rotation_tickers(
     )
 
 
-def _portfolio_tracking_tickers(journal: object) -> list[str]:
+def _portfolio_tracking_tickers(journal: object, *, strict: bool = False) -> list[str]:
     """Devuelve posiciones vigentes sin resucitar ventas ni alternativas."""
 
     positions = pd.DataFrame()
     try:
         positions = journal.open_positions()
     except (JournalStorageError, AttributeError, ValueError):
-        pass
+        if strict:
+            raise
 
     operations = pd.DataFrame()
     if hasattr(journal, "list_operations"):
         try:
             operations = journal.list_operations()
         except (JournalStorageError, AttributeError, ValueError):
-            pass
+            if strict:
+                raise
 
     latest = pd.DataFrame()
     has_snapshot = False
@@ -6982,7 +7241,8 @@ def _portfolio_tracking_tickers(journal: object) -> list[str]:
             if has_snapshot:
                 latest, _ = latest_portfolio_snapshot(stored)
         except (JournalStorageError, AttributeError, ValueError):
-            pass
+            if strict:
+                raise
 
     if has_snapshot:
         # La foto completa manda sobre operaciones anteriores. Sólo los movimientos
@@ -9074,6 +9334,7 @@ def _render_thesis_override(
     if snapshot.empty or not held_tickers:
         return
     current = thesis_invalidations(snapshot)
+    contexts = position_contexts_from_snapshot(snapshot.to_dict("records"))
     with st.expander(
         "Revisión manual de tesis",
         expanded=False,
@@ -9088,6 +9349,64 @@ def _render_thesis_override(
             held_tickers,
             key="home_thesis_ticker",
         )
+        position_context = contexts.get(selected, {})
+        strategy_options = {
+            "previous_thesis": "Mantener tesis / estrategia previa",
+            PRIMARY_STRATEGY_ID: "Crecimiento y momentum",
+            COMPARATIVE_STRATEGY_ID: "Calidad, valoración, tesis y riesgo",
+        }
+        saved_strategy = str(position_context.get("strategy_id") or "previous_thesis")
+        if saved_strategy not in strategy_options:
+            strategy_options[saved_strategy] = str(
+                position_context.get("strategy_label") or saved_strategy
+            )
+        st.caption(
+            "Asignación manual del plan: guardarlo no compra, vende ni cambia cantidades. "
+            "Se aplica a las líneas guardadas del ticker seleccionado. "
+            "Sin una asignación explícita se conserva el criterio previo."
+        )
+        with st.form(f"home_position_plan_form_{selected}"):
+            assigned_strategy = st.selectbox(
+                "Estrategia de esta posición",
+                list(strategy_options),
+                index=list(strategy_options).index(saved_strategy),
+                format_func=lambda value: strategy_options[value],
+            )
+            assigned_horizon = st.text_input(
+                "Horizonte de esta posición",
+                value=(
+                    str(position_context.get("horizon") or "")
+                    if position_context.get("horizon") != "No documentado"
+                    else ""
+                ),
+                placeholder="Ej.: 6–12 meses; revisión trimestral",
+                max_chars=100,
+            )
+            assigned_thesis = st.text_area(
+                "Tesis que justifica mantener esta posición",
+                value=str(position_context.get("thesis") or ""),
+                max_chars=4000,
+            )
+            save_plan = st.form_submit_button("Guardar plan de esta posición", width="stretch")
+        if save_plan:
+            try:
+                plan_rows = build_position_plan_update_rows(
+                    snapshot,
+                    selected,
+                    strategy=str(assigned_strategy),
+                    horizon=assigned_horizon,
+                    thesis=assigned_thesis,
+                )
+                journal.upsert_portfolio_snapshot_positions(
+                    plan_rows,
+                    recorded_by=actor_username,
+                )
+            except (JournalStorageError, ValueError, AttributeError) as exc:
+                st.error(str(exc))
+            else:
+                st.success("Plan guardado; no se ha ejecutado ninguna operación.")
+                st.rerun()
+        st.markdown("#### Estado de la tesis")
         with st.form(f"home_thesis_form_{selected}"):
             invalidated = st.checkbox(
                 "He confirmado que la tesis empresarial se ha invalidado",
@@ -9788,6 +10107,7 @@ def render_home(
     )
 
     if home_view == "Resumen":
+        render_analysis_approach_overview()
         refresh_a, refresh_b = st.columns([1.6, 1])
         with refresh_a:
             if snapshot_refresh is not None:
@@ -9840,6 +10160,21 @@ def render_home(
         latest_snapshot, snapshot_summary = latest_portfolio_snapshot(latest_snapshot)
     if not market_snapshot.empty:
         market_snapshot, market_summary = latest_portfolio_snapshot(market_snapshot)
+
+    if home_view == "Resumen":
+        position_strategy_rows = _position_strategy_rows(latest_snapshot)
+        if not position_strategy_rows.empty:
+            with st.expander("Estrategia, horizonte y tesis de mis posiciones"):
+                st.caption(
+                    "Sólo se muestra lo guardado. Una posición sin asignación mantiene "
+                    "su tesis previa; no se reasigna automáticamente al nuevo enfoque. "
+                    "Para documentarla, abre Decisiones → Revisión manual de tesis."
+                )
+                st.dataframe(
+                    position_strategy_rows,
+                    hide_index=True,
+                    width="stretch",
+                )
 
     if home_view in {"Decisiones", "Laboratorio"}:
         rotation_snapshot = _rotation_eligible_snapshot(market_snapshot)
@@ -10186,10 +10521,11 @@ def render_opportunities_page(
     include_company_detail: bool = True,
 ) -> None:
     render_page_intro(
-        "RADAR",
+        "RADAR COMPARATIVO",
         "Todas mis empresas",
         "Aquí aparecen todas tus favoritas: entradas, empresas en espera y pendientes. "
-        "La pestaña «Entradas hoy» aplica después el filtro de precio actual.",
+        "La pestaña «Entradas hoy» aplica después el filtro de precio actual. "
+        "Estas notas complementan, pero no sustituyen, crecimiento y momentum.",
     )
     st.button(
         "Ver sólo las entradas que pasan el filtro de hoy",
@@ -11238,6 +11574,8 @@ def render_company_analysis_page(
     raw_fundamentals: dict[str, dict[str, object]],
     price_verifications: dict[str, PriceVerification],
     journal: object,
+    *,
+    policy_snapshots: dict[str, dict[str, object]] | None = None,
 ) -> None:
     """Muestra sólo la empresa activa; el radar no repite este detalle."""
 
@@ -11272,6 +11610,7 @@ def render_company_analysis_page(
         journal,
         opportunity_results,
         fundamental_results,
+        policy_snapshot=(policy_snapshots or {}).get(selected),
     )
 
 
@@ -12337,6 +12676,129 @@ def render_fundamental_filter_page(
         )
 
 
+def render_growth_candidate_overview(
+    results: dict[str, GrowthMomentumResult],
+    *,
+    held_tickers: list[str] | tuple[str, ...] = (),
+    portfolio_snapshot: pd.DataFrame | None = None,
+    names: dict[str, str] | None = None,
+    currencies: dict[str, str] | None = None,
+    prepared: dict[str, pd.DataFrame] | None = None,
+    universe: list[str] | tuple[str, ...] = (),
+    comparison_rows: list[dict[str, object]] | None = None,
+    reference_date: date | None = None,
+    holdings_verified: bool = True,
+) -> tuple[list[str], list[str], bool]:
+    """Una sola tabla de decisión; las notas y el plan se abren a petición."""
+
+    rows = build_growth_candidate_rows(
+        results,
+        held_tickers=held_tickers,
+        portfolio_snapshot=portfolio_snapshot,
+        names=names,
+        currencies=currencies,
+        prepared=prepared,
+        universe=universe,
+        comparison_rows=comparison_rows or [],
+        reference_date=reference_date or pd.Timestamp.now(tz="Europe/Madrid").date(),
+    )
+    if not holdings_verified:
+        st.warning(
+            "Cartera sin verificar: no se identifican nuevas entradas hasta poder "
+            "comprobar las posiciones abiertas. No es una señal de venta."
+        )
+        for row in rows:
+            if not row["En cartera"]:
+                row["Grupo"] = "Esperar"
+                row["Qué revisar"] = "Verificar cartera antes de considerar una entrada"
+                row["Entrada / stop orientativos"] = "Pendiente de verificar cartera"
+    groups = ["Nuevas entradas", "Mi cartera", "Esperar"]
+    grouped = {group: [row for row in rows if row["Grupo"] == group] for group in groups}
+    if st.session_state.get("growth_action_group") not in groups:
+        st.session_state["growth_action_group"] = next(
+            (group for group in groups if grouped[group]), "Nuevas entradas"
+        )
+    st.markdown("### Qué merece revisión")
+    active = st.radio(
+        "Qué quieres revisar",
+        groups,
+        horizontal=True,
+        format_func=lambda group: f"{group} · {len(grouped[group])}",
+        key="growth_action_group",
+        label_visibility="collapsed",
+    )
+    st.caption(
+        "Nuevas entradas: candidatas que no figuran en tu cartera. Mi cartera: "
+        "gestionar la tesis o revisar una posible ampliación, nunca comprar más "
+        "automáticamente. Esperar: precio, señal o datos aún pendientes."
+    )
+    visible_rows = []
+    for row in grouped[active]:
+        weight = row.get("Peso cartera %")
+        holding = "No" if holdings_verified else "N/D"
+        if row["En cartera"]:
+            holding = (
+                f"Sí · {float(weight):.1f}%"
+                if weight is not None and isfinite(float(weight)) else "Sí · peso N/D"
+            )
+        visible_rows.append({
+            "Ticker": row["Ticker"],
+            "Empresa": row["Empresa"],
+            "En cartera / peso": holding,
+            "Qué revisar": row["Qué revisar"],
+            "Entrada / stop orientativos": row["Entrada / stop orientativos"],
+            "Motivo": row["Motivo"],
+            "Actualizado": row.get("Fecha") or "N/D",
+        })
+    selection: list[str] = []
+    if visible_rows:
+        selection = render_ticker_dataframe(
+            pd.DataFrame(visible_rows),
+            key=f"growth_action_table_{groups.index(active)}",
+            height=min(460, 85 + 48 * len(visible_rows)),
+            column_config={
+                "Ticker": None,
+                "Empresa": st.column_config.TextColumn(width="medium"),
+                "En cartera / peso": st.column_config.TextColumn(width="small"),
+                "Qué revisar": st.column_config.TextColumn(width="medium"),
+                "Entrada / stop orientativos": st.column_config.TextColumn(width="medium"),
+                "Motivo": st.column_config.TextColumn(width="large"),
+                "Actualizado": st.column_config.TextColumn(width="small"),
+            },
+        )
+        st.download_button(
+            "Descargar esta lista",
+            pd.DataFrame(visible_rows).to_csv(index=False).encode("utf-8-sig"),
+            file_name="candidatas_crecimiento_momentum.csv",
+            mime="text/csv",
+            key="growth_action_download",
+        )
+    else:
+        st.info(
+            "No hay empresas en este grupo. Que no haya nuevas entradas no significa "
+            "que debas vender lo que ya tienes. Revisa los otros filtros y los datos pendientes."
+        )
+    snapshot_dates = sorted({
+        str(row["Fecha peso cartera"]) for row in rows if row.get("Fecha peso cartera")
+    })
+    if snapshot_dates:
+        st.caption(
+            "Pesos según la última fotografía guardada: " + ", ".join(snapshot_dates)
+            + ". Base: activos cotizados analizables; no es sincronización con el bróker."
+        )
+    st.caption(
+        "El último cierre es una referencia, no una orden ni una zona de compra validada. "
+        "El stop es teórico: los gaps y el deslizamiento pueden aumentar la pérdida. "
+        "Datos incompletos no se convierten en señales de compra o venta."
+    )
+    detail = st.toggle(
+        "Ver análisis detallado y tamaño orientativo",
+        value=False,
+        key="growth_show_detail",
+    )
+    return [row["Ticker"] for row in grouped[active]], selection, detail
+
+
 def render_growth_momentum_page(
     prepared: dict[str, pd.DataFrame],
     raw_fundamentals: dict[str, dict[str, object]],
@@ -12348,294 +12810,313 @@ def render_growth_momentum_page(
     private_favorites: pd.DataFrame,
     group_favorites: pd.DataFrame,
     username: str = "",
+    *,
+    comparative_summary: list[dict[str, object]] | None = None,
+    portfolio_snapshot: pd.DataFrame | None = None,
+    held_tickers: list[str] | tuple[str, ...] | None = None,
 ) -> None:
-    """Muestra el plan mensual dinámico sin modificar el motor equilibrado."""
+    """Muestra el enfoque principal sin modificar las notas comparativas."""
 
     is_ddriu = username.strip().lower() == "ddriu"
     render_page_intro(
-        "ESTRATEGIA DINÁMICA",
+        "ENFOQUE PRINCIPAL",
         "Crecimiento y momentum",
-        "Busca crecimiento empresarial y fortaleza de precio para una parte del dinero "
-        "nuevo, sin modificar Sego, Civislend ni el análisis principal.",
+        "Crecimiento empresarial, fortaleza del precio y contexto de mercado. "
+        "El análisis complementario de calidad, valoración, riesgo y tesis sigue disponible "
+        "con sus propias notas. No se modifican las inversiones sin ticker.",
     )
     st.info(
         "Busca empresas que ya muestran crecimiento y fortaleza. Si no aparece una "
         "entrada válida, la aportación mensual queda disponible: no es obligatorio comprar."
     )
+    st.caption(
+        "El contexto cíclico/estacional requiere evidencia con fecha, horizonte y límites. "
+        "No se presume una ventaja por el mes del año; sin evidencia permanece pendiente. "
+        "Esperar una nueva entrada no es una orden de venta para posiciones existentes."
+    )
 
-    st.markdown("### Universo de favoritas")
-    scan_scope = st.radio(
-        "Listas que quieres revisar",
-        ["Mi lista privada", "Mi lista privada y la del grupo"],
-        horizontal=True,
-        key="growth_favorite_scope",
-        help="La lista del grupo puede contener ideas compartidas por los cuatro usuarios.",
-    )
-    included_group = (
-        group_favorites
-        if scan_scope == "Mi lista privada y la del grupo"
-        else pd.DataFrame()
-    )
-    favorite_universe, _ = build_favorite_catalog(
-        private_favorites,
-        included_group,
-    )
-    favorite_universe = list(
-        dict.fromkeys(resolve_analysis_ticker(ticker) for ticker in favorite_universe)
-    )
-    loaded_favorites = [ticker for ticker in favorite_universe if ticker in prepared]
-    complete_fundamentals = [
-        ticker
-        for ticker in loaded_favorites
-        if growth_fundamental_status(raw_fundamentals.get(ticker)) == "complete"
-    ]
-    partial_fundamentals = [
-        ticker
-        for ticker in loaded_favorites
-        if growth_fundamental_status(raw_fundamentals.get(ticker))
-        in {"partial", "error"}
-    ]
-    scan_cols = st.columns(4)
-    scan_cols[0].metric("Favoritas en la lista", len(favorite_universe))
-    scan_cols[1].metric("Precio y momentum cargados", len(loaded_favorites))
-    scan_cols[2].metric("Análisis empresarial completo", len(complete_fundamentals))
-    scan_cols[3].metric("Datos parciales o con error", len(partial_fundamentals))
-    completed_scan = st.session_state.pop("_growth_scan_completed", {}) or {}
-    if isinstance(completed_scan, int):
-        completed_scan = {"requested": completed_scan, "complete": completed_scan}
-    if completed_scan:
-        reviewed_count = int(completed_scan.get("requested", 0) or 0)
-        complete_count = int(completed_scan.get("complete", 0) or 0)
-        partial_count = int(completed_scan.get("partial", 0) or 0)
-        error_count = int(completed_scan.get("error", 0) or 0)
-        st.success(
-            f"Bloque revisado: {reviewed_count} empresas; {complete_count} con datos "
-            f"empresariales suficientes, {partial_count} parciales y {error_count} con error. "
-            "El radar conserva los bloques anteriores."
+    overview_area = st.container()
+    if portfolio_snapshot is None:
+        portfolio_snapshot = pd.DataFrame()
+        if hasattr(journal, "list_portfolio_snapshot_positions"):
+            try:
+                portfolio_snapshot, _ = latest_portfolio_snapshot(
+                    journal.list_portfolio_snapshot_positions()
+                )
+            except (JournalStorageError, ValueError, AttributeError):
+                st.warning("No se pudo verificar la fotografía de cartera; los pesos quedan pendientes.")
+    holdings_verified = True
+    if held_tickers is None:
+        try:
+            held_tickers = _portfolio_tracking_tickers(journal, strict=True)
+        except (JournalStorageError, ValueError, AttributeError):
+            holdings_verified = False
+            held_tickers = []
+            st.warning("No se pudieron confirmar las posiciones abiertas. Contrasta la cartera antes de comprar.")
+    private_held = list(dict.fromkeys(
+        resolve_analysis_ticker(ticker) for ticker in held_tickers if str(ticker).strip()
+    ))
+
+    with st.expander("Listas y cobertura de datos", expanded=False):
+        scan_scope = st.radio(
+            "Listas que quieres revisar",
+            ["Mi lista privada", "Mi lista privada y la del grupo"],
+            horizontal=True,
+            key="growth_favorite_scope",
+            help="La lista del grupo puede contener ideas compartidas por los cuatro usuarios.",
         )
-    if favorite_universe:
-        remaining_count = sum(
-            ticker not in prepared
-            or growth_fundamental_status(raw_fundamentals.get(ticker)) != "complete"
-            for ticker in favorite_universe
+        included_group = (
+            group_favorites
+            if scan_scope == "Mi lista privada y la del grupo"
+            else pd.DataFrame()
         )
-        if remaining_count:
-            st.caption(
-                f"{remaining_count} empresas no reúnen todavía precio o fundamentales "
-                "completos. Ya se han intentado automáticamente; permanecen visibles como "
-                "datos parciales y se volverán a comprobar en la próxima revisión diaria."
+        favorite_universe, _ = build_favorite_catalog(
+            private_favorites,
+            included_group,
+        )
+        favorite_universe = list(
+            dict.fromkeys(resolve_analysis_ticker(ticker) for ticker in favorite_universe)
+        )
+        loaded_favorites = [ticker for ticker in favorite_universe if ticker in prepared]
+        complete_fundamentals = [
+            ticker
+            for ticker in loaded_favorites
+            if growth_fundamental_status(raw_fundamentals.get(ticker)) == "complete"
+        ]
+        partial_fundamentals = [
+            ticker
+            for ticker in loaded_favorites
+            if growth_fundamental_status(raw_fundamentals.get(ticker))
+            in {"partial", "error"}
+        ]
+        scan_cols = st.columns(4)
+        scan_cols[0].metric("Favoritas en la lista", len(favorite_universe))
+        scan_cols[1].metric("Precio y momentum cargados", len(loaded_favorites))
+        scan_cols[2].metric("Análisis empresarial completo", len(complete_fundamentals))
+        scan_cols[3].metric("Datos parciales o con error", len(partial_fundamentals))
+        completed_scan = st.session_state.pop("_growth_scan_completed", {}) or {}
+        if isinstance(completed_scan, int):
+            completed_scan = {"requested": completed_scan, "complete": completed_scan}
+        if completed_scan:
+            reviewed_count = int(completed_scan.get("requested", 0) or 0)
+            complete_count = int(completed_scan.get("complete", 0) or 0)
+            partial_count = int(completed_scan.get("partial", 0) or 0)
+            error_count = int(completed_scan.get("error", 0) or 0)
+            st.success(
+                f"Bloque revisado: {reviewed_count} empresas; {complete_count} con datos "
+                f"empresariales suficientes, {partial_count} parciales y {error_count} con error. "
+                "El radar conserva los bloques anteriores."
             )
-    else:
-        st.warning(
-            "Esta lista todavía no tiene favoritas. Añádelas en Favoritos o utiliza "
-            "las empresas cargadas manualmente en la barra lateral."
-        )
-
-    with st.expander("1. Capital disponible", expanded=True):
-        capital_a, capital_b, capital_c, capital_d = st.columns(4)
-        liquid_capital = capital_a.number_input(
-            "Cartera líquida aproximada (€)",
-            min_value=100.0,
-            value=4_400.0 if is_ddriu else 10_000.0,
-            step=500.0,
-            help="No incluye Sego ni Civislend si no puedes disponer de ese dinero rápidamente.",
-            key="growth_liquid_capital",
-        )
-        monthly_investable = capital_b.number_input(
-            "Dinero mensual total para invertir (€)",
-            min_value=0.0,
-            value=1_000.0,
-            step=50.0,
-            help=(
-                "Incluye las aportaciones a Civislend, facturas, acciones tradicionales "
-                "y la estrategia escalonada."
-            ),
-            key="growth_monthly_investable",
-        )
-        current_strategy_value = capital_c.number_input(
-            "Ya invertido con esta estrategia (€)",
-            min_value=0.0,
-            value=640.0 if is_ddriu else 0.0,
-            step=100.0,
-            help="Sirve para no superar el techo reservado al bloque dinámico.",
-            key="growth_current_strategy_value",
-        )
-        current_open_risk = capital_d.number_input(
-            "Riesgo ya abierto (€)",
-            min_value=0.0,
-            value=0.0,
-            step=10.0,
-            help="Suma de las pérdidas previstas hasta la invalidación de las posiciones dinámicas abiertas.",
-            key="growth_current_open_risk",
-        )
-
-    with st.expander("2. Límites de la estrategia", expanded=True):
-        limits_a, limits_b, limits_c = st.columns(3)
-        monthly_allocation = limits_a.slider(
-            "% mensual para esta estrategia",
-            5.0,
-            50.0,
-            20.0,
-            1.0,
-            format="%.0f%%",
-            key="growth_monthly_allocation",
-        )
-        strategy_cap = limits_b.slider(
-            "Techo sobre cartera líquida",
-            5.0,
-            40.0,
-            15.0,
-            1.0,
-            format="%.0f%%",
-            key="growth_strategy_cap",
-        )
-        normal_risk = limits_c.slider(
-            "Riesgo normal por entrada",
-            0.10,
-            1.50,
-            0.50,
-            0.05,
-            format="%.2f%%",
-            key="growth_normal_risk",
-        )
-
-        max_open_risk = 2.0
-        max_sector = 20.0
-        watch_score = 65
-        candidate_score = 75
-        strong_score = 82
-        minimum_turnover_millions = 5.0
-        commission_per_order = 1.0
-        show_growth_advanced = st.checkbox(
-            "Mostrar ajustes avanzados",
-            value=False,
-            key="growth_show_advanced",
-        )
-        if show_growth_advanced:
-            advanced_a, advanced_b = st.columns(2)
-            max_open_risk = advanced_a.slider(
-                "Riesgo máximo simultáneo",
-                0.50,
-                5.0,
-                2.0,
-                0.25,
-                format="%.2f%%",
-                key="growth_max_open_risk",
+        if favorite_universe:
+            remaining_count = sum(
+                ticker not in prepared
+                or growth_fundamental_status(raw_fundamentals.get(ticker)) != "complete"
+                for ticker in favorite_universe
             )
-            max_sector = advanced_b.slider(
-                "Máximo del bloque dinámico en un sector",
+            if remaining_count:
+                st.caption(
+                    f"{remaining_count} empresas no reúnen todavía precio o fundamentales "
+                    "completos. Ya se han intentado automáticamente; permanecen visibles como "
+                    "datos parciales y se volverán a comprobar en la próxima revisión diaria."
+                )
+        else:
+            st.warning(
+                "Esta lista todavía no tiene favoritas. Añádelas en Favoritos o utiliza "
+                "las empresas cargadas manualmente en la barra lateral."
+            )
+
+    with st.expander("Capital y riesgo (opcional)", expanded=False):
+        with st.container():
+            st.markdown("**Capital para el cálculo orientativo**")
+            capital_a, capital_b, capital_c, capital_d = st.columns(4)
+            liquid_capital = capital_a.number_input(
+                "Cartera líquida aproximada (€)",
+                min_value=100.0,
+                value=4_400.0 if is_ddriu else 10_000.0,
+                step=500.0,
+                help="No incluye Sego ni Civislend si no puedes disponer de ese dinero rápidamente.",
+                key="growth_liquid_capital",
+            )
+            monthly_investable = capital_b.number_input(
+                "Dinero mensual total para invertir (€)",
+                min_value=0.0,
+                value=1_000.0,
+                step=50.0,
+                help=(
+                    "Incluye las aportaciones a Civislend, facturas, acciones tradicionales "
+                    "y la estrategia escalonada."
+                ),
+                key="growth_monthly_investable",
+            )
+            current_strategy_value = capital_c.number_input(
+                "Ya invertido con esta estrategia (€)",
+                min_value=0.0,
+                value=640.0 if is_ddriu else 0.0,
+                step=100.0,
+                help="Sirve para no superar el techo reservado al bloque dinámico.",
+                key="growth_current_strategy_value",
+            )
+            current_open_risk = capital_d.number_input(
+                "Riesgo ya abierto (€)",
+                min_value=0.0,
+                value=0.0,
+                step=10.0,
+                help="Suma de las pérdidas previstas hasta la invalidación de las posiciones dinámicas abiertas.",
+                key="growth_current_open_risk",
+            )
+
+        with st.container():
+            st.markdown("**Límites de la estrategia**")
+            limits_a, limits_b, limits_c = st.columns(3)
+            monthly_allocation = limits_a.slider(
+                "% mensual para esta estrategia",
                 5.0,
-                40.0,
+                50.0,
                 20.0,
                 1.0,
                 format="%.0f%%",
-                key="growth_max_sector",
+                key="growth_monthly_allocation",
             )
-            score_a, score_b, score_c = st.columns(3)
-            watch_score = score_a.slider(
-                "Vigilancia desde", 50, 75, 65, key="growth_watch_score"
+            strategy_cap = limits_b.slider(
+                "Techo sobre cartera líquida",
+                5.0,
+                40.0,
+                15.0,
+                1.0,
+                format="%.0f%%",
+                key="growth_strategy_cap",
             )
-            candidate_score = score_b.slider(
-                "Entrada candidata", 60, 90, 75, key="growth_candidate_score"
-            )
-            strong_score = score_c.slider(
-                "Entrada fuerte", 70, 95, 82, key="growth_strong_score"
-            )
-            execution_a, execution_b = st.columns(2)
-            minimum_turnover_millions = execution_a.number_input(
-                "Liquidez diaria preferida (millones €)",
-                min_value=0.0,
-                value=5.0,
-                step=1.0,
-                key="growth_min_turnover_millions",
-            )
-            commission_per_order = execution_b.number_input(
-                "Comisión por compra o venta (€)",
-                min_value=0.0,
-                value=1.0,
-                step=0.25,
-                key="growth_commission_per_order",
+            normal_risk = limits_c.slider(
+                "Riesgo normal por entrada",
+                0.10,
+                1.50,
+                0.50,
+                0.05,
+                format="%.2f%%",
+                key="growth_normal_risk",
             )
 
-    config = GrowthMomentumConfig(
-        monthly_allocation_pct=float(monthly_allocation),
-        strategy_cap_pct=float(strategy_cap),
-        normal_risk_pct=float(normal_risk),
-        max_open_risk_pct=float(max_open_risk),
-        max_sector_pct=float(max_sector),
-        min_turnover_eur=float(minimum_turnover_millions) * 1_000_000.0,
-        watch_score=int(watch_score),
-        candidate_score=int(candidate_score),
-        strong_score=int(strong_score),
-        commission_per_order_eur=float(commission_per_order),
-    )
-    try:
-        config.validate()
-    except ValueError as exc:
-        st.error(f"Configuración dinámica inválida: {exc}")
-        return
+            max_open_risk = 2.0
+            max_sector = 20.0
+            watch_score = 65
+            candidate_score = 75
+            strong_score = 82
+            minimum_turnover_millions = 5.0
+            commission_per_order = 1.0
+            show_growth_advanced = st.checkbox(
+                "Mostrar ajustes avanzados",
+                value=False,
+                key="growth_show_advanced",
+            )
+            if show_growth_advanced:
+                advanced_a, advanced_b = st.columns(2)
+                max_open_risk = advanced_a.slider(
+                    "Riesgo máximo simultáneo",
+                    0.50,
+                    5.0,
+                    2.0,
+                    0.25,
+                    format="%.2f%%",
+                    key="growth_max_open_risk",
+                )
+                max_sector = advanced_b.slider(
+                    "Máximo del bloque dinámico en un sector",
+                    5.0,
+                    40.0,
+                    20.0,
+                    1.0,
+                    format="%.0f%%",
+                    key="growth_max_sector",
+                )
+                score_a, score_b, score_c = st.columns(3)
+                watch_score = score_a.slider(
+                    "Vigilancia desde", 50, 75, 65, key="growth_watch_score"
+                )
+                candidate_score = score_b.slider(
+                    "Entrada candidata", 60, 90, 75, key="growth_candidate_score"
+                )
+                strong_score = score_c.slider(
+                    "Entrada fuerte", 70, 95, 82, key="growth_strong_score"
+                )
+                execution_a, execution_b = st.columns(2)
+                minimum_turnover_millions = execution_a.number_input(
+                    "Liquidez diaria preferida (millones €)",
+                    min_value=0.0,
+                    value=5.0,
+                    step=1.0,
+                    key="growth_min_turnover_millions",
+                )
+                commission_per_order = execution_b.number_input(
+                    "Comisión por compra o venta (€)",
+                    min_value=0.0,
+                    value=1.0,
+                    step=0.25,
+                    key="growth_commission_per_order",
+                )
 
-    monthly_budget = float(monthly_investable) * config.monthly_allocation_pct / 100
-    strategy_limit = float(liquid_capital) * config.strategy_cap_pct / 100
-    remaining_limit = max(strategy_limit - float(current_strategy_value), 0.0)
-    summary_cols = st.columns(4)
-    summary_cols[0].metric(
-        "Reserva mensual dinámica",
-        f"{monthly_budget:,.2f} €",
-        help="Puede acumularse si este mes no aparece una entrada válida.",
-    )
-    summary_cols[1].metric(
-        "Espacio hasta el techo",
-        f"{remaining_limit:,.2f} €",
-        help=f"Techo configurado: {strategy_limit:,.2f} €.",
-    )
-    summary_cols[2].metric(
-        "Pérdida normal máxima",
-        f"{float(liquid_capital) * config.normal_risk_pct / 100:,.2f} €",
-        help="Los sectores de mayor incertidumbre utilizan una cifra inferior.",
-    )
-    maximum_open_risk_eur = float(liquid_capital) * config.max_open_risk_pct / 100
-    summary_cols[3].metric(
-        "Riesgo abierto disponible",
-        f"{max(maximum_open_risk_eur - float(current_open_risk), 0.0):,.2f} €",
-        help="Suma de las pérdidas previstas si se activaran todos los niveles de invalidación.",
-    )
-    st.caption(
-        "La estimación del capital a diciembre, 1, 2, 3, 4 y 10 años está ahora "
-        "separada del radar."
-    )
-    st.button(
-        "Abrir proyección de capital",
-        icon=":material/monitoring:",
-        width="stretch",
-        key="growth_open_capital_projection",
-        on_click=_open_capital_projection,
-    )
-
-    radar_prepared = prepared
-    if favorite_universe:
-        only_favorites = st.checkbox(
-            "Mostrar sólo favoritas en este radar",
-            value=True,
-            key="growth_only_favorites",
-            help="Desmárcalo para incluir también tickers cargados manualmente o posiciones abiertas.",
+        config = GrowthMomentumConfig(
+            monthly_allocation_pct=float(monthly_allocation),
+            strategy_cap_pct=float(strategy_cap),
+            normal_risk_pct=float(normal_risk),
+            max_open_risk_pct=float(max_open_risk),
+            max_sector_pct=float(max_sector),
+            min_turnover_eur=float(minimum_turnover_millions) * 1_000_000.0,
+            watch_score=int(watch_score),
+            candidate_score=int(candidate_score),
+            strong_score=int(strong_score),
+            commission_per_order_eur=float(commission_per_order),
         )
-        if only_favorites:
-            radar_prepared = {
-                ticker: prepared[ticker]
-                for ticker in favorite_universe
-                if ticker in prepared
-            }
+        try:
+            config.validate()
+        except ValueError as exc:
+            st.error(f"Configuración dinámica inválida: {exc}")
+            return
 
-    if not radar_prepared:
-        st.warning(
-            "Todavía no hay empresas de este universo cargadas. Pulsa el botón de "
-            "revisión de favoritas o actualiza empresas desde la barra lateral."
+        monthly_budget = float(monthly_investable) * config.monthly_allocation_pct / 100
+        strategy_limit = float(liquid_capital) * config.strategy_cap_pct / 100
+        remaining_limit = max(strategy_limit - float(current_strategy_value), 0.0)
+        summary_cols = st.columns(4)
+        summary_cols[0].metric(
+            "Reserva mensual dinámica",
+            f"{monthly_budget:,.2f} €",
+            help="Puede acumularse si este mes no aparece una entrada válida.",
         )
-        return
+        summary_cols[1].metric(
+            "Espacio hasta el techo",
+            f"{remaining_limit:,.2f} €",
+            help=f"Techo configurado: {strategy_limit:,.2f} €.",
+        )
+        summary_cols[2].metric(
+            "Pérdida normal máxima",
+            f"{float(liquid_capital) * config.normal_risk_pct / 100:,.2f} €",
+            help="Los sectores de mayor incertidumbre utilizan una cifra inferior.",
+        )
+        maximum_open_risk_eur = float(liquid_capital) * config.max_open_risk_pct / 100
+        summary_cols[3].metric(
+            "Riesgo abierto disponible",
+            f"{max(maximum_open_risk_eur - float(current_open_risk), 0.0):,.2f} €",
+            help="Suma de las pérdidas previstas si se activaran todos los niveles de invalidación.",
+        )
+        st.caption(
+            "La estimación del capital a diciembre, 1, 2, 3, 4 y 10 años está ahora "
+            "separada del radar."
+        )
+        st.button(
+            "Abrir proyección de capital",
+            icon=":material/monitoring:",
+            width="stretch",
+            key="growth_open_capital_projection",
+            on_click=_open_capital_projection,
+        )
 
+    candidate_universe = list(dict.fromkeys([*favorite_universe, *private_held]))
+    if not favorite_universe:
+        candidate_universe = list(dict.fromkeys([*prepared, *private_held]))
+    radar_prepared = {
+        ticker: frame for ticker, frame in prepared.items() if ticker in candidate_universe
+    }
     results: dict[str, GrowthMomentumResult] = {}
-    errors: list[str] = []
+    calculation_errors: dict[str, str] = {}
     for ticker, frame in radar_prepared.items():
         try:
             results[ticker] = evaluate_growth_momentum(
@@ -12647,164 +13128,51 @@ def render_growth_momentum_page(
                 broad_market=reference_data.get(benchmark_for_ticker(ticker)),
                 config=config,
             )
-        except ValueError as exc:
-            errors.append(f"{ticker}: {exc}")
-    for error in errors:
-        st.warning(error)
-    if not results:
-        st.error("No hay suficiente información para calcular el perfil dinámico.")
+        except (ValueError, KeyError, TypeError, IndexError) as exc:
+            calculation_errors[ticker] = str(exc) or "Análisis pendiente de datos."
+
+    company_names: dict[str, str] = {}
+    for favorites in (private_favorites, included_group):
+        if favorites.empty:
+            continue
+        for row in favorites.to_dict("records"):
+            ticker = str(row.get("ticker") or "").strip()
+            if ticker:
+                company_names.setdefault(
+                    resolve_analysis_ticker(ticker), str(row.get("name") or ticker)
+                )
+    for ticker, info in raw_fundamentals.items():
+        company_names.setdefault(
+            ticker, str(info.get("shortName") or info.get("longName") or ticker)
+        )
+    table_comparisons = [dict(row) for row in comparative_summary or []]
+    for ticker, issue in calculation_errors.items():
+        table_comparisons.append({"Ticker": ticker, "Incidencia principal": issue})
+    with overview_area:
+        visible_tickers, selected_rows, show_detail = render_growth_candidate_overview(
+            results,
+            held_tickers=private_held,
+            portfolio_snapshot=portfolio_snapshot,
+            names=company_names,
+            currencies={ticker: str(info.get("currency") or "")
+                        for ticker, info in raw_fundamentals.items()},
+            prepared=prepared,
+            universe=candidate_universe,
+            comparison_rows=table_comparisons,
+            holdings_verified=holdings_verified,
+        )
+    if not show_detail:
         return
+    ordered_tickers = [ticker for ticker in visible_tickers if ticker in results]
+    if not ordered_tickers:
+        st.info("Este grupo no tiene todavía un análisis completo para abrir. Completa sus datos primero.")
+        return
+    selection_marker = (tuple(visible_tickers), tuple(selected_rows))
+    if (selected_rows and selected_rows[0] in ordered_tickers
+            and st.session_state.get("_growth_detail_selection") != selection_marker):
+        st.session_state["growth_selected_ticker"] = selected_rows[0]
+    st.session_state["_growth_detail_selection"] = selection_marker
 
-    st.markdown("### 3. Radar independiente")
-    st.caption(
-        "Crecimiento, momentum y contexto permanecen separados. La confianza indica "
-        "cobertura de datos, no la probabilidad de ganar."
-    )
-    radar_rows = [
-        {
-            "Ticker": result.ticker,
-            "Lectura": result.label,
-            "Total": result.score,
-            "Crecimiento": (
-                float(result.growth_score)
-                if result.growth_score is not None
-                else float("nan")
-            ),
-            "Momentum": result.momentum_score,
-            "Mercado y riesgo": result.context_score,
-            "Confianza datos": result.confidence_pct,
-            "Perfil": result.sector_label,
-            "Small cap": "Sí" if result.is_small_cap else "No",
-            "Riesgo por entrada": result.suggested_risk_pct,
-            "Stop por volatilidad": result.atr_stop_pct,
-            "Último cierre": result.price,
-            "Moneda": str(
-                raw_fundamentals.get(result.ticker, {}).get("currency") or "N/D"
-            ),
-            "Datos hasta": result.as_of.date(),
-        }
-        for result in sorted(
-            results.values(),
-            key=lambda item: (item.score, item.momentum_score, item.confidence_pct),
-            reverse=True,
-        )
-    ]
-    radar_frame = pd.DataFrame(radar_rows)
-    calculated_radar_groups = growth_radar_ticker_groups(
-        zip(radar_frame["Ticker"], radar_frame["Lectura"])
-    )
-    radar_group_specs = [
-        ("all", "Empresas revisadas", ":material/domain_verification:"),
-        ("strong", "Entradas fuertes", ":material/rocket_launch:"),
-        ("candidates", "Entradas candidatas", ":material/trending_up:"),
-        ("watch", "En vigilancia", ":material/visibility:"),
-        ("pending", "Pendientes de datos", ":material/pending_actions:"),
-    ]
-    # Una versión anterior del agrupador sólo devolvía las categorías con
-    # resultados. Streamlit Cloud puede conservar ese módulo durante un
-    # despliegue en caliente, por lo que completamos siempre el contrato aquí.
-    radar_groups = {
-        group_key: list(calculated_radar_groups.get(group_key, []))
-        for group_key, _, _ in radar_group_specs
-    }
-    valid_group_keys = {group_key for group_key, _, _ in radar_group_specs}
-    if st.session_state.get("growth_radar_group") not in valid_group_keys:
-        st.session_state["growth_radar_group"] = "all"
-    active_group = str(st.session_state["growth_radar_group"])
-    radar_cols = st.columns(5)
-    for column, (group_key, group_label, group_icon) in zip(
-        radar_cols,
-        radar_group_specs,
-    ):
-        column.button(
-            f"{group_label} · {len(radar_groups[group_key])}",
-            icon=group_icon,
-            type="primary" if active_group == group_key else "secondary",
-            width="stretch",
-            key=f"growth_radar_group_button_{group_key}",
-            on_click=_set_growth_radar_group,
-            args=(group_key,),
-            help=f"Mostrar las empresas de «{group_label}».",
-        )
-
-    active_group = str(st.session_state.get("growth_radar_group", "all"))
-    active_group_label = next(
-        label for key, label, _ in radar_group_specs if key == active_group
-    )
-    active_group_tickers = radar_groups[active_group]
-    radar_lookup = radar_frame.set_index("Ticker").to_dict(orient="index")
-
-    def radar_company_label(ticker: str) -> str:
-        row = radar_lookup[ticker]
-        info = raw_fundamentals.get(ticker, {})
-        company_name = str(info.get("shortName") or info.get("longName") or "").strip()
-        identity = (
-            f"{ticker} · {company_name}"
-            if company_name and company_name.upper() != ticker
-            else ticker
-        )
-        return f"{identity} — {row['Lectura']} · {float(row['Total']):.0f}/100"
-
-    with st.container(border=True):
-        st.markdown(
-            f"**{active_group_label}** · {len(active_group_tickers)} empresas"
-        )
-        if not active_group_tickers:
-            st.info("Ahora mismo no hay empresas dentro de este grupo.")
-        else:
-            radar_pick = st.selectbox(
-                "Elige una empresa del grupo",
-                active_group_tickers,
-                format_func=radar_company_label,
-                key=f"growth_radar_pick_{active_group}",
-            )
-            radar_action_a, radar_action_b = st.columns(2)
-            radar_action_a.button(
-                f"Preparar plan de {radar_pick}",
-                icon=":material/checklist:",
-                width="stretch",
-                key=f"growth_radar_plan_{active_group}",
-                on_click=_select_growth_radar_ticker,
-                args=(radar_pick,),
-            )
-            radar_action_b.button(
-                f"Abrir análisis completo de {radar_pick}",
-                icon=":material/open_in_new:",
-                type="primary",
-                width="stretch",
-                key=f"growth_radar_analysis_{active_group}",
-                on_click=_open_ticker_analysis,
-                args=(radar_pick,),
-            )
-
-    st.caption(
-        "Marca una empresa para abrirla o varias para llevarlas al comparador."
-    )
-    render_ticker_dataframe(
-        radar_frame,
-        key="growth_momentum_radar",
-        column_config={
-            "Total": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
-            "Crecimiento": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
-            "Momentum": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
-            "Mercado y riesgo": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
-            "Confianza datos": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d%%"),
-            "Riesgo por entrada": st.column_config.NumberColumn(format="%.2f%%"),
-            "Stop por volatilidad": st.column_config.NumberColumn(format="%.1f%%"),
-            "Último cierre": st.column_config.NumberColumn(format="%.2f"),
-            "Datos hasta": st.column_config.DateColumn(format="DD/MM/YYYY"),
-        },
-    )
-    st.download_button(
-        "Descargar radar completo en CSV",
-        radar_frame.to_csv(index=False).encode("utf-8-sig"),
-        file_name="radar_favoritos_crecimiento_momentum.csv",
-        mime="text/csv",
-        width="stretch",
-        key="growth_download_radar",
-    )
-
-    ordered_tickers = [row["Ticker"] for row in radar_rows]
     quick_tickers = [
         ticker
         for ticker in ordered_tickers
@@ -12865,6 +13233,16 @@ def render_growth_momentum_page(
             sector_override=sector_choice,
         )
 
+    selected_reading = build_growth_candidate_rows(
+        {selected: selected_result},
+        held_tickers=private_held,
+        portfolio_snapshot=portfolio_snapshot,
+        prepared={selected: prepared[selected]},
+        comparison_rows=table_comparisons,
+        reference_date=pd.Timestamp.now(tz="Europe/Madrid").date(),
+    )[0]
+    review_ready = selected_reading["Precio referencia"] is not None and holdings_verified
+
     score_cols = st.columns(5)
     score_cols[0].metric("Lectura dinámica", f"{selected_result.score}/100", selected_result.label)
     score_cols[1].metric(
@@ -12880,12 +13258,102 @@ def render_growth_momentum_page(
         f"**{selected_result.label}.** La nota total es {selected_result.score}/100. "
         "Antes de utilizar dinero real deben completarse las comprobaciones sectoriales."
     )
-    if selected_result.label in {"Entrada fuerte", "Entrada candidata"}:
+    if not selected_reading["Datos completos"] or not holdings_verified:
+        st.warning(
+            "Lectura calculada, no una entrada vigente: "
+            + (str(selected_reading["Motivo"]) if holdings_verified else "cartera sin verificar")
+            + ". Actualiza o verifica los datos antes de preparar una compra."
+        )
+    elif review_ready:
         st.success(message)
     elif selected_result.label in {"Vigilancia activa", "Esperar mejor precio"}:
         st.info(message)
     else:
         st.warning(message)
+
+    comparison_row = next(
+        (
+            row
+            for row in comparative_summary or []
+            if str(row.get("Ticker") or "").strip().upper() == selected
+        ),
+        {},
+    )
+    previous_policy = comparison_row.get("Política de análisis", {})
+    selected_policy = build_policy_snapshot(
+        comparison_row or {
+            "Ticker": selected,
+            "Fecha": selected_result.as_of,
+            "Cierre": selected_result.price,
+            "Moneda": raw_fundamentals.get(selected, {}).get("currency"),
+            "Fuente": "Yahoo Finance / yfinance · cierre diario",
+        },
+        growth_result=selected_result,
+        fundamental_filter=evaluate_fundamental_filter(
+            raw_fundamentals.get(selected, {}), selected
+        ),
+        position_context=(
+            previous_policy.get("position", {})
+            if isinstance(previous_policy, dict)
+            else {}
+        ),
+        held=selected in private_held,
+        config={
+            "growth": asdict(config),
+            "technical": (
+                previous_policy.get("config", {}).get("technical")
+                if isinstance(previous_policy, dict)
+                else None
+            ),
+        },
+    )
+    with st.expander("Contraste complementario y gestión de la posición"):
+        def comparative_score(key: str, fallback: str) -> str:
+            value = comparison_row.get(key, comparison_row.get(fallback))
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return "N/D"
+            return f"{numeric:.0f}/100" if isfinite(numeric) else "N/D"
+
+        comparison_cols = st.columns(3)
+        comparison_cols[0].metric(
+            "Calidad comparativa",
+            comparative_score("Calidad comparativa", "Calidad empresa"),
+        )
+        comparison_cols[1].metric(
+            "Valoración comparativa",
+            comparative_score("Valoración comparativa", "Valoración"),
+        )
+        comparison_cols[2].metric(
+            "Riesgo comparativo",
+            comparative_score("Riesgo comparativo", "Riesgo controlado"),
+        )
+        st.caption(
+            f"Principal: datos de precio hasta {selected_result.as_of.date()} · "
+            f"cobertura {selected_result.confidence_pct}% (no probabilidad de ganar). "
+            f"Complementario: {comparison_row.get('Fecha') or 'fecha no disponible'}. "
+            "N/D significa que no hay una evaluación comparable disponible."
+        )
+        for issue_key in ("Incidencia principal", "Incidencia comparativa"):
+            if comparison_row.get(issue_key):
+                st.warning(f"{issue_key}: {comparison_row[issue_key]}")
+        st.write(
+            "Gestión de una posición existente: "
+            + str(comparison_row.get("Gestión posición") or "Revisar estrategia y tesis guardadas")
+        )
+        st.caption(
+            f"Estrategia: {comparison_row.get('Estrategia posición') or 'No documentada'} · "
+            f"horizonte: {comparison_row.get('Horizonte posición') or 'No documentado'}. "
+            "Una entrada pendiente no invalida por sí sola la tesis."
+        )
+        if comparison_row.get("Diferencia enfoques"):
+            st.write(str(comparison_row["Diferencia enfoques"]))
+        for label, key in (
+            ("Contexto cíclico", "Contexto cíclico"),
+            ("Contexto estacional", "Contexto estacional"),
+        ):
+            st.caption(f"{label}: {comparison_row.get(key) or 'sin evidencia validada'}.")
 
     selected_info = raw_fundamentals.get(selected, {})
     selected_data_status = growth_fundamental_status(selected_info)
@@ -12961,114 +13429,124 @@ def render_growth_momentum_page(
         else:
             st.caption("No aparecen alertas cuantificadas importantes.")
 
-    st.markdown("### 4. Tamaño orientativo de la entrada")
-    quote_currency = str(
-        raw_fundamentals.get(selected, {}).get("currency") or ""
-    ).strip()
-    plan_inputs_a, plan_inputs_b, plan_inputs_c = st.columns(3)
-    entry_price = plan_inputs_a.number_input(
-        (
-            f"Precio que estás considerando ({quote_currency})"
-            if quote_currency
-            else "Precio que estás considerando"
-        ),
-        min_value=0.01,
-        value=float(selected_result.price),
-        step=0.01,
-        key=f"growth_entry_price_{selected}",
-    )
-    manual_stop = plan_inputs_b.number_input(
-        "Distancia hasta la invalidación",
-        min_value=1.0,
-        max_value=40.0,
-        value=float(selected_result.atr_stop_pct),
-        step=0.5,
-        format="%.1f",
-        help="La propuesta usa ATR y el perfil sectorial. Puedes sustituirla por un soporte razonado.",
-        key=f"growth_stop_{selected}_{selected_result.sector_key}",
-    )
-    current_sector_value = plan_inputs_c.number_input(
-        "Ya invertido en el mismo sector o tema (€)",
-        min_value=0.0,
-        value=0.0,
-        step=100.0,
-        help=(
-            "Incluye empresas diferentes que dependan de la misma narrativa, como nuclear y uranio. "
-            "El límite sectorial se calcula dentro del bloque dinámico."
-        ),
-        key=f"growth_sector_value_{selected_result.sector_key}",
-    )
-    try:
-        entry_price_eur = quote_price_to_eur(
-            float(entry_price),
-            quote_currency,
-            fx_snapshot.rates_per_eur,
+    plan = None
+    entry_price = float(selected_result.price)
+    if not review_ready:
+        st.info(
+            str(selected_reading["Qué revisar"])
+            + ". No se propone tamaño de entrada mientras esta revisión esté pendiente. "
+            "La lectura de entrada no decide por sí sola vender una posición existente."
         )
-    except ValueError as exc:
-        st.error(
-            "No se puede calcular una cantidad fiable sin convertir la cotización "
-            f"a euros: {exc}"
-        )
-        st.caption(
-            "Completa primero el análisis empresarial para obtener la moneda o espera "
-            "a que el Banco Central Europeo publique un tipo compatible."
-        )
-        return
-    if quote_currency.upper() != "EUR":
-        st.caption(
-            f"Conversión aplicada: una acción a {float(entry_price):,.2f} {quote_currency} "
-            f"equivale aproximadamente a {entry_price_eur:,.2f} € por unidad."
-        )
-    try:
-        plan = calculate_growth_position_plan(
-            result=selected_result,
-            config=config,
-            liquid_capital=float(liquid_capital),
-            monthly_investable=float(monthly_investable),
-            current_strategy_value=float(current_strategy_value),
-            current_sector_value=float(current_sector_value),
-            current_open_risk=float(current_open_risk),
-            entry_price=float(entry_price),
-            entry_price_eur=entry_price_eur,
-            manual_stop_pct=float(manual_stop),
-        )
-    except ValueError as exc:
-        st.error(str(exc))
-        return
 
-    plan_cols = st.columns(4)
-    plan_cols[0].metric(
-        "Entrada máxima este mes",
-        f"{plan.suggested_position_value:,.2f} €",
-        help="Es el menor límite entre presupuesto mensual, riesgo, tamaño sectorial y techo de estrategia.",
-    )
-    plan_cols[1].metric("Cantidad aproximada", f"{plan.quantity:,.4f}")
-    plan_cols[2].metric(
-        "Invalidación orientativa",
-        f"{plan.stop_price:,.2f} {quote_currency}",
-        f"-{plan.stop_distance_pct:.1f}%",
-    )
-    plan_cols[3].metric(
-        "Pérdida si se ejecutara allí",
-        f"{plan.loss_at_stop:,.2f} €",
-        help="Puede ser mayor durante un gap o si el activo tiene poca liquidez.",
-    )
-    st.caption(
-        f"Referencia 2R: {plan.reference_target_2r:,.2f} {quote_currency} · Comisión de ida y vuelta: "
-        f"{plan.round_trip_commission:,.2f} € ({plan.commission_drag_pct:.2f}% de la entrada) · "
-        f"Riesgo sectorial utilizado: {selected_result.suggested_risk_pct:.3f}% de la cartera líquida · "
-        f"Capacidad restante del sector/tema: {plan.remaining_sector_capacity:,.2f} €."
-    )
-    if plan.suggested_position_value <= 0:
-        st.error("El bloque dinámico ya ha alcanzado su techo; no queda capacidad configurada.")
-    elif selected_result.label not in {"Entrada fuerte", "Entrada candidata"}:
-        st.warning(
-            "El cálculo de tamaño no convierte la señal en compra. Con la lectura actual, "
-            "la aplicación reservaría el dinero y esperaría confirmación."
+    else:
+        st.markdown("### Tamaño orientativo de la entrada")
+        quote_currency = str(
+            raw_fundamentals.get(selected, {}).get("currency") or ""
+        ).strip()
+        plan_inputs_a, plan_inputs_b, plan_inputs_c = st.columns(3)
+        entry_price = plan_inputs_a.number_input(
+            (
+                f"Precio que estás considerando ({quote_currency})"
+                if quote_currency
+                else "Precio que estás considerando"
+            ),
+            min_value=0.01,
+            value=float(selected_result.price),
+            step=0.01,
+            key=f"growth_entry_price_{selected}",
         )
+        manual_stop = plan_inputs_b.number_input(
+            "Distancia hasta la invalidación",
+            min_value=1.0,
+            max_value=40.0,
+            value=float(selected_result.atr_stop_pct),
+            step=0.5,
+            format="%.1f",
+            help="La propuesta usa ATR y el perfil sectorial. Puedes sustituirla por un soporte razonado.",
+            key=f"growth_stop_{selected}_{selected_result.sector_key}",
+        )
+        current_sector_value = plan_inputs_c.number_input(
+            "Ya invertido en el mismo sector o tema (€)",
+            min_value=0.0,
+            value=0.0,
+            step=100.0,
+            help=(
+                "Incluye empresas diferentes que dependan de la misma narrativa, como nuclear y uranio. "
+                "El límite sectorial se calcula dentro del bloque dinámico."
+            ),
+            key=f"growth_sector_value_{selected_result.sector_key}",
+        )
+        try:
+            entry_price_eur = quote_price_to_eur(
+                float(entry_price),
+                quote_currency,
+                fx_snapshot.rates_per_eur,
+            )
+        except ValueError as exc:
+            st.error(
+                "No se puede calcular una cantidad fiable sin convertir la cotización "
+                f"a euros: {exc}"
+            )
+            st.caption(
+                "Completa primero el análisis empresarial para obtener la moneda o espera "
+                "a que el Banco Central Europeo publique un tipo compatible."
+            )
+            return
+        if quote_currency.upper() != "EUR":
+            st.caption(
+                f"Conversión aplicada: una acción a {float(entry_price):,.2f} {quote_currency} "
+                f"equivale aproximadamente a {entry_price_eur:,.2f} € por unidad."
+            )
+        try:
+            plan = calculate_growth_position_plan(
+                result=selected_result,
+                config=config,
+                liquid_capital=float(liquid_capital),
+                monthly_investable=float(monthly_investable),
+                current_strategy_value=float(current_strategy_value),
+                current_sector_value=float(current_sector_value),
+                current_open_risk=float(current_open_risk),
+                entry_price=float(entry_price),
+                entry_price_eur=entry_price_eur,
+                manual_stop_pct=float(manual_stop),
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+    
+        plan_cols = st.columns(4)
+        plan_cols[0].metric(
+            "Entrada máxima este mes",
+            f"{plan.suggested_position_value:,.2f} €",
+            help="Es el menor límite entre presupuesto mensual, riesgo, tamaño sectorial y techo de estrategia.",
+        )
+        plan_cols[1].metric("Cantidad aproximada", f"{plan.quantity:,.4f}")
+        plan_cols[2].metric(
+            "Invalidación orientativa",
+            f"{plan.stop_price:,.2f} {quote_currency}",
+            f"-{plan.stop_distance_pct:.1f}%",
+        )
+        plan_cols[3].metric(
+            "Pérdida si se ejecutara allí",
+            f"{plan.loss_at_stop:,.2f} €",
+            help="Puede ser mayor durante un gap o si el activo tiene poca liquidez.",
+        )
+        st.caption(
+            f"Referencia 2R: {plan.reference_target_2r:,.2f} {quote_currency} · Comisión de ida y vuelta: "
+            f"{plan.round_trip_commission:,.2f} € ({plan.commission_drag_pct:.2f}% de la entrada) · "
+            f"Riesgo sectorial utilizado: {selected_result.suggested_risk_pct:.3f}% de la cartera líquida · "
+            f"Capacidad restante del sector/tema: {plan.remaining_sector_capacity:,.2f} €."
+        )
+        if plan.suggested_position_value <= 0:
+            st.error("El bloque dinámico ya ha alcanzado su techo; no queda capacidad configurada.")
+        elif selected_result.label not in {"Entrada fuerte", "Entrada candidata"}:
+            st.warning(
+                "El cálculo de tamaño no convierte la señal en compra. Con la lectura actual, "
+                "la aplicación reservaría el dinero y esperaría confirmación."
+            )
 
     profile = SECTOR_PROFILES[selected_result.sector_key]
-    with st.expander(f"5. Validación obligatoria · {profile.label}", expanded=True):
+    with st.expander(f"Validación obligatoria · {profile.label}", expanded=True):
         st.write(profile.description)
         st.caption(
             f"Tamaño máximo individual: {selected_result.max_position_pct:.1f}% de la cartera líquida · "
@@ -13098,13 +13576,17 @@ def render_growth_momentum_page(
             type="primary",
             key=f"growth_save_{selected}",
         ):
+            plan_description = (
+                f"entrada orientativa máxima {plan.suggested_position_value:.2f} €."
+                if plan is not None else "observación sin plan de entrada vigente."
+            )
             explanation = (
                 "Estrategia Crecimiento y momentum. "
                 f"Total {selected_result.score}/100; crecimiento "
                 f"{selected_result.growth_score if selected_result.growth_score is not None else 'N/D'}; "
                 f"momentum {selected_result.momentum_score}; contexto {selected_result.context_score}; "
                 f"lectura {selected_result.label}; perfil {selected_result.sector_label}; "
-                f"entrada orientativa máxima {plan.suggested_position_value:.2f} €."
+                + plan_description
             )
             try:
                 journal.add_analysis_snapshot(
@@ -13112,6 +13594,7 @@ def render_growth_momentum_page(
                     analyzed_at=selected_result.as_of,
                     price=float(entry_price),
                     opportunity_score=selected_result.score,
+                    confidence_pct=selected_result.confidence_pct,
                     company_score=selected_result.growth_score,
                     entry_score=selected_result.momentum_score,
                     valuation_score=None,
@@ -13123,11 +13606,11 @@ def render_growth_momentum_page(
                     risk_score=selected_result.context_score,
                     opportunity_label=f"Dinámica · {selected_result.label}",
                     entry_label=selected_result.label,
-                    position_label="Plan mensual",
+                    position_label="Plan mensual" if plan is not None else "Sin plan de entrada",
                     horizon_days=126,
                     sector=selected_result.sector_label,
                     explanation=explanation,
-                    note=note,
+                    note=_analysis_snapshot_note(note, selected_policy, PRIMARY_STRATEGY_ID),
                 )
             except (JournalStorageError, ValueError) as exc:
                 st.error(str(exc))
@@ -13406,7 +13889,35 @@ def render_saved_analysis_history(
         )
         return
 
+    method_labels = {
+        PRIMARY_STRATEGY_ID: "Principal · crecimiento y momentum",
+        COMPARATIVE_STRATEGY_ID: "Complementario · calidad, valoración y riesgo",
+    }
+    method_frames = {
+        method: _analysis_history_method_rows(snapshots, method)
+        for method in method_labels
+    }
+    available_methods = [method for method, frame in method_frames.items() if not frame.empty]
+    if not available_methods:
+        st.info("No hay fotografías con una metodología identificable.")
+        return
+    if st.session_state.get("saved_history_method") not in available_methods:
+        st.session_state.pop("saved_history_method", None)
+    selected_method = st.selectbox(
+        "Metodología del historial",
+        available_methods,
+        format_func=lambda value: method_labels[value],
+        key="saved_history_method",
+    )
+    snapshots = method_frames[selected_method]
+    st.caption(
+        "Cada gráfica conserva el significado de sus factores. Una fotografía dual "
+        "puede verse en ambos métodos, pero nunca se mezcla el total de momentum con "
+        "las notas comparativas. Las revisiones legacy sin metadata siguen identificadas."
+    )
     tickers = sorted(snapshots["ticker"].dropna().astype(str).unique())
+    if st.session_state.get("saved_history_ticker") not in tickers:
+        st.session_state.pop("saved_history_ticker", None)
     selected_ticker = st.selectbox(
         "Empresa",
         tickers,
@@ -13460,16 +13971,23 @@ def render_saved_analysis_history(
     )
     count_col.info(f"{len(selected)} revisiones guardadas de {selected_ticker}.")
 
-    evolution = selected.set_index("analyzed_at")[
-        ["opportunity_score", "entry_score", "timing_score", "company_score"]
-    ].rename(
-        columns={
-            "opportunity_score": "Atractivo global",
-            "entry_score": "Momento técnico",
-            "timing_score": "Timing",
+    is_primary_history = selected_method == PRIMARY_STRATEGY_ID
+    factor_labels = (
+        {
+            "opportunity_score": "Nota principal",
+            "company_score": "Crecimiento",
+            "entry_score": "Momentum",
+            "risk_score": "Contexto mercado",
+        }
+        if is_primary_history
+        else {
             "company_score": "Calidad negocio",
+            "valuation_score": "Valoración",
+            "risk_score": "Riesgo",
+            "entry_score": "Momento técnico",
         }
     )
+    evolution = selected.set_index("analyzed_at")[list(factor_labels)].rename(columns=factor_labels)
     st.line_chart(evolution, height=330)
 
     visible = selected.sort_values("analyzed_at", ascending=False).rename(
@@ -13493,32 +14011,41 @@ def render_saved_analysis_history(
             "subsequent_return_1d": "Retorno posterior 1d",
             "subsequent_return_5d": "Retorno posterior 5d",
             "subsequent_return_20d": "Retorno posterior 20d",
+            "policy_version": "Política guardada",
+            "data_status": "Estado de datos",
+            "method_coverage_pct": "Cobertura principal %" if is_primary_history else "Cobertura negocio %",
+            "data_issue": "Incidencia de datos",
+            "snapshot_id": "ID de política",
+            "position_strategy": "Estrategia posición",
+            "position_horizon": "Horizonte posición",
         }
     )
+    if is_primary_history:
+        visible = visible.rename(
+            columns={
+                "Atractivo global": "Nota principal",
+                "Calidad negocio": "Crecimiento",
+                "Momento técnico": "Momentum",
+                "Riesgo": "Contexto mercado",
+            }
+        )
+    factor_columns = list(factor_labels.values())
+    visible_columns = [
+        "ID", "Fecha", "Precio",
+        *([] if is_primary_history else ["Atractivo global", "Timing"]),
+        *factor_columns,
+        "Lectura conjunta", "Lectura entrada", "Sesiones",
+        *([] if is_primary_history else ["Retorno histórico", "Casos positivos", "Precio estadístico"]),
+        "Retorno posterior 1d", "Retorno posterior 5d", "Retorno posterior 20d",
+        "Política guardada", "Estado de datos",
+        "Cobertura principal %" if is_primary_history else "Cobertura negocio %",
+        "Incidencia de datos", "Estrategia posición", "Horizonte posición",
+        "Nota personal", "ID de política",
+    ]
     st.dataframe(
         visible.loc[
             :,
-            [
-                "ID",
-                "Fecha",
-                "Precio",
-                "Atractivo global",
-                "Calidad negocio",
-                "Momento técnico",
-                "Timing",
-                "Valoración",
-                "Riesgo",
-                "Lectura conjunta",
-                "Lectura entrada",
-                "Retorno histórico",
-                "Casos positivos",
-                "Precio estadístico",
-                "Sesiones",
-                "Retorno posterior 1d",
-                "Retorno posterior 5d",
-                "Retorno posterior 20d",
-                "Nota personal",
-            ],
+            [column for column in visible_columns if column in visible],
         ],
         width="stretch",
         hide_index=True,
@@ -13534,14 +14061,7 @@ def render_saved_analysis_history(
                 column: st.column_config.ProgressColumn(
                     min_value=0, max_value=100, format="%d"
                 )
-                for column in [
-                    "Atractivo global",
-                    "Calidad negocio",
-                    "Momento técnico",
-                    "Timing",
-                    "Valoración",
-                    "Riesgo",
-                ]
+                for column in factor_columns
             },
         },
     )
@@ -13551,7 +14071,7 @@ def render_saved_analysis_history(
         labels = {
             int(row.id): (
                 f"{pd.Timestamp(row.analyzed_at).date()} · "
-                f"técnico {int(row.entry_score)}/100"
+                f"{method_labels[selected_method]}"
             )
             for row in selected.itertuples(index=False)
         }
@@ -13571,14 +14091,137 @@ def render_saved_analysis_history(
                 st.rerun()
 
 
+def _render_manual_email_review(journal: object, preferences: object, *, mail_configured: bool) -> None:
+    """Un envío explícito por cuenta y sesión; nunca ejecuta el lote general."""
+
+    owner = journal.owner
+    owner_key = sha256(owner.encode()).hexdigest()
+    attempt_key = f"_manual_email_review_{owner_key}"
+    attempt = st.session_state.get(attempt_key)
+    ready = bool(mail_configured and preferences.enabled and preferences.email)
+    st.markdown("#### Revisar ahora y recibir el resumen")
+    st.write(f"Destino guardado: {preferences.email or 'sin configurar'}.")
+    st.caption(
+        "Frecuencia: este botón inicia una revisión manual; la programación sigue "
+        "de lunes a viernes a las 07:15 UTC (08:15/09:15 en Madrid). "
+        "No cambia tus preferencias ni tus posiciones, operaciones o planes."
+    )
+    source = "Origen: tus favoritas guardadas y tus posiciones abiertas"
+    source += (
+        ", más las favoritas y posiciones del grupo porque lo tienes activado."
+        if preferences.include_group
+        else "; la cartera del grupo no está incluida."
+    )
+    st.caption(source)
+    st.caption(
+        "Se descargan precios y datos fundamentales de las fuentes de la aplicación. "
+        "Puede haber retrasos o datos parciales: N/D no equivale a una señal negativa. "
+        "Se usan las preferencias guardadas, no los cambios sin guardar del formulario."
+    )
+    if not ready:
+        st.info(
+            "Para iniciar la revisión, conecta el canal de correo y guarda una dirección "
+            "con las alertas automáticas activadas."
+        )
+    requested = st.button(
+        "Revisar mis favoritas y enviarme el resumen",
+        key=f"manual_email_review_send_{owner_key}",
+        disabled=not ready or attempt is not None,
+        width="stretch",
+    )
+    retry_requested = False
+    if attempt is not None:
+        if attempt.get("status") != "complete":
+            st.warning(
+                "La revisión se inició, pero no hay un resultado confirmado. No se puede "
+                "saber si SMTP aceptó algún correo. El reintento queda bloqueado en esta "
+                "sesión para evitar duplicados."
+            )
+        else:
+            accepted = attempt["accepted"]
+            metrics = st.columns(4)
+            metrics[0].metric("Empresas solicitadas", attempt["requested"])
+            metrics[1].metric("Con precios", attempt["with_prices"])
+            metrics[2].metric("Con precios recientes", attempt["fresh_prices"])
+            metrics[3].metric("Correos aceptados por SMTP", accepted)
+            if accepted:
+                st.info(
+                    f"SMTP aceptó {accepted} correo(s) para {attempt['email']}. "
+                    "Esto no confirma su llegada a la bandeja de entrada; revisa también "
+                    "spam. No se repetirá el envío desde esta sesión."
+                )
+            else:
+                st.warning(
+                    "No consta ningún correo aceptado por SMTP en esta revisión. "
+                    "No se confirma ningún envío."
+                )
+            partial = (
+                attempt["issues"] > 0
+                or attempt["with_prices"] < attempt["requested"]
+                or attempt["fresh_prices"] < attempt["requested"]
+            )
+            if partial:
+                st.warning(
+                    f"Revisión parcial: {attempt['issues']} incidencia(s); puede faltar "
+                    "información o alguno de los correos. Los contadores anteriores no "
+                    "confirman que se haya completado todo el proceso."
+                )
+            if not accepted and attempt["issues"]:
+                st.warning(
+                    "Las incidencias pueden incluir una respuesta SMTP incierta: cero "
+                    "aceptaciones registradas no garantiza que el servidor no aceptara "
+                    "un mensaje. Se bloquea el reintento en esta sesión para evitar "
+                    "duplicados."
+                )
+            elif not accepted:
+                confirmed = st.checkbox(
+                    "Confirmo que quiero reintentar esta revisión sin aceptación SMTP registrada",
+                    key=f"manual_email_review_retry_confirm_{owner_key}_{attempt['number']}",
+                )
+                retry_requested = st.button(
+                    "Reintentar la revisión y el envío",
+                    key=f"manual_email_review_retry_{owner_key}_{attempt['number']}",
+                    disabled=not ready or not confirmed,
+                    width="stretch",
+                )
+
+    if (requested and attempt is None or retry_requested) and ready:
+        # Se guarda antes de cualquier lectura remota o SMTP. Una interrupción,
+        # rerun o doble clic no debe volver a ejecutar el envío a ciegas.
+        attempt_number = int(attempt.get("number", 0)) + 1 if attempt else 1
+        st.session_state[attempt_key] = {
+            "status": "started", "email": preferences.email, "number": attempt_number,
+        }
+        try:
+            with st.spinner("Revisando tus empresas y preparando el correo…"):
+                summary = run_daily_alerts(owner=owner)
+            result = {
+                "status": "complete", "email": preferences.email,
+                "number": attempt_number, "accepted": summary.emails_sent,
+                "requested": summary.tickers_checked,
+                "with_prices": summary.tickers_with_prices,
+                "fresh_prices": summary.tickers_with_fresh_prices,
+                "issues": len(summary.errors),
+            }
+        except Exception:
+            # No exponer errores de proveedores/credenciales ni suponer que una
+            # excepción implica cero aceptaciones previas por el servidor.
+            result = {
+                "status": "unknown", "email": preferences.email, "number": attempt_number,
+            }
+        st.session_state[attempt_key] = result
+        st.rerun()
+
+
 def render_email_alert_settings(journal: object) -> None:
-    """Preferencias privadas y prueba controlada del canal de correo."""
+    """Preferencias privadas, prueba del canal y revisión manual aislada."""
 
     st.subheader("Alertas por correo")
     st.write(
-        "Recibe dos formatos complementarios: un resumen diario de todas tus "
-        "favoritas y posiciones, y una alerta accionable cuando una empresa supera "
-        "todos los filtros de «Entradas» o una posición cambia a reducir o vender."
+        "Recibe un resumen diario de tus favoritas y posiciones, y alertas de "
+        "Crecimiento y momentum, la estrategia principal. La calidad fundamental "
+        "se muestra como comparación independiente. Para posiciones abiertas, "
+        "los avisos revisan el riesgo y la tesis de su plan guardado."
     )
     st.info(
         "Una alerta invita a revisar los datos; no compra, vende ni envía órdenes a "
@@ -13591,6 +14234,16 @@ def render_email_alert_settings(journal: object) -> None:
         st.caption(
             "El administrador debe ejecutar la versión actual de supabase/schema.sql."
         )
+        return
+
+    journal_owner = getattr(journal, "owner", None)
+    if (
+        not isinstance(journal_owner, str)
+        or not journal_owner.strip()
+        or journal_owner == GROUP_PORTFOLIO_OWNER
+        or preferences.owner != journal_owner
+    ):
+        st.error("No se pueden gestionar alertas de una cuenta distinta de la sesión.")
         return
 
     with st.form("email_alert_preferences_form"):
@@ -13610,21 +14263,25 @@ def render_email_alert_settings(journal: object) -> None:
                 "Entradas interesantes",
                 value=preferences.alert_buy,
                 help=(
-                    "Avisa sobre favoritas que no están en tu cartera sólo cuando "
-                    "también superan timing, precio, evento y beneficio/riesgo."
+                    "Avisa de candidatas de Crecimiento y momentum que todavía "
+                    "no tienes, según el umbral y los controles de entrada. No "
+                    "requiere consenso con la comparación fundamental."
                 ),
             )
         with type_b:
             alert_reduce = st.checkbox(
                 "Revisar / reducir",
                 value=preferences.alert_reduce,
-                help="Avisa cuando una posición pierde fuerza o la media intermedia.",
+                help="Revisa el riesgo y la tesis de posiciones con un plan guardado.",
             )
         with type_c:
             alert_sell = st.checkbox(
                 "Posible salida",
                 value=preferences.alert_sell,
-                help="Avisa al perder la tendencia larga o activar el stop configurado.",
+                help=(
+                    "Revisa salidas por riesgo, stop o deterioro de tesis. Una mala "
+                    "nota de entrada aislada no implica vender una posición."
+                ),
             )
         minimum_buy_score = st.slider(
             "Puntuación mínima para avisar de una posible entrada",
@@ -13644,7 +14301,7 @@ def render_email_alert_settings(journal: object) -> None:
         only_changes = st.checkbox(
             "Avisar sólo cuando cambie la señal",
             value=preferences.only_changes,
-            help="Evita recibir el mismo aviso todos los días.",
+            help="Evita repetir alertas accionables; el resumen diario se mantiene.",
         )
         saved = st.form_submit_button(
             "Guardar mis preferencias",
@@ -13654,7 +14311,7 @@ def render_email_alert_settings(journal: object) -> None:
     if saved:
         try:
             values = normalize_alert_preferences(
-                owner=preferences.owner,
+                owner=journal_owner,
                 email=email_address,
                 enabled=enabled,
                 alert_buy=alert_buy,
@@ -13689,25 +14346,34 @@ def render_email_alert_settings(journal: object) -> None:
     ):
         try:
             send_test_email(preferences.email)
-            st.success("Correo enviado. Si no aparece, revisa también la carpeta de spam.")
+            st.success(
+                "SMTP aceptó el correo de prueba; no confirma su llegada a la bandeja "
+                "de entrada. Revisa también spam."
+            )
         except (EmailConfigurationError, EmailDeliveryError) as exc:
             st.error(str(exc))
+
+    _render_manual_email_review(journal, preferences, mail_configured=mail_configured)
 
     with st.expander("¿Qué empresas se revisan y cuándo se avisa?"):
         st.markdown(
             """
             - Tus favoritas privadas y todas tus posiciones abiertas.
             - Opcionalmente, las favoritas y posiciones de la cartera del grupo.
-            - **Compra:** sólo para empresas que todavía no figuran en tu cartera y
-              aparecen como **Comprable** tras el filtro completo de Entradas.
-            - **Reducir o vender:** sólo para posiciones registradas, utilizando su
-              coste medio para comprobar también el stop loss.
+            - **Estrategia principal:** Crecimiento y momentum, con sus propios
+              criterios y controles. La calidad fundamental es una comparación
+              independiente: no se mezclan las notas ni se exige consenso.
+            - **Entradas:** candidatas que todavía no figuran en tu cartera y
+              cumplen los criterios de la estrategia y el umbral guardado.
+            - **Posiciones abiertas:** se revisa el riesgo, el stop y la tesis del
+              plan guardado. Sin un plan no se inventa una estrategia; una mala
+              nota de entrada aislada no obliga a reducir ni vender.
             - **Resumen diario:** una sola fila por empresa con lectura técnica,
               crecimiento, calidad fundamental y oportunidad. Incluye N/D cuando
               falta una fuente, sin convertir esa ausencia en una nota negativa.
-            - **Alerta accionable:** destaca únicamente entradas comprables o cambios
-              de una posición a reducir/vender. Un mismo estado no vuelve a enviarse
-              hasta que la señal cambie.
+            - **Alerta accionable:** destaca candidatas de la estrategia principal
+              o cambios de riesgo y tesis de posiciones. Con «Avisar sólo cuando
+              cambie la señal», no se repite el mismo estado hasta que cambie.
 
             La revisión programada utiliza el perfil Equilibrado. Si cambias el perfil
             sólo durante una sesión, la pantalla puede mostrar notas distintas.
@@ -13971,7 +14637,7 @@ def main() -> None:
     elif requested_route in ANALYSIS_OPTIONS:
         st.session_state["analysis_navigation"] = requested_route
     else:
-        st.session_state["analysis_navigation"] = "Radar"
+        st.session_state["analysis_navigation"] = "Estrategias"
     if requested_analysis_company_navigation in COMPANY_OPTIONS:
         st.session_state["analysis_company_navigation"] = (
             requested_analysis_company_navigation
@@ -14564,6 +15230,31 @@ def main() -> None:
         if raw_data
         else ({}, [], {}, {}, {}, {}, {})
     )
+    if summary:
+        policy_positions = pd.DataFrame()
+        if hasattr(journal, "list_portfolio_snapshot_positions"):
+            try:
+                policy_positions, _ = latest_portfolio_snapshot(
+                    journal.list_portfolio_snapshot_positions()
+                )
+            except (JournalStorageError, ValueError, AttributeError):
+                pass
+        summary = _enrich_current_analysis_policy(
+            summary,
+            prepared,
+            raw_fundamentals,
+            reference_data,
+            relative_results,
+            risk_results,
+            strategy=strategy,
+            position_snapshot=policy_positions,
+            held_tickers=_portfolio_tracking_tickers(journal),
+        )
+    policy_snapshots = {
+        str(row["Ticker"]): row["Política de análisis"]
+        for row in summary
+        if row.get("Ticker") and isinstance(row.get("Política de análisis"), dict)
+    }
     snapshot_batch_tickers = (
         review_universe
         if automatic_review_page and favorites_reviewed and growth_scan_tickers
@@ -14581,6 +15272,7 @@ def main() -> None:
                 risk_results,
                 opportunity_results,
                 strategy,
+                policy_snapshots=policy_snapshots,
             )
         except (JournalStorageError, AttributeError, ValueError) as exc:
             st.session_state["_analysis_snapshot_batch_error"] = str(exc)
@@ -14704,6 +15396,7 @@ def main() -> None:
                 raw_fundamentals,
                 price_verifications,
                 journal,
+                policy_snapshots=policy_snapshots,
             )
         elif (
             analysis_section == "Empresa"
@@ -14738,6 +15431,7 @@ def main() -> None:
                 private_favorites,
                 group_favorites,
                 authenticated_user.username,
+                comparative_summary=summary,
             )
         elif (
             analysis_section == "Estrategias"

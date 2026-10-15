@@ -315,25 +315,82 @@ tabla conserva los descartes y sus motivos para evitar seleccionar únicamente g
 Cada usuario puede guardar su propio correo, activar o desactivar avisos de entrada,
 reducción y posible salida, elegir una nota mínima de entrada e incluir el seguimiento
 del grupo. El proceso genera dos formatos complementarios. El **resumen diario** reúne
-todas las favoritas y posiciones en una tabla con técnica, crecimiento, calidad
-fundamental y oportunidad; una fuente ausente se marca como N/D y la empresa no
-desaparece. La cabecera indica cuántas empresas se solicitaron y cuántas se pudieron
-procesar con precios, para que una descarga fallida no parezca una revisión completa.
-La **alerta accionable** sólo se envía cuando existe una entrada comprable
-o una posición cambia a reducir/vender y, por defecto, no repite el mismo estado.
-Cuando hay datos suficientes, esta alerta comienza con un bloque compacto de mejores
-oportunidades que añade nombre, ticker, timing, score conjunto, estado y zona preferida.
+un extracto de hasta 15 empresas, priorizando riesgo de posiciones, cambios y nuevas
+candidatas. Los recuentos describen todo el universo solicitado; las omisiones del
+extracto se indican y enlazan con la aplicación. Las fuentes ausentes aparecen como
+N/D: un fallo de descarga no se presenta como revisión completa.
+La **alerta relevante** distingue candidatura condicionada, revisión de exposición y
+revisión de tesis. No convierte una mala entrada actual en una venta. Por defecto no
+repite el mismo estado; las posiciones que siguen requiriendo revisión permanecen
+visibles en el resumen diario.
 
 La revisión automática incluye favoritas y posiciones abiertas. Las entradas se
 evalúan únicamente para empresas que no están ya en cartera y sólo generan correo
-cuando el análisis conjunto las marca como **Comprable**; las alertas de reducir
-o vender se limitan a posiciones registradas y utilizan su coste medio para comprobar
-el stop loss. El proceso usa el perfil equilibrado predeterminado y precios diarios:
+cuando crecimiento y momentum cumple sus propias reglas y el umbral de la preferencia.
+Calidad, valoración, riesgo y el filtro auxiliar se muestran por separado, conservando
+sus advertencias y discrepancias; no se exige una nota de consenso. Datos primarios
+incompletos no generan una nueva candidata. Las revisiones de exposición o tesis se
+limitan a posiciones registradas y respetan su plan explícito o la tesis previa.
+El proceso usa configuración predeterminada documentada y precios diarios:
 no vigila el mercado en tiempo real ni garantiza que el precio continúe disponible.
 La interfaz conserva la fecha del último correo aceptado por SMTP aunque las revisiones
 posteriores no tengan novedades, permitiendo distinguir revisión de entrega. También
 conserva las notas de crecimiento, fundamentales y oportunidad calculadas en la misma
 ejecución del correo.
+
+## Dos enfoques sin nuevas suscripciones
+
+### Revisión manual y envío individual
+
+En **Más → Alertas por correo**, «Revisar mis favoritas y enviarme el resumen»
+utiliza exclusivamente las preferencias guardadas del usuario autenticado. No
+enumera destinatarios ajenos ni cambia direcciones o posiciones. Requiere canal
+SMTP configurado, avisos activados y al menos un análisis fresco utilizable.
+El resumen distingue aceptación SMTP de llegada a la bandeja de entrada. La
+sesión bloquea dobles clics, reenvíos tras aceptación y reintentos con entrega
+incierta; no es una garantía global de entrega exactamente una vez.
+
+Publicar una revisión de interfaz no envía correos ni activa solicitudes de prueba.
+El envío individual requiere pulsar el control del usuario autenticado. El workflow
+periódico, sus destinatarios y las preferencias existentes se conservan.
+
+La navegación propone **Analizar → Estrategias → Crecimiento y momentum** como lectura
+principal y conserva calidad fundamental, ventaja relativa, especulativas, radar y
+validación. El contraste de calidad/valoración/tesis/riesgo permanece independiente.
+El contexto cíclico y estacional no genera entradas por calendario: sin evidencia se
+declara no validado. No se promete rentabilidad ni probabilidad de éxito desde un score.
+
+La vista principal tiene una sola tabla con tres filtros: **Nuevas entradas**, **Mi
+cartera** y **Esperar**. Muestra empresa, peso guardado, qué revisar, referencia de
+cierre/stop teórico, motivo y fecha. Los pesos indican la fecha de la fotografía y
+no simulan una sincronización con el bróker. Una señal de entrada insuficiente no
+ordena vender lo que ya se tiene; una cartera sin verificar tampoco se interpreta
+como vacía. Los valores sin datos permanecen visibles como pendientes. Las notas,
+otros enfoques y el dimensionamiento se abren mediante el detalle, mientras las
+listas y la configuración de capital/riesgo quedan plegadas. El detalle no habilita
+un plan de compra para datos obsoletos ni para una tesis invalidada.
+
+Cada posición puede documentar estrategia, horizonte y tesis mediante un formulario
+manual. No se asignan planes ni se borran invalidaciones de tesis al abrir la página.
+Los planes se guardan en comentarios ya existentes; las fotografías de análisis
+conservan metodología, configuración y un identificador verificable en sus notas.
+Ambos backends conservan estos bloques completos, sin una migración de esquema.
+El historial reconstruye cada lectura desde su metadata y distingue las revisiones
+anteriores que no disponen de ella; no presenta momentum como calidad fundamental.
+
+La versión reutiliza Python, pandas, NumPy, Plotly, los datos gratuitos y la conversión
+de referencia del BCE existentes. No añade suscripciones, endpoints de pago ni envío
+de órdenes. SEC y EIA son opciones públicas para ampliar evidencia, pero añadir una
+fuente no supone que todas las empresas o patrones estén cubiertos. La licencia del
+software y los derechos de redistribución de los datos son distintos: yfinance declara
+uso personal; debe revisarse antes de ampliar el uso compartido. El análisis diario
+no sustituye una orden stop registrada en el bróker ni vigila el mercado en tiempo real.
+
+El laboratorio conserva su comparación de la temporada existente frente a mantener
+y al benchmark. La nueva presentación de dos enfoques no convierte retrospectivamente
+esa temporada en dos bots validados: cualquier comparación adicional necesitará reglas
+registradas antes de observar resultados e historial suficiente. No se selecciona un
+ganador retrospectivamente ni se rellenan rentabilidades inexistentes.
 
 El workflow `.github/workflows/daily-alerts.yml` se ejecuta por la mañana de lunes
 a viernes y también puede iniciarse manualmente. Necesita cuatro secretos de GitHub:
