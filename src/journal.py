@@ -23,6 +23,47 @@ from src.alerts import (
 )
 from src.favorite_tags import serialize_favorite_tags
 from src.data_sources import convert_currency
+from src.analysis_policy import (
+    POSITION_PLAN_MARKER,
+    POLICY_NOTE_MARKER,
+    decode_policy_note,
+    encode_policy_note,
+)
+
+
+def _bounded_analysis_note(note: str) -> str:
+    """Acota texto humano sin cortar la identificación comprobable del análisis."""
+    policy = decode_policy_note(note)
+    if policy is None:
+        return note.strip()[:1_000]
+    human = "\n".join(line for line in note.strip().splitlines()
+                      if not line.strip().startswith(POLICY_NOTE_MARKER))[:1_000]
+    normalized = encode_policy_note(human, policy)
+    if len(normalized) > 20_000:
+        raise ValueError("La metadata del análisis supera el límite permitido.")
+    return normalized
+
+
+def _bounded_position_comments(comments: str) -> str:
+    """Los planes explícitos se conservan completos, nunca JSON truncado."""
+    raw = comments.strip()
+    lines = [line.strip() for line in raw.splitlines()
+             if line.strip().startswith(POSITION_PLAN_MARKER)]
+    if not lines:
+        return raw[:1_000]
+    if len(raw) > 20_000:
+        raise ValueError("Los comentarios con plan superan el límite permitido.")
+    for line in lines:
+        try:
+            plan = json.loads(line.removeprefix(POSITION_PLAN_MARKER).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("El plan guardado en comentarios no es válido.") from exc
+        if not isinstance(plan, dict) or not all(
+            isinstance(plan.get(key), str) and bool(plan[key].strip())
+            for key in ("strategy", "horizon", "thesis")
+        ):
+            raise ValueError("El plan necesita estrategia, horizonte y tesis.")
+    return raw
 
 
 OPERATION_COLUMNS = [
@@ -735,7 +776,7 @@ def normalize_analysis_snapshot(
         "horizon_days": normalized_horizon,
         "sector": sector.strip(),
         "explanation": explanation.strip(),
-        "note": note.strip()[:1_000],
+        "note": _bounded_analysis_note(note),
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -897,7 +938,7 @@ def normalize_portfolio_snapshot_position(
             if gain_loss_eur is not None and pd.notna(gain_loss_eur)
             else None
         ),
-        "comments": comments.strip()[:1_000],
+        "comments": _bounded_position_comments(comments),
         "source": source.strip()[:500],
         "notes": notes.strip()[:1_000],
         "created_at": now,

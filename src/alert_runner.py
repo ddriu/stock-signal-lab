@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timedelta
+from math import isfinite
 from typing import Callable
 from zoneinfo import ZoneInfo
 
@@ -20,6 +21,7 @@ from src.alerts import (
     build_digest_content,
     describe_state_change,
     filter_changed_candidates,
+    is_valid_email,
     signal_signature,
 )
 from src.data_loader import (
@@ -45,6 +47,12 @@ from src.portfolio_decisions import build_portfolio_decision_rows
 from src.market_data_quality import quote_freshness
 from src.signal_engine import evaluate_latest_signal
 from src.storage import GROUP_PORTFOLIO_OWNER, create_journal
+from src.analysis_policy import (
+    build_policy_snapshot,
+    decode_policy_note,
+    encode_policy_note,
+    position_contexts_from_snapshot,
+)
 
 
 @dataclass(frozen=True)
@@ -129,6 +137,22 @@ def _snapshot_positions(journal: object) -> dict[str, str]:
     return positions
 
 
+def _position_contexts(journal: object, *, errors: list[str] | None = None,
+                       owner: str = "") -> dict[str, dict[str, object]]:
+    """Lee planes ya guardados; no asigna una nueva estrategia por defecto."""
+    if not hasattr(journal, "list_portfolio_snapshot_positions"):
+        return {}
+    try:
+        latest, _ = latest_portfolio_snapshot(journal.list_portfolio_snapshot_positions())
+        contexts = position_contexts_from_snapshot(latest.to_dict("records"))
+        return {resolve_analysis_ticker(ticker): context for ticker, context in contexts.items()}
+    except Exception as exc:
+        # Un plan opcional no debe cancelar los avisos del resto del universo.
+        if errors is not None:
+            errors.append(f"{owner}: planes no disponibles; no se infiere una nueva estrategia ({exc}).")
+        return {}
+
+
 def _download_alert_frames(
     tickers: set[str],
     *,
@@ -150,6 +174,7 @@ def _download_alert_frames(
 
 def run_daily_alerts(
     *,
+    owner: str | None = None,
     journal_factory: Callable[[str], object] = create_journal,
     downloader: Callable[..., pd.DataFrame] = download_prices,
     fundamental_downloader: Callable[[str], dict[str, object]] = (
@@ -158,24 +183,63 @@ def run_daily_alerts(
     sender: Callable[..., None] = send_email,
     today: date | None = None,
 ) -> AlertRunSummary:
-    """Ejecuta el radar de todas las preferencias activas del backend."""
+    """Ejecuta el radar diario o una revisión manual de un solo propietario.
+
+    Con ``owner`` sólo se consultan sus preferencias guardadas y se utiliza su
+    dirección exacta: no se enumeran ni se modifican las de otros usuarios. Una
+    revisión manual sin análisis frescos utilizables no envía ni marca estados.
+    """
 
     resolved_today = today or datetime.now(ZoneInfo("Europe/Madrid")).date()
-    group_journal = journal_factory(GROUP_PORTFOLIO_OWNER)
-    if not hasattr(group_journal, "list_enabled_alert_preferences"):
-        raise RuntimeError(
-            "La ejecución automática requiere Supabase; SQLite sólo admite pruebas manuales."
+    manual_owner: str | None = None
+    manual_journal: object | None = None
+    if owner is not None:
+        if not isinstance(owner, str):
+            raise ValueError("La revisión manual necesita un usuario propietario válido.")
+        manual_owner = owner.strip().lower()
+        if not manual_owner or manual_owner == GROUP_PORTFOLIO_OWNER:
+            raise ValueError("La revisión manual necesita un usuario privado propietario.")
+        manual_journal = journal_factory(manual_owner)
+        if not hasattr(manual_journal, "get_alert_preferences"):
+            raise RuntimeError("No se pueden leer las preferencias del usuario.")
+        preference = manual_journal.get_alert_preferences()
+        if not isinstance(preference, AlertPreferences) or preference.owner != manual_owner:
+            raise ValueError("Las preferencias no pertenecen al usuario solicitado.")
+        if preference.enabled is not True:
+            raise ValueError("Activa los avisos por correo antes de solicitar una revisión manual.")
+        recipient = preference.email
+        if (
+            not isinstance(recipient, str)
+            or not recipient
+            or recipient != recipient.strip()
+            or any(character in recipient for character in "\r\n")
+            or not is_valid_email(recipient)
+        ):
+            raise ValueError("Guarda una única dirección de correo válida para tus avisos.")
+        preferences = [preference]
+        group_journal = (
+            journal_factory(GROUP_PORTFOLIO_OWNER) if preference.include_group else None
         )
-    preferences: list[AlertPreferences] = (
-        group_journal.list_enabled_alert_preferences()
-    )
+    else:
+        group_journal = journal_factory(GROUP_PORTFOLIO_OWNER)
+        if not hasattr(group_journal, "list_enabled_alert_preferences"):
+            raise RuntimeError(
+                "La ejecución automática requiere Supabase; SQLite sólo admite pruebas manuales."
+            )
+        preferences = group_journal.list_enabled_alert_preferences()
     if not preferences:
         return AlertRunSummary(0, 0, 0, 0, ())
 
-    group_names = _favorite_names(group_journal)
+    errors: list[str] = []
+    group_names = _favorite_names(group_journal) if group_journal is not None else {}
     group_favorites = set(group_names)
-    group_positions = _position_costs(group_journal)
-    group_snapshot_positions = _snapshot_positions(group_journal)
+    group_positions = _position_costs(group_journal) if group_journal is not None else {}
+    group_snapshot_positions = _snapshot_positions(group_journal) if group_journal is not None else {}
+    group_contexts = (
+        _position_contexts(group_journal, errors=errors, owner=GROUP_PORTFOLIO_OWNER)
+        if group_journal is not None else {}
+    )
+    user_contexts: dict[str, dict[str, dict[str, object]]] = {}
     for ticker, name in group_snapshot_positions.items():
         group_positions.setdefault(ticker, None)
         group_names.setdefault(ticker, name)
@@ -190,14 +254,16 @@ def run_daily_alerts(
         ],
     ] = {}
     all_tickers: set[str] = set()
-    errors: list[str] = []
     for preference in preferences:
         try:
-            user_journal = journal_factory(preference.owner)
+            user_journal = (
+                manual_journal if manual_owner is not None else journal_factory(preference.owner)
+            )
             names = _favorite_names(user_journal)
             favorites = set(names)
             positions = _position_costs(user_journal)
             snapshot_positions = _snapshot_positions(user_journal)
+            contexts = _position_contexts(user_journal, errors=errors, owner=preference.owner)
             for ticker, name in snapshot_positions.items():
                 positions.setdefault(ticker, None)
                 names.setdefault(ticker, name)
@@ -207,6 +273,8 @@ def run_daily_alerts(
                     names.setdefault(ticker, name)
                 for ticker, average_cost in group_positions.items():
                     positions.setdefault(ticker, average_cost)
+                for ticker, context in group_contexts.items():
+                    contexts.setdefault(ticker, context)
             scope = favorites | set(positions)
             scopes[preference.owner] = (
                 preference,
@@ -216,6 +284,7 @@ def run_daily_alerts(
                 names,
             )
             all_tickers |= scope
+            user_contexts[preference.owner] = contexts
         except Exception as exc:
             errors.append(f"{preference.owner}: no se pudo leer su seguimiento ({exc}).")
 
@@ -273,6 +342,7 @@ def run_daily_alerts(
                 else {}
             )
             saved_snapshot_keys: set[tuple[str, date]] = set()
+            saved_policy_keys: set[tuple[str, date, str]] = set()
             if hasattr(journal, "list_analysis_snapshots"):
                 try:
                     saved_snapshots = journal.list_analysis_snapshots()
@@ -283,6 +353,12 @@ def run_daily_alerts(
                         saved_dates = pd.to_datetime(
                             saved_snapshots["analyzed_at"], errors="coerce"
                         ).dt.date
+                        for saved in saved_snapshots.to_dict("records"):
+                            policy = decode_policy_note(saved.get("note"))
+                            saved_date = pd.to_datetime(saved.get("analyzed_at"), errors="coerce")
+                            if policy and pd.notna(saved_date) and policy.get("snapshot_id"):
+                                saved_policy_keys.add((str(saved.get("ticker") or "").strip().upper(),
+                                                       saved_date.date(), str(policy["snapshot_id"])))
                         canonical_scores = {
                             "company_score",
                             "entry_score",
@@ -355,8 +431,10 @@ def run_daily_alerts(
                         ))
                         errors.append(f"{owner} / {ticker}: {freshness.status}.")
                         continue
-                    fresh_tickers.add(ticker)
                     price = float(frame["close"].iloc[-1])
+                    if manual_owner is not None and (not isfinite(price) or price <= 0):
+                        raise ValueError("El precio reciente no es válido para una revisión manual.")
+                    fresh_tickers.add(ticker)
                     state_signature = signal_signature(signal, held=held)
                     candidate = None
                     if ticker not in fundamental_cache:
@@ -383,11 +461,13 @@ def run_daily_alerts(
                         data_notes.append("fundamentales parciales: alguna fuente no pudo verificar las cuentas")
 
                     quick_fundamental = None
+                    fundamental_error = ""
                     try:
                         quick_fundamental = evaluate_fundamental_filter(info, ticker)
                         if quick_fundamental.score is None:
                             data_notes.append("calidad fundamental parcial")
-                    except (KeyError, TypeError, ValueError):
+                    except (KeyError, TypeError, ValueError) as exc:
+                        fundamental_error = str(exc) or "No se pudo completar el filtro fundamental."
                         data_notes.append("calidad fundamental incompleta")
 
                     risk = None
@@ -419,6 +499,7 @@ def run_daily_alerts(
                         data_notes.append("fuerza relativa parcial")
 
                     growth = None
+                    growth_error = ""
                     try:
                         growth = evaluate_growth_momentum(
                             ticker=ticker,
@@ -429,7 +510,8 @@ def run_daily_alerts(
                             broad_market=broad_market,
                             config=growth_config,
                         )
-                    except (KeyError, TypeError, ValueError):
+                    except (KeyError, TypeError, ValueError) as exc:
+                        growth_error = str(exc) or "No se pudo completar crecimiento y momentum."
                         data_notes.append("crecimiento parcial")
 
                     enhanced = None
@@ -485,6 +567,30 @@ def run_daily_alerts(
                         if enhanced is not None
                         else None
                     )
+                    context = user_contexts.get(owner, {}).get(ticker, {})
+                    policy_row = {
+                        "Ticker": ticker, "Fecha": str(signal.as_of.date()),
+                        "Fuente": "Yahoo Finance / yfinance · cierre diario",
+                        "Precio": price,
+                        "Moneda": info.get("currency") or frame.attrs.get("quote_currency") or "",
+                        "Sector": info.get("sector") or "",
+                        "Si ya la tienes": signal.position_label,
+                        "Lectura entrada": signal.label,
+                        "Calidad empresa": getattr(fundamental, "score", None),
+                        "Valoración": getattr(valuation, "score", None),
+                        "Riesgo controlado": getattr(risk, "score", None),
+                        "Cobertura fundamental": getattr(fundamental, "coverage_pct", None),
+                        "Incidencia principal": growth_error,
+                        "Incidencia comparativa": fundamental_error,
+                    }
+                    policy = build_policy_snapshot(
+                        policy_row, growth_result=growth,
+                        fundamental_filter=quick_fundamental,
+                        position_context=context, held=held,
+                        config={"growth": asdict(growth_config), "technical": asdict(config)},
+                    )
+                    if not held:
+                        state_signature = f"entry:growth_momentum:{policy['primary']['status']}"
                     position_decision = None
                     if held:
                         position_decision = build_portfolio_decision_rows(
@@ -498,6 +604,8 @@ def run_daily_alerts(
                                 "Confianza datos": confidence,
                                 "Motivo posición": signal.explanation,
                                 "Fecha": str(signal.as_of.date()),
+                                "Tesis invalidada": context.get("invalidated", False),
+                                "Motivo tesis": context.get("invalidation_reason") or "",
                             }],
                             [ticker],
                         )[0]
@@ -509,12 +617,36 @@ def run_daily_alerts(
                         preferences=preference,
                         company_name=company_name,
                         position_decision=position_decision,
+                        policy_snapshot=policy,
+                        strategy_id=(str(policy["position"]["strategy_id"]) if held else "growth_momentum"),
+                        strategy_label=(str(policy["position"]["strategy_label"]) if held else "Crecimiento + momentum"),
+                        horizon=str(policy["position"]["horizon"]),
+                        data_source=str(policy["source"] or "Fuente no documentada"),
+                        data_limitations="; ".join(dict.fromkeys(data_notes)),
+                        next_step=(str(position_decision.get("Confirmar antes") or "Contrastar tesis y exposición.")
+                                   if position_decision else "Confirmar precio, tamaño, liquidez y próximos resultados; no es una orden."),
+                        previous_signature=previous_signatures.get(ticker),
                     )
 
                     if candidate is not None:
                         candidate = replace(candidate, company_name=company_name)
                     if candidate is not None and candidate.kind == "Compra":
-                        if enhanced is None:
+                        if policy["primary"]["entry_candidate"]:
+                            # El enfoque principal conserva sus propias reglas: una
+                            # nota comparativa discrepante no obliga a un consenso.
+                            candidate = replace(
+                                candidate,
+                                timing_score=(getattr(getattr(enhanced, "timing", None), "score", None)),
+                                opportunity_score=getattr(enhanced, "opportunity_score", None),
+                                opportunity_status=str(getattr(enhanced, "status_label", "") or ""),
+                                preferred_entry=str(getattr(getattr(getattr(enhanced, "zones", None), "preferred_entry", None), "label", "") or ""),
+                                event_label=str(getattr(getattr(enhanced, "event", None), "label", "") or ""),
+                                fundamental_filter_score=getattr(quick_fundamental, "score", None),
+                                fundamental_filter_label=str(getattr(quick_fundamental, "label", "") or ""),
+                                signature=f"entry:growth_momentum:{policy['primary']['status']}",
+                            )
+                            state_signature = candidate.signature
+                        elif enhanced is None:
                             state_signature = (
                                 f"entry:{signal.label}:OPORTUNIDAD_INCOMPLETA"
                             )
@@ -557,6 +689,11 @@ def run_daily_alerts(
                             held=held,
                         )
                     )
+                    if candidate is not None:
+                        candidate = replace(candidate, previous_state=previous_state,
+                                            current_state=current_state,
+                                            change_reason=(str(position_decision.get("Motivo") or "")
+                                                           if position_decision else str(policy["primary"]["entry_reading"])))
                     overview_row = DailyOverviewRow(
                             ticker=ticker,
                             company_name=company_name,
@@ -600,11 +737,20 @@ def run_daily_alerts(
                                 if position_decision is not None else ""
                             ),
                             confidence_pct=confidence,
+                            policy_snapshot=policy,
+                            strategy_id=(str(policy["position"]["strategy_id"]) if held else "growth_momentum"),
+                            strategy_label=(str(policy["position"]["strategy_label"]) if held else "Crecimiento + momentum"),
+                            horizon=str(policy["position"]["horizon"]),
+                            data_source=str(policy["source"] or "Fuente no documentada"),
+                            data_limitations="; ".join(dict.fromkeys(data_notes)),
+                            next_step=(str(position_decision.get("Confirmar antes") or "Contrastar tesis y exposición.")
+                                       if position_decision else str(policy["primary"]["entry_reading"])),
                         )
                     overview_rows.append(overview_row)
                     snapshot_key = (ticker, pd.Timestamp(signal.as_of).date())
+                    policy_key = (*snapshot_key, str(policy["snapshot_id"]))
                     if (
-                        snapshot_key not in saved_snapshot_keys
+                        policy_key not in saved_policy_keys
                         and enhanced is not None
                         and hasattr(journal, "add_analysis_snapshot")
                     ):
@@ -641,9 +787,10 @@ def run_daily_alerts(
                                     or ""
                                 ),
                                 explanation=enhanced.explanation,
-                                note="Actualización automática del radar diario",
+                                note=encode_policy_note("Actualización automática del radar diario", policy),
                             )
                             saved_snapshot_keys.add(snapshot_key)
+                            saved_policy_keys.add(policy_key)
                         except Exception:
                             data_notes.append("historial no guardado")
                             overview_row = replace(
@@ -680,6 +827,13 @@ def run_daily_alerts(
                         )
                     )
 
+            if manual_owner is not None and not evaluated:
+                errors.append(
+                    f"{owner}: no se envió la revisión manual porque no hay análisis "
+                    "frescos utilizables; actualiza los datos e inténtalo de nuevo."
+                )
+                continue
+
             selected = filter_changed_candidates(
                 candidates,
                 previous_signatures,
@@ -711,6 +865,7 @@ def run_daily_alerts(
                 subject, plain_body, html_body = build_daily_overview_content(
                     owner.capitalize(),
                     overview_rows,
+                    app_url="https://stock-signal-lab-ddriu.streamlit.app/",
                 )
                 try:
                     sender(

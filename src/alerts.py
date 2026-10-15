@@ -11,7 +11,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from email.utils import parseaddr
 import html
+from math import isfinite
 from typing import Iterable
+from urllib.parse import urlsplit
 
 from src.signal_engine import (
     LABEL_BUY,
@@ -55,6 +57,20 @@ ALERT_STATE_COLUMNS = [
     "data_note",
 ]
 
+DAILY_OVERVIEW_LIMIT = 15
+
+
+def _html_document(title: str, body: str) -> str:
+    """Declara UTF-8 también al abrir una plantilla fuera del cliente de correo."""
+
+    return (
+        '<!DOCTYPE html>\n<html lang="es">\n<head>\n'
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f'<title>{html.escape(title)}</title>\n'
+        f'</head>\n<body>\n{body}\n</body>\n</html>\n'
+    )
+
 
 @dataclass(frozen=True)
 class AlertPreferences:
@@ -95,6 +111,16 @@ class AlertCandidate:
     event_label: str = ""
     fundamental_filter_score: int | None = None
     fundamental_filter_label: str = ""
+    strategy_id: str = ""
+    strategy_label: str = ""
+    horizon: str = ""
+    data_source: str = ""
+    data_limitations: str = ""
+    next_step: str = ""
+    previous_state: str = ""
+    current_state: str = ""
+    change_reason: str = ""
+    policy_snapshot: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -123,6 +149,13 @@ class DailyOverviewRow:
     portfolio_decision: str = ""
     decision_reason: str = ""
     confidence_pct: int | None = None
+    strategy_id: str = ""
+    strategy_label: str = ""
+    horizon: str = ""
+    data_source: str = ""
+    data_limitations: str = ""
+    next_step: str = ""
+    policy_snapshot: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -239,11 +272,33 @@ def _signature_state(signature: str, *, held: bool) -> tuple[str, tuple[int, int
 
     if normalized.startswith("position:"):
         position = normalized.split(":", 1)[1]
-        ranks = {LABEL_SELL: 0, LABEL_REDUCE: 1}
+        ranks = {
+            LABEL_SELL: 0,
+            LABEL_REDUCE: 1,
+            "Revisar posible salida": 0,
+            "Revisar exposición": 1,
+            "Esperar confirmación": 2,
+            "Mantener": 2,
+        }
         return position, (ranks.get(position, 1), 0)
 
     if normalized.startswith("entry:"):
         parts = normalized.split(":")
+        if len(parts) > 1 and parts[1] == "growth_momentum":
+            state = ":".join(parts[2:]) or "Estado principal pendiente"
+            growth_ranks = {
+                "Entrada fuerte": (4, 2),
+                "Entrada candidata": (4, 1),
+                "Esperar mejor precio": (3, 0),
+                "Vigilancia activa": (2, 0),
+                "No preparada": (1, 0),
+                "Pendiente de fundamentales": (0, 0),
+                "Datos empresariales parciales": (0, 0),
+                "Datos empresariales insuficientes": (0, 0),
+                "Datos de crecimiento incompletos": (0, 0),
+                "Datos insuficientes": (0, 0),
+            }
+            return state, growth_ranks.get(state, (1, 0))
         technical = parts[1] if len(parts) > 1 else "Entrada"
         status = parts[2] if len(parts) > 2 else ""
         technical_rank = 2 if technical == LABEL_STRONG else 1
@@ -306,9 +361,35 @@ def build_alert_candidate(
     fundamental_filter_score: int | None = None,
     fundamental_filter_label: str = "",
     position_decision: dict[str, object] | None = None,
+    strategy_id: str = "",
+    strategy_label: str = "",
+    horizon: str = "",
+    data_source: str = "",
+    data_limitations: str = "",
+    next_step: str = "",
+    previous_signature: str | None = None,
+    change_reason: str = "",
+    policy_snapshot: dict[str, object] | None = None,
 ) -> AlertCandidate | None:
     """Aplica las preferencias a una señal ya calculada."""
 
+    primary = (policy_snapshot or {}).get("primary")
+    primary_eligible = False
+    if not held and policy_snapshot is not None:
+        if not isinstance(primary, dict):
+            return None
+        primary_score = primary.get("score")
+        primary_eligible = (
+            primary.get("entry_candidate") is True
+            and primary.get("data_status") == "complete"
+            and isinstance(primary_score, (int, float))
+            and not isinstance(primary_score, bool)
+            and isfinite(primary_score)
+            and primary_score >= preferences.minimum_buy_score
+        )
+        if not primary_eligible:
+            # La técnica auxiliar no suplanta datos ni umbrales del método principal.
+            return None
     signature = signal_signature(signal, held=held)
     kind = ""
     title = ""
@@ -328,8 +409,12 @@ def build_alert_candidate(
         ):
             kind = "Revisión de riesgo"
             title = decision_label
+    elif primary_eligible and preferences.alert_buy:
+        kind = "Compra"
+        title = "Candidata · " + str(primary.get("label") or "Crecimiento + momentum")
+        signature = f"entry:growth_momentum:{primary.get('status') or 'Entrada candidata'}"
     elif (
-        not held
+        policy_snapshot is None
         and signal.label in {LABEL_BUY, LABEL_STRONG}
         and signal.score >= preferences.minimum_buy_score
         and preferences.alert_buy
@@ -342,6 +427,9 @@ def build_alert_candidate(
         )
     if not kind:
         return None
+    _, _, previous_state, current_state = describe_state_change(
+        previous_signature, signature, held=held,
+    )
     return AlertCandidate(
         ticker=signal.ticker,
         kind=kind,
@@ -354,7 +442,8 @@ def build_alert_candidate(
         explanation=(
             str(position_decision.get("Motivo") or signal.explanation)
             if held and position_decision is not None
-            else signal.explanation
+            else str(primary.get("entry_reading") or primary.get("status") or signal.explanation)
+            if primary_eligible else signal.explanation
         ),
         signature=signature,
         held=held,
@@ -366,6 +455,16 @@ def build_alert_candidate(
         event_label=event_label.strip(),
         fundamental_filter_score=fundamental_filter_score,
         fundamental_filter_label=fundamental_filter_label.strip(),
+        strategy_id=strategy_id.strip(),
+        strategy_label=strategy_label.strip(),
+        horizon=horizon.strip(),
+        data_source=data_source.strip(),
+        data_limitations=data_limitations.strip(),
+        next_step=next_step.strip(),
+        previous_state=previous_state,
+        current_state=current_state,
+        change_reason=change_reason.strip(),
+        policy_snapshot=policy_snapshot,
     )
 
 
@@ -424,6 +523,257 @@ def filter_changed_candidates(
     ]
 
 
+def _policy_section(
+    row: AlertCandidate | DailyOverviewRow, section: str,
+) -> dict[str, object]:
+    value = (row.policy_snapshot or {}).get(section)
+    return value if isinstance(value, dict) else {}
+
+
+def _strategy_context(row: AlertCandidate | DailyOverviewRow) -> str:
+    position = _policy_section(row, "position")
+    strategy = row.strategy_label or str(position.get("strategy_label") or "")
+    horizon = row.horizon or str(position.get("horizon") or "")
+    return (
+        f"Estrategia: {strategy or 'no documentada'} · "
+        f"Horizonte: {horizon or 'no documentado'}"
+        + (f" · Tesis previa: {position['thesis']}" if position.get("thesis") else "")
+    )
+
+
+def _score_text(value: object) -> str:
+    return "N/D" if value is None or value == "" else f"{value}/100"
+
+
+def _main_evidence(row: AlertCandidate | DailyOverviewRow) -> list[str]:
+    primary = _policy_section(row, "primary")
+    lines: list[str] = []
+    for key, prefix, maximum in (
+        ("positive_factors", "Motivos principales (máximo 3; no garantizan rentabilidad)", 3),
+        ("risk_factors", "Argumento contrario / riesgos", None),
+        ("manual_checks", "Pendientes del método principal", None),
+    ):
+        values = primary.get(key)
+        if isinstance(values, (list, tuple)):
+            factors = [str(value) for value in values if value is not None and str(value).strip()]
+            if maximum is not None:
+                factors = factors[:maximum]
+            if factors:
+                lines.append(prefix + ": " + "; ".join(factors))
+    return lines
+
+
+def _method_readings(row: AlertCandidate | DailyOverviewRow) -> list[str]:
+    """Conserva ambos métodos sin fabricar una media ni un voto de consenso."""
+
+    primary = _policy_section(row, "primary")
+    comparative = _policy_section(row, "comparative")
+    daily = isinstance(row, DailyOverviewRow)
+    technical = row.technical_score if daily else row.entry_score
+    technical_label = row.technical_label if daily else row.entry_label
+    growth = row.growth_score if daily else None
+    fundamental = row.fundamental_score if daily else None
+    filter_score = None if daily else row.fundamental_filter_score
+    primary_status = str(primary.get("entry_reading") or primary.get("status") or "")
+    comparative_reading = str(comparative.get("reading") or "")
+    readings = [
+        "Método principal · "
+        + str(primary.get("label") or "Crecimiento + momentum")
+        + ": Crecimiento "
+        + _score_text(primary.get("growth_score") if primary else growth)
+        + (" · Momentum " if primary else " · Momentum/Técnica ")
+        + _score_text(primary.get("momentum_score") if primary else technical)
+        + (f" ({technical_label or 'sin lectura'})" if not primary else "")
+        + " · Contexto " + _score_text(primary.get("context_score"))
+        + (
+            " · Puntuación del método " + _score_text(primary["score"])
+            if primary.get("score") is not None else ""
+        )
+        + (f" · Estado: {primary['status']}" if primary.get("status") else "")
+        + (f" · Lectura: {primary_status}" if primary_status else ""),
+        "Método comparativo · "
+        + str(comparative.get("label") or "Calidad / valoración / tesis / riesgo")
+        + ": Calidad fundamental — Fundamental "
+        + _score_text(comparative.get("quality_score") if comparative else fundamental)
+        + " · Valoración " + _score_text(comparative.get("valuation_score"))
+        + " · Riesgo " + _score_text(comparative.get("risk_score"))
+        + " · Filtro fundamental "
+        + _score_text(comparative.get("filter_score") if comparative else filter_score)
+        + (
+            f" ({row.fundamental_filter_label})"
+            if not daily and row.fundamental_filter_label else ""
+        )
+        + (
+            f" ({row.fundamental_label})"
+            if daily and row.fundamental_label else ""
+        )
+        + " · Tesis: " + {
+            "not_documented": "no documentada",
+            "documented": "documentada; preservar la evidencia previa",
+            "invalidated": "invalidación declarada; contrastar el motivo",
+        }.get(str(comparative.get("thesis_status")), str(comparative.get("thesis_status") or "no documentada"))
+        + (f" · Lectura: {comparative_reading}" if comparative_reading else ""),
+    ]
+    readings[1:1] = _main_evidence(row)
+    if primary:
+        readings.append(
+            "Técnica de precio auxiliar: Técnica " + _score_text(technical)
+            + f" ({technical_label or 'sin lectura'}); no exige consenso con el método principal."
+        )
+    if row.opportunity_score is not None or row.opportunity_status:
+        readings.append(
+            "Filtro de entrada auxiliar: Oportunidad "
+            + _score_text(row.opportunity_score)
+            + (
+                " · Timing " + _score_text(row.timing_score)
+                if not daily and row.timing_score is not None else ""
+            )
+            + (f" · {row.opportunity_status}" if row.opportunity_status else "")
+            + (
+                f" · Zona {row.preferred_entry}"
+                if not daily and row.preferred_entry else ""
+            )
+        )
+    if not daily and row.event_label:
+        readings.append(f"Evento auxiliar: {row.event_label}")
+    if (
+        not daily and comparative and row.fundamental_filter_score is not None
+        and comparative.get("filter_score") != row.fundamental_filter_score
+    ):
+        readings.append(
+            "Filtro fundamental auxiliar disponible: Filtro fundamental "
+            + _score_text(row.fundamental_filter_score)
+            + (f" ({row.fundamental_filter_label})" if row.fundamental_filter_label else "")
+            + "; independiente de la nota principal."
+        )
+    if not daily and primary.get("entry_candidate") is True and any(
+        word in row.opportunity_status.casefold() for word in ("evento", "esperar", "extendida")
+    ):
+        readings.append(
+            "Contraste de entrada: el método principal identifica una candidata, "
+            f"pero el filtro auxiliar señala {row.opportunity_status}. "
+            "Se conservan ambas lecturas; la condición pendiente requiere revisión "
+            "antes de confirmar una entrada, sin orden automática."
+        )
+    disagreement = (row.policy_snapshot or {}).get("disagreement")
+    if isinstance(disagreement, dict):
+        note = str(disagreement.get("reading") or disagreement.get("reason") or disagreement.get("label") or "")
+    elif isinstance(disagreement, str):
+        note = disagreement
+    else:
+        note = "Lecturas distintas; revisar ambas" if disagreement else ""
+    if note:
+        readings.append(f"Divergencia entre métodos: {note}")
+    context = _policy_section(row, "context")
+    if context.get("cycle") or context.get("seasonality"):
+        readings.append(
+            "Contexto separado (no crea una entrada ni modifica scores): "
+            + " · ".join(str(context[key]) for key in ("cycle", "seasonality") if context.get(key))
+        )
+    return readings
+
+
+def _data_context(row: AlertCandidate | DailyOverviewRow) -> list[str]:
+    coverage = (
+        f" · Cobertura de datos: {row.confidence_pct}%"
+        if isinstance(row, DailyOverviewRow) and row.confidence_pct is not None
+        else ""
+    )
+    limitations = row.data_limitations
+    if isinstance(row, DailyOverviewRow) and row.data_note:
+        limitations = "; ".join(value for value in (limitations, row.data_note) if value)
+    lines = [
+        f"Fecha del precio: {row.as_of or 'N/D'} · Fuente: "
+        f"{row.data_source or 'no documentada'}{coverage}",
+        "Limitaciones: " + (
+            limitations or "Cobertura y fecha de los fundamentales no verificadas; "
+            "la cotización no confirma por sí sola una entrada ni invalida una tesis."
+        ),
+    ]
+    if row.policy_snapshot:
+        lines.append(
+            "Referencia del análisis: política "
+            + str(row.policy_snapshot.get("policy_version") or "N/D")
+            + " · Snapshot " + str(row.policy_snapshot.get("snapshot_id") or "N/D")[:12]
+            + " (identificador compartido con la aplicación; sin nuevo cálculo)."
+        )
+    return lines
+
+
+def _next_step(row: AlertCandidate | DailyOverviewRow) -> str:
+    if isinstance(row, AlertCandidate) and "evento" in row.opportunity_status.casefold():
+        base = row.next_step or "Validar datos, precio de entrada, horizonte y tamaño antes de decidir."
+        return base + " Revisar " + (row.event_label or "el evento señalado") + (
+            " y esperar información nueva antes de confirmar una operación."
+        )
+    if row.next_step:
+        return row.next_step
+    decision = row.position_label if isinstance(row, AlertCandidate) else _overview_decision(row)
+    if not row.held:
+        return "Validar datos, precio de entrada, horizonte y tamaño antes de decidir."
+    if decision == "Revisar posible salida":
+        return "Contrastar la tesis con hechos actualizados antes de decidir mantener o salir."
+    if decision == "Revisar exposición":
+        return "Revisar concentración, tamaño y tolerancia al riesgo antes de cambiar la posición."
+    return "Revisar la tesis y las condiciones pendientes; sin acción automática."
+
+
+def _candidate_headline(candidate: AlertCandidate) -> str:
+    if not candidate.held:
+        if "evento" in candidate.opportunity_status.casefold():
+            return "Candidata condicionada · revisar el evento antes de la entrada"
+        return "Candidata condicionada · revisar entrada"
+    if candidate.kind == "Revisión de tesis" or candidate.position_label == "Revisar posible salida":
+        return "Revisión de tesis · confirmar antes de decidir"
+    return "Revisión de exposición · validar el riesgo"
+
+
+def _candidate_change(candidate: AlertCandidate) -> str:
+    if candidate.previous_state and candidate.current_state:
+        if candidate.previous_state == candidate.current_state:
+            return "Estado sin cambio de categoría; revisión solicitada por preferencias."
+        return f"Antes: {candidate.previous_state} → Ahora: {candidate.current_state}."
+    return "Sin estado anterior comparable; primera lectura o historial no disponible."
+
+
+def _top_candidate_score(candidate: AlertCandidate) -> int | float | None:
+    primary = _policy_section(candidate, "primary")
+    if primary:
+        score = primary.get("score")
+        if (
+            primary.get("entry_candidate") is True
+            and primary.get("data_status") == "complete"
+            and isinstance(score, (int, float)) and not isinstance(score, bool)
+            and isfinite(score)
+        ):
+            return score
+        return None
+    return candidate.opportunity_score
+
+
+def _top_candidate_reading(candidate: AlertCandidate) -> str:
+    primary = _policy_section(candidate, "primary")
+    if primary:
+        text = f"Nota principal {_score_text(primary.get('score'))}"
+        if primary.get("status"):
+            text += f" · {primary['status']}"
+        if candidate.opportunity_score is not None:
+            text += f" · Filtro auxiliar: Oportunidad {_score_text(candidate.opportunity_score)}"
+            if candidate.opportunity_status:
+                text += f" ({candidate.opportunity_status})"
+    else:
+        text = f"Oportunidad {_score_text(candidate.opportunity_score)}"
+        if candidate.opportunity_status:
+            text += f" · {candidate.opportunity_status}"
+    if candidate.timing_score is not None:
+        text += f" · Timing {_score_text(candidate.timing_score)}"
+    if candidate.preferred_entry:
+        text += f" · Zona {candidate.preferred_entry}"
+    if candidate.event_label:
+        text += f" · Evento auxiliar: {candidate.event_label}"
+    return text
+
+
 def build_digest_content(
     display_name: str,
     candidates: Iterable[AlertCandidate],
@@ -445,44 +795,44 @@ def build_digest_content(
     # antes de abrir el mensaje. El cuerpo conserva todas las empresas.
     subject = f"Stock Signal Lab · {alert_word}"
     if rows:
+        if all(not candidate.held for candidate in rows):
+            subject += " · candidatas condicionadas"
+        elif all(candidate.held for candidate in rows):
+            subject += " · revisión de cartera"
+        else:
+            subject += " · candidatas y revisiones"
         subject += f" · {display_label(rows[0])}"
         if len(rows) > 1:
             subject += f" y {len(rows) - 1} más"
     plain_lines = [
         f"Hola {display_name},",
         "",
-        "TOP OPORTUNIDADES",
+        "AVISOS PARA REVISIÓN · NO SON ÓRDENES",
+        "La decisión requiere validar estrategia, horizonte y datos. Ningún score "
+        "es una probabilidad de ganar ni un consenso entre métodos.",
+        "",
+        "TOP OPORTUNIDADES · CANDIDATAS CONDICIONADAS",
     ]
     opportunity_rows = sorted(
         (
             candidate
             for candidate in rows
-            if candidate.kind == "Compra" and candidate.opportunity_score is not None
+            if candidate.kind == "Compra" and _top_candidate_score(candidate) is not None
         ),
-        key=lambda candidate: int(candidate.opportunity_score or 0),
+        key=lambda candidate: float(_top_candidate_score(candidate) or 0),
         reverse=True,
     )[:5]
     for candidate in opportunity_rows:
-        timing_text = (
-            f" / Timing {candidate.timing_score}"
-            if candidate.timing_score is not None
-            else ""
-        )
-        zone_text = (
-            f" · Zona {candidate.preferred_entry}"
-            if candidate.preferred_entry
-            else ""
-        )
         plain_lines.append(
-            f"{display_label(candidate)} · Oportunidad {candidate.opportunity_score}"
-            f"{timing_text} · {candidate.opportunity_status or candidate.title}{zone_text}"
+            f"{display_label(candidate)} · Candidata condicionada; revisar precio y datos. "
+            f"{_top_candidate_reading(candidate)}"
         )
     if not opportunity_rows:
-        plain_lines.append("Sin nuevas entradas con score conjunto disponible.")
+        plain_lines.append("Sin candidatas nuevas con método principal o filtro de entrada disponible.")
     plain_lines.extend(
         [
             "",
-            "Estas señales han cambiado y merecen revisión:",
+            "QUÉ REVISAR Y POR QUÉ",
             "",
         ]
     )
@@ -496,114 +846,98 @@ def build_digest_content(
     }
     for candidate in rows:
         label = display_label(candidate)
+        headline = _candidate_headline(candidate)
+        reason = candidate.change_reason or candidate.explanation
+        method_readings = _method_readings(candidate)
+        data_context = _data_context(candidate)
+        next_step = _next_step(candidate)
         plain_lines.extend(
             [
-                f"{label} · {candidate.kind} · {candidate.title}",
-                (
-                    f"Score técnico {candidate.entry_score}/100 ({candidate.entry_label}); "
-                    f"posición: {candidate.position_label}; cierre: {candidate.price:.2f}."
-                ),
-                (
-                    f"Filtro fundamental {candidate.fundamental_filter_score}/100 "
-                    f"({candidate.fundamental_filter_label})."
-                    if candidate.fundamental_filter_score is not None
-                    else (
-                        "Filtro fundamental: datos insuficientes."
-                        if candidate.kind == "Compra"
-                        else ""
-                    )
-                ),
-                candidate.explanation,
+                f"{label} · {headline}",
+                _strategy_context(candidate),
+                f"Qué cambió: {_candidate_change(candidate)}",
+                f"Motivo: {reason}",
+                f"Siguiente paso: {next_step}",
+                "LECTURAS INDEPENDIENTES (puntuaciones de apoyo)",
+                *method_readings,
+                f"Cierre histórico: {candidate.price:.2f}",
+                *data_context,
                 "",
             ]
         )
         color = color_by_kind.get(candidate.kind, "#2563eb")
+        detail_lines = [
+            _strategy_context(candidate),
+            f"Qué cambió: {_candidate_change(candidate)}",
+            f"Motivo: {reason}",
+            f"Siguiente paso: {next_step}",
+        ]
+        details_html = "".join(
+            f'<p style="margin:0 0 8px">{html.escape(line)}</p>'
+            for line in detail_lines
+        )
+        readings_html = "".join(
+            f'<p style="margin:4px 0;color:#475569">{html.escape(line)}</p>'
+            for line in method_readings
+        )
+        data_html = "".join(
+            f'<p style="margin:4px 0;color:#64748b">{html.escape(line)}</p>'
+            for line in data_context
+        )
         html_rows.append(
             f"""
             <div style="border:1px solid #e2e8f0;border-left:5px solid {color};
                         border-radius:10px;padding:14px 16px;margin:12px 0">
               <div style="font-size:12px;color:{color};font-weight:700">
-                {html.escape(candidate.kind.upper())}
+                {html.escape('CANDIDATA CONDICIONADA' if not candidate.held else candidate.kind.upper())}
               </div>
               <h3 style="margin:4px 0 8px;color:#14213d">
-                {html.escape(label)} · {html.escape(candidate.title)}
+                {html.escape(label)} · {html.escape(headline)}
               </h3>
-              <p style="margin:0 0 8px">
-                Score técnico <strong>{candidate.entry_score}/100</strong>
-                ({html.escape(candidate.entry_label)}) · Posición:
-                <strong>{html.escape(candidate.position_label)}</strong> ·
-                cierre {candidate.price:.2f} · datos {html.escape(candidate.as_of)}
-              </p>
-              {
-                  '<p style="margin:0 0 8px">Timing <strong>'
-                  + str(candidate.timing_score)
-                  + '/100</strong> · Oportunidad <strong>'
-                  + str(candidate.opportunity_score)
-                  + '/100</strong> · '
-                  + html.escape(candidate.opportunity_status)
-                  + (f' · Zona {html.escape(candidate.preferred_entry)}' if candidate.preferred_entry else '')
-                  + '</p>'
-                  if candidate.opportunity_score is not None
-                  else ''
-              }
-              {
-                  '<p style="margin:0 0 8px">Calidad fundamental <strong>'
-                  + str(candidate.fundamental_filter_score)
-                  + '/100</strong> · '
-                  + html.escape(candidate.fundamental_filter_label)
-                  + '</p>'
-                  if candidate.fundamental_filter_score is not None
-                  else (
-                      '<p style="margin:0 0 8px;color:#64748b">Calidad fundamental: datos insuficientes</p>'
-                      if candidate.kind == 'Compra'
-                      else ''
-                  )
-              }
-              <p style="margin:0;color:#475569">{html.escape(candidate.explanation)}</p>
+              {details_html}
+              <div style="background:#f8fafc;padding:8px;border-radius:6px">
+                <strong>Lecturas independientes · puntuaciones de apoyo</strong>
+                {readings_html}
+              </div>
+              <p style="margin:8px 0 4px">Cierre histórico: {candidate.price:.2f}</p>
+              {data_html}
             </div>
             """
         )
     disclaimer = (
         "Son señales probabilísticas basadas en datos históricos. No constituyen "
-        "asesoramiento financiero ni garantizan rentabilidad."
+        "asesoramiento financiero ni garantizan rentabilidad. Este correo no ordena "
+        "comprar, reducir ni vender; requiere una decisión manual."
     )
     plain_lines.extend([disclaimer, "Puedes desactivar estos avisos desde la aplicación."])
     html_opportunity_rows = "".join(
         '<p style="margin:8px 0">'
         + html.escape(display_label(candidate))
-        + " · Oportunidad <strong>"
-        + str(candidate.opportunity_score)
-        + "/100</strong>"
-        + (
-            " · Timing " + str(candidate.timing_score) + "/100"
-            if candidate.timing_score is not None
-            else ""
-        )
+        + " · Candidata condicionada; revisar precio y datos."
         + '<br><span style="color:#475569">'
-        + html.escape(candidate.opportunity_status or candidate.title)
-        + (
-            " · Zona " + html.escape(candidate.preferred_entry)
-            if candidate.preferred_entry
-            else ""
-        )
+        + html.escape(_top_candidate_reading(candidate))
         + "</span></p>"
         for candidate in opportunity_rows
     )
     if not html_opportunity_rows:
         html_opportunity_rows = (
             '<p style="margin:8px 0;color:#64748b">'
-            "Sin nuevas entradas con score conjunto disponible.</p>"
+            "Sin candidatas nuevas con método principal o filtro de entrada disponible.</p>"
         )
     html_body = f"""
     <div style="font-family:Arial,sans-serif;max-width:680px;margin:auto;color:#1e293b">
       <h2 style="color:#14213d">Stock Signal Lab</h2>
       <p>Hola {html.escape(display_name)},</p>
+      <p><strong>Avisos para revisión · no son órdenes</strong><br>
+        Validar estrategia, horizonte y datos antes de decidir. Los scores no son
+        una probabilidad de ganar ni un consenso entre métodos.
+      </p>
       <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;
                   padding:12px 16px;margin:12px 0">
-        <strong>🔥 TOP OPORTUNIDADES</strong>
+        <strong>TOP OPORTUNIDADES · CANDIDATAS CONDICIONADAS</strong>
         {html_opportunity_rows}
       </div>
-      <p>Estas señales han cambiado y merecen revisión:</p>
+      <p>Qué revisar y por qué:</p>
       {''.join(html_rows)}
       <p style="font-size:12px;color:#64748b;margin-top:22px">{html.escape(disclaimer)}</p>
       <p style="font-size:12px;color:#64748b">
@@ -611,7 +945,7 @@ def build_digest_content(
       </p>
     </div>
     """
-    return subject, "\n".join(plain_lines), html_body
+    return subject, "\n".join(plain_lines), _html_document(subject, html_body)
 
 
 def _overview_display_label(row: DailyOverviewRow) -> str:
@@ -635,6 +969,9 @@ def _overview_decision(row: DailyOverviewRow) -> str:
         and row.opportunity_score is None
     ):
         return "Datos insuficientes"
+    management = _policy_section(row, "position").get("management_reading")
+    if row.held and management:
+        return str(management)
     if row.held:
         decision = build_portfolio_decision_rows(
             [{
@@ -648,18 +985,21 @@ def _overview_decision(row: DailyOverviewRow) -> str:
             [row.ticker],
         )[0]
         return str(decision["Decisión"])
+    primary = _policy_section(row, "primary")
+    if primary and (
+        primary.get("entry_candidate") is False
+        or primary.get("data_status") in {"pending", "partial"}
+    ):
+        return str(primary.get("entry_reading") or "Datos insuficientes para validar entrada")
     if (
         "comprable" in row.opportunity_status.casefold()
         and row.confidence_pct is not None
         and row.confidence_pct >= 60
     ):
         return "Entrada validada para revisar"
-    if (
-        row.growth_score is not None
-        and row.growth_score >= 75
-        and (row.technical_score or 0) >= 70
-    ):
-        return "Crecimiento y momento fuertes; validar precio"
+    primary_reading = primary.get("entry_reading")
+    if primary_reading:
+        return str(primary_reading)
     if (row.technical_score or 0) >= 75:
         return "Momento fuerte; faltan confirmaciones"
     if row.fundamental_score is not None and row.fundamental_score >= 65:
@@ -667,28 +1007,52 @@ def _overview_decision(row: DailyOverviewRow) -> str:
     return "Vigilancia"
 
 
+def _overview_headline(row: DailyOverviewRow) -> str:
+    decision = _overview_decision(row)
+    if decision == "Datos insuficientes":
+        return decision + " · no valorar una operación"
+    if row.held:
+        if decision == "Revisar posible salida":
+            return "Revisión de tesis · confirmar antes de decidir"
+        if decision == "Revisar exposición":
+            return "Revisión de exposición · validar el riesgo"
+        return decision
+    if decision == "Vigilancia":
+        return "Vigilar · sin entrada confirmada"
+    primary = _policy_section(row, "primary")
+    if primary:
+        candidate = primary.get("entry_candidate") is True and primary.get("data_status") not in {"pending", "partial"}
+    else:
+        candidate = decision == "Entrada validada para revisar" or "Momento fuerte" in decision
+    return ("Candidata condicionada · " if candidate else "Vigilar · ") + decision
+
+
 def _overview_priority(row: DailyOverviewRow) -> tuple[int, int, str]:
     decision = _overview_decision(row)
-    if decision == "Revisar posible salida":
+    primary = _policy_section(row, "primary")
+    primary_candidate = (
+        primary.get("entry_candidate") is True
+        and primary.get("data_status") == "complete"
+    )
+    if row.held and decision.startswith("Revisar posible salida"):
         priority = 0
-    elif decision == "Revisar exposición":
+    elif row.held and decision.startswith("Revisar"):
         priority = 1
-    elif decision == "Entrada validada para revisar":
-        priority = 2
-    elif "fuertes" in decision or "Momento fuerte" in decision:
-        priority = 3
     elif row.changed:
-        priority = 4
+        priority = 2
+    elif primary_candidate or decision == "Entrada validada para revisar" or "Momento fuerte" in decision:
+        priority = 3
     elif row.held:
+        priority = 4
+    elif row.change_kind == "new":
         priority = 5
     else:
         priority = 6
-    combined = max(
-        row.opportunity_score or 0,
-        row.growth_score or 0,
-        row.technical_score or 0,
-    )
-    return priority, -combined, row.ticker
+    # Desempata por el método principal, nunca por una mezcla de métodos.
+    primary_score = primary.get("score")
+    if not isinstance(primary_score, (int, float)) or isinstance(primary_score, bool) or not isfinite(primary_score):
+        primary_score = row.growth_score if row.growth_score is not None else row.technical_score or 0
+    return priority, -int(primary_score), row.ticker
 
 
 def _overview_change_label(row: DailyOverviewRow) -> str:
@@ -710,11 +1074,32 @@ def _overview_change_label(row: DailyOverviewRow) -> str:
 def build_daily_overview_content(
     display_name: str,
     rows: Iterable[DailyOverviewRow],
+    *,
+    app_url: str = "",
 ) -> tuple[str, str, str]:
-    """Crea el segundo correo: todas las empresas, una fila por empresa."""
+    """Recuentos completos y extracto priorizado; nunca más de quince empresas."""
 
     values = sorted(list(rows), key=_overview_priority)
     total = len(values)
+    selected = values[:DAILY_OVERVIEW_LIMIT]
+    omitted = total - len(selected)
+    try:
+        parsed_url = urlsplit(app_url.strip())
+        safe_app_url = (
+            app_url.strip()
+            if parsed_url.scheme in {"http", "https"} and parsed_url.hostname
+            and not parsed_url.username and not parsed_url.password
+            and "\r" not in app_url and "\n" not in app_url else ""
+        )
+    except ValueError:
+        safe_app_url = ""
+    detail_text = (
+        f"Favoritas y posiciones completas en la aplicación: {safe_app_url}"
+        if safe_app_url else "Favoritas y posiciones completas: abre Stock Signal Lab; "
+        "la URL de la aplicación no está configurada en este correo."
+    )
+    extract_text = f"Extracto priorizado: {len(selected)} de {total} empresas (máximo {DAILY_OVERVIEW_LIMIT})."
+    omitted_text = f"Empresas fuera del extracto: {omitted}; sí están incluidas en los recuentos."
     buyable = sum(_overview_decision(row) == "Entrada validada para revisar" for row in values)
     portfolio_reviews = sum(
         row.held
@@ -734,18 +1119,24 @@ def build_daily_overview_content(
     plain_lines = [
         f"Hola {display_name},",
         "",
-        "RESUMEN DIARIO COMBINADO",
+        "RESUMEN DIARIO · MÉTODOS INDEPENDIENTES",
         f"Empresas solicitadas: {total}",
         f"Empresas procesadas con precios: {priced}",
         f"Empresas sin precio o sin análisis: {unavailable}",
         f"Entradas validadas para revisar: {buyable}",
-        f"Posiciones para revisar/reducir/salir: {portfolio_reviews}",
+        f"Posiciones para revisar (sin orden de venta): {portfolio_reviews}",
         f"Cambios relevantes desde el análisis anterior: {changed}",
         f"Primeras lecturas: {new_readings}",
         f"Empresas con datos parciales: {incomplete}",
         "",
-        "Cada empresa aparece una sola vez. Técnica, crecimiento, fundamentos y "
-        "oportunidad son lecturas distintas; ninguna garantiza rentabilidad.",
+        extract_text,
+        omitted_text,
+        detail_text,
+        "",
+        "Cada empresa mostrada aparece una sola vez en el extracto. El método principal es crecimiento + "
+        "momentum; el comparativo muestra calidad, valoración, tesis y riesgo. "
+        "No se suman entre sí ni forman una orden o un consenso. "
+        "Las puntuaciones son apoyo, no probabilidades de rentabilidad.",
         "",
         "QUÉ REQUIERE ATENCIÓN HOY",
     ]
@@ -753,64 +1144,86 @@ def build_daily_overview_content(
     if changed_rows:
         plain_lines.append(
             f"Hay {changed} cambio{'s' if changed != 1 else ''} de estado. "
-            "Aparecen destacados en la tabla."
+            "Se priorizan en el extracto; consulta el resto en la aplicación."
         )
     else:
         plain_lines.append("Sin cambios de estado relevantes.")
-    plain_lines.extend(["", "TODAS LAS FAVORITAS Y POSICIONES"])
-    for row in values:
-        scores = (
-            f"Técnica {row.technical_score if row.technical_score is not None else 'N/D'} · "
-            f"Crecimiento {row.growth_score if row.growth_score is not None else 'N/D'} · "
-            f"Fundamental {row.fundamental_score if row.fundamental_score is not None else 'N/D'} · "
-            f"Oportunidad {row.opportunity_score if row.opportunity_score is not None else 'N/D'}"
-        )
+    plain_lines.extend(["", "EXTRACTO PRIORIZADO DE FAVORITAS Y POSICIONES"])
+    for row in selected:
         marker = _overview_change_label(row)
         plain_lines.extend(
             [
-                _overview_display_label(row),
-                f"{scores} · {_overview_decision(row)}",
-                f"Fecha del precio: {row.as_of or 'N/D'} · Cobertura de datos: "
-                f"{str(row.confidence_pct) + '%' if row.confidence_pct is not None else 'N/D'}",
+                f"{_overview_display_label(row)} · {_overview_headline(row)}",
+                _strategy_context(row),
+                f"Siguiente paso: {_next_step(row)}",
             ]
         )
         if row.decision_reason:
             plain_lines.append(f"Motivo: {row.decision_reason}")
         if marker:
-            plain_lines.append(marker)
-        if row.data_note:
-            plain_lines.append(f"Datos: {row.data_note}")
+            plain_lines.append(f"Qué cambió: {marker}")
+        elif row.changed:
+            plain_lines.append("Qué cambió: cambio marcado, sin estado anterior comparable.")
+        else:
+            plain_lines.append("Qué cambió: sin cambio de categoría confirmado.")
+        plain_lines.extend(_method_readings(row))
+        plain_lines.extend(_data_context(row))
         plain_lines.append("")
-
-    def score_cell(value: int | None) -> str:
-        return "—" if value is None else str(value)
-
-    table_rows = "".join(
-        f"""
-        <tr style="border-bottom:1px solid #e2e8f0">
-          <td style="padding:9px 7px;min-width:150px">
-            <strong>{html.escape(_overview_display_label(row))}</strong>
-            {f'<br><span style="color:#b7791f;font-size:11px">{html.escape(_overview_change_label(row))}</span>' if _overview_change_label(row) else ''}
-            {f'<br><span style="color:#64748b">{html.escape(row.data_note)}</span>' if row.data_note else ''}
-          </td>
-          <td style="padding:9px 7px">{html.escape(row.as_of or 'N/D')}</td>
-          <td style="padding:9px 7px;text-align:center">{score_cell(row.technical_score)}</td>
-          <td style="padding:9px 7px;text-align:center">{score_cell(row.growth_score)}</td>
-          <td style="padding:9px 7px;text-align:center">{score_cell(row.fundamental_score)}</td>
-          <td style="padding:9px 7px;text-align:center">{score_cell(row.opportunity_score)}</td>
-          <td style="padding:9px 7px;text-align:center">{str(row.confidence_pct) + '%' if row.confidence_pct is not None else 'N/D'}</td>
-          <td style="padding:9px 7px;min-width:170px">{html.escape(_overview_decision(row))}
-            {f'<br><span style="color:#64748b">{html.escape(row.decision_reason)}</span>' if row.decision_reason else ''}
-          </td>
-        </tr>
-        """
-        for row in values
+    plain_lines.append(
+        "No constituyen asesoramiento financiero ni garantizan rentabilidad. "
+        "Este correo no ordena comprar, reducir ni vender; toda decisión es manual. "
+        "Los datos N/D no se convierten en una nota negativa."
     )
+
+    html_rows: list[str] = []
+    for row in selected:
+        marker = _overview_change_label(row)
+        readings_html = "".join(
+            f'<p style="margin:0 0 7px">{html.escape(line)}</p>'
+            for line in _method_readings(row)
+        )
+        data_html = "".join(
+            f'<p style="margin:4px 0;color:#64748b">{html.escape(line)}</p>'
+            for line in _data_context(row)
+        )
+        reason_html = (
+            f'<p style="margin:4px 0">Motivo: {html.escape(row.decision_reason)}</p>'
+            if row.decision_reason else ""
+        )
+        change_text = marker or (
+            "Cambio marcado, sin estado anterior comparable."
+            if row.changed else "Sin cambio de categoría confirmado."
+        )
+        html_rows.append(
+            f"""
+            <tr style="border-bottom:1px solid #e2e8f0;vertical-align:top">
+              <td style="padding:12px 9px;min-width:145px;width:20%">
+                <strong>{html.escape(_overview_display_label(row))}</strong>
+                <p style="margin:4px 0;color:#b7791f">Qué cambió: {html.escape(change_text)}</p>
+              </td>
+              <td style="padding:12px 9px;min-width:200px;width:35%">
+                <strong>{html.escape(_overview_headline(row))}</strong>
+                <p style="margin:4px 0">{html.escape(_strategy_context(row))}</p>
+                {reason_html}
+                <p style="margin:4px 0">Siguiente paso: {html.escape(_next_step(row))}</p>
+                {data_html}
+              </td>
+              <td style="padding:12px 9px;min-width:240px;width:45%;color:#475569">
+                {readings_html}
+              </td>
+            </tr>
+            """
+        )
+    table_rows = "".join(html_rows)
     attention_text = (
         f"Hay {changed} cambio{'s' if changed != 1 else ''} de estado. "
-        "Aparecen destacados en la tabla."
+        "Se priorizan en el extracto; consulta el resto en la aplicación."
         if changed_rows
         else "Sin cambios de estado relevantes."
+    )
+    app_link_html = (
+        f'<a href="{html.escape(safe_app_url, quote=True)}">Abrir favoritas y posiciones completas en Stock Signal Lab</a>'
+        if safe_app_url else html.escape(detail_text)
     )
     html_body = f"""
     <div style="font-family:Arial,sans-serif;max-width:920px;margin:auto;color:#1e293b">
@@ -830,21 +1243,22 @@ def build_daily_overview_content(
         <span style="color:#475569">{html.escape(attention_text)}</span>
       </div>
       <p style="color:#475569">
-        Cada empresa aparece una sola vez. Las columnas son lecturas independientes
-        y no una probabilidad de ganar.
+        Cada empresa mostrada aparece una sola vez en el extracto. Crecimiento + momentum es el método
+        principal; calidad / valoración / tesis / riesgo es el comparativo.
+        Para las empresas mostradas, se conservan las lecturas independientes:
+        no se suman ni forman un consenso.
+        Los scores son apoyo, no una probabilidad de ganar ni una orden.
+      </p>
+      <p><strong>{html.escape(extract_text)}</strong><br>
+        {html.escape(omitted_text)}<br>{app_link_html}
       </p>
       <div style="overflow-x:auto">
         <table style="border-collapse:collapse;width:100%;font-size:12px">
           <thead>
             <tr style="background:#e8f4ef;color:#0f5132">
               <th style="padding:9px 7px;text-align:left">Empresa</th>
-              <th style="padding:9px 7px">Fecha precio</th>
-              <th style="padding:9px 7px">Técnica</th>
-              <th style="padding:9px 7px">Crecimiento</th>
-              <th style="padding:9px 7px">Fundamental</th>
-              <th style="padding:9px 7px">Oportunidad</th>
-              <th style="padding:9px 7px">Cobertura datos</th>
-              <th style="padding:9px 7px;text-align:left">Lectura</th>
+              <th style="padding:9px 7px;text-align:left">Qué revisar · datos · siguiente paso</th>
+              <th style="padding:9px 7px;text-align:left">Métodos independientes · puntuaciones de apoyo</th>
             </tr>
           </thead>
           <tbody>{table_rows}</tbody>
@@ -853,8 +1267,9 @@ def build_daily_overview_content(
       <p style="font-size:12px;color:#64748b;margin-top:22px">
         Son señales probabilísticas basadas en datos históricos. No constituyen
         asesoramiento financiero ni garantizan rentabilidad. Los datos N/D no se
-        convierten en una nota negativa.
+        convierten en una nota negativa. Este correo no ordena comprar, reducir
+        ni vender; toda decisión es manual y requiere validar la tesis y el horizonte.
       </p>
     </div>
     """
-    return subject, "\n".join(plain_lines), html_body
+    return subject, "\n".join(plain_lines), _html_document(subject, html_body)

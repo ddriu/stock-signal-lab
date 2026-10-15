@@ -104,8 +104,8 @@ def send_email(
     message["Subject"] = subject
     message["From"] = f"{resolved.sender_name} <{resolved.sender_email}>"
     message["To"] = recipient
-    message.set_content(plain_body)
-    message.add_alternative(html_body, subtype="html")
+    message.set_content(plain_body, charset="utf-8")
+    message.add_alternative(html_body, subtype="html", charset="utf-8")
 
     context = ssl.create_default_context()
     try:
@@ -117,12 +117,16 @@ def send_email(
                 timeout=30,
             ) as server:
                 server.login(resolved.username, resolved.password)
-                server.send_message(message)
+                refused = server.send_message(message)
+                if refused:
+                    raise EmailDeliveryError("El servidor SMTP rechazó el destinatario; no se confirma el envío.")
         else:
             with smtplib.SMTP(resolved.host, resolved.port, timeout=30) as server:
                 server.starttls(context=context)
                 server.login(resolved.username, resolved.password)
-                server.send_message(message)
+                refused = server.send_message(message)
+                if refused:
+                    raise EmailDeliveryError("El servidor SMTP rechazó el destinatario; no se confirma el envío.")
     except (OSError, smtplib.SMTPException) as exc:
         raise EmailDeliveryError(
             "No se pudo enviar el correo. Revisa la cuenta y su contraseña de aplicación."

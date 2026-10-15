@@ -9,6 +9,7 @@ de base de datos sólo para este estado. El marcador nunca ejecuta una venta:
 from __future__ import annotations
 
 from typing import Iterable, Mapping
+import json
 
 import pandas as pd
 
@@ -17,6 +18,53 @@ from src.portfolio_snapshot import latest_portfolio_snapshot
 
 
 THESIS_INVALIDATED_MARKER = "[[SSL_TESIS_INVALIDADA]]"
+POSITION_PLAN_MARKER = "[[SSL_POSITION_PLAN]]"
+
+
+def build_position_plan_update_rows(
+    snapshot: pd.DataFrame,
+    ticker: str,
+    *,
+    strategy: str,
+    horizon: str,
+    thesis: str,
+) -> pd.DataFrame:
+    """Prepara un plan explícito sin cambiar posiciones ni su tesis invalidada.
+
+    Sólo modifica comentarios en copias de las líneas del ticker. El llamador
+    debe guardar mediante una acción manual; nunca se infiere una estrategia
+    desde las puntuaciones, ni se elimina una invalidación ya declarada.
+    """
+
+    normalized = _ticker(ticker)
+    strategy, horizon, thesis = strategy.strip(), horizon.strip(), thesis.strip()
+    if not normalized or not strategy or not horizon:
+        raise ValueError("Indica posición, estrategia y horizonte.")
+    if len(strategy) > 100 or len(horizon) > 100:
+        raise ValueError("Estrategia y horizonte deben tener como máximo 100 caracteres.")
+    if len(thesis) < 10 or len(thesis) > 4000:
+        raise ValueError("Describe la tesis entre 10 y 4000 caracteres.")
+    latest, _ = latest_portfolio_snapshot(snapshot)
+    if latest.empty or "analysis_ticker" not in latest:
+        raise ValueError("No hay una fotografía de cartera disponible.")
+    matching = latest.loc[latest["analysis_ticker"].map(_ticker) == normalized].copy()
+    if matching.empty:
+        raise ValueError("La posición elegida ya no aparece en la cartera actual.")
+    marker = POSITION_PLAN_MARKER + " " + json.dumps(
+        {"strategy": strategy, "horizon": horizon, "thesis": thesis},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    comments = matching.get("comments", pd.Series("", index=matching.index))
+    def with_plan(comment: object) -> str:
+        original = "" if comment is None or pd.isna(comment) else str(comment)
+        preserved = "\n".join(
+            line for line in original.splitlines()
+            if not line.strip().startswith(POSITION_PLAN_MARKER)
+        ).rstrip()
+        return f"{preserved}\n{marker}" if preserved else marker
+    matching["comments"] = comments.map(with_plan)
+    return matching.reset_index(drop=True)
 
 
 def _ticker(value: object) -> str:
