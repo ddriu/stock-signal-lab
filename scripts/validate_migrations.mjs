@@ -234,3 +234,15 @@ try {
   process.stderr.write(`FAILED: ${error.message}\n`);
   process.exitCode = 1;
 } finally { await db.close(); }
+
+if (!process.exitCode) {
+  const { validateReconciledImport } = await import('./validate_reconciled_import.mjs');
+  try {
+    const checks = await validateReconciledImport(repo);
+    process.stdout.write(`RESULT: ${checks} reconciled-import PostgreSQL checks passed. No external database used.\n`);
+  }
+  catch (error) {
+    process.stderr.write(`FAILED: ${error.message}\n`);
+    process.exitCode = 1;
+  }
+}

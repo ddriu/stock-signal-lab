@@ -221,6 +221,14 @@ from src.portfolio_snapshot import (
 from src.portfolio_decisions import (
     build_portfolio_decision_rows,
 )
+from src.portfolio_overview_ui import render_portfolio_overview
+from src.reconciled_portfolio_loader import load_reconciled_portfolio
+from src.reconciled_portfolio_ui import (
+    render_reconciled_workbook_import,
+    render_reconciled_accounting_details,
+    render_position_review_table,
+)
+from src.position_review import build_position_review_rows
 from src.portfolio_rotation import (
     CANDIDATE_REJECTION_LABELS,
     HORIZON_POLICIES,
@@ -4103,7 +4111,10 @@ def render_private_investments(
             "No se pueden guardar posiciones hasta crear la tabla de cartera en Supabase."
         )
 
-    with st.expander("Importar una fotografía completa de mi cartera (.xlsx)"):
+    render_reconciled_workbook_import(
+        journal, actor_username=actor_username, key=f"{view_key}_reconciled",
+    )
+    with st.expander("Importar sólo una fotografía de cartera (.xlsx), sin historial"):
         st.caption(
             "Guarda las posiciones tal como aparecen en el archivo, sin inventar compras. "
             "Si faltan cantidades o el coste es estimado, la app lo indica. Volver a subir "
@@ -5933,6 +5944,11 @@ def render_admin_panel(
             usernames,
             format_func=lambda value: f"{accounts[value].display_name} ({value})",
             key="admin_snapshot_owner",
+        )
+        render_reconciled_workbook_import(
+            cached_journal(selected_import_owner),
+            actor_username=admin_username,
+            key=f"admin_{selected_import_owner}_reconciled",
         )
         snapshot_file = st.file_uploader(
             "Excel de cartera",
@@ -10042,6 +10058,8 @@ def render_home(
     group_favorites: pd.DataFrame,
     section: str = "Hoy",
 ) -> None:
+    stored_snapshots = pd.DataFrame()
+    reconciled_report = None
     latest_snapshot = pd.DataFrame()
     market_snapshot = pd.DataFrame()
     snapshot_summary = None
@@ -10057,6 +10075,9 @@ def render_home(
             st.warning(f"No se pudo leer la fotografía de cartera: {exc}")
 
     latest_prices, price_dates = recent_market_prices(prepared)
+    # Thesis/plan forms update comments on the persisted baseline only. Saving
+    # derived quantities/marks back to that date would replay later trades twice.
+    thesis_source_snapshot = latest_snapshot.copy(deep=True)
     market_snapshot = latest_snapshot.copy()
     market_summary = snapshot_summary
     if not market_snapshot.empty:
@@ -10146,22 +10167,50 @@ def render_home(
         private_kpis = None
         group_kpis = None
 
-    latest_snapshot = reconcile_current_portfolio(
-        latest_snapshot,
-        private_operations,
-        private_dashboard,
-    )
-    market_snapshot = reconcile_current_portfolio(
-        market_snapshot,
-        private_operations,
-        private_dashboard,
-    )
-    if not latest_snapshot.empty:
-        latest_snapshot, snapshot_summary = latest_portfolio_snapshot(latest_snapshot)
-    if not market_snapshot.empty:
-        market_snapshot, market_summary = latest_portfolio_snapshot(market_snapshot)
+    try:
+        reconciled_report = load_reconciled_portfolio(
+            journal, stored_snapshots, private_operations,
+            prepared=prepared, rates_per_eur=fx_snapshot.rates_per_eur,
+            reference_date=date.today(),
+            sector_by_ticker={
+                str(row.get("Ticker", "")): str(row["Sector"])
+                for row in summary
+                if row.get("Ticker") and row.get("Sector")
+                and str(row["Sector"]).casefold() not in {"sin clasificar", "unknown", "desconocido"}
+            },
+        )
+    except (JournalStorageError, ValueError, TypeError) as exc:
+        st.warning(f"La conciliación no está disponible; se muestra la vista anterior, no un total conciliado: {exc}")
+    if reconciled_report is not None:
+        # The reconciled ledger is anchored to the raw historical snapshot, not
+        # to the legacy account-aggregated reconciliation or inferred trades.
+        latest_snapshot = reconciled_report.positions.copy()
+        market_snapshot = reconciled_report.positions.copy()
+    else:
+        latest_snapshot = reconcile_current_portfolio(latest_snapshot, private_operations, private_dashboard)
+        market_snapshot = reconcile_current_portfolio(market_snapshot, private_operations, private_dashboard)
+        if not latest_snapshot.empty:
+            latest_snapshot, snapshot_summary = latest_portfolio_snapshot(latest_snapshot)
+        if not market_snapshot.empty:
+            market_snapshot, market_summary = latest_portfolio_snapshot(market_snapshot)
 
     if home_view == "Resumen":
+        if reconciled_report is not None:
+            if snapshot_summary is not None:
+                st.info(
+                    f"Última fotografía guardada: {snapshot_summary.value_eur:,.2f} € "
+                    f"en {snapshot_summary.platform_count} plataformas, a {snapshot_summary.snapshot_date}. "
+                    "Es una referencia histórica, no el saldo actual tras los movimientos posteriores."
+                )
+            valuation_dates = pd.to_datetime(
+                reconciled_report.positions.get("market_as_of", pd.Series(dtype=object)), errors="coerce",
+            ).dropna()
+            render_portfolio_overview(
+                reconciled_report,
+                snapshot_date=snapshot_summary.snapshot_date if snapshot_summary is not None else None,
+                valuation_date=valuation_dates.max().date().isoformat() if not valuation_dates.empty else None,
+            )
+            render_reconciled_accounting_details(reconciled_report)
         position_strategy_rows = _position_strategy_rows(latest_snapshot)
         if not position_strategy_rows.empty:
             with st.expander("Estrategia, horizonte y tesis de mis posiciones"):
@@ -10192,7 +10241,7 @@ def render_home(
         )
         summary = apply_thesis_invalidations(summary, latest_snapshot)
 
-    if home_view == "Resumen":
+    if home_view == "Resumen" and reconciled_report is None:
         display_summary, uses_market_estimate = preferred_portfolio_summary(
             snapshot_summary,
             market_summary,
@@ -10365,6 +10414,10 @@ def render_home(
             st.caption("Aún no hay una fotografía completa con partidas manuales.")
 
     if home_view == "Decisiones":
+        if reconciled_report is not None:
+            render_position_review_table(build_position_review_rows(
+                reconciled_report.positions, summary, prepared, reference_date=date.today(),
+            ))
         st.markdown("### Decisiones de cartera")
         st.caption(
             "Primero protege las posiciones actuales; después compara sólo alternativas "
@@ -10440,7 +10493,7 @@ def render_home(
         _render_rotation_dashboard(rotation_dashboard, candidate_diagnostic)
         _render_thesis_override(
             journal,
-            latest_snapshot,
+            thesis_source_snapshot,
             held_tickers,
             actor_username=user.username,
         )

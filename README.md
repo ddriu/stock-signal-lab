@@ -57,6 +57,44 @@ La instalación local solicita las credenciales guardadas en
 └── tests/                    # Pruebas unitarias sin red
 ```
 
+## Cartera conciliada e historial privado
+
+En **Carteras → Privada → Importar cartera conciliada e historial** se puede
+previsualizar un libro compatible antes de confirmar su guardado. La hoja
+`Cartera` es una fotografía histórica, no una compra. Las hojas de operaciones
+aportan el diario; los resúmenes, referencias y controles FIFO no vuelven a
+registrarse como operaciones. Los movimientos posteriores actualizan las
+cantidades por plataforma sin sumar de nuevo el saldo inicial.
+
+El guardado es aditivo, transaccional e idempotente. Conserva una copia privada
+de los registros anteriores y deja los conflictos pendientes, sin sustituir
+operaciones manuales. Los archivos originales, bases privadas y copias de
+seguridad nunca deben añadirse al repositorio. La copia está en el almacenamiento
+privado del usuario; su lectura no forma parte de la carga habitual de Inicio.
+
+Para una instalación existente de Supabase, aplicar primero
+`supabase/migrations/20261015192038_reconciled_portfolio_import.sql`.
+El RPC sólo está disponible para el servidor con `service_role`; no se expone a
+roles anónimos o autenticados. Una instalación nueva puede usar `supabase/schema.sql`.
+SQLite prepara su esquema local al abrir el diario.
+
+**Inicio → Resumen** muestra patrimonio, efectivo, ilíquidos, resultados,
+distribuciones y fechas, con detalle mensual/anual y FIFO. Las cifras sin
+cobertura suficiente quedan `N/D`, con sus subtotales documentados. El cambio
+actual sólo valora las posiciones: no reconstruye liquidaciones históricas.
+Sin aportaciones y valoraciones completas no se publica una rentabilidad global
+ni se dibuja una curva inventada a partir de compras y ventas.
+
+**Inicio → Decisiones** separa la revisión de la posición de la candidatura de
+entrada. Las propuestas de peso y capacidad son límites de concentración, no
+dinero disponible ni órdenes. Los enfoques de crecimiento/momentum y comparación
+de estrategias permanecen independientes; no se fusionan notas.
+
+Las pruebas de importación usan exclusivamente datos sintéticos. El validador
+`node scripts/validate_migrations.mjs /ruta/al/repositorio` incluye el RPC
+conciliado sobre PostgreSQL en memoria y comprueba permisos, conflictos,
+idempotencia y rollback sin acceder a una base externa.
+
 ## Reglas y score
 
 El radar conserva separadas cinco puntuaciones y añade un resumen:

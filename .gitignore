@@ -13,4 +13,16 @@ dist_installer/
 data/*.db
 data/*.db-*
 data/private-backups/
+# Private financial source files and reconciliation backups are never public.
+*.xlsx
+*.xls
+*.xlsm
+*.ods
+*.sqlite
+*.sqlite3
+private/
+data/imports/
+data/backups/
+data/reconciled-*.json
+data/reconciled-*.csv
 .DS_Store

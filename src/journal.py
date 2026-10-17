@@ -75,6 +75,8 @@ OPERATION_COLUMNS = [
     "price",
     "fees",
     "settlement_amount_eur",
+    "settlement_amount_local",
+    "source_event_id",
     "fee_eur",
     "fx_rate_to_eur",
     "executed_at",
@@ -521,6 +523,8 @@ def normalize_operation(
     settlement_amount_eur: float | None = None,
     fee_eur: float | None = None,
     fx_rate_to_eur: float | None = None,
+    settlement_amount_local: float | None = None,
+    source_event_id: str | None = None,
 ) -> dict[str, object]:
     """Valida una operación y devuelve valores normalizados para cualquier backend."""
 
@@ -557,17 +561,23 @@ def normalize_operation(
     if normalized_fx is not None and (not math.isfinite(normalized_fx) or normalized_fx <= 0):
         raise ValueError("El tipo de cambio a euros debe ser positivo.")
 
-    local_settlement = (
+    computed_settlement = (
         float(quantity) * float(price) + float(fees)
         if side == "Compra"
         else float(quantity) * float(price) - float(fees)
     )
-    if local_settlement <= 0:
+    local_settlement = float(settlement_amount_local) if settlement_amount_local is not None and pd.notna(settlement_amount_local) else computed_settlement
+    if not math.isfinite(local_settlement) or local_settlement <= 0:
         raise ValueError("La liquidación de la operación debe ser positiva.")
+    normalized_source_id = str(source_event_id).strip() if source_event_id is not None and pd.notna(source_event_id) else None
+    if normalized_source_id and len(normalized_source_id) > 200:
+        raise ValueError("La identidad de origen de la operación es demasiado larga.")
     if normalized_currency == "EUR":
         normalized_settlement = normalized_settlement or local_settlement
         normalized_fee_eur = (
-            float(fees) if normalized_fee_eur is None else normalized_fee_eur
+            float(fees) if normalized_fee_eur is None and
+            _import_operation_metadata({"notes": notes}).get("fee_quality") != "unknown"
+            else normalized_fee_eur
         )
         normalized_fx = 1.0
     elif normalized_settlement is None and normalized_fx is not None:
@@ -583,6 +593,8 @@ def normalize_operation(
         "price": float(price),
         "fees": float(fees),
         "settlement_amount_eur": normalized_settlement,
+        "settlement_amount_local": local_settlement if settlement_amount_local is not None and pd.notna(settlement_amount_local) else None,
+        "source_event_id": normalized_source_id or None,
         "fee_eur": normalized_fee_eur,
         "fx_rate_to_eur": normalized_fx,
         "executed_at": pd.Timestamp(executed_at).isoformat(),
@@ -946,6 +958,39 @@ def normalize_portfolio_snapshot_position(
     }
 
 
+def _import_operation_metadata(operation: object) -> dict[str, object]:
+    marker = "[reconciled-workbook:v1]"
+    notes = str((operation.get("notes", "") if isinstance(operation, Mapping) else getattr(operation, "notes", "")) or "")
+    if not notes.startswith(marker):
+        return {}
+    try:
+        metadata = json.loads(notes.removeprefix(marker))
+    except (TypeError, ValueError):
+        return {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def operation_settlement_local(operation: object) -> float | None:
+    """Prefiere el efectivo nativo documentado; no deduce una comisión del residuo."""
+    recorded = pd.to_numeric(getattr(operation, "settlement_amount_local", None), errors="coerce")
+    if pd.notna(recorded) and math.isfinite(float(recorded)) and recorded > 0:
+        return float(recorded)
+    currency = str(getattr(operation, "currency", "EUR") or "EUR").upper()
+    eur = pd.to_numeric(getattr(operation, "settlement_amount_eur", None), errors="coerce")
+    if currency == "EUR" and pd.notna(eur) and math.isfinite(float(eur)) and eur > 0:
+        return float(eur)
+    if _import_operation_metadata(operation).get("fee_quality") == "unknown":
+        return None
+    quantity = pd.to_numeric(getattr(operation, "quantity", None), errors="coerce")
+    price = pd.to_numeric(getattr(operation, "price", None), errors="coerce")
+    fee = pd.to_numeric(getattr(operation, "fees", None), errors="coerce")
+    if any(pd.isna(value) for value in (quantity, price, fee)):
+        return None
+    side = str(getattr(operation, "side", ""))
+    local = float(quantity * price + fee if side == "Compra" else quantity * price - fee)
+    return local if side in {"Compra", "Venta"} and math.isfinite(local) and local > 0 else None
+
+
 def operation_settlement_eur(
     operation: object,
     rates_per_eur: dict[str, float] | None = None,
@@ -957,15 +1002,9 @@ def operation_settlement_eur(
     recorded = pd.to_numeric(getattr(operation, "settlement_amount_eur", None), errors="coerce")
     if pd.notna(recorded) and math.isfinite(float(recorded)) and recorded > 0:
         return float(recorded), "Liquidación del bróker"
-    quantity = pd.to_numeric(getattr(operation, "quantity", None), errors="coerce")
-    price = pd.to_numeric(getattr(operation, "price", None), errors="coerce")
-    fee = pd.to_numeric(getattr(operation, "fees", 0), errors="coerce")
-    if pd.isna(quantity) or pd.isna(price) or quantity <= 0 or price <= 0:
-        return None, "Estimación incompleta"
-    fee = float(fee) if pd.notna(fee) else 0.0
+    local = operation_settlement_local(operation)
     side = str(getattr(operation, "side", ""))
-    local = float(quantity) * float(price) + fee if side == "Compra" else float(quantity) * float(price) - fee
-    if side not in {"Compra", "Venta"} or not math.isfinite(local) or local <= 0:
+    if local is None:
         return None, "Estimación incompleta"
     currency = str(getattr(operation, "currency", "EUR") or "EUR").upper()
     fx = pd.to_numeric(getattr(operation, "fx_rate_to_eur", None), errors="coerce")
@@ -973,6 +1012,8 @@ def operation_settlement_eur(
         return local * float(fx), "Estimación con cambio registrado"
     if currency == "EUR":
         return local, "Importe en EUR calculado"
+    if _import_operation_metadata(operation):
+        return None, "Cambio histórico no documentado"
     try:
         converted = float(convert_currency(local, currency, "EUR", rates_per_eur or {}))
     except (TypeError, ValueError):
@@ -984,6 +1025,8 @@ def operation_settlement_eur(
 def operation_fee_eur(
     operation: object, rates_per_eur: dict[str, float] | None = None
 ) -> float | None:
+    if _import_operation_metadata(operation).get("fee_quality") == "unknown":
+        return None
     recorded = pd.to_numeric(getattr(operation, "fee_eur", None), errors="coerce")
     if pd.notna(recorded) and math.isfinite(float(recorded)):
         return float(recorded)
@@ -1082,19 +1125,23 @@ def calculate_position_states(
         quantity = float(operation.quantity)
         price = float(operation.price)
         fee = float(operation.fees)
+        native_settlement = operation_settlement_local(operation)
         settlement_eur, source = operation_settlement_eur(operation, rates_per_eur)
         fee_eur = operation_fee_eur(operation, rates_per_eur)
-        state["paid_fees"] = float(state["paid_fees"]) + fee
+        if _import_operation_metadata(operation).get("fee_quality") == "unknown":
+            state["paid_fees"] = None
+        elif state["paid_fees"] is not None:
+            state["paid_fees"] = float(state["paid_fees"]) + fee
         if pd.isna(fee_eur):
             state["paid_fees_eur"] = None
         elif state["paid_fees_eur"] is not None:
             state["paid_fees_eur"] = float(state["paid_fees_eur"]) + float(fee_eur)
         if operation.side == "Compra":
             state["quantity"] = float(state["quantity"]) + quantity
-            native_cost = settlement_eur if currency == "EUR" and settlement_eur is not None else quantity * price + fee
+            native_cost = native_settlement
             state["lots"].append({"quantity": quantity, "cost_basis": native_cost,
                                   "cost_basis_eur": settlement_eur, "source": source})
-            state["cost_basis"] = sum(float(lot["cost_basis"]) for lot in state["lots"])
+            state["cost_basis"] = sum(float(lot["cost_basis"]) for lot in state["lots"]) if all(lot["cost_basis"] is not None for lot in state["lots"]) else None
             state["cost_basis_eur"] = (
                 sum(float(lot["cost_basis_eur"]) for lot in state["lots"])
                 if all(lot["cost_basis_eur"] is not None for lot in state["lots"])
@@ -1106,18 +1153,13 @@ def calculate_position_states(
         sold = min(quantity, available)
         if sold <= 0:
             continue
-        allocated_fee = fee * (sold / quantity)
-        proceeds = (
-            settlement_eur * sold / quantity
-            if currency == "EUR" and settlement_eur is not None
-            else sold * price - allocated_fee
-        )
+        proceeds = native_settlement * sold / quantity if native_settlement is not None else None
         removed, _ = consume_fifo_lots(
             state["lots"], sold, cost_fields=("cost_basis", "cost_basis_eur")
         )
-        removed_cost = float(removed["cost_basis"])
+        removed_cost = removed["cost_basis"]
         removed_cost_eur = removed["cost_basis_eur"]
-        state["realized_pnl"] = float(state["realized_pnl"]) + proceeds - removed_cost
+        state["realized_pnl"] = float(state["realized_pnl"]) + proceeds - removed_cost if state["realized_pnl"] is not None and proceeds is not None and removed_cost is not None else None
         if (
             removed_cost_eur is None
             or pd.isna(settlement_eur)
@@ -1129,7 +1171,7 @@ def calculate_position_states(
                 settlement_eur * sold / quantity
             ) - removed_cost_eur
         state["quantity"] = available - sold
-        state["cost_basis"] = sum(float(lot["cost_basis"]) for lot in state["lots"])
+        state["cost_basis"] = sum(float(lot["cost_basis"]) for lot in state["lots"]) if all(lot["cost_basis"] is not None for lot in state["lots"]) else None
         state["cost_basis_eur"] = (
             sum(float(lot["cost_basis_eur"]) for lot in state["lots"])
             if all(lot["cost_basis_eur"] is not None for lot in state["lots"])
@@ -1141,7 +1183,7 @@ def calculate_position_states(
         quantity = float(state["quantity"])
         if not include_closed and quantity <= 1e-9:
             continue
-        cost_basis = float(state["cost_basis"])
+        cost_basis = float(state["cost_basis"]) if state["cost_basis"] is not None else float("nan")
         rows.append(
             {
                 **state,
@@ -1207,6 +1249,8 @@ class TradingJournal:
                     price REAL NOT NULL CHECK (price > 0),
                     fees REAL NOT NULL DEFAULT 0 CHECK (fees >= 0),
                     settlement_amount_eur REAL,
+                    settlement_amount_local REAL,
+                    source_event_id TEXT,
                     fee_eur REAL,
                     fx_rate_to_eur REAL,
                     executed_at TEXT NOT NULL,
@@ -1232,6 +1276,8 @@ class TradingJournal:
             for column, definition in (
                 ("account_name", "TEXT NOT NULL DEFAULT ''"),
                 ("settlement_amount_eur", "REAL"),
+                ("settlement_amount_local", "REAL"),
+                ("source_event_id", "TEXT"),
                 ("fee_eur", "REAL"),
                 ("fx_rate_to_eur", "REAL"),
             ):
@@ -1239,6 +1285,13 @@ class TradingJournal:
                     connection.execute(
                         f"ALTER TABLE operations ADD COLUMN {column} {definition}"
                     )
+            connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS operations_source_event_id_idx ON operations(source_event_id) WHERE source_event_id IS NOT NULL AND source_event_id <> ''")
+            connection.execute("""CREATE TABLE IF NOT EXISTS portfolio_import_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL,
+                source_sha256 TEXT NOT NULL, snapshot_date TEXT NOT NULL,
+                metadata TEXT NOT NULL, backup TEXT NOT NULL, summary TEXT NOT NULL,
+                recorded_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+                UNIQUE(owner, source_sha256))""")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS favorites (
@@ -1752,6 +1805,8 @@ class TradingJournal:
         settlement_amount_eur: float | None = None,
         fee_eur: float | None = None,
         fx_rate_to_eur: float | None = None,
+        settlement_amount_local: float | None = None,
+        source_event_id: str | None = None,
     ) -> int:
         operation = normalize_operation(
             ticker,
@@ -1766,6 +1821,8 @@ class TradingJournal:
             settlement_amount_eur,
             fee_eur,
             fx_rate_to_eur,
+            settlement_amount_local,
+            source_event_id,
         )
         if side == "Venta":
             positions = self.open_positions()
@@ -1784,9 +1841,10 @@ class TradingJournal:
                     (
                         ticker, account_name, side, quantity, price, fees,
                         settlement_amount_eur, fee_eur, fx_rate_to_eur,
+                        settlement_amount_local, source_event_id,
                         executed_at, notes, currency, recorded_by, created_at
                     )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     operation["ticker"],
@@ -1798,6 +1856,8 @@ class TradingJournal:
                     operation["settlement_amount_eur"],
                     operation["fee_eur"],
                     operation["fx_rate_to_eur"],
+                    operation["settlement_amount_local"],
+                    operation["source_event_id"],
                     operation["executed_at"],
                     operation["notes"],
                     operation["currency"],
@@ -1862,6 +1922,16 @@ class TradingJournal:
             return pd.read_sql_query(
                 "SELECT * FROM operations ORDER BY executed_at DESC, id DESC", connection
             )
+
+    def import_reconciled_portfolio(self, bundle: Mapping[str, object], *, recorded_by: str = "") -> dict[str, object]:
+        from src.reconciled_workbook_store import store_reconciled_bundle_sqlite
+        return store_reconciled_bundle_sqlite(self, bundle, recorded_by=recorded_by)
+
+    def list_portfolio_imports(self, *, include_backup: bool = False) -> pd.DataFrame:
+        from src.reconciled_workbook_store import IMPORT_BATCH_COLUMNS
+        columns = [column for column in IMPORT_BATCH_COLUMNS if include_backup or column != "backup"]
+        with self._connect() as connection:
+            return pd.read_sql_query(f"SELECT {','.join(columns)} FROM portfolio_import_batches WHERE owner=? ORDER BY created_at DESC,id DESC", connection, params=(self.owner,))
 
     def delete_operation(self, operation_id: int) -> None:
         with self._connect() as connection:
