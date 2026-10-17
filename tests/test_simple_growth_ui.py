@@ -35,13 +35,16 @@ def frame(end=recent):
 '''
 
 
-def _overview(*, unverified: bool = False, empty: bool = False) -> AppTest:
+def _overview(*, unverified: bool = False, empty: bool = False, previous_group: str = "") -> AppTest:
     script = SETUP + f'''
 results = {{}} if {empty!r} else {{"NEW": result("NEW"), "HELD": result("HELD"),
+    "CAND": result("CAND", label="Entrada candidata", score=76, momentum_score=70, context_score=45),
     "WAIT": result("WAIT", label="Esperar mejor precio"),
     "OLD": result("OLD", as_of=recent-pd.Timedelta(days=30))}}
+if {previous_group!r} and "growth_action_group" not in st.session_state:
+    st.session_state["growth_action_group"] = {previous_group!r}
 app.render_growth_candidate_overview(results, held_tickers=["HELD"] if not {empty!r} else [],
-    universe=[] if {empty!r} else ["NEW", "HELD", "WAIT", "OLD", "IPO"],
+    universe=[] if {empty!r} else ["NEW", "HELD", "CAND", "WAIT", "OLD", "IPO"],
     names={{"NEW": "Nueva empresa", "HELD": "Empresa actual"}}, currencies={{"NEW": "EUR"}},
     portfolio_snapshot=pd.DataFrame([dict(snapshot_date="2026-09-13",
         analysis_ticker="HELD", value_eur=100, asset_type="Acción")]),
@@ -91,13 +94,14 @@ with patch.object(app, "evaluate_growth_momentum", side_effect=lambda **kw: resu
     return AppTest.from_string(script, default_timeout=30).run()
 
 
-def test_one_table_has_three_filters_and_six_visible_columns() -> None:
+def test_one_table_starts_with_holdings_then_strong_candidates_and_waiting() -> None:
     page = _overview()
     assert not page.exception
-    assert page.radio[0].options == ["Nuevas entradas · 1", "Mi cartera · 1", "Esperar · 3"]
-    assert page.dataframe[0].value["Empresa"].tolist() == ["Nueva empresa · NEW"]
+    assert page.radio[0].options == ["Mi cartera · 1", "Entradas fuertes · 1", "Candidatas · 1", "Esperar · 3"]
+    assert page.radio[0].value == "Mi cartera"
+    assert page.dataframe[0].value["Empresa"].tolist() == ["Empresa actual · HELD"]
     assert list(page.dataframe[0].value.columns) == [
-        "Ticker", "Empresa", "En cartera / peso", "Qué revisar",
+        "Ticker", "Empresa", "En cartera / peso", "Señal de entrada", "Qué revisar",
         "Entrada / stop orientativos", "Motivo", "Actualizado",
     ]
     assert json.loads(page.dataframe[0].proto.columns)["Ticker"]["hidden"]
@@ -117,16 +121,17 @@ def test_filters_separate_existing_positions_and_keep_missing_favorites() -> Non
     waiting = page.dataframe[0].value.set_index("Ticker")
     assert set(waiting.index) == {"WAIT", "OLD", "IPO"}
     assert waiting.loc["OLD", "Entrada / stop orientativos"] == "Pendiente de datos"
+    assert waiting.loc["OLD", "Señal de entrada"] == "Pendiente de datos recientes"
     assert waiting.loc["IPO", "Actualizado"] == "N/D"
 
 
 def test_filter_tables_have_distinct_widget_identities() -> None:
     page = _overview()
     first_id = page.dataframe[0].proto.id
-    page.radio(key="growth_action_group").set_value("Mi cartera").run()
+    page.radio(key="growth_action_group").set_value("Entradas fuertes").run()
     assert not page.exception
     assert first_id != page.dataframe[0].proto.id
-    page.radio(key="growth_action_group").set_value("Nuevas entradas").run()
+    page.radio(key="growth_action_group").set_value("Mi cartera").run()
     assert not page.exception
     assert page.dataframe[0].proto.id == first_id
 
@@ -134,7 +139,7 @@ def test_filter_tables_have_distinct_widget_identities() -> None:
 def test_unverified_holdings_are_not_reported_as_empty_or_new_entries() -> None:
     page = _overview(unverified=True)
     assert not page.exception
-    assert page.radio[0].options == ["Nuevas entradas · 0", "Mi cartera · 1", "Esperar · 4"]
+    assert page.radio[0].options == ["Mi cartera · 1", "Entradas fuertes · 0", "Candidatas · 0", "Esperar · 5"]
     page.radio(key="growth_action_group").set_value("Esperar").run()
     rows = page.dataframe[0].value
     assert set(rows["En cartera / peso"]) == {"N/D"}
@@ -189,9 +194,37 @@ def test_sidebar_companies_remain_visible_without_favorites_when_holdings_exist(
     page = _page(manual=True)
     assert not page.exception
     assert page.radio(key="growth_action_group").options == [
-        "Nuevas entradas · 1", "Mi cartera · 1", "Esperar · 0",
+        "Mi cartera · 1", "Entradas fuertes · 1", "Candidatas · 0", "Esperar · 0",
     ]
-    assert page.dataframe[0].value["Ticker"].tolist() == ["MANUAL"]
+    assert page.dataframe[0].value["Ticker"].tolist() == ["TEST"]
+
+
+def test_strong_and_candidate_entries_have_separate_lists_and_visible_readings() -> None:
+    page = _overview()
+    page.radio(key="growth_action_group").set_value("Entradas fuertes").run()
+    assert not page.exception
+    assert page.dataframe[0].value["Ticker"].tolist() == ["NEW"]
+    assert page.dataframe[0].value["Señal de entrada"].tolist() == ["Entrada fuerte"]
+    page.radio(key="growth_action_group").set_value("Candidatas").run()
+    assert not page.exception
+    assert page.dataframe[0].value["Ticker"].tolist() == ["CAND"]
+    assert page.dataframe[0].value["Señal de entrada"].tolist() == ["Entrada candidata"]
+
+
+def test_legacy_new_entries_selection_moves_to_holdings_before_widget_creation() -> None:
+    page = _overview(previous_group="Nuevas entradas")
+    assert not page.exception
+    assert page.radio(key="growth_action_group").value == "Mi cartera"
+    assert page.dataframe[0].value["Ticker"].tolist() == ["HELD"]
+
+
+def test_explicit_current_filter_choice_is_preserved_on_rerun() -> None:
+    page = _overview(previous_group="Candidatas")
+    assert not page.exception
+    assert page.radio(key="growth_action_group").value == "Candidatas"
+    page.run()
+    assert not page.exception
+    assert page.radio(key="growth_action_group").value == "Candidatas"
 
 
 def test_strict_holdings_lookup_exposes_storage_failure_without_breaking_legacy_default() -> None:

@@ -100,7 +100,7 @@ from src.growth_momentum import (
     next_growth_analysis_batch,
     quote_price_to_eur,
 )
-from src.growth_candidates import build_growth_candidate_rows
+from src.growth_candidates import GROWTH_CANDIDATE_GROUPS, build_growth_candidate_rows
 from src.email_sender import (
     EmailConfigurationError,
     EmailDeliveryError,
@@ -12765,11 +12765,11 @@ def render_growth_candidate_overview(
                 row["Grupo"] = "Esperar"
                 row["Qué revisar"] = "Verificar cartera antes de considerar una entrada"
                 row["Entrada / stop orientativos"] = "Pendiente de verificar cartera"
-    groups = ["Nuevas entradas", "Mi cartera", "Esperar"]
+    groups = list(GROWTH_CANDIDATE_GROUPS)
     grouped = {group: [row for row in rows if row["Grupo"] == group] for group in groups}
     if st.session_state.get("growth_action_group") not in groups:
         st.session_state["growth_action_group"] = next(
-            (group for group in groups if grouped[group]), "Nuevas entradas"
+            (group for group in groups if grouped[group]), "Mi cartera"
         )
     st.markdown("### Qué merece revisión")
     active = st.radio(
@@ -12781,9 +12781,11 @@ def render_growth_candidate_overview(
         label_visibility="collapsed",
     )
     st.caption(
-        "Nuevas entradas: candidatas que no figuran en tu cartera. Mi cartera: "
-        "gestionar la tesis o revisar una posible ampliación, nunca comprar más "
-        "automáticamente. Esperar: precio, señal o datos aún pendientes."
+        "Primero, Mi cartera: gestionar lo que ya tienes y revisar posibles ampliaciones. "
+        "Después, Entradas fuertes: nuevas oportunidades con la señal más exigente de "
+        "crecimiento y momentum; Candidatas: pasan el nivel inicial, pero no el fuerte. "
+        "Esperar: precio, señal o datos pendientes. «Fuerte» no significa que la acción "
+        "esté barata ni que debas comprarla: confirma precio, costes, peso y riesgo."
     )
     visible_rows = []
     for row in grouped[active]:
@@ -12798,6 +12800,9 @@ def render_growth_candidate_overview(
             "Ticker": row["Ticker"],
             "Empresa": row["Empresa"],
             "En cartera / peso": holding,
+            "Señal de entrada": (
+                row["Lectura principal"] if row["Datos completos"] else "Pendiente de datos recientes"
+            ),
             "Qué revisar": row["Qué revisar"],
             "Entrada / stop orientativos": row["Entrada / stop orientativos"],
             "Motivo": row["Motivo"],
@@ -12807,12 +12812,16 @@ def render_growth_candidate_overview(
     if visible_rows:
         selection = render_ticker_dataframe(
             pd.DataFrame(visible_rows),
-            key=f"growth_action_table_{groups.index(active)}",
+            key="growth_action_table_" + {
+                "Mi cartera": "portfolio", "Entradas fuertes": "strong",
+                "Candidatas": "candidates", "Esperar": "waiting",
+            }[active],
             height=min(460, 85 + 48 * len(visible_rows)),
             column_config={
                 "Ticker": None,
                 "Empresa": st.column_config.TextColumn(width="medium"),
                 "En cartera / peso": st.column_config.TextColumn(width="small"),
+                "Señal de entrada": st.column_config.TextColumn(width="small"),
                 "Qué revisar": st.column_config.TextColumn(width="medium"),
                 "Entrada / stop orientativos": st.column_config.TextColumn(width="medium"),
                 "Motivo": st.column_config.TextColumn(width="large"),

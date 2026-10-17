@@ -398,8 +398,12 @@ validación. El contraste de calidad/valoración/tesis/riesgo permanece independ
 El contexto cíclico y estacional no genera entradas por calendario: sin evidencia se
 declara no validado. No se promete rentabilidad ni probabilidad de éxito desde un score.
 
-La vista principal tiene una sola tabla con tres filtros: **Nuevas entradas**, **Mi
-cartera** y **Esperar**. Muestra empresa, peso guardado, qué revisar, referencia de
+La vista principal tiene una sola tabla con cuatro filtros, en este orden: **Mi
+cartera**, **Entradas fuertes**, **Candidatas** y **Esperar**. Abre primero las posiciones
+existentes cuando las hay; las nuevas entradas fuertes y candidatas se mantienen
+separadas. «Entrada fuerte» es el nivel más exigente de crecimiento/momentum, no
+una afirmación de precio barato ni una orden de compra. Muestra empresa, peso
+guardado, señal de entrada, qué revisar, referencia de
 cierre/stop teórico, motivo y fecha. Los pesos indican la fecha de la fotografía y
 no simulan una sincronización con el bróker. Una señal de entrada insuficiente no
 ordena vender lo que ya se tiene; una cartera sin verificar tampoco se interpreta
