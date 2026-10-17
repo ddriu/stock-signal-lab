@@ -17,7 +17,7 @@ from src.instruments import resolve_analysis_ticker
 from src.market_data_quality import quote_freshness
 
 
-GROWTH_CANDIDATE_GROUPS = ("Nuevas entradas", "Mi cartera", "Esperar")
+GROWTH_CANDIDATE_GROUPS = ("Mi cartera", "Entradas fuertes", "Candidatas", "Esperar")
 _ENTRY_LABELS = frozenset({"Entrada fuerte", "Entrada candidata"})
 _MISSING_TEXT = frozenset({"", "nan", "nat", "none", "<na>"})
 _NONQUOTED_TERMS = (
@@ -257,6 +257,8 @@ def build_growth_candidate_rows(
     última fotografía; una posición sin valor comprobable mantiene peso ``None``.
     Si se aporta ``prepared``, también se comprueba el último cierre/histórico.
     Todos los objetos de entrada se conservan sin mutaciones y no hay descargas.
+    La cartera precede a las entradas fuertes y éstas a las candidatas; dentro
+    de cada nivel de entrada sólo se ordena por la nota principal existente.
     """
 
     growth = _normalized_mapping(results)
@@ -291,7 +293,12 @@ def build_growth_candidate_rows(
         )
         in_portfolio = ticker in held
         invalidation = invalidations.get(ticker) if in_portfolio else None
-        group = "Mi cartera" if in_portfolio else "Nuevas entradas" if candidate else "Esperar"
+        if in_portfolio:
+            group = "Mi cartera"
+        elif candidate and not invalidation:
+            group = "Entradas fuertes" if reading == "Entrada fuerte" else "Candidatas"
+        else:
+            group = "Esperar"
         reason = _factor(result, "positive_factors") if candidate else _factor(result, "risk_factors")
         if invalidation:
             state = "Revisión prioritaria de tesis"
@@ -347,4 +354,14 @@ def build_growth_candidate_rows(
             "Datos completos": complete, "Lectura principal": _text(_read(result, "label")),
             "Nota principal": _score(_read(result, "score")), "Moneda": currency or None,
         })
-    return rows
+    group_order = {group: index for index, group in enumerate(GROWTH_CANDIDATE_GROUPS)}
+
+    def sort_key(row: dict[str, object]) -> tuple[int, int, float]:
+        group = str(row["Grupo"])
+        thesis_priority = int(group == "Mi cartera" and row["Estado"] != "Revisión prioritaria de tesis")
+        score = row["Nota principal"] if group in {"Entradas fuertes", "Candidatas"} else None
+        # El orden estable conserva la prioridad previa de la cartera, salvo
+        # las invalidaciones declaradas que requieren revisión primero.
+        return group_order[group], thesis_priority, -float(score) if score is not None else 0.0
+
+    return sorted(rows, key=sort_key)
