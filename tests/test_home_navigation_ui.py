@@ -103,3 +103,24 @@ def test_access_panel_does_not_compute_hidden_decisions_or_lab() -> None:
     assert "VISIBLE_LAB_ONLY" not in _text(app)
     assert "VISIBLE_DECISIONS_ONLY" not in _text(app)
     assert any(button.label == "Abrir análisis" for button in app.button)
+
+
+def test_reconciled_overview_replaces_legacy_totals_without_hidden_calculations() -> None:
+    report = '''
+    report = SimpleNamespace(
+        positions=pd.DataFrame(columns=['platform','asset_name','analysis_ticker','value_eur','liquidity_class']),
+        metrics_global={'value_eur':1000.,'value_complete':True},
+        metrics_by_platform=pd.DataFrame(),metrics_by_asset=pd.DataFrame(),
+        realized_trades=pd.DataFrame(),cash_flows=pd.DataFrame(),
+        monthly=pd.DataFrame(),annual=pd.DataFrame(),issues=(),
+    )
+    patches.enter_context(patch.object(application,'load_reconciled_portfolio',return_value=report))
+'''
+    script = HOME_SCRIPT.replace('    application.render_home(', report + '\n    application.render_home(')
+    app = AppTest.from_string(script, default_timeout=30).run()
+    assert not app.exception
+    assert not app.error
+    assert any(metric.label == 'Patrimonio financiero' for metric in app.metric)
+    assert 'Valor de mi cartera' not in _text(app)
+    assert 'VISIBLE_LAB_ONLY' not in _text(app)
+    assert 'VISIBLE_DECISIONS_ONLY' not in _text(app)

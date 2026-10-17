@@ -67,6 +67,8 @@ LEGACY_OPERATION_COLUMNS = [
     not in {
         "account_name",
         "settlement_amount_eur",
+        "settlement_amount_local",
+        "source_event_id",
         "fee_eur",
         "fx_rate_to_eur",
     }
@@ -77,6 +79,8 @@ RECONCILIATION_COLUMNS = {
     "settlement_amount_eur",
     "fee_eur",
     "fx_rate_to_eur",
+    "settlement_amount_local",
+    "source_event_id",
 }
 EXTENDED_ALERT_STATE_COLUMNS = set(ALERT_STATE_COLUMNS[9:])
 LEGACY_ANALYSIS_SNAPSHOT_COLUMNS = [
@@ -592,6 +596,8 @@ class SupabaseTradingJournal:
         settlement_amount_eur: float | None = None,
         fee_eur: float | None = None,
         fx_rate_to_eur: float | None = None,
+        settlement_amount_local: float | None = None,
+        source_event_id: str | None = None,
     ) -> int:
         operation = normalize_operation(
             ticker,
@@ -606,6 +612,8 @@ class SupabaseTradingJournal:
             settlement_amount_eur,
             fee_eur,
             fx_rate_to_eur,
+            settlement_amount_local,
+            source_event_id,
         )
         if side == "Venta":
             positions = self.open_positions()
@@ -622,6 +630,9 @@ class SupabaseTradingJournal:
             **operation,
             "recorded_by": recorded_by.strip().lower(),
         }
+        for optional in ("settlement_amount_local", "source_event_id"):
+            if payload[optional] is None:
+                payload.pop(optional)
         try:
             response = self._request(
                 "POST",
@@ -723,11 +734,18 @@ class SupabaseTradingJournal:
         try:
             rows = self._list_rows(params=params)
         except JournalStorageError as exc:
-            if not self._is_missing_columns_error(exc, RECONCILIATION_COLUMNS):
+            if self._is_missing_columns_error(exc, {"settlement_amount_local", "source_event_id"}):
+                previous_columns = [column for column in OPERATION_COLUMNS if column not in {"settlement_amount_local", "source_event_id"}]
+                try:
+                    rows = self._list_rows(params={**params, "select": ",".join(previous_columns)})
+                except JournalStorageError as older:
+                    if not self._is_missing_columns_error(older, RECONCILIATION_COLUMNS):
+                        raise
+                    rows = self._list_rows(params={**params, "select": ",".join(LEGACY_OPERATION_COLUMNS)})
+            elif not self._is_missing_columns_error(exc, RECONCILIATION_COLUMNS):
                 raise
-            rows = self._list_rows(
-                params={**params, "select": ",".join(LEGACY_OPERATION_COLUMNS)},
-            )
+            else:
+                rows = self._list_rows(params={**params, "select": ",".join(LEGACY_OPERATION_COLUMNS)})
         if not isinstance(rows, list):
             raise JournalStorageError("Supabase devolvió un histórico inválido.")
         if not rows:
@@ -737,6 +755,31 @@ class SupabaseTradingJournal:
             if column not in frame.columns:
                 frame[column] = None
         return frame.loc[:, OPERATION_COLUMNS]
+
+    def import_reconciled_portfolio(self, bundle: dict[str, object], *, recorded_by: str = "") -> dict[str, object]:
+        from src.reconciled_workbook_store import normalize_reconciled_bundle
+
+        data = normalize_reconciled_bundle(bundle)
+        if (self.table, self.portfolio_snapshots_table, self.portfolio_accounts_table, self.private_investments_table) != ("operations", "portfolio_snapshots", "portfolio_accounts", "private_investments"):
+            raise JournalStorageError("La importación atómica requiere las tablas contables estándar.")
+        try:
+            response = self._request("POST", endpoint=f"{self.url}/rest/v1/rpc/import_reconciled_portfolio", json={"p_owner": self.owner, "p_bundle": data, "p_recorded_by": recorded_by.strip().lower()})
+        except JournalStorageError as exc:
+            if exc.status_code == 404 or self._is_missing_columns_error(exc, {"import_reconciled_portfolio", "portfolio_import_batches", "source_event_id", "settlement_amount_local"}):
+                raise JournalStorageError("Falta la migración de importación reconciliada. No se ha importado ninguna fila ni sustituido la fotografía anterior.", status_code=exc.status_code, response_body=exc.response_body) from exc
+            raise
+        summary = response.json()
+        if not isinstance(summary, dict) or summary.get("source_sha256") != data["source_sha256"]:
+            raise JournalStorageError("Supabase devolvió un resumen de importación inesperado.")
+        return summary
+
+    def list_portfolio_imports(self, *, include_backup: bool = False) -> pd.DataFrame:
+        from src.reconciled_workbook_store import IMPORT_BATCH_COLUMNS
+
+        columns = [column for column in IMPORT_BATCH_COLUMNS if include_backup or column != "backup"]
+        rows = self._list_rows(endpoint=f"{self.url}/rest/v1/portfolio_import_batches", params={"owner": f"eq.{self.owner}", "select": ",".join(columns), "order": "created_at.desc,id.desc"})
+        frame = pd.DataFrame(rows, columns=columns)
+        return _canonicalize_paper_json_columns(frame, object_columns={column for column in ("metadata", "backup", "summary") if column in columns}, array_columns=set())
 
     def delete_operation(self, operation_id: int) -> None:
         self._request(
