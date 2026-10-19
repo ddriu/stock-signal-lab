@@ -15,6 +15,7 @@ from typing import Iterable, Mapping
 import pandas as pd
 
 from src.data_loader import resolve_analysis_ticker
+from src.instruments import resolve_company_name
 from src.portfolio_decisions import build_portfolio_decision_rows
 
 
@@ -729,6 +730,7 @@ def build_rotation_dashboard(
     held_tickers: Iterable[object],
     favorite_tickers: Iterable[object],
     *,
+    company_names: Mapping[str, object] | None = None,
     allocations_pct: Mapping[str, float] | None = None,
     horizon: str = "Mensual",
     recovery_hurdles: Mapping[tuple[str, str], Mapping[str, object]] | None = None,
@@ -757,6 +759,11 @@ def build_rotation_dashboard(
     held = list(dict.fromkeys(_ticker(value) for value in held_tickers if _ticker(value)))
     favorites = {
         _ticker(value) for value in favorite_tickers if _ticker(value)
+    }
+    names = {
+        _ticker(ticker): value
+        for ticker, value in (company_names or {}).items()
+        if _ticker(ticker)
     }
     allocations = {
         _ticker(ticker): float(value)
@@ -790,6 +797,7 @@ def build_rotation_dashboard(
             {
                 "Color": color,
                 "Ticker": ticker,
+                "Empresa": resolve_company_name(ticker, names.get(ticker), source),
                 "Peso cotizado": allocations.get(ticker),
                 "Score horizonte": score.get("Score horizonte"),
                 "Confianza": score.get("Confianza"),
@@ -828,6 +836,7 @@ def build_rotation_dashboard(
                 {
                     "Color": "Gris",
                     "Ticker": ticker,
+                    "Empresa": resolve_company_name(ticker, names.get(ticker)),
                     "Score horizonte": None,
                     "Confianza": 0.0,
                     "Cobertura": 0.0,
@@ -844,6 +853,7 @@ def build_rotation_dashboard(
             {
                 "Color": color,
                 "Ticker": ticker,
+                "Empresa": resolve_company_name(ticker, names.get(ticker), source),
                 "Score horizonte": score.get("Score horizonte"),
                 "Confianza": score.get("Confianza"),
                 "Cobertura": score.get("Cobertura"),
@@ -949,6 +959,7 @@ def build_rotation_dashboard(
                         {
                             "Origen": current_ticker,
                             "Alternativa": candidate_ticker,
+                            "Empresa alternativa": candidate.get("Empresa"),
                             "Lectura": _switch_label(
                                 advantage=advantage,
                                 confidence=min(
@@ -1049,6 +1060,10 @@ def build_rotation_priorities(
         for row in dashboard.switches
         if str(row.get("Alternativa") or "")
     }
+    names_by_ticker = {
+        str(row.get("Ticker") or ""): row.get("Empresa")
+        for row in (*dashboard.positions, *dashboard.candidates)
+    }
     position_rank = {"Rojo": 0, "Naranja": 1, "Gris": 2, "Azul": 3, "Amarillo": 4}
     labels = {
         "Rojo": "Revisar posible salida",
@@ -1078,7 +1093,12 @@ def build_rotation_priorities(
                 {
                     "Estado": color,
                     "Prioridad": labels[color],
-                    "Empresa": alternative or ticker,
+                    "Ticker": alternative or ticker,
+                    "Empresa": resolve_company_name(
+                        alternative or ticker,
+                        (switch or {}).get("Empresa alternativa"),
+                        names_by_ticker.get(alternative or ticker),
+                    ),
                     "Posición": ticker,
                     "Alternativa": alternative or "—",
                     "Acción": action,
@@ -1097,7 +1117,8 @@ def build_rotation_priorities(
                 {
                     "Estado": "Azul",
                     "Prioridad": "Estudiar nuevo capital",
-                    "Empresa": ticker,
+                    "Ticker": ticker,
+                    "Empresa": resolve_company_name(ticker, candidate.get("Empresa")),
                     "Posición": "—",
                     "Alternativa": ticker,
                     "Acción": candidate.get("Acción") or "Validar entrada y tamaño.",
