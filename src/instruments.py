@@ -10,6 +10,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 
+COMPANY_NAMES_VERSION = "company-names-v1"
+
+
 ANALYSIS_TICKER_ALIASES: dict[str, str] = {
     "6VO": "RDDT",
     "AMAZON": "AMZN",
