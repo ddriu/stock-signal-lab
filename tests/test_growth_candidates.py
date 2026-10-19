@@ -72,6 +72,38 @@ def test_held_entry_means_review_addition_and_held_wait_keeps_its_thesis() -> No
     assert all(row["Peso cartera %"] is None for row in rows)
 
 
+@pytest.mark.parametrize("name", ["TEST", None, "NaN"])
+def test_placeholder_name_does_not_hide_portfolio_company_name(name: object) -> None:
+    snapshot = pd.DataFrame([{
+        "analysis_ticker": "TEST", "asset_name": "Empresa de cartera, S.A.",
+        "snapshot_date": "2026-10-14", "value_eur": 100,
+    }])
+    original = snapshot.copy(deep=True)
+    row = _rows({"TEST": _result()}, names={"TEST": name}, portfolio_snapshot=snapshot)[0]
+    assert row["Empresa"] == "Empresa de cartera, S.A. · TEST"
+    assert row["Ticker"] == "TEST"
+    pd.testing.assert_frame_equal(snapshot, original)
+
+
+def test_full_company_name_and_comparison_fallback_keep_tickers() -> None:
+    rows = _rows(
+        {"TEST": _result(), "OTHER": _result(ticker="OTHER")},
+        names={"TEST": {"shortName": "Test", "longName": "Test Company, Inc."}},
+        comparison_rows=[{"Ticker": "OTHER", "Empresa": "Otra empresa"}],
+    )
+    assert [(row["Ticker"], row["Empresa"]) for row in rows] == [
+        ("TEST", "Test Company, Inc. · TEST"), ("OTHER", "Otra empresa · OTHER"),
+    ]
+
+
+def test_canonical_placeholder_does_not_overwrite_useful_alias_name() -> None:
+    row = _rows(
+        {"AMZN": _result(ticker="AMZN")},
+        names={"AMZ": "Amazon.com, Inc.", "AMZN": "AMZN"},
+    )[0]
+    assert row["Empresa"] == "Amazon.com, Inc. · AMZN"
+
+
 def test_review_order_keeps_holdings_first_then_strong_entries_before_higher_scored_candidates() -> None:
     results = {
         "CANDIDATE": _result(ticker="CANDIDATE", label="Entrada candidata", score=99),

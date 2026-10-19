@@ -101,6 +101,7 @@ from src.growth_momentum import (
     quote_price_to_eur,
 )
 from src.growth_candidates import GROWTH_CANDIDATE_GROUPS, build_growth_candidate_rows
+from src.instruments import resolve_company_name
 from src.email_sender import (
     EmailConfigurationError,
     EmailDeliveryError,
@@ -7681,7 +7682,10 @@ def _render_rotation_dashboard(
         render_ticker_dataframe(
             priority_frame,
             key=f"home_rotation_priorities_{dashboard.policy.label}",
-            ticker_column="Empresa",
+            column_config={
+                "Ticker": None,
+                "Empresa": st.column_config.TextColumn(width="large"),
+            },
         )
         st.caption(
             "Máximo cinco asuntos, ordenados por ruptura de tesis, exposición, "
@@ -7711,6 +7715,7 @@ def _render_rotation_dashboard(
             columns = [
                 "Estado",
                 "Ticker",
+                "Empresa",
                 "Peso cotizado",
                 "Score horizonte",
                 "Confianza",
@@ -7724,6 +7729,7 @@ def _render_rotation_dashboard(
                 frame.loc[:, [column for column in columns if column in frame]],
                 key=f"home_rotation_positions_{dashboard.policy.label}",
                 column_config={
+                    "Empresa": st.column_config.TextColumn(width="large"),
                     "Peso cotizado": st.column_config.ProgressColumn(
                         min_value=0, max_value=100, format="%.1f%%"
                     ),
@@ -7779,6 +7785,7 @@ def _render_rotation_dashboard(
             columns = [
                 "Estado",
                 "Ticker",
+                "Empresa",
                 "Score horizonte",
                 "Confianza",
                 "Cobertura",
@@ -7791,6 +7798,7 @@ def _render_rotation_dashboard(
                 frame.loc[:, [column for column in columns if column in frame]],
                 key=f"home_rotation_candidates_{dashboard.policy.label}",
                 column_config={
+                    "Empresa": st.column_config.TextColumn(width="large"),
                     "Score horizonte": st.column_config.ProgressColumn(
                         min_value=0, max_value=100, format="%.0f"
                     ),
@@ -10479,6 +10487,10 @@ def render_home(
             summary,
             held_tickers,
             favorite_rotation_tickers,
+            company_names=_analysis_company_names(
+                st.session_state.get("fundamental_data", {}),
+                private_favorites, group_favorites, rotation_snapshot,
+            ),
             allocations_pct=allocations,
             horizon=rotation_horizon,
             recovery_hurdles=recovery_hurdles,
@@ -12052,6 +12064,31 @@ def render_capital_projection_page(username: str) -> None:
     )
 
 
+def _analysis_company_names(
+    raw_fundamentals: dict[str, dict[str, object]],
+    *catalogs: pd.DataFrame,
+) -> dict[str, str]:
+    """Recupera nombres de favoritas/cartera y prefiere metadatos completos."""
+
+    names: dict[str, str] = {}
+    for catalog in catalogs:
+        if catalog is None:
+            continue
+        for row in catalog.to_dict("records"):
+            raw_ticker = next((
+                value for key in ("analysis_ticker", "ticker")
+                if isinstance((value := row.get(key)), str) and value.strip()
+            ), "")
+            if not raw_ticker:
+                continue
+            ticker = resolve_analysis_ticker(raw_ticker)
+            names[ticker] = resolve_company_name(raw_ticker, names.get(ticker), row)
+    for raw_ticker, info in raw_fundamentals.items():
+        ticker = resolve_analysis_ticker(raw_ticker)
+        names[ticker] = resolve_company_name(raw_ticker, info, names.get(ticker))
+    return names
+
+
 def _favorite_company_names(
     favorite_labels: dict[str, str],
 ) -> dict[str, str]:
@@ -12819,7 +12856,7 @@ def render_growth_candidate_overview(
             height=min(460, 85 + 48 * len(visible_rows)),
             column_config={
                 "Ticker": None,
-                "Empresa": st.column_config.TextColumn(width="medium"),
+                "Empresa": st.column_config.TextColumn(width="large"),
                 "En cartera / peso": st.column_config.TextColumn(width="small"),
                 "Señal de entrada": st.column_config.TextColumn(width="small"),
                 "Qué revisar": st.column_config.TextColumn(width="medium"),
@@ -13193,20 +13230,9 @@ def render_growth_momentum_page(
         except (ValueError, KeyError, TypeError, IndexError) as exc:
             calculation_errors[ticker] = str(exc) or "Análisis pendiente de datos."
 
-    company_names: dict[str, str] = {}
-    for favorites in (private_favorites, included_group):
-        if favorites.empty:
-            continue
-        for row in favorites.to_dict("records"):
-            ticker = str(row.get("ticker") or "").strip()
-            if ticker:
-                company_names.setdefault(
-                    resolve_analysis_ticker(ticker), str(row.get("name") or ticker)
-                )
-    for ticker, info in raw_fundamentals.items():
-        company_names.setdefault(
-            ticker, str(info.get("shortName") or info.get("longName") or ticker)
-        )
+    company_names = _analysis_company_names(
+        raw_fundamentals, private_favorites, included_group, portfolio_snapshot,
+    )
     table_comparisons = [dict(row) for row in comparative_summary or []]
     for ticker, issue in calculation_errors.items():
         table_comparisons.append({"Ticker": ticker, "Incidencia principal": issue})
@@ -13266,6 +13292,10 @@ def render_growth_momentum_page(
     selected = st.selectbox(
         "Empresa para preparar el plan",
         ordered_tickers,
+        format_func=lambda ticker: (
+            f"{company_names[ticker]} · {ticker}"
+            if company_names.get(ticker, ticker) != ticker else ticker
+        ),
         key="growth_selected_ticker",
     )
     automatic_result = results[selected]

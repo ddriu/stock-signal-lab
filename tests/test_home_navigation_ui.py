@@ -1,5 +1,7 @@
 """Home navigation must not execute hidden simulation or decision panels."""
 
+import json
+
 from streamlit.testing.v1 import AppTest
 
 
@@ -103,6 +105,51 @@ def test_access_panel_does_not_compute_hidden_decisions_or_lab() -> None:
     assert "VISIBLE_LAB_ONLY" not in _text(app)
     assert "VISIBLE_DECISIONS_ONLY" not in _text(app)
     assert any(button.label == "Abrir análisis" for button in app.button)
+
+
+def test_rotation_tables_show_company_names_and_preserve_separate_symbols() -> None:
+    script = '''
+from types import SimpleNamespace
+import app
+from src.portfolio_rotation import HORIZON_POLICIES
+
+dashboard = SimpleNamespace(
+    policy=HORIZON_POLICIES["Mensual"], switches=(),
+    positions=({"Ticker": "HELD", "Empresa": "Held Company, Inc.", "Color": "Naranja",
+        "Peso cotizado": 100.0, "Acción": "Revisar exposición", "Motivo": "Peso alto"},),
+    candidates=({"Ticker": "NEW", "Empresa": "New Company, Inc.", "Color": "Azul",
+        "Score horizonte": 85, "Acción": "Estudiar entrada"},),
+)
+app._render_rotation_dashboard(dashboard)
+'''
+    page = AppTest.from_string(script, default_timeout=30).run()
+    assert not page.exception
+    priorities, positions, candidates = (item.value for item in page.dataframe)
+    assert priorities["Empresa"].tolist() == ["Held Company, Inc.", "New Company, Inc."]
+    assert priorities["Ticker"].tolist() == ["HELD", "NEW"]
+    assert json.loads(page.dataframe[0].proto.columns)["Ticker"]["hidden"]
+    assert positions["Empresa"].tolist() == ["Held Company, Inc."]
+    assert candidates["Empresa"].tolist() == ["New Company, Inc."]
+
+
+def test_company_row_selection_opens_ticker_not_full_company_name() -> None:
+    script = '''
+from types import SimpleNamespace
+from unittest.mock import patch
+import pandas as pd
+import streamlit as st
+import app
+
+with patch.object(st, "dataframe", return_value=SimpleNamespace(selection=SimpleNamespace(rows=[0]))):
+    selected = app.render_ticker_dataframe(pd.DataFrame([{
+        "Ticker": "NKE", "Empresa": "NIKE, Inc.", "Posición": "NKE",
+    }]), key="named_row", column_config={"Ticker": None})
+st.write("SELECTED=" + ",".join(selected))
+'''
+    page = AppTest.from_string(script, default_timeout=30).run()
+    assert not page.exception
+    assert any(item.label == "Abrir NKE" for item in page.button)
+    assert "SELECTED=NKE" in _text(page)
 
 
 def test_reconciled_overview_replaces_legacy_totals_without_hidden_calculations() -> None:

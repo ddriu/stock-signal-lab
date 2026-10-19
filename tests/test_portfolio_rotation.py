@@ -1,6 +1,7 @@
 from datetime import date
 
 import pandas as pd
+import pytest
 
 from src.portfolio_rotation import (
     build_pair_correlations,
@@ -89,7 +90,10 @@ def test_positions_that_need_review_are_listed_before_healthy_positions() -> Non
     assert dashboard.positions[0]["Color"] == "Naranja"
 
 
-def test_priorities_are_limited_and_merge_the_best_switch_into_its_source() -> None:
+@pytest.mark.parametrize("limit_candidates", [0, 15])
+def test_priorities_are_limited_and_merge_the_best_switch_into_its_source(
+    limit_candidates: int,
+) -> None:
     dashboard = build_rotation_dashboard(
         [
             _row(
@@ -120,6 +124,10 @@ def test_priorities_are_limited_and_merge_the_best_switch_into_its_source() -> N
         ],
         ["OLD"],
         ["FAV"],
+        company_names={
+            "old": "Empresa de origen",
+            "FAV": {"longName": "Empresa alternativa completa", "shortName": "Alternativa"},
+        },
         allocations_pct={"OLD": 8.0},
         horizon="Mensual",
         recovery_hurdles={
@@ -131,16 +139,67 @@ def test_priorities_are_limited_and_merge_the_best_switch_into_its_source() -> N
             }
         },
         pair_correlations={("OLD", "FAV"): 0.20},
+        limit_candidates=limit_candidates,
         today=TODAY,
     )
 
     priorities = build_rotation_priorities(dashboard, limit=1)
 
     assert len(priorities) == 1
+    assert dashboard.positions[0]["Empresa"] == "Empresa de origen"
     assert priorities[0]["Posición"] == "OLD"
     assert priorities[0]["Alternativa"] == "FAV"
-    assert priorities[0]["Empresa"] == "FAV"
+    assert priorities[0]["Ticker"] == "FAV"
+    assert priorities[0]["Empresa"] == "Empresa alternativa completa"
     assert "OLD → FAV" in str(priorities[0]["Acción"])
+
+
+def test_priorities_keep_names_separate_from_held_and_candidate_symbols() -> None:
+    summary = [
+        _row("HELD", Fecha=date(2025, 1, 1), longName="Empresa en cartera"),
+        _row("FAV", Empresa="Empresa favorita", **{"Confianza datos": 95}),
+    ]
+    dashboard = build_rotation_dashboard(
+        summary,
+        ["HELD"],
+        ["FAV"],
+        company_names={"HELD": "HELD", "FAV": "NaN"},
+        today=TODAY,
+    )
+
+    priorities = build_rotation_priorities(dashboard)
+
+    assert dashboard.positions[0]["Empresa"] == "Empresa en cartera"
+    assert dashboard.candidates[0]["Empresa"] == "Empresa favorita"
+    assert priorities[0]["Ticker"] == "HELD"
+    assert priorities[0]["Empresa"] == "Empresa en cartera"
+    assert priorities[0]["Posición"] == "HELD"
+    assert priorities[0]["Alternativa"] == "—"
+    assert priorities[1]["Ticker"] == "FAV"
+    assert priorities[1]["Empresa"] == "Empresa favorita"
+    assert priorities[1]["Posición"] == "—"
+    assert priorities[1]["Alternativa"] == "FAV"
+    assert "Empresa" not in summary[0]
+
+
+def test_priority_names_fall_back_to_tickers_and_preserve_unanalyzed_favorite_name() -> None:
+    dashboard = build_rotation_dashboard(
+        [_row("FAV", **{"Confianza datos": 95})],
+        ["HELD"],
+        ["FAV", "UNANALYZED"],
+        company_names={"UNANALYZED": "Favorita sin análisis"},
+        today=TODAY,
+    )
+
+    priorities = build_rotation_priorities(dashboard)
+
+    assert [(row["Ticker"], row["Empresa"]) for row in priorities] == [
+        ("HELD", "HELD"),
+        ("FAV", "FAV"),
+    ]
+    unanalyzed = next(row for row in dashboard.candidates if row["Ticker"] == "UNANALYZED")
+    assert unanalyzed["Empresa"] == "Favorita sin análisis"
+    assert unanalyzed["Color"] == "Gris"
 
 
 def test_manual_thesis_invalidation_stays_red_even_with_old_market_data() -> None:

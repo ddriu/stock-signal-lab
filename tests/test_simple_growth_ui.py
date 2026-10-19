@@ -53,7 +53,7 @@ app.render_growth_candidate_overview(results, held_tickers=["HELD"] if not {empt
     return AppTest.from_string(script, default_timeout=30).run()
 
 
-def _page(*, scenario: str = "fresh", manual: bool = False) -> AppTest:
+def _page(*, scenario: str = "fresh", manual: bool = False, full_names: bool = False) -> AppTest:
     script = SETUP + f'''
 scenario = {scenario!r}
 held = ["TEST"] if scenario == "invalidated" else []
@@ -86,6 +86,9 @@ class Journal:
 fundamentals = {{key: dict(currency="EUR", revenueGrowth=.2, earningsGrowth=.3)
     for key in prepared}}
 favorites = pd.DataFrame() if {manual!r} else pd.DataFrame([dict(ticker="TEST", name="Test company")])
+if {full_names!r}:
+    favorites = pd.DataFrame([dict(ticker="TEST", name="TEST")])
+    fundamentals["TEST"].update(longName="Test Company, Inc.", shortName="Test")
 with patch.object(app, "evaluate_growth_momentum", side_effect=lambda **kw: results[kw["ticker"]]):
     app.render_growth_momentum_page(prepared, fundamentals, {{}}, {{}}, {{}},
         FxSnapshot(today, {{"EUR": 1.0}}), Journal(), favorites, pd.DataFrame(), "test",
@@ -169,6 +172,33 @@ def test_main_page_keeps_configuration_collapsed_and_detail_opt_in() -> None:
     assert any(metric.label == "Entrada máxima este mes" for metric in page.metric)
     assert any(widget.label == "Guardar evaluación dinámica" for widget in page.button)
     assert "saved_observation" not in page.session_state
+
+
+def test_full_name_replaces_ticker_placeholder_in_table_and_detail_picker() -> None:
+    page = _page(full_names=True)
+    assert not page.exception
+    assert page.dataframe[0].value["Empresa"].tolist() == ["Test Company, Inc. · TEST"]
+    page.toggle(key="growth_show_detail").set_value(True).run()
+    assert not page.exception
+    picker = page.selectbox(key="growth_selected_ticker")
+    assert picker.options == ["Test Company, Inc. · TEST"]
+    assert picker.value == "TEST"
+    assert "saved_observation" not in page.session_state
+
+
+def test_name_catalog_falls_back_from_missing_alias_names_to_portfolio() -> None:
+    favorites = pd.DataFrame([dict(ticker="AMZ", name="AMZ"), dict(ticker="SONY", name="Sony ADR")])
+    snapshot = pd.DataFrame([
+        dict(analysis_ticker="AMZN", asset_name="Amazon.com, Inc."),
+        dict(analysis_ticker="6758.T", asset_name="Sony Group Corporation (Tokyo)"),
+        dict(analysis_ticker=pd.NA, asset_name="Cash"),
+    ])
+    names = application._analysis_company_names(
+        {"AMZN": {"longName": "None", "shortName": "AMZN"}}, favorites, snapshot,
+    )
+    assert names == {
+        "AMZN": "Amazon.com, Inc.", "SONY": "Sony ADR", "6758.T": "Sony Group Corporation (Tokyo)",
+    }
 
 
 @pytest.mark.parametrize("scenario", ["stale", "invalidated", "wait", "unverified"])

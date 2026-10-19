@@ -13,7 +13,7 @@ import math
 import pandas as pd
 
 from src.analysis_policy import decode_policy_note
-from src.instruments import resolve_analysis_ticker
+from src.instruments import resolve_analysis_ticker, resolve_company_name
 from src.market_data_quality import quote_freshness
 
 
@@ -263,7 +263,13 @@ def build_growth_candidate_rows(
 
     growth = _normalized_mapping(results)
     frames = _normalized_mapping(prepared)
-    company_names = _normalized_mapping(names)
+    company_names: dict[str, str] = {}
+    for raw_ticker, source in (names or {}).items():
+        ticker = _ticker(raw_ticker)
+        if ticker:
+            company_names[ticker] = resolve_company_name(
+                str(raw_ticker), company_names.get(ticker), source,
+            )
     quote_currencies = _normalized_mapping(currencies)
     held = {_ticker(value) for value in held_tickers if _ticker(value)}
     tickers = dict.fromkeys([*growth, *(_ticker(value) for value in universe), *sorted(held)])
@@ -277,8 +283,7 @@ def build_growth_candidate_rows(
         ticker = next((_ticker(source.get(key)) for key in ("Ticker", "ticker", "analysis_ticker") if _text(source.get(key))), "")
         if not ticker:
             continue
-        if ticker not in company_names and _text(source.get("asset_name")):
-            company_names[ticker] = source["asset_name"]
+        company_names[ticker] = resolve_company_name(ticker, company_names.get(ticker), source)
         invalidation = _invalidation(source)
         if invalidation:
             invalidations[ticker] = invalidation
@@ -340,10 +345,7 @@ def build_growth_candidate_rows(
             reference = f"Referencia último cierre {_price_text(entry_price)}"
             reference += f" · stop teórico {_price_text(stop)}" if stop is not None else " · stop pendiente"
             reference += f" · {currency or 'moneda N/D'}"
-        name = company_names.get(ticker)
-        if isinstance(name, Mapping):
-            name = next((_text(name.get(key)) for key in ("shortName", "longName", "name", "Empresa") if _text(name.get(key))), "")
-        name = _text(name)
+        name = resolve_company_name(ticker, company_names.get(ticker))
         rows.append({
             "Ticker": ticker, "Empresa": f"{name} · {ticker}" if name and name.upper() != ticker else ticker,
             "Grupo": group, "Estado": state, "En cartera": in_portfolio,
