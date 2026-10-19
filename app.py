@@ -100,8 +100,28 @@ from src.growth_momentum import (
     next_growth_analysis_batch,
     quote_price_to_eur,
 )
-from src.growth_candidates import GROWTH_CANDIDATE_GROUPS, build_growth_candidate_rows
+# Streamlit puede conservar módulos de la versión anterior al volver a ejecutar
+# app.py. Actualiza primero la dependencia de nombres y después sus consumidores
+# antes de importar una API nueva; una instalación en frío ya trae las versiones
+# esperadas y no necesita recargarlas en cada interacción.
+import src.instruments as _instruments_module
+
+if (
+    getattr(_instruments_module, "COMPANY_NAMES_VERSION", "") != "company-names-v1"
+    or not hasattr(_instruments_module, "resolve_company_name")
+):
+    _instruments_module = importlib.reload(_instruments_module)
+
 from src.instruments import resolve_company_name
+import src.growth_candidates as _growth_candidates_module
+
+if (
+    getattr(_growth_candidates_module, "GROWTH_CANDIDATE_PRESENTATION_VERSION", "")
+    != "company-names-v1"
+):
+    _growth_candidates_module = importlib.reload(_growth_candidates_module)
+
+from src.growth_candidates import GROWTH_CANDIDATE_GROUPS, build_growth_candidate_rows
 from src.email_sender import (
     EmailConfigurationError,
     EmailDeliveryError,
@@ -230,6 +250,14 @@ from src.reconciled_portfolio_ui import (
     render_position_review_table,
 )
 from src.position_review import build_position_review_rows
+import src.portfolio_rotation as _portfolio_rotation_module
+
+if (
+    getattr(_portfolio_rotation_module, "ROTATION_PRESENTATION_VERSION", "")
+    != "company-names-v1"
+):
+    _portfolio_rotation_module = importlib.reload(_portfolio_rotation_module)
+
 from src.portfolio_rotation import (
     CANDIDATE_REJECTION_LABELS,
     HORIZON_POLICIES,

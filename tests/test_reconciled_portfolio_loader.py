@@ -152,7 +152,9 @@ def test_latest_dated_close_and_explicit_inverse_fx_are_current_valuation_only()
 @pytest.mark.parametrize("rates", [{}, {"USD": 0}, {"USD": -2}, {"USD": float("nan")}])
 def test_absent_or_invalid_fx_does_not_assume_usd_to_eur(rates):
     prepared = {"AAA": pd.DataFrame({"close": [15]}, index=pd.to_datetime(["2026-10-15"]))}
-    report = loader.load_reconciled_portfolio(Journal(), snapshot("USD"), pd.DataFrame(), prepared=prepared, rates_per_eur=rates)
+    # Test FX handling against the synthetic quote date, not the wall clock.
+    report = loader.load_reconciled_portfolio(Journal(), snapshot("USD"), pd.DataFrame(),
+        prepared=prepared, rates_per_eur=rates, reference_date="2026-10-15")
     row = report.positions.loc[report.positions.ticker == "AAA"].iloc[0]
     assert pd.isna(row.value_eur)
     assert row.valuation_status == "Cambio de moneda pendiente"
@@ -172,7 +174,8 @@ def test_missing_or_conflicting_native_currency_never_gets_a_usd_default():
 def test_tr_execution_currency_is_not_mistaken_for_quote_currency():
     snapshots = snapshot("USD")
     prepared = {"AAA": pd.DataFrame({"close": [24]}, index=pd.to_datetime(["2026-10-15"]))}
-    prices = loader._price_map(snapshots, pd.DataFrame([trade()]), prepared, {"USD": 1.2}, None, [])
+    prices = loader._price_map(snapshots, pd.DataFrame([trade()]), prepared,
+        {"USD": 1.2}, pd.Timestamp("2026-10-15"), [])
     assert prices[("Broker", "AAA", "EUR")]["currency"] == "USD"
     assert prices[("Broker", "AAA", "EUR")]["fx_rate_to_eur"] == pytest.approx(1 / 1.2)
 
@@ -235,7 +238,8 @@ def test_equivalent_json_numeric_and_timestamp_representations_are_one_income_ev
 
 def test_duplicate_quote_dates_choose_last_valid_close_without_ambiguous_series():
     prepared = {"AAA": pd.DataFrame({"close": [14, 15]}, index=pd.to_datetime(["2026-10-15", "2026-10-15"]))}
-    report = loader.load_reconciled_portfolio(Journal(), snapshot(), pd.DataFrame(), prepared=prepared)
+    report = loader.load_reconciled_portfolio(Journal(), snapshot(), pd.DataFrame(),
+        prepared=prepared, reference_date="2026-10-15")
     assert report.positions.loc[report.positions.ticker == "AAA", "value_eur"].iloc[0] == 150
 
 

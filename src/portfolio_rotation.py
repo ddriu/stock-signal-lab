@@ -19,6 +19,9 @@ from src.instruments import resolve_company_name
 from src.portfolio_decisions import build_portfolio_decision_rows
 
 
+ROTATION_PRESENTATION_VERSION = "company-names-v1"
+
+
 ROTATION_COLORS: dict[str, dict[str, str]] = {
     "Azul": {"hex": "#2776D2", "meaning": "Posible destino de capital"},
     "Verde": {"hex": "#16875A", "meaning": "Mantener"},

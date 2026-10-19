@@ -17,6 +17,7 @@ from src.instruments import resolve_analysis_ticker, resolve_company_name
 from src.market_data_quality import quote_freshness
 
 
+GROWTH_CANDIDATE_PRESENTATION_VERSION = "company-names-v1"
 GROWTH_CANDIDATE_GROUPS = ("Mi cartera", "Entradas fuertes", "Candidatas", "Esperar")
 _ENTRY_LABELS = frozenset({"Entrada fuerte", "Entrada candidata"})
 _MISSING_TEXT = frozenset({"", "nan", "nat", "none", "<na>"})
