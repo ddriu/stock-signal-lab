@@ -358,8 +358,13 @@ VALIDATION_OPTIONS = [
     "Evolución del análisis",
     "Resultado posterior",
     "Backtest técnico",
+    "Auditoría de estrategias",
 ]
 ANALYSIS_VIEW_DESCRIPTIONS = {
+    "Auditoría de estrategias": (
+        "Comprueba las recomendaciones guardadas con lotes virtuales y precios posteriores. "
+        "No modifica tu cartera, las señales actuales ni los correos."
+    ),
     "Radar": (
         "Lectura comparativa: ordena tus favoritas por calidad, valoración, entrada "
         "y riesgo; conserva las empresas en espera o pendientes de datos."
@@ -14909,6 +14914,17 @@ def main() -> None:
 
     layout_analysis_section = analysis_detail or analysis_section
     apply_section_layout(str(selected_section), layout_analysis_section)
+    # Keep the audit outside the live-radar refresh path. Reading historical
+    # recommendations must never generate new snapshots or send notifications.
+    if (
+        selected_section == "Analizar"
+        and analysis_section == "Validar"
+        and analysis_detail == "Auditoría de estrategias"
+    ):
+        from src.strategy_audit_ui import render_strategy_audit
+
+        render_strategy_audit(journal)
+        return
     favorite_storage_error = ""
     try:
         private_favorites = journal.list_favorites()
