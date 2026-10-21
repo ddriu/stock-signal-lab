@@ -32,6 +32,7 @@ jobs:
 
       - name: Analizar y enviar resúmenes
         env:
+          MODEL_RESULTS_ENABLED: ${{ vars.MODEL_RESULTS_ENABLED }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           EMAIL_SMTP_HOST: smtp.gmail.com

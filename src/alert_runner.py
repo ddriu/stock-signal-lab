@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timedelta
+import hashlib
+import json
 from math import isfinite
+import os
 from typing import Callable
 from zoneinfo import ZoneInfo
 
@@ -64,6 +67,29 @@ class AlertRunSummary:
     errors: tuple[str, ...]
     tickers_with_prices: int = 0
     tickers_with_fresh_prices: int = 0
+
+
+def _model_email_delivery_id(owner: str, kind: str, day: date,
+                             subject: str, plain_body: str, html_body: str) -> str:
+    """Stable semantic identity; no raw address or email content is persisted."""
+    return hashlib.sha256(json.dumps([owner, kind, day.isoformat(),
+        subject, plain_body, html_body], ensure_ascii=False,
+        separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _record_model_email(journal: object, receipt: object, delivery_id: str, *,
+                        owner: str, errors: list[str]) -> None:
+    """Optional evidence only; never activate a season or retry a message."""
+    if os.getenv("MODEL_RESULTS_ENABLED", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+        return
+    try:
+        from src.model_results_tracking import record_model_email_evidence
+
+        record_model_email_evidence(journal, receipt, delivery_id)
+    except Exception as exc:
+        # Recording must not turn an accepted email into a delivery failure or
+        # expose provider errors/credentials. Existing delivery semantics stay.
+        errors.append(f"{owner}: no se pudo registrar la evidencia de correo del modelo ({type(exc).__name__}); no se reintentó el envío.")
 
 
 def _favorite_names(journal: object) -> dict[str, str]:
@@ -180,7 +206,7 @@ def run_daily_alerts(
     fundamental_downloader: Callable[[str], dict[str, object]] = (
         download_fundamental_snapshot
     ),
-    sender: Callable[..., None] = send_email,
+    sender: Callable[..., object] = send_email,
     today: date | None = None,
 ) -> AlertRunSummary:
     """Ejecuta el radar diario o una revisión manual de un solo propietario.
@@ -845,8 +871,10 @@ def run_daily_alerts(
                     owner.capitalize(),
                     selected,
                 )
+                delivery_id = _model_email_delivery_id(owner, "alerts", resolved_today,
+                    subject, plain_body, html_body)
                 try:
-                    sender(
+                    receipt = sender(
                         preference.email,
                         subject,
                         plain_body,
@@ -856,7 +884,13 @@ def run_daily_alerts(
                     errors.append(
                         f"{owner}: no se pudo enviar el correo de alertas ({exc})."
                     )
+                    _record_model_email(journal,
+                        getattr(exc, "smtp_receipt", None) or
+                        {"status": "failed", "error_type": type(exc).__name__},
+                        delivery_id, owner=owner, errors=errors)
                 else:
+                    _record_model_email(journal, receipt, delivery_id,
+                        owner=owner, errors=errors)
                     actionable_delivered = True
                     emails_sent += 1
                     alerts_sent += len(selected)
@@ -867,8 +901,10 @@ def run_daily_alerts(
                     overview_rows,
                     app_url="https://stock-signal-lab-ddriu.streamlit.app/",
                 )
+                delivery_id = _model_email_delivery_id(owner, "overview", resolved_today,
+                    subject, plain_body, html_body)
                 try:
-                    sender(
+                    receipt = sender(
                         preference.email,
                         subject,
                         plain_body,
@@ -878,7 +914,13 @@ def run_daily_alerts(
                     errors.append(
                         f"{owner}: no se pudo enviar el resumen diario ({exc})."
                     )
+                    _record_model_email(journal,
+                        getattr(exc, "smtp_receipt", None) or
+                        {"status": "failed", "error_type": type(exc).__name__},
+                        delivery_id, owner=owner, errors=errors)
                 else:
+                    _record_model_email(journal, receipt, delivery_id,
+                        owner=owner, errors=errors)
                     emails_sent += 1
 
             notified_tickers = (

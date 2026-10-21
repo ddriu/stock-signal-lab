@@ -1,0 +1,40 @@
+name: Medición prospectiva del modelo (sin correos)
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Enviar alertas diarias"]
+    types: [completed]
+    branches: [main]
+  schedule:
+    # Capture completed regular sessions in Europe and the US; calendars, not
+    # this UTC schedule, decide which opening is eligible. No daily-profit claim.
+    - cron: "30 22 * * 1-5"
+
+concurrency:
+  group: stock-signal-lab-model-results
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    if: vars.MODEL_RESULTS_ENABLED == 'true' && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion != 'cancelled')
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Actualizar exclusivamente carteras virtuales activadas
+        env:
+          MODEL_RESULTS_ENABLED: "true"
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+        run: python -m scripts.run_model_tracking
