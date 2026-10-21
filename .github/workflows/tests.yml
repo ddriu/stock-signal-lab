@@ -55,3 +55,6 @@ jobs:
 
       - name: Validar migraciones, permisos y rollback sin producción
         run: node scripts/validate_migrations.mjs "$GITHUB_WORKSPACE"
+
+      - name: Validar registro inmutable del modelo, moneda y permisos
+        run: node scripts/validate_model_results_migration.mjs "$GITHUB_WORKSPACE"

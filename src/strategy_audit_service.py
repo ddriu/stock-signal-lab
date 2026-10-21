@@ -70,9 +70,18 @@ def exchange_schedule(metadata: Mapping[str, object], start: str, end: str) -> p
     if calendar_name is None:
         raise ValueError(f"Calendario sin verificar para mercado {exchange or 'desconocido'}")
     calendar = calendars.get_calendar(calendar_name)
+    first, last = pd.Timestamp(start).date(), pd.Timestamp(end).date()
+    if first > last:
+        raise ValueError("El intervalo de calendario debe estar ordenado")
+    if first < calendar.schedule.index.min().date() or last > calendar.schedule.index.max().date():
+        raise ValueError("El calendario disponible no cubre todo el intervalo solicitado")
     schedule = calendar.schedule.loc[start:end, ["open", "close"]].rename(
         columns={"open": "market_open", "close": "market_close"})
-    schedule.attrs.update(calendar=calendar_name, calendar_version=calendars.__version__)
+    # The requested range includes dates with no sessions. A list ending on a
+    # Friday does not itself prove that the following Monday was a holiday.
+    schedule.attrs.update(calendar=calendar_name, calendar_version=calendars.__version__,
+                          calendar_coverage_start=first.isoformat(),
+                          calendar_coverage_end=last.isoformat())
     return schedule
 
 
@@ -142,6 +151,9 @@ def fetch_audit_market_bundle(
                 open_at=row.market_open.isoformat(), close_at=row.market_close.isoformat(),
             ) for day, row in schedule.iterrows()]
             prepared.attrs["required_last_close_at"] = schedule.market_close.iloc[-1].isoformat() if not schedule.empty else None
+            for name in ("calendar_coverage_start", "calendar_coverage_end"):
+                if name in schedule.attrs:
+                    prepared.attrs[name] = schedule.attrs[name]
             bars[ticker] = prepared
             issues.extend(problems.to_dict("records") if isinstance(problems, pd.DataFrame) else problems)
         except Exception as error:
@@ -174,7 +186,10 @@ def matched_benchmark(lots: pd.DataFrame, bars: pd.DataFrame, end: object) -> di
     cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
     if len(str(end)) == 10:
         cutoff += pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
-    source = bars.loc[pd.to_datetime(bars.close_at, utc=True) <= cutoff].copy() if not bars.empty else bars.copy()
+    completed = pd.to_datetime(bars.close_at, utc=True) <= cutoff
+    if "close_available_at" in bars:
+        completed &= pd.to_datetime(bars.close_available_at, utc=True, errors="coerce") <= cutoff
+    source = bars.loc[completed].copy() if not bars.empty else bars.copy()
     quantity, pending = 0.0, 0
     for row in lots.to_dict("records"):
         opened = source.loc[pd.to_datetime(source.open_at, utc=True) >= pd.Timestamp(row["entry_at"])]
@@ -197,8 +212,15 @@ def matched_benchmark(lots: pd.DataFrame, bars: pd.DataFrame, end: object) -> di
     expected_closes = [pd.Timestamp(row["close_at"]) for row in schedule
                        if pd.Timestamp(row["close_at"]) <= cutoff]
     required = max(expected_closes) if expected_closes else bars.attrs.get("required_last_close_at")
-    terminal_complete = (not required or (not source.empty and
-        pd.Timestamp(source.iloc[-1].close_at) >= pd.Timestamp(required)))
+    calendar_days = [pd.Timestamp(row["session"]).date().isoformat() for row in schedule]
+    if not calendar_days and not bars.empty:
+        calendar_days = [pd.Timestamp(day).date().isoformat() for day in bars.index]
+    coverage_start = bars.attrs.get("calendar_coverage_start") or (min(calendar_days) if calendar_days else None)
+    coverage_end = bars.attrs.get("calendar_coverage_end") or (max(calendar_days) if calendar_days else None)
+    calendar_complete = (coverage_start is not None and coverage_end is not None
+        and str(coverage_start) <= cutoff.date().isoformat() <= str(coverage_end))
+    terminal_complete = (calendar_complete and (not required or (not source.empty and
+        pd.Timestamp(source.iloc[-1].close_at) >= pd.Timestamp(required))))
     if not source.empty and not pending and terminal_complete:
         terminal = source.iloc[-1]
         price = float(terminal.close) * float(terminal.fx_close)
@@ -221,8 +243,13 @@ def prospective_results(signals: pd.DataFrame, bars: Mapping[str, pd.DataFrame],
     rows = []
     for signal in signals.to_dict("records"):
         frame = bars.get(str(signal["ticker"]), pd.DataFrame())
-        eligible = frame.loc[(pd.to_datetime(frame.open_at, utc=True) > signal["observed_at"])
-                             & (pd.to_datetime(frame.close_at, utc=True) <= cutoff)] if not frame.empty else frame
+        if not frame.empty:
+            completed = pd.to_datetime(frame.close_at, utc=True) <= cutoff
+            if "close_available_at" in frame:
+                completed &= pd.to_datetime(frame.close_available_at, utc=True, errors="coerce") <= cutoff
+            eligible = frame.loc[(pd.to_datetime(frame.open_at, utc=True) > signal["observed_at"]) & completed]
+        else:
+            eligible = frame
         for horizon in horizons:
             result = dict(event_id=signal["event_id"], ticker=signal["ticker"],
                           observed_at=signal["observed_at"], sessions=horizon,

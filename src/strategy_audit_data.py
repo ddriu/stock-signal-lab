@@ -26,7 +26,7 @@ from src.price_units import normalize_price_frame_units, resolve_quote_unit
 from src.signal_engine import add_signal_columns
 
 
-AUDIT_DATA_VERSION = "strategy-audit-data-v2"
+AUDIT_DATA_VERSION = "strategy-audit-data-v3"
 _GROWTH_READINGS = frozenset({
     "Entrada fuerte", "Entrada candidata", "Vigilancia activa", "No preparada",
     "Esperar mejor precio", "Pendiente de fundamentales", "Datos empresariales parciales",
@@ -46,7 +46,10 @@ _SIGNAL_COLUMNS = (
 _ISSUE_COLUMNS = ("code", "severity", "ticker", "session", "detail")
 _BAR_COLUMNS = (
     "open_at", "close_at", "open", "high", "low", "close", "volume",
+    "source_close_available_at", "close_available_at",
     "fx_open", "fx_close", "reduce_setup", "sell_setup", "sma_long",
+    "exit_indicators_ready", "fx_open_available_at", "fx_close_available_at",
+    "fx_open_age_days", "fx_close_age_days",
 )
 
 
@@ -311,6 +314,7 @@ def prepare_audit_bars(
     *,
     actions: pd.DataFrame | None = None,
     splits: pd.Series | pd.DataFrame | Mapping[object, object] | None = None,
+    fx_max_age_days: float = 7.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Prepare causal bars; FX quotes are USD per principal native currency.
 
@@ -319,14 +323,31 @@ def prepare_audit_bars(
     that session and its suffix, never erasing otherwise valid earlier history.
     ``adjustment_basis`` should declare split_adjusted/total_return_adjusted or
     raw/unadjusted. Missing metadata is a limitation, not invented adjustment.
+    ``fx_max_age_days`` is an explicit data-quality limit, not a strategy
+    parameter. Stale quotes retain their availability/age but cannot value or
+    execute a lot. Unready exit indicators remain unknown, never false or sell.
+    Explicit ``close_available_at`` clocks must follow the scheduled close.
+    ``source_close_available_at`` preserves each supplied clock; the effective
+    ``close_available_at`` is its cumulative knowledge maximum, because an
+    indicator can depend on previous bars that arrived late. Missing explicit
+    clocks leave that bar and dependent suffix unavailable. If no clocks are
+    supplied, exchange closes are only a declared retrospective proxy, never
+    proof that a prospective collector observed the data at that time.
     """
 
     config.validate()
+    maximum_fx_age = _number(fx_max_age_days)
+    if maximum_fx_age is None or maximum_fx_age <= 0:
+        raise ValueError("fx_max_age_days must be finite and positive")
     symbol = resolve_analysis_ticker(ticker)
     issues: list[dict[str, object]] = []
     quarantines: list[pd.Timestamp] = []
     blocked = False
     attrs = dict(raw.attrs)
+    has_close_availability = "close_available_at" in raw.columns
+    attrs.update(close_availability_assumed=not has_close_availability,
+                 close_availability_basis=("explicit_source_clock_cumulative_knowledge"
+                     if has_close_availability else "historical_exchange_close_proxy"))
 
     def issue(code: str, severity: str, session: object, detail: str) -> None:
         issues.append(dict(code=code, severity=severity, ticker=symbol, session=session, detail=detail))
@@ -337,11 +358,16 @@ def prepare_audit_bars(
         frame.attrs.update({"ticker": symbol, "audit_data_version": AUDIT_DATA_VERSION,
                             "strategy_config": asdict(config),
                             "strategy_config_sha256": _digest(asdict(config)),
+                            "fx_max_age_days": maximum_fx_age,
+                            "fx_staleness_policy": "Elapsed calendar days since the quote became available; stale rates are unavailable, not forward-filled.",
+                            "exit_readiness_policy": "Exit flags are unknown until score inputs and the configured trend-confirmation history are available.",
+                            "close_availability_policy": "Explicit source clocks are preserved; the effective clock includes all earlier indicator inputs. Without explicit clocks, exchange close is a retrospective assumption, not an observed feed timestamp.",
                             "audit_blocked": blocked or (bool(quarantines) and frame.empty),
                             "audit_has_quarantine": bool(quarantines),
                             "quarantined_from": min(quarantines).isoformat() if quarantines else None,
-                            "limitations": tuple(dict.fromkeys(
-                                item["code"] for item in issues if item["severity"] != "info"))})
+                            "limitations": tuple(dict.fromkeys([
+                                *(["historical_close_availability_assumed"] if not has_close_availability else []),
+                                *(item["code"] for item in issues if item["severity"] != "info")]))})
         return frame, pd.DataFrame(issues, columns=_ISSUE_COLUMNS)
 
     empty = pd.DataFrame(columns=_BAR_COLUMNS, index=pd.DatetimeIndex([], name="session"))
@@ -454,13 +480,59 @@ def prepare_audit_bars(
     # Discard all previously computed columns: indicators and rule flags must
     # correspond to this frozen config, not to a cached live-account analysis.
     bars = add_signal_columns(add_indicators(normalized, config), config)
+    score_inputs = (
+        "sma_short", "sma_medium", "sma_long", "sma_medium_slope", "rsi",
+        "macd", "macd_signal", "volume_average", "distance_sma_short_pct",
+        "momentum_short_pct", "momentum_medium_pct", "distance_high_pct",
+    )
+    score_ready = bars.loc[:, score_inputs].notna().all(axis=1)
+    breakout_ready = (bars["close"].shift(1).rolling(config.breakout_period,
+        min_periods=config.breakout_period).count() >= config.breakout_period)
+    trend_ready = bars[["sma_medium", "sma_long"]].notna().all(axis=1)
+    confirmation_ready = (trend_ready.astype(int).rolling(config.trend_confirmation_days,
+        min_periods=config.trend_confirmation_days).sum() >= config.trend_confirmation_days)
+    bars["exit_indicators_ready"] = score_ready & breakout_ready & confirmation_ready
+    for flag in ("reduce_setup", "sell_setup"):
+        bars[flag] = bars[flag].astype("boolean").where(bars["exit_indicators_ready"], pd.NA)
+    unready = ~bars["exit_indicators_ready"]
+    if unready.any():
+        issue("exit_indicators_not_ready", "warning", bars.index[unready][0],
+              f"{int(unready.sum())} supplied sessions lack mature exit indicators/confirmation history; exit flags remain unknown.")
     bars["open_at"] = pd.to_datetime([calendar[session][0] for session in bars.index], utc=True)
     bars["close_at"] = pd.to_datetime([calendar[session][1] for session in bars.index], utc=True)
+    if has_close_availability:
+        source_column = ("source_close_available_at"
+                         if "source_close_available_at" in raw.columns else "close_available_at")
+        arrivals: dict[pd.Timestamp, list[pd.Timestamp]] = {}
+        for label, value in raw[source_column].items():
+            session, arrived = _session(label), _utc(value)
+            if session in calendar and arrived is not None and arrived >= calendar[session][1]:
+                arrivals.setdefault(session, []).append(arrived)
+        own_clocks = pd.Series(pd.to_datetime([
+            min(arrivals[session]) if session in arrivals else pd.NaT for session in bars.index
+        ], utc=True), index=bars.index)
+        bars["source_close_available_at"] = own_clocks
+        # A missing explicit source clock is unknown, not permission to use an
+        # unobserved bar as an input to later recursive indicators.
+        bars["close_available_at"] = own_clocks.cummax().where(own_clocks.notna().cummin())
+        invalid = own_clocks.isna()
+        if invalid.any():
+            issue("missing_or_invalid_close_availability", "warning", bars.index[invalid][0],
+                  f"{int(invalid.sum())} supplied close clocks are absent, naive, or earlier than the final exchange close; dependent history remains unavailable.")
+    else:
+        bars["source_close_available_at"] = pd.Series(pd.NaT, index=bars.index, dtype="datetime64[ns, UTC]")
+        bars["close_available_at"] = bars["close_at"]
     bars["fx_open"], bars["fx_close"] = np.nan, np.nan
+    for field in ("open", "close"):
+        bars[f"fx_{field}_available_at"] = pd.Series(pd.NaT, index=bars.index, dtype="datetime64[ns, UTC]")
+        bars[f"fx_{field}_age_days"] = np.nan
     if not currency_known:
         pass
     elif native_currency == "USD":
         bars["fx_open"], bars["fx_close"] = 1.0, 1.0
+        for field in ("open", "close"):
+            bars[f"fx_{field}_available_at"] = bars[f"{field}_at"]
+            bars[f"fx_{field}_age_days"] = 0.0
     elif fx is None or fx.empty or not {"close", "available_at"}.issubset(fx.columns):
         issue("missing_point_in_time_fx", "warning", None, "USD-per-native quotes with available_at are required for valuation/fills.")
     else:
@@ -485,6 +557,14 @@ def prepare_audit_bars(
                     matched = matched.sort_values("order")
                     bars[output] = matched["rate"].to_numpy()
                     bars[f"{output}_available_at"] = pd.to_datetime(matched["available_at"].array, utc=True)
+                    age = (pd.to_datetime(matched["at"], utc=True)
+                           - pd.to_datetime(matched["available_at"], utc=True)).dt.total_seconds() / 86400.0
+                    bars[f"{output}_age_days"] = age.to_numpy()
+                    stale = bars[f"{output}_age_days"] > maximum_fx_age
+                    if stale.any():
+                        bars.loc[stale, output] = np.nan
+                        issue("stale_fx_observation", "warning", bars.index[stale][0],
+                              f"{int(stale.sum())} {output} marks exceed {maximum_fx_age:g} elapsed calendar days; availability and age retained but rates are unavailable.")
         if bars[["fx_open", "fx_close"]].isna().any().any():
             issue("fx_unavailable_at_some_bar_times", "warning", None, "No future FX quote was backfilled into an earlier open/close.")
     return finish(bars)

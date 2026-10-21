@@ -40,6 +40,15 @@ def test_authoritative_calendar_accounts_for_us_early_close_and_refuses_unknown(
         exchange_schedule({"exchangeName": "UNKNOWN"}, "2026-10-05", "2026-10-09")
 
 
+def test_calendar_coverage_includes_requested_holidays_and_weekend_not_just_last_session():
+    schedule = exchange_schedule({"exchangeName": "NMS"}, "2026-11-26", "2026-11-29")
+    assert schedule.index[-1].date().isoformat() == "2026-11-27"
+    assert schedule.attrs["calendar_coverage_start"] == "2026-11-26"
+    assert schedule.attrs["calendar_coverage_end"] == "2026-11-29"
+    with pytest.raises(ValueError, match="no cubre"):
+        exchange_schedule({"exchangeName": "NMS"}, "2099-01-01", "2099-01-10")
+
+
 def test_benchmark_matches_multiple_contributions_not_lump_sum_and_earlier_cutoff():
     frame = bars()
     lots = pd.DataFrame([dict(entry_at=frame.iloc[0].open_at, contribution_usd=100),
@@ -59,6 +68,30 @@ def test_benchmark_does_not_value_using_a_stale_close_or_skip_pending_contributi
     missing_first = matched_benchmark(lots.assign(entry_at=frame.iloc[0].open_at), frame.iloc[1:], "2026-10-09")
     assert missing_first["pending_contributions"] == 1
     assert missing_first["value_usd"] is None
+
+
+def test_benchmark_does_not_invent_market_closures_after_calendar_horizon():
+    frame = bars()
+    lots = pd.DataFrame([dict(entry_at=frame.iloc[0].open_at, contribution_usd=100)])
+    assert matched_benchmark(lots, frame, "2026-10-11")["value_usd"] is None
+    frame.attrs.update(calendar_coverage_start="2026-10-05", calendar_coverage_end="2026-10-11")
+    weekend = matched_benchmark(lots, frame, "2026-10-11")
+    assert weekend["value_usd"] == pytest.approx(111)
+    assert weekend["data_complete"] is True
+    outside = matched_benchmark(lots, frame, "2026-10-12")
+    assert outside["value_usd"] is None and outside["data_complete"] is False
+
+
+def test_benchmark_and_forward_horizon_wait_for_actual_final_bar_availability():
+    frame = bars()
+    frame["close_available_at"] = frame["close_at"].copy()
+    frame.loc[frame.index[-1], "close_available_at"] = pd.Timestamp("2026-10-12T10:00:00Z")
+    lots = pd.DataFrame([dict(entry_at=frame.iloc[0].open_at, contribution_usd=100)])
+    assert matched_benchmark(lots, frame, "2026-10-09")["value_usd"] is None
+    forward = prospective_results(signals(), {"TEST": frame}, end="2026-10-09", horizons=(4, 5))
+    assert forward.iloc[0]["status"] == "Observado"
+    assert forward.iloc[1]["status"] == "Pendiente"
+    assert pd.isna(forward.iloc[1]["return_pct"])
 
 
 def test_forward_followup_never_counts_missing_session_as_later_session():
@@ -86,6 +119,9 @@ def test_explicit_fetch_recomputes_units_and_does_not_look_ahead_fx():
     assert frame.iloc[-1].fx_open == 1.2
     assert pd.isna(frame.iloc[0].fx_open)
     assert frame.attrs["session_schedule"]
+    assert frame.attrs["calendar_coverage_start"] == calls[0][1]
+    assert frame.attrs["calendar_coverage_end"] == "2026-10-06"
+    assert bundle.manifest["calendars"]["TEST.L"]["calendar_coverage_end"] == "2026-10-06"
     assert calls[0][2] == "2026-10-07"
     assert not bundle.manifest["cash_dividends_included"]
 

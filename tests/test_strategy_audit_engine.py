@@ -52,6 +52,26 @@ def test_exact_open_observation_must_wait_another_open():
     assert result.lots.iloc[0].entry_at == frame.iloc[2].open_at
 
 
+def test_delayed_close_cannot_sell_at_an_open_before_it_was_known():
+    frame = bars([100, 100, 100, 100], sell_setup=[False, True, False, False])
+    frame["close_available_at"] = frame.close_at
+    frame.loc[frame.index[1], "close_available_at"] = frame.iloc[2].close_at
+    result = run([signal()], frame, exit_policy="sell")
+    assert result.trades.iloc[0].decision_at == frame.iloc[2].close_at
+    assert result.trades.iloc[0].exit_at == frame.iloc[3].open_at
+    early = run([signal()], frame, exit_policy="sell", end="2026-01-06T20:00:00Z")
+    assert early.trades.empty
+    assert pd.isna(early.daily.loc["2026-01-05", "value_usd"])
+
+
+def test_position_stop_reads_frozen_config_not_a_hardcoded_eight():
+    frame = bars([100, 100, 90, 95])
+    wide = run([signal()], frame, exit_policy="sell", strategy_config=replace(StrategyConfig(), stop_loss_pct=15))
+    assert wide.trades.empty
+    default = run([signal()], frame, exit_policy="sell")
+    assert default.trades.iloc[0].exit_reason == "close_stop8"
+
+
 def test_recorded_intraday_signal_is_preserved_without_using_its_later_final_close():
     frame = bars([100, 110, 120])
     result = run([signal(observed="2026-01-02T18:00:00Z")], frame, exit_policy="hold")
@@ -338,6 +358,8 @@ def test_authoritative_closed_market_holiday_can_carry_its_last_mark_only():
     american = bars([100, 100, 120])
     holiday = american.iloc[:2].copy()
     holiday.attrs["session_schedule"] = schedule(holiday)
+    holiday.attrs.update(calendar_coverage_start=american.index[0].date().isoformat(),
+                         calendar_coverage_end=american.index[-1].date().isoformat())
     observations = pd.DataFrame([signal(), signal("british", ticker="BBB")])
     result = run_strategy_audit(observations, {"AAA": american, "BBB": holiday}, AuditConfig(exit_policy="hold"))
     assert result.metrics["final_value_usd"] == pytest.approx(2.2)
@@ -372,3 +394,40 @@ def test_inputs_are_not_mutated_and_manifest_and_ids_are_reproducible():
     pd.testing.assert_frame_equal(frame, frame_before)
     pd.testing.assert_frame_equal(observations, signals_before)
     assert config == replace(config)
+
+
+def test_truncated_calendar_cannot_call_all_later_dates_market_holidays():
+    frame = bars([100, 100])
+    frame.attrs.update(session_schedule=schedule(frame),
+        required_last_close_at=frame.iloc[-1].close_at.isoformat())
+    result = run([signal()], frame, end="2026-01-20", exit_policy="hold")
+    assert result.metrics["final_value_usd"] is None
+    assert result.metrics["coverage_complete"] is False
+    assert result.metrics["last_complete_valuation_date"] == "2026-01-05"
+    assert pd.isna(result.lots.iloc[0]["value_usd"])
+
+
+def test_declared_calendar_can_prove_closed_weekend_but_not_an_expired_later_day():
+    frame = bars([100, 100], first="2026-01-08")  # Thursday and Friday.
+    frame.attrs.update(session_schedule=schedule(frame),
+        calendar_coverage_start="2026-01-08", calendar_coverage_end="2026-01-11")
+    observation = signal(day="2026-01-08")
+    closed = run([observation], frame, end="2026-01-11", exit_policy="hold")
+    assert closed.metrics["final_value_usd"] == 1
+    assert closed.metrics["coverage_complete"] is True
+    assert closed.lots.iloc[0]["valuation_carried_closed_market"]
+    expired = run([observation], frame, end="2026-01-12", exit_policy="hold")
+    assert expired.metrics["final_value_usd"] is None
+    assert expired.metrics["coverage_complete"] is False
+    assert not expired.lots.iloc[0]["valuation_carried_closed_market"]
+
+
+def test_calendar_range_does_not_turn_a_missing_expected_final_bar_into_a_closure():
+    full = bars([100, 100, 120])
+    frame = full.iloc[:2].copy()
+    frame.attrs.update(session_schedule=schedule(full),
+        calendar_coverage_start="2026-01-02", calendar_coverage_end="2026-01-06")
+    result = run([signal()], frame, end="2026-01-06", exit_policy="hold")
+    assert result.metrics["final_value_usd"] is None
+    assert result.metrics["coverage_complete"] is False
+    assert "missing_expected_bar" in set(result.issues["code"])

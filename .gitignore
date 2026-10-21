@@ -26,3 +26,4 @@ data/backups/
 data/reconciled-*.json
 data/reconciled-*.csv
 .DS_Store
+supabase/.temp/

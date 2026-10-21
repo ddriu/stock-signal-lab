@@ -355,12 +355,17 @@ STRATEGY_OPTIONS = [
     "Especulativas",
 ]
 VALIDATION_OPTIONS = [
+    "Resultados del modelo",
     "Evolución del análisis",
     "Resultado posterior",
     "Backtest técnico",
     "Auditoría de estrategias",
 ]
 ANALYSIS_VIEW_DESCRIPTIONS = {
+    "Resultados del modelo": (
+        "Compara las cuatro estrategias congeladas, sus operaciones y su riesgo con índices. "
+        "El seguimiento virtual está separado de tu cartera real."
+    ),
     "Auditoría de estrategias": (
         "Comprueba las recomendaciones guardadas con lotes virtuales y precios posteriores. "
         "No modifica tu cartera, las señales actuales ni los correos."
@@ -14914,6 +14919,18 @@ def main() -> None:
 
     layout_analysis_section = analysis_detail or analysis_section
     apply_section_layout(str(selected_section), layout_analysis_section)
+    if (
+        selected_section == "Analizar"
+        and analysis_section == "Validar"
+        and analysis_detail == "Resultados del modelo"
+    ):
+        from src.model_results_ui import render_model_results_page
+        from src.model_results_tracking_ui import render_model_tracking_page
+        from src.model_results_tracking import git_revision
+
+        render_model_results_page(journal, git_sha=git_revision())
+        render_model_tracking_page(journal)
+        return
     # Keep the audit outside the live-radar refresh path. Reading historical
     # recommendations must never generate new snapshots or send notifications.
     if (

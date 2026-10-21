@@ -201,12 +201,110 @@ def test_empty_inputs_keep_typed_contract_and_invalid_source_is_rejected() -> No
 def test_usd_bars_use_supplied_schedule_and_do_not_need_fx() -> None:
     raw = _raw()
     bars, issues = _prepare(raw)
-    assert issues.empty
+    assert issues["code"].tolist() == ["exit_indicators_not_ready"]
     assert bars["fx_open"].eq(1).all() and bars["fx_close"].eq(1).all()
+    assert bars["fx_open_age_days"].eq(0).all()
     assert bars.iloc[0]["open_at"] == _schedule(raw.index).iloc[0]["market_open"]
     assert bars.iloc[0]["close_at"] == _schedule(raw.index).iloc[0]["market_close"]
     assert {"reduce_setup", "sell_setup", "sma_long"}.issubset(bars.columns)
     assert bars.attrs["strategy_config"] == asdict(StrategyConfig())
+
+
+def test_immature_exit_indicators_remain_unknown_and_cannot_certify_a_lot() -> None:
+    from src.strategy_audit_engine import AuditConfig, run_strategy_audit
+
+    raw = _raw(10)
+    raw.attrs["original_provenance"] = {"provider": "synthetic", "immutable": True}
+    bars, issues = _prepare(raw)
+    assert bars["sma_long"].isna().all()
+    assert not bars["exit_indicators_ready"].any()
+    assert bars[["reduce_setup", "sell_setup"]].isna().all().all()
+    assert "exit_indicators_not_ready" in set(issues["code"])
+    assert bars.attrs["original_provenance"] == raw.attrs["original_provenance"]
+    observed = _schedule(raw.index).iloc[0]["market_close"] + pd.Timedelta(minutes=1)
+    signals = pd.DataFrame([dict(event_id="short-history", ticker="TEST",
+        signal_session=raw.index[0].date().isoformat(), observed_at=observed,
+        entry_label="Entrada fuerte", entry_score=80)])
+    for exit_policy in ("reduce", "sell"):
+        result = run_strategy_audit(signals, {"TEST": bars}, AuditConfig(
+            start=raw.index[0].date(), end=raw.index[-1].date(),
+            amount_usd=100, exit_policy=exit_policy))
+        assert len(result.lots) == 1
+        assert result.lots.iloc[0]["status"] == "unresolved"
+        assert result.trades.empty  # Unknown is neither maintain nor sell.
+        assert result.metrics["coverage_complete"] is False
+        assert result.metrics["final_value_usd"] is None
+
+
+def test_exit_readiness_requires_previous_confirmation_inputs_and_preserves_mature_rules() -> None:
+    raw = _raw()
+    config = StrategyConfig(trend_confirmation_days=3)
+    bars, _ = _prepare(raw, config=config)
+    expected = add_signal_columns(add_indicators(raw, config), config)
+    assert bars["exit_indicators_ready"].iloc[:201].eq(False).all()
+    assert bars["exit_indicators_ready"].iloc[201:].all()
+    for flag in ("reduce_setup", "sell_setup"):
+        assert bars[flag].iloc[:201].isna().all()
+        pd.testing.assert_series_equal(bars[flag].iloc[201:].astype(bool),
+            expected[flag].iloc[201:].rename_axis("session"), check_freq=False)
+    assert asdict(config) == bars.attrs["strategy_config"]
+
+
+def test_historical_close_clock_is_only_an_explicitly_declared_reconstruction_proxy() -> None:
+    bars, _ = _prepare(_raw(3))
+    assert bars["close_available_at"].equals(bars["close_at"])
+    assert bars["source_close_available_at"].isna().all()
+    assert bars.attrs["close_availability_assumed"] is True
+    assert bars.attrs["close_availability_basis"] == "historical_exchange_close_proxy"
+    assert "historical_close_availability_assumed" in bars.attrs["limitations"]
+
+
+def test_explicit_close_availability_preserves_source_and_delays_dependent_bar_knowledge() -> None:
+    raw = _raw(3)
+    schedule = _schedule(raw.index)
+    # The first final bar arrives after the next two. Indicators depending on
+    # that bar were not knowable at those later sessions' exchange closes.
+    delayed = schedule.iloc[-1]["market_close"] + pd.Timedelta(hours=1)
+    raw["close_available_at"] = schedule["market_close"].copy()
+    raw.loc[raw.index[0], "close_available_at"] = delayed
+    before = raw.copy(deep=True)
+    bars, issues = _prepare(raw)
+    pd.testing.assert_series_equal(bars["source_close_available_at"],
+        raw["close_available_at"].rename("source_close_available_at").rename_axis("session"), check_freq=False)
+    assert bars["close_available_at"].eq(delayed).all()
+    assert (bars["close_available_at"] >= bars["close_at"]).all()
+    assert bars.attrs["close_availability_assumed"] is False
+    assert "historical_close_availability_assumed" not in bars.attrs["limitations"]
+    assert "missing_or_invalid_close_availability" not in set(issues["code"])
+    prefix, _ = _prepare(raw.iloc[:2], schedule=schedule)
+    pd.testing.assert_frame_equal(bars.iloc[:2], prefix)
+    pd.testing.assert_frame_equal(raw, before)
+
+
+@pytest.mark.parametrize("bad_clock", [None, "2025-01-02T19:59:59Z", "2025-01-02T21:00:00"])
+def test_missing_naive_or_preclose_explicit_clock_never_falls_back_to_exchange_close(bad_clock: object) -> None:
+    raw = _raw(3)
+    raw["close_available_at"] = _schedule(raw.index)["market_close"].astype(object)
+    raw.loc[raw.index[0], "close_available_at"] = bad_clock
+    bars, issues = _prepare(raw)
+    assert pd.isna(bars.iloc[0]["source_close_available_at"])
+    assert bars["source_close_available_at"].iloc[1:].notna().all()
+    assert bars["close_available_at"].isna().all()
+    assert bars.attrs["close_availability_assumed"] is False
+    assert "missing_or_invalid_close_availability" in set(issues["code"])
+
+
+def test_identical_price_duplicate_uses_first_valid_arrival_and_repreparing_keeps_source_clocks() -> None:
+    raw = _raw(3)
+    raw["close_available_at"] = _schedule(raw.index)["market_close"] + pd.Timedelta(hours=2)
+    duplicate = raw.iloc[[0]].copy()
+    duplicate["close_available_at"] -= pd.Timedelta(hours=1)
+    duplicated = pd.concat([raw, duplicate])
+    duplicated.attrs = dict(raw.attrs)
+    bars, _ = _prepare(duplicated)
+    assert bars.iloc[0]["source_close_available_at"] == duplicate.iloc[0]["close_available_at"]
+    repeated, _ = _prepare(bars)
+    pd.testing.assert_frame_equal(bars, repeated)
 
 
 def test_fx_is_asof_available_at_and_never_uses_later_close_for_open() -> None:
@@ -242,11 +340,62 @@ def test_naive_fx_availability_is_ignored_not_assumed_utc() -> None:
     assert "invalid_fx_observation" in set(issues["code"])
 
 
+def test_years_old_fx_remains_evidence_but_cannot_execute_or_value_a_lot() -> None:
+    from src.strategy_audit_engine import AuditConfig, run_strategy_audit
+
+    raw = _raw(10)
+    fx = pd.DataFrame({"close": [1.25], "available_at": ["2020-01-01T00:00:00Z"]})
+    bars, issues = _prepare(raw, currency="GBP", fx=fx)
+    assert bars[["fx_open", "fx_close"]].isna().all().all()
+    assert bars["fx_open_available_at"].eq(pd.Timestamp("2020-01-01T00:00:00Z")).all()
+    assert bars["fx_open_age_days"].gt(365).all()
+    assert bars.attrs["fx_max_age_days"] == 7.0
+    assert "stale_fx_observation" in set(issues["code"])
+    assert "stale_fx_observation" in bars.attrs["limitations"]
+    observed = _schedule(raw.index).iloc[0]["market_close"] + pd.Timedelta(minutes=1)
+    signals = pd.DataFrame([dict(event_id="stale-fx", ticker="TEST",
+        signal_session=raw.index[0].date().isoformat(), observed_at=observed,
+        entry_label="Entrada fuerte", entry_score=80)])
+    result = run_strategy_audit(signals, {"TEST": bars}, AuditConfig(
+        start=raw.index[0].date(), end=raw.index[-1].date(), exit_policy="hold"))
+    assert result.lots.empty
+    assert result.metrics["unfilled_entries"] == 1
+    assert result.metrics["coverage_complete"] is False
+
+
+def test_fx_age_is_elapsed_calendar_time_including_weekends_and_limit_is_explicit() -> None:
+    raw = _raw(3)
+    opened = _schedule(raw.index).iloc[0]["market_open"]
+    available = opened - pd.Timedelta(days=7)
+    future = _schedule(raw.index).iloc[-1]["market_close"] + pd.Timedelta(hours=1)
+    fx = pd.DataFrame({"close": [1.25, 99.0], "available_at": [available, future]})
+    bars, _ = _prepare(raw, currency="GBP", fx=fx)
+    assert bars.iloc[0]["fx_open"] == 1.25
+    assert bars.iloc[0]["fx_open_age_days"] == 7.0
+    assert pd.isna(bars.iloc[0]["fx_close"])
+    assert bars.iloc[0]["fx_close_age_days"] == 7.25
+    assert bars.iloc[-1]["fx_open_age_days"] == 11.0  # Thursday to Monday.
+    assert pd.isna(bars.iloc[-1]["fx_close"])
+    assert bars["fx_close_available_at"].eq(available).all()
+    relaxed, _ = _prepare(raw, currency="GBP", fx=fx, fx_max_age_days=8)
+    assert relaxed.iloc[0]["fx_close"] == 1.25
+    assert relaxed.iloc[1]["fx_open"] == 1.25
+    assert pd.isna(relaxed.iloc[1]["fx_close"])
+    assert relaxed.attrs["fx_max_age_days"] == 8
+    assert relaxed.attrs["strategy_config"] == bars.attrs["strategy_config"]
+
+
+@pytest.mark.parametrize("maximum", [0, -1, float("nan"), float("inf"), True])
+def test_fx_data_quality_limit_must_be_finite_and_positive(maximum: object) -> None:
+    with pytest.raises(ValueError, match="fx_max_age_days"):
+        _prepare(_raw(3), fx_max_age_days=maximum)
+
+
 def test_gbp_normalizes_ohlc_once_before_indicators_and_keeps_volume() -> None:
     raw = _raw()
     raw.loc[:, ["open", "high", "low", "close"]] *= 100
     before = raw.copy(deep=True)
-    fx = pd.DataFrame({"close": [1.25], "available_at": ["2020-01-01T00:00:00Z"]})
+    fx = pd.DataFrame({"close": 1.25, "available_at": pd.to_datetime(raw.index, utc=True)})
     bars, _ = _prepare(raw, currency="GBp", fx=fx)
     already_normalized = normalize_price_frame_units(raw, "GBp")
     repeated, _ = _prepare(already_normalized, currency="GBp", fx=fx)
@@ -269,7 +418,9 @@ def test_cached_indicators_and_signal_flags_are_always_recomputed() -> None:
     bars, _ = _prepare(raw, config=config)
     expected = add_signal_columns(add_indicators(raw.loc[:, ["open", "high", "low", "close", "volume"]], config), config)
     expected.index.name = "session"
-    pd.testing.assert_series_equal(bars["sell_setup"], expected["sell_setup"], check_freq=False)
+    mature = bars["exit_indicators_ready"]
+    pd.testing.assert_series_equal(bars.loc[mature, "sell_setup"].astype(bool),
+        expected.loc[mature, "sell_setup"], check_freq=False)
     assert bars["sma_long"].iloc[-1] > 0
     assert not bool(bars["sell_setup"].iloc[-1])
 

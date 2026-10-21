@@ -182,6 +182,7 @@ def run_strategy_audit(signals: pd.DataFrame, bars: Mapping[str, pd.DataFrame], 
     scheduled_sessions: dict[str, dict[str, dict[str, object]]] = {}
     expected_session_dates: dict[str, set[str]] = {}
     required_closes: dict[str, pd.Timestamp] = {}
+    calendar_ranges: dict[str, tuple[str, str]] = {}
     for raw_ticker, source in sorted(bars.items()):
         ticker = str(raw_ticker).strip().upper()
         if not ticker:
@@ -223,7 +224,13 @@ def run_strategy_audit(signals: pd.DataFrame, bars: Mapping[str, pd.DataFrame], 
             if quarantine and session >= quarantine:
                 issue("quarantined_bar", ticker, session=session)
                 continue
-            row.update(session=session, open_at=opened, close_at=closed)
+            available = _aware(row.get("close_available_at")) if "close_available_at" in row else closed
+            if available is None or available < closed:
+                issue("invalid_close_knowledge_clock", ticker, session=session)
+                # The opening can still be checked, but this close cannot create
+                # a decision or valuation. Do not invent a source-arrival time.
+                available = None
+            row.update(session=session, open_at=opened, close_at=closed, close_available_at=available)
             for field_name in ("open", "high", "low", "close", "fx_open", "fx_close", "sma_long"):
                 row[field_name] = _positive(row.get(field_name))
             if all(row.get(key) is not None for key in ("open", "high", "low", "close")) and not (
@@ -253,6 +260,10 @@ def run_strategy_audit(signals: pd.DataFrame, bars: Mapping[str, pd.DataFrame], 
             if calendar_valid and len({item["session"] for item in calendar}) == len(calendar):
                 calendar.sort(key=lambda item: item["open_at"])
                 schedules[ticker] = calendar
+                calendar_ranges[ticker] = (
+                    _session(source.attrs.get("calendar_coverage_start")) or calendar[0]["session"],
+                    _session(source.attrs.get("calendar_coverage_end")) or calendar[-1]["session"],
+                )
                 scheduled_sessions[ticker] = {item["session"]: item for item in calendar}
                 expected_session_dates.setdefault(ticker, set()).update(scheduled_sessions[ticker])
                 for expected in calendar:
@@ -406,8 +417,9 @@ def run_strategy_audit(signals: pd.DataFrame, bars: Mapping[str, pd.DataFrame], 
         for row in rows:
             if end is None or row["open_at"] <= end:
                 events.append((row["open_at"], 0, ticker, row))
-            if end is None or row["close_at"] <= end:
-                events.append((row["close_at"], 1, ticker, row))
+            known_at = row["close_available_at"]
+            if known_at is not None and (end is None or known_at <= end):
+                events.append((known_at, 1, ticker, row))
     events.sort(key=lambda item: (item[0], item[1], item[2]))
     lots: list[dict[str, object]] = []
     ticker_lots: dict[str, list[dict[str, object]]] = {}
@@ -460,6 +472,11 @@ def run_strategy_audit(signals: pd.DataFrame, bars: Mapping[str, pd.DataFrame], 
         if day in expected_session_dates.get(ticker, set()):
             # A scheduled session with no actual bar/close is not a holiday.
             return by_session.get(ticker, {}).get(day), False
+        coverage = calendar_ranges.get(ticker)
+        if coverage is None or day < coverage[0] or day > coverage[1]:
+            # An expired calendar cannot prove that an unlisted day is a
+            # holiday. Missing market data must not become a stale valid mark.
+            return None, False
         prior = [item for item in schedules[ticker] if item["close_at"] <= cutoff]
         if not prior:
             return None, False
@@ -501,7 +518,7 @@ def run_strategy_audit(signals: pd.DataFrame, bars: Mapping[str, pd.DataFrame], 
                 ticker_lots.setdefault(ticker, []).append(new_lot)
         else:
             for lot in ticker_lots.get(ticker, []):
-                if lot["status"] != "open" or when <= lot["entry_at"]:
+                if lot["status"] != "open" or when <= lot["entry_at"] or row["close_at"] <= lot["entry_at"]:
                     continue
                 level = stop_level(lot)
                 if level is not None:
@@ -525,8 +542,8 @@ def run_strategy_audit(signals: pd.DataFrame, bars: Mapping[str, pd.DataFrame], 
                     continue
                 reason = None
                 if config.exit_policy in {"reduce", "sell"}:
-                    if row["close"] <= lot["entry_price_native"] * .92:
-                        reason = "close_stop8"
+                    if row["close"] <= lot["entry_price_native"] * (1 - config.strategy_config.stop_loss_pct / 100):
+                        reason = f"close_stop{config.strategy_config.stop_loss_pct:g}"
                     elif _flag(row.get("sell_setup")) is True:
                         reason = "sell_setup"
                     elif config.exit_policy == "reduce" and _flag(row.get("reduce_setup")) is True:
@@ -567,7 +584,7 @@ def run_strategy_audit(signals: pd.DataFrame, bars: Mapping[str, pd.DataFrame], 
         values = []
         for lot in active:
             mark, carried = valuation_mark(lot["ticker"], day, cutoff)
-            valid = mark is not None and mark["close_at"] <= cutoff and mark["close"] is not None and mark["fx_close"] is not None
+            valid = mark is not None and mark["close_available_at"] is not None and mark["close_available_at"] <= cutoff and mark["close"] is not None and mark["fx_close"] is not None
             valid = valid and mark["close_at"] >= lot["entry_at"]
             required = required_closes.get(lot["ticker"])
             if valid and required is not None and required <= cutoff and mark["close_at"] < required:
@@ -605,7 +622,7 @@ def run_strategy_audit(signals: pd.DataFrame, bars: Mapping[str, pd.DataFrame], 
     for lot in lots:
         if lot["status"] != "closed":
             mark, carried = valuation_mark(lot["ticker"], final_day, end) if end is not None and final_day else (None, False)
-            valid = lot["status"] == "open" and mark is not None and mark["close"] is not None and mark["fx_close"] is not None and (end is None or mark["close_at"] <= end)
+            valid = lot["status"] == "open" and mark is not None and mark["close"] is not None and mark["fx_close"] is not None and mark["close_available_at"] is not None and (end is None or mark["close_available_at"] <= end)
             valid = valid and mark["close_at"] >= lot["entry_at"]
             required = required_closes.get(lot["ticker"])
             if valid and required is not None and required <= end and mark["close_at"] < required:
@@ -665,6 +682,11 @@ def run_strategy_audit(signals: pd.DataFrame, bars: Mapping[str, pd.DataFrame], 
         input_hash=_hash({"signals": raw_records, "bars": {str(key): {"index": list(value.index), "rows": value.to_dict("records"), "attrs": value.attrs} for key, value in sorted(bars.items())}}),
         signals_received=len(signals), signals_unique=len(observations), first_session_observations=len(first),
         eligible_event_ids=[row["event_id"] for row in eligible], filled_event_ids=sorted(filled_ids), unfilled_event_ids=unfilled,
+        pending_exit_orders=_safe([dict(lot_id=lot["lot_id"], ticker=lot["ticker"],
+            decision_at=lot["_pending"]["at"], reason=lot["_pending"]["reason"],
+            intended_open_at=next((item["open_at"] for item in schedules.get(lot["ticker"], [])
+                if item["open_at"] > lot["_pending"]["at"]), None))
+            for lot in lots if lot.get("_pending")]),
         eligible_tickers=sorted({row["ticker"] for row in eligible}), missing_tickers=sorted(missing_tickers),
         blocked_tickers=sorted(blocked), quarantined_from=quarantines, coverage_complete=metrics["coverage_complete"],
         entry_rule="Exactly Entrada fuerte; first observation per ticker/signal_session; first open_at strictly after observed_at.",

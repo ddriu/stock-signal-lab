@@ -7,12 +7,126 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from src.alerts import AlertPreferences, normalize_alert_preferences
+from src.alerts import AlertCandidate, AlertPreferences, normalize_alert_preferences
 from src.alert_runner import _snapshot_positions, run_daily_alerts
 from src.entry_opportunity import STATUS_BUYABLE, STATUS_WAIT_PRICE
 from src.opportunity import evaluate_relative_strength
 from src.signal_engine import SignalResult
 from src.storage import GROUP_PORTFOLIO_OWNER
+
+
+def _email_evidence_run(monkeypatch, *, sender, enabled=True, recorder=None):
+    """Exercise both existing mail sites with synthetic inputs and no SMTP."""
+    import src.model_results_tracking as tracking
+
+    monkeypatch.setenv("MODEL_RESULTS_ENABLED", "1" if enabled else "0")
+    if recorder is not None:
+        monkeypatch.setattr(tracking, "record_model_email_evidence", recorder)
+    preference = normalize_alert_preferences(owner="ddriu", email="ddriu@example.com",
+        enabled=True, include_group=False)
+    user = FakeManualJournal(preference, tickers=("MINE",))
+    frame = _manual_test_frame(monkeypatch)
+    candidate = AlertCandidate(ticker="MINE", kind="buy", title="Entrada de prueba",
+        entry_score=80, entry_label="Entrada fuerte", position_label="Mantener", price=100,
+        as_of="2026-10-14", explanation="Synthetic", signature="test:buy", held=False)
+    monkeypatch.setattr("src.alert_runner.filter_changed_candidates", lambda *args, **kwargs: [candidate])
+    result = run_daily_alerts(owner="ddriu", journal_factory=lambda owner: user,
+        downloader=lambda *args, **kwargs: frame, fundamental_downloader=lambda ticker: {},
+        sender=sender, today=date(2026, 10, 15))
+    return result, user, preference
+
+
+def test_both_existing_mail_sites_mirror_receipts_without_changing_delivery(monkeypatch) -> None:
+    from src.email_sender import EmailDeliveryReceipt
+
+    sent, evidence = [], []
+    receipt = EmailDeliveryReceipt(status="smtp_accepted", smtp_code=250,
+        accepted_at="2026-10-15T07:00:00+00:00", receipt_hash="a" * 64, message_hash="b" * 64)
+
+    def sender(*args):
+        sent.append(args)
+        return receipt
+
+    result, user, preference = _email_evidence_run(monkeypatch, sender=sender,
+        recorder=lambda journal, received, identity: evidence.append((journal, received, identity)))
+    assert result.emails_sent == 2 and result.alerts_sent == 1
+    assert len(sent) == len(evidence) == 2
+    assert [message[0] for message in sent] == [preference.email] * 2
+    assert [entry[0] for entry in evidence] == [user, user]
+    assert all(entry[1] is receipt for entry in evidence)
+    assert len({entry[2] for entry in evidence}) == 2  # Digest and overview are distinct.
+    assert all(len(entry[2]) == 64 and "@" not in entry[2] for entry in evidence)
+    assert user.preference is preference and user.preference_reads == 1
+
+
+def test_legacy_sender_success_remains_unverified_in_optional_evidence(monkeypatch) -> None:
+    evidence = []
+    result, _, _ = _email_evidence_run(monkeypatch, sender=lambda *args: None,
+        recorder=lambda journal, receipt, identity: evidence.append(receipt))
+    assert result.emails_sent == 2
+    assert evidence == [None, None]  # No synthetic smtp_accepted claim.
+
+
+def test_optional_email_tracking_is_off_by_default_and_never_initializes_ledger(monkeypatch) -> None:
+    import src.alert_runner as runner
+
+    monkeypatch.delenv("MODEL_RESULTS_ENABLED", raising=False)
+    errors = []
+    runner._record_model_email(object(), None, "identity", owner="ddriu", errors=errors)
+    assert errors == []
+    result, _, _ = _email_evidence_run(monkeypatch, enabled=False, sender=lambda *args: None,
+        recorder=lambda *args, **kwargs: pytest.fail("Disabled tracking must not touch a ledger"))
+    assert result.emails_sent == 2
+
+
+def test_tracking_failure_does_not_retry_or_reclassify_accepted_mail(monkeypatch) -> None:
+    sent = []
+
+    def recorder(*args, **kwargs):
+        raise RuntimeError("private-token secret@example.invalid")
+
+    result, _, _ = _email_evidence_run(monkeypatch, sender=lambda *args: sent.append(args), recorder=recorder)
+    assert len(sent) == result.emails_sent == 2
+    assert result.alerts_sent == 1
+    evidence_errors = [error for error in result.errors if "evidencia de correo" in error]
+    assert len(evidence_errors) == 2
+    assert all("RuntimeError" in error for error in evidence_errors)
+    assert "private-token" not in repr(result.errors)
+    assert "secret@example.invalid" not in repr(result.errors)
+
+
+def test_send_failure_records_only_failure_category_and_keeps_original_error(monkeypatch) -> None:
+    evidence, attempts = [], []
+
+    def sender(*args):
+        attempts.append(args)
+        raise RuntimeError("synthetic original sending failure")
+
+    result, _, _ = _email_evidence_run(monkeypatch, sender=sender,
+        recorder=lambda journal, receipt, identity: evidence.append(receipt))
+    assert result.emails_sent == result.alerts_sent == 0
+    assert len(attempts) == 2
+    assert evidence == [{"status": "failed", "error_type": "RuntimeError"}] * 2
+    assert sum("synthetic original sending failure" in error for error in result.errors) == 2
+
+
+def test_post_acceptance_transport_error_keeps_receipt_without_changing_old_error_semantics(monkeypatch) -> None:
+    from src.email_sender import EmailDeliveryError, EmailDeliveryReceipt
+
+    receipt = EmailDeliveryReceipt(status="smtp_accepted", smtp_code=250,
+        accepted_at="2026-10-15T07:00:00+00:00", receipt_hash="a" * 64, message_hash="b" * 64)
+    evidence = []
+
+    def sender(*args):
+        error = EmailDeliveryError("synthetic failure after DATA acceptance")
+        error.smtp_receipt = receipt
+        raise error
+
+    result, _, _ = _email_evidence_run(monkeypatch, sender=sender,
+        recorder=lambda journal, received, identity: evidence.append(received))
+    assert result.emails_sent == result.alerts_sent == 0  # Preserve existing counters.
+    assert evidence == [receipt, receipt]  # But do not erase proven SMTP acceptance.
+    assert sum("synthetic failure after DATA acceptance" in error for error in result.errors) == 2
 
 
 class FakeJournal:

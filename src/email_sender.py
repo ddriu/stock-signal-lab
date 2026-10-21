@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from email.message import EmailMessage
+import hashlib
+import json
 import os
 import smtplib
 import ssl
@@ -15,6 +18,34 @@ class EmailConfigurationError(RuntimeError):
 
 class EmailDeliveryError(RuntimeError):
     """El servidor SMTP rechazó o no pudo entregar el mensaje."""
+
+
+@dataclass(frozen=True)
+class EmailDeliveryReceipt:
+    """Evidence of SMTP DATA acceptance, never mailbox delivery or reading.
+
+    No credentials, envelope addresses, subject or body are returned. The
+    message hash identifies the exact supplied content, not a wire transcript.
+    """
+
+    status: str
+    smtp_code: int
+    accepted_at: str
+    receipt_hash: str
+    message_hash: str
+
+
+def _acceptance_receipt(subject: str, plain_body: str, html_body: str) -> EmailDeliveryReceipt:
+    message_hash = hashlib.sha256(json.dumps(
+        {"subject": subject, "plain_body": plain_body, "html_body": html_body},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    accepted_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    evidence = {"status": "smtp_accepted", "smtp_code": 250,
+                "accepted_at": accepted_at, "message_hash": message_hash}
+    receipt_hash = hashlib.sha256(json.dumps(evidence, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")).hexdigest()
+    return EmailDeliveryReceipt(**evidence, receipt_hash=receipt_hash)
 
 
 @dataclass(frozen=True)
@@ -92,8 +123,13 @@ def send_email(
     html_body: str,
     *,
     config: EmailConfig | None = None,
-) -> None:
-    """Envía un mensaje multipart; nunca registra ni devuelve la contraseña."""
+) -> EmailDeliveryReceipt | None:
+    """Envía un multipart y conserva evidencia de aceptación sin PII.
+
+    ``smtplib.send_message`` returns an empty refusal dictionary only after a
+    successful DATA response (250). A legacy/mock sender returning ``None``
+    produces no receipt; merely returning without an exception is not evidence.
+    """
 
     resolved = config or load_email_config()
     if not resolved.configured or not resolved.sender_email:
@@ -108,6 +144,7 @@ def send_email(
     message.add_alternative(html_body, subtype="html", charset="utf-8")
 
     context = ssl.create_default_context()
+    receipt = None
     try:
         if resolved.use_ssl:
             with smtplib.SMTP_SSL(
@@ -120,6 +157,8 @@ def send_email(
                 refused = server.send_message(message)
                 if refused:
                     raise EmailDeliveryError("El servidor SMTP rechazó el destinatario; no se confirma el envío.")
+                if isinstance(refused, dict):
+                    receipt = _acceptance_receipt(subject, plain_body, html_body)
         else:
             with smtplib.SMTP(resolved.host, resolved.port, timeout=30) as server:
                 server.starttls(context=context)
@@ -127,10 +166,19 @@ def send_email(
                 refused = server.send_message(message)
                 if refused:
                     raise EmailDeliveryError("El servidor SMTP rechazó el destinatario; no se confirma el envío.")
+                if isinstance(refused, dict):
+                    receipt = _acceptance_receipt(subject, plain_body, html_body)
     except (OSError, smtplib.SMTPException) as exc:
-        raise EmailDeliveryError(
+        error = EmailDeliveryError(
             "No se pudo enviar el correo. Revisa la cuenta y su contraseña de aplicación."
-        ) from exc
+        )
+        # A connection can fail during QUIT after DATA was accepted. Preserve
+        # the original exception semantics, but do not erase proven acceptance
+        # or cause the optional ledger to mislabel it as an SMTP rejection.
+        if receipt is not None:
+            error.smtp_receipt = receipt
+        raise error from exc
+    return receipt
 
 
 def send_test_email(recipient: str, *, config: EmailConfig | None = None) -> None:
