@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta
 import html
 from hashlib import sha256
 import importlib
+import inspect
 import json
 from math import isfinite
 
@@ -18,6 +19,20 @@ import pandas as pd
 import streamlit as st
 
 from config import BacktestConfig, StrategyConfig
+import src.analysis_policy as _analysis_policy_module
+
+# Un despliegue en caliente puede conservar las funciones anteriores en memoria.
+# Recarga la API antes de enlazar sus símbolos; no se omiten los controles nuevos
+# ni se cambian las reglas del motor para ocultar una incompatibilidad de versión.
+if any(
+    "fundamental_info" not in inspect.signature(function).parameters
+    for function in (
+        _analysis_policy_module.enrich_analysis_rows,
+        _analysis_policy_module.build_policy_snapshot,
+    )
+):
+    _analysis_policy_module = importlib.reload(_analysis_policy_module)
+
 from src.analysis_policy import (
     COMPARATIVE_STRATEGY_ID,
     PRIMARY_STRATEGY_ID,
