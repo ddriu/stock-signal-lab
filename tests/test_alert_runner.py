@@ -16,7 +16,7 @@ from src.storage import GROUP_PORTFOLIO_OWNER
 
 
 def _email_evidence_run(monkeypatch, *, sender, enabled=True, recorder=None):
-    """Exercise both existing mail sites with synthetic inputs and no SMTP."""
+    """Exercise the single reserved digest with synthetic inputs and no SMTP."""
     import src.model_results_tracking as tracking
 
     monkeypatch.setenv("MODEL_RESULTS_ENABLED", "1" if enabled else "0")
@@ -26,17 +26,28 @@ def _email_evidence_run(monkeypatch, *, sender, enabled=True, recorder=None):
         enabled=True, include_group=False)
     user = FakeManualJournal(preference, tickers=("MINE",))
     frame = _manual_test_frame(monkeypatch)
+    frame["open"], frame["high"], frame["low"], frame["atr_14"] = 99., 101., 98., 2.
+    monkeypatch.setattr("src.alert_runner.evaluate_growth_momentum", lambda **kwargs: SimpleNamespace(
+        score=85, confidence_pct=90, label="Entrada fuerte", growth_score=80, momentum_score=90,
+        context_score=80, sector_key="technology", as_of=kwargs["frame"].index[-1],
+        positive_factors=(), risk_factors=(), manual_checks=()))
+    monkeypatch.setattr("src.alert_runner.evaluate_entry_opportunity", lambda **kwargs: SimpleNamespace(
+        opportunity_score=75, confidence_pct=80, status_code=STATUS_BUYABLE,
+        status_label="Entrada evaluada", explanation="Análisis sintético completo"))
     candidate = AlertCandidate(ticker="MINE", kind="buy", title="Entrada de prueba",
         entry_score=80, entry_label="Entrada fuerte", position_label="Mantener", price=100,
-        as_of="2026-10-14", explanation="Synthetic", signature="test:buy", held=False)
-    monkeypatch.setattr("src.alert_runner.filter_changed_candidates", lambda *args, **kwargs: [candidate])
+        as_of="2026-10-14", explanation="Synthetic", signature="test:buy", held=False,
+        policy_snapshot={"data_quality": {"block_entry": False}})
+    from src.analysis_policy import decode_policy_note
+    monkeypatch.setattr("src.alert_runner.filter_changed_candidates", lambda *args, **kwargs: [
+        replace(candidate, policy_snapshot=decode_policy_note(user.snapshots[-1]["note"]))])
     result = run_daily_alerts(owner="ddriu", journal_factory=lambda owner: user,
-        downloader=lambda *args, **kwargs: frame, fundamental_downloader=lambda ticker: {},
+        downloader=lambda *args, **kwargs: frame, fundamental_downloader=_verified_growth_info,
         sender=sender, today=date(2026, 10, 15))
     return result, user, preference
 
 
-def test_both_existing_mail_sites_mirror_receipts_without_changing_delivery(monkeypatch) -> None:
+def test_single_digest_mirrors_receipt_and_preserves_recipient_preferences(monkeypatch) -> None:
     from src.email_sender import EmailDeliveryReceipt
 
     sent, evidence = [], []
@@ -49,12 +60,12 @@ def test_both_existing_mail_sites_mirror_receipts_without_changing_delivery(monk
 
     result, user, preference = _email_evidence_run(monkeypatch, sender=sender,
         recorder=lambda journal, received, identity: evidence.append((journal, received, identity)))
-    assert result.emails_sent == 2 and result.alerts_sent == 1
-    assert len(sent) == len(evidence) == 2
-    assert [message[0] for message in sent] == [preference.email] * 2
-    assert [entry[0] for entry in evidence] == [user, user]
+    assert result.emails_sent == 1 and result.alerts_sent == 1
+    assert len(sent) == len(evidence) == 1
+    assert [message[0] for message in sent] == [preference.email]
+    assert [entry[0] for entry in evidence] == [user]
     assert all(entry[1] is receipt for entry in evidence)
-    assert len({entry[2] for entry in evidence}) == 2  # Digest and overview are distinct.
+    assert len({entry[2] for entry in evidence}) == 1
     assert all(len(entry[2]) == 64 and "@" not in entry[2] for entry in evidence)
     assert user.preference is preference and user.preference_reads == 1
 
@@ -63,8 +74,8 @@ def test_legacy_sender_success_remains_unverified_in_optional_evidence(monkeypat
     evidence = []
     result, _, _ = _email_evidence_run(monkeypatch, sender=lambda *args: None,
         recorder=lambda journal, receipt, identity: evidence.append(receipt))
-    assert result.emails_sent == 2
-    assert evidence == [None, None]  # No synthetic smtp_accepted claim.
+    assert result.emails_sent == 1
+    assert evidence == [None]  # No synthetic smtp_accepted claim.
 
 
 def test_optional_email_tracking_is_off_by_default_and_never_initializes_ledger(monkeypatch) -> None:
@@ -76,7 +87,7 @@ def test_optional_email_tracking_is_off_by_default_and_never_initializes_ledger(
     assert errors == []
     result, _, _ = _email_evidence_run(monkeypatch, enabled=False, sender=lambda *args: None,
         recorder=lambda *args, **kwargs: pytest.fail("Disabled tracking must not touch a ledger"))
-    assert result.emails_sent == 2
+    assert result.emails_sent == 1
 
 
 def test_tracking_failure_does_not_retry_or_reclassify_accepted_mail(monkeypatch) -> None:
@@ -86,10 +97,10 @@ def test_tracking_failure_does_not_retry_or_reclassify_accepted_mail(monkeypatch
         raise RuntimeError("private-token secret@example.invalid")
 
     result, _, _ = _email_evidence_run(monkeypatch, sender=lambda *args: sent.append(args), recorder=recorder)
-    assert len(sent) == result.emails_sent == 2
+    assert len(sent) == result.emails_sent == 1
     assert result.alerts_sent == 1
     evidence_errors = [error for error in result.errors if "evidencia de correo" in error]
-    assert len(evidence_errors) == 2
+    assert len(evidence_errors) == 1
     assert all("RuntimeError" in error for error in evidence_errors)
     assert "private-token" not in repr(result.errors)
     assert "secret@example.invalid" not in repr(result.errors)
@@ -105,9 +116,10 @@ def test_send_failure_records_only_failure_category_and_keeps_original_error(mon
     result, _, _ = _email_evidence_run(monkeypatch, sender=sender,
         recorder=lambda journal, receipt, identity: evidence.append(receipt))
     assert result.emails_sent == result.alerts_sent == 0
-    assert len(attempts) == 2
-    assert evidence == [{"status": "failed", "error_type": "RuntimeError"}] * 2
-    assert sum("synthetic original sending failure" in error for error in result.errors) == 2
+    assert len(attempts) == 1
+    assert evidence == [{"status": "failed", "error_type": "RuntimeError"}]
+    assert sum("requiere revisión" in error for error in result.errors) == 1
+    assert "synthetic original sending failure" not in repr(result.errors)
 
 
 def test_post_acceptance_transport_error_keeps_receipt_without_changing_old_error_semantics(monkeypatch) -> None:
@@ -124,15 +136,19 @@ def test_post_acceptance_transport_error_keeps_receipt_without_changing_old_erro
 
     result, _, _ = _email_evidence_run(monkeypatch, sender=sender,
         recorder=lambda journal, received, identity: evidence.append(received))
-    assert result.emails_sent == result.alerts_sent == 0  # Preserve existing counters.
-    assert evidence == [receipt, receipt]  # But do not erase proven SMTP acceptance.
-    assert sum("synthetic failure after DATA acceptance" in error for error in result.errors) == 2
+    assert result.emails_sent == result.alerts_sent == 1
+    assert evidence == [receipt]  # Do not erase proven SMTP acceptance.
+    assert sum("requiere revisión" in error for error in result.errors) == 1
 
 
 class FakeJournal:
     def __init__(self, *, tickers: tuple[str, ...] = ()) -> None:
         self.tickers = tickers
         self.saved_states: list[object] = []
+        self.snapshots: list[dict[str, object]] = []
+        self.reports: dict[str, dict[str, object]] = {}
+        self.delivery_claims: dict[str, tuple[str, str]] = {}
+        self.delivery_finishes: list[tuple[str, str, str]] = []
 
     def list_favorites(self) -> pd.DataFrame:
         return pd.DataFrame({"ticker": list(self.tickers)})
@@ -145,6 +161,37 @@ class FakeJournal:
 
     def upsert_alert_states(self, states: list[object]) -> None:
         self.saved_states.extend(states)
+
+    def list_analysis_snapshots(self) -> pd.DataFrame:
+        return pd.DataFrame(self.snapshots)
+
+    def add_analysis_snapshot(self, **values: object) -> int:
+        values.setdefault("created_at", (pd.Timestamp(values["analyzed_at"]).normalize()
+            + pd.Timedelta(hours=22)).isoformat())
+        self.snapshots.append(values)
+        return len(self.snapshots)
+
+    def save_daily_score_report(self, report: dict[str, object]) -> str:
+        self.reports[report["report_id"]] = report
+        return report["report_id"]
+
+    def claim_daily_digest(self, delivery_key: str, market_date: str, report_id: str) -> bool:
+        assert report_id in self.reports
+        if delivery_key in self.delivery_claims:
+            return False
+        self.delivery_claims[delivery_key] = (market_date, report_id)
+        return True
+
+    def finish_daily_digest(self, delivery_key: str, status: str, *, error_type: str = "") -> None:
+        self.delivery_finishes.append((delivery_key, status, error_type))
+
+
+def _verified_growth_info(ticker):
+    metrics = dict(revenueGrowth=.2, earningsGrowth=.3, operatingMargins=.2,
+                   returnOnEquity=.2, freeCashflow=100.)
+    return dict(symbol=ticker, longName=f"Empresa {ticker}", **metrics,
+        _metric_periods={name: dict(periodicity="annual", period_end="2025-12-31",
+                                   source="SEC EDGAR", comparable=True) for name in metrics})
 
 
 def test_latest_snapshot_positions_are_included_in_the_daily_scope() -> None:
@@ -221,6 +268,8 @@ class FakeManualJournal(FakeJournal):
         super().upsert_alert_states(states)
 
     def add_analysis_snapshot(self, **values: object) -> int:
+        values.setdefault("created_at", (pd.Timestamp(values["analyzed_at"]).normalize()
+            + pd.Timedelta(hours=22)).isoformat())
         self.snapshots.append(values)
         return len(self.snapshots)
 
@@ -237,6 +286,252 @@ def _manual_test_frame(monkeypatch, *, as_of: str = "2026-10-14") -> pd.DataFram
         ),
     )
     return frame
+
+
+def test_daily_digest_claim_blocks_same_session_even_when_body_changes(monkeypatch):
+    preference = normalize_alert_preferences(owner="ddriu", email="ddriu@example.com",
+        enabled=True, include_group=False)
+    user = FakeManualJournal(preference, tickers=("MINE",))
+    frame = _manual_test_frame(monkeypatch)
+    sent = []
+    kwargs = dict(owner="ddriu", journal_factory=lambda owner: user,
+        downloader=lambda *args, **kwargs: frame, fundamental_downloader=lambda ticker: {},
+        sender=lambda *args: sent.append(args), today=date(2026, 10, 15))
+    first = run_daily_alerts(**kwargs)
+    user.tickers = ("MINE", "NEW")
+    second = run_daily_alerts(**kwargs)
+    assert first.emails_sent == 1
+    assert second.emails_sent == 0 and second.emails_skipped == 1
+    assert len(sent) == 1
+    assert len(user.delivery_claims) == 1
+    assert user.delivery_finishes[0][1] == "uncertain"  # The legacy fake has no SMTP receipt.
+
+
+def test_uncertain_smtp_attempt_is_reserved_without_automatic_retry(monkeypatch):
+    preference = normalize_alert_preferences(owner="ddriu", email="ddriu@example.com",
+        enabled=True, include_group=False)
+    user = FakeManualJournal(preference, tickers=("MINE",))
+    frame = _manual_test_frame(monkeypatch)
+    attempts = []
+    def sender(*args):
+        attempts.append(args)
+        raise RuntimeError("secret smtp transport message")
+    kwargs = dict(owner="ddriu", journal_factory=lambda owner: user,
+        downloader=lambda *args, **kwargs: frame, fundamental_downloader=lambda ticker: {},
+        sender=sender, today=date(2026, 10, 15))
+    first = run_daily_alerts(**kwargs)
+    second = run_daily_alerts(**kwargs)
+    assert first.emails_sent == second.emails_sent == 0
+    assert second.emails_skipped == 1
+    assert len(attempts) == 1
+    assert user.delivery_finishes[0][1:] == ("uncertain", "RuntimeError")
+    assert "secret smtp" not in repr(first.errors)
+
+
+@pytest.mark.parametrize("broken", ["list_analysis_snapshots", "save_daily_score_report", "claim_daily_digest"])
+def test_digest_fails_closed_before_smtp_if_history_or_claim_unavailable(monkeypatch, broken):
+    preference = normalize_alert_preferences(owner="ddriu", email="ddriu@example.com",
+        enabled=True, include_group=False)
+    user = FakeManualJournal(preference, tickers=("MINE",))
+    def fail(*args, **kwargs):
+        raise RuntimeError("private backend detail")
+    setattr(user, broken, fail)
+    frame = _manual_test_frame(monkeypatch)
+    summary = run_daily_alerts(owner="ddriu", journal_factory=lambda owner: user,
+        downloader=lambda *args, **kwargs: frame, fundamental_downloader=lambda ticker: {},
+        sender=lambda *args: pytest.fail("No SMTP without persistent history and claim"),
+        today=date(2026, 10, 15))
+    assert summary.emails_sent == 0 and summary.errors
+    assert "private backend" not in repr(summary.errors)
+
+
+def test_scheduled_holiday_does_not_resend_last_sessions_report(monkeypatch):
+    group, user = FakeGroupJournal(), FakeJournal(tickers=("MINE",))
+    frame = _manual_test_frame(monkeypatch, as_of="2026-10-23")
+    result = run_daily_alerts(journal_factory=lambda owner: group if owner == GROUP_PORTFOLIO_OWNER else user,
+        downloader=lambda *args, **kwargs: frame, fundamental_downloader=lambda ticker: {},
+        sender=lambda *args: pytest.fail("No new market session"), today=date(2026, 10, 26),
+        require_current_session=True)
+    assert result.emails_sent == 0 and result.emails_skipped == 1
+
+
+def test_scheduled_european_session_is_not_skipped_for_a_us_holiday(monkeypatch):
+    group, user = FakeGroupJournal(), FakeJournal(tickers=("IBE.MC",))
+    frame = _manual_test_frame(monkeypatch, as_of="2026-02-16")
+    frame["open"], frame["high"], frame["low"], frame["atr_14"] = 99., 101., 98., 2.
+    monkeypatch.setattr("src.alert_runner.evaluate_entry_opportunity", lambda **kwargs: SimpleNamespace(
+        opportunity_score=50, confidence_pct=20, status_code=STATUS_WAIT_PRICE,
+        status_label="Esperar", explanation="Análisis sintético de una sesión europea cerrada"))
+    sent = []
+    result = run_daily_alerts(journal_factory=lambda owner: group if owner == GROUP_PORTFOLIO_OWNER else user,
+        downloader=lambda *args, **kwargs: frame, fundamental_downloader=lambda ticker: {},
+        sender=lambda *args: sent.append(args), today=date(2026, 2, 16),
+        require_current_session=True)
+    assert result.emails_sent == 1 and len(sent) == 1
+
+
+def test_new_purchase_alert_is_not_promoted_with_unverified_fundamental_dates(monkeypatch):
+    preference = normalize_alert_preferences(owner="ddriu", email="ddriu@example.com",
+        enabled=True, include_group=False)
+    user = FakeManualJournal(preference, tickers=("MINE",))
+    frame = _manual_test_frame(monkeypatch)
+    candidate = AlertCandidate(ticker="MINE", kind="Compra", title="Entrada fuerte",
+        entry_score=88, entry_label="Entrada fuerte", position_label="Mantener", price=100,
+        as_of="2026-10-14", explanation="Motor bruto", signature="entry:strong", held=False,
+        policy_snapshot={"data_quality": {"block_entry": True}})
+    monkeypatch.setattr("src.alert_runner.filter_changed_candidates", lambda *args, **kwargs: [candidate])
+    sent = []
+    summary = run_daily_alerts(owner="ddriu", journal_factory=lambda owner: user,
+        downloader=lambda *args, **kwargs: frame, fundamental_downloader=lambda ticker: {},
+        sender=lambda *args: sent.append(args), today=date(2026, 10, 15))
+    assert summary.emails_sent == 1 and summary.alerts_sent == 0
+    report = next(iter(user.reports.values()))
+    assert report["alerts"] == []
+    assert "Revisar datos" in sent[0][2]
+
+
+def test_delivery_key_is_private_and_scoped_to_owner_recipient_and_session():
+    from src.alert_runner import _daily_digest_delivery_key
+    key = _daily_digest_delivery_key("Owner", "ME@EXAMPLE.COM", "2026-10-23")
+    assert key == _daily_digest_delivery_key("owner", "me@example.com", "2026-10-23")
+    assert len(key) == 64 and "@" not in key
+    assert key != _daily_digest_delivery_key("other", "me@example.com", "2026-10-23")
+    assert key != _daily_digest_delivery_key("owner", "other@example.com", "2026-10-23")
+    assert key != _daily_digest_delivery_key("owner", "me@example.com", "2026-10-26")
+
+
+def test_five_visible_alerts_only_are_counted_and_omitted_changes_remain_pending(monkeypatch):
+    class StatefulManual(FakeManualJournal):
+        def list_alert_states(self):
+            if not self.saved_states:
+                return pd.DataFrame(columns=["ticker", "signature", "notified_at"])
+            return pd.DataFrame([dict(ticker=item.ticker, signature=item.signature,
+                                      notified_at=item.notified_at) for item in self.saved_states
+            ]).drop_duplicates("ticker", keep="last")
+    preference = normalize_alert_preferences(owner="ddriu", email="ddriu@example.com",
+        enabled=True, include_group=False)
+    user = StatefulManual(preference, tickers=("AAA", "BBB", "CCC", "DDD", "EEE", "FFF"))
+    frame = _manual_test_frame(monkeypatch, as_of="2026-10-14")
+    frame["open"], frame["high"], frame["low"], frame["atr_14"] = 99., 101., 98., 2.
+    monkeypatch.setattr("src.alert_runner.evaluate_entry_opportunity", lambda **kwargs: SimpleNamespace(
+        opportunity_score=75, confidence_pct=80, status_code=STATUS_BUYABLE,
+        status_label="Entrada evaluada", explanation="Análisis sintético completo"))
+    monkeypatch.setattr("src.alert_runner.evaluate_growth_momentum", lambda **kwargs: SimpleNamespace(
+        score=85, confidence_pct=90, label="Entrada fuerte", growth_score=80, momentum_score=90,
+        context_score=80, sector_key="technology", as_of=kwargs["frame"].index[-1],
+        positive_factors=("Tendencia confirmada",), risk_factors=(), manual_checks=()))
+    sent = []
+    kwargs = dict(owner="ddriu", journal_factory=lambda owner: user,
+        downloader=lambda *args, **kwargs: frame, fundamental_downloader=_verified_growth_info,
+        sender=lambda *args: sent.append(args))
+    first = run_daily_alerts(**kwargs, today=date(2026, 10, 14))
+    assert first.alerts_sent == 5 and first.emails_sent == 1
+    report = next(iter(user.reports.values()))
+    assert len(report["alerts"]) == 5
+    assert {item.ticker for item in user.saved_states} == {"AAA", "BBB", "CCC", "DDD", "EEE"}
+    assert "FFF" in {item["ticker"] for item in user.snapshots}
+    frame.index = pd.DatetimeIndex(["2026-10-15"])
+    second = run_daily_alerts(**kwargs, today=date(2026, 10, 15))
+    assert second.alerts_sent == 1 and second.emails_sent == 1
+    report = list(user.reports.values())[-1]
+    assert [item["ticker"] for item in report["alerts"]] == ["FFF"]
+
+
+def test_runner_with_real_sqlite_history_report_and_claim_has_no_duplicate_mail(monkeypatch, tmp_path):
+    from src.journal import TradingJournal
+    from src.email_sender import EmailDeliveryReceipt
+    user = TradingJournal(tmp_path / "digest.sqlite", owner="synthetic")
+    user.save_alert_preferences(normalize_alert_preferences(owner="synthetic",
+        email="synthetic@example.invalid", enabled=True, include_group=False))
+    monkeypatch.setattr(user, "list_favorites", lambda: pd.DataFrame({"ticker": ["MINE"]}))
+    frame = _manual_test_frame(monkeypatch)
+    frame["open"], frame["high"], frame["low"], frame["atr_14"] = 99., 101., 98., 2.
+    monkeypatch.setattr("src.alert_runner.evaluate_entry_opportunity", lambda **kwargs: SimpleNamespace(
+        opportunity_score=50, confidence_pct=20, status_code=STATUS_WAIT_PRICE,
+        status_label="Esperar", explanation="Análisis sintético para probar persistencia"))
+    calls = []
+    def sender(*args):
+        calls.append(args)
+        return EmailDeliveryReceipt(status="smtp_accepted", smtp_code=250,
+            accepted_at="2026-10-15T21:00:00+00:00", receipt_hash="a" * 64, message_hash="b" * 64)
+    kwargs = dict(owner="synthetic", journal_factory=lambda owner: user,
+        downloader=lambda *args, **kwargs: frame, fundamental_downloader=lambda ticker: {},
+        sender=sender, today=date(2026, 10, 15))
+    first = run_daily_alerts(**kwargs)
+    second = run_daily_alerts(**kwargs)
+    assert first.emails_sent == 1 and not first.errors
+    assert second.emails_sent == 0 and second.emails_skipped == 1 and not second.errors
+    assert len(calls) == 1
+    snapshots = user.list_analysis_snapshots()
+    assert len(snapshots) == 1
+    import re
+    identity = re.search(r"digest=([a-f0-9]{64})", calls[0][2]).group(1)
+    report = user.get_daily_score_report(identity)
+    assert report["report_id"] == identity and report["as_of"] == "2026-10-14"
+
+
+def _real_closing_digest_case(monkeypatch, tmp_path, *, ticker, session, created_at, clock):
+    from src.journal import TradingJournal
+    user = TradingJournal(tmp_path / "closing-digest.sqlite", owner="synthetic")
+    user.save_alert_preferences(normalize_alert_preferences(owner="synthetic",
+        email="synthetic@example.invalid", enabled=True, include_group=False))
+    monkeypatch.setattr(user, "list_favorites", lambda: pd.DataFrame({"ticker": [ticker]}))
+    original_add = user.add_analysis_snapshot
+    def add_at_known_time(**values):
+        identity = original_add(**values)
+        with user._connect() as connection:
+            connection.execute("UPDATE analysis_snapshots SET created_at = ? WHERE id = ?",
+                               (created_at, identity))
+        return identity
+    monkeypatch.setattr(user, "add_analysis_snapshot", add_at_known_time)
+    monkeypatch.setattr("src.daily_digest._utc_clock", lambda value=None: pd.Timestamp(clock))
+    frame = _manual_test_frame(monkeypatch, as_of=session)
+    frame["open"], frame["high"], frame["low"], frame["atr_14"] = 99., 101., 98., 2.
+    monkeypatch.setattr("src.alert_runner.evaluate_growth_momentum", lambda **kwargs: SimpleNamespace(
+        score=85, confidence_pct=90, label="Entrada fuerte", growth_score=80, momentum_score=90,
+        context_score=80, sector_key="technology", as_of=kwargs["frame"].index[-1],
+        positive_factors=("Tendencia confirmada",), risk_factors=(), manual_checks=()))
+    monkeypatch.setattr("src.alert_runner.evaluate_entry_opportunity", lambda **kwargs: SimpleNamespace(
+        opportunity_score=75, confidence_pct=80, status_code=STATUS_BUYABLE,
+        status_label="Entrada evaluada", explanation="Análisis sintético completo"))
+    return user, frame
+
+
+def test_manual_intraday_policy_is_not_reintroduced_into_a_previous_closing_report(monkeypatch, tmp_path):
+    user, frame = _real_closing_digest_case(monkeypatch, tmp_path, ticker="MINE", session="2026-10-26",
+        created_at="2026-10-26T14:00:00+00:00", clock="2026-10-26T15:00:00+00:00")
+    result = run_daily_alerts(owner="synthetic", journal_factory=lambda owner: user,
+        downloader=lambda *args, **kwargs: frame, fundamental_downloader=_verified_growth_info,
+        sender=lambda *args: pytest.fail("An open US session is not a closing digest"),
+        today=date(2026, 10, 26))
+    assert result.emails_sent == result.alerts_sent == 0
+    assert result.emails_skipped == 1
+    assert any("sesión abierta" in error for error in result.errors)
+    assert user.list_alert_states().empty
+    with user._connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM daily_score_reports").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM daily_digest_deliveries").fetchone()[0] == 0
+
+
+def test_european_closing_digest_uses_exact_report_session_for_real_sqlite_claim_on_us_holiday(monkeypatch, tmp_path):
+    from src.email_sender import EmailDeliveryReceipt
+    user, frame = _real_closing_digest_case(monkeypatch, tmp_path, ticker="IBE.MC", session="2026-02-16",
+        created_at="2026-02-16T21:00:00+00:00", clock="2026-02-16T22:15:00+00:00")
+    calls = []
+    def sender(*args):
+        calls.append(args)
+        return EmailDeliveryReceipt(status="smtp_accepted", smtp_code=250,
+            accepted_at="2026-02-16T22:15:00+00:00", receipt_hash="a" * 64, message_hash="b" * 64)
+    result = run_daily_alerts(owner="synthetic", journal_factory=lambda owner: user,
+        downloader=lambda *args, **kwargs: frame, fundamental_downloader=_verified_growth_info,
+        sender=sender, today=date(2026, 2, 16), require_current_session=True)
+    assert result.emails_sent == result.alerts_sent == 1 and not result.errors
+    assert len(calls) == 1
+    with user._connect() as connection:
+        report = connection.execute("SELECT market_date FROM daily_score_reports").fetchone()
+        claim = connection.execute("SELECT market_date, status FROM daily_digest_deliveries").fetchone()
+    assert report[0] == claim[0] == "2026-02-16"
+    assert claim[1] == "sent"
 
 
 def test_manual_review_reads_only_the_selected_owner_and_uses_the_stored_recipient(monkeypatch) -> None:
@@ -479,10 +774,10 @@ def test_primary_candidate_preserves_auxiliary_event_warning_and_its_evidence(mo
         event=SimpleNamespace(label="Resultados mañana")))
     sent = []
     result = run_daily_alerts(journal_factory=lambda owner: group if owner == GROUP_PORTFOLIO_OWNER else user,
-        downloader=lambda *args, **kwargs: frame, fundamental_downloader=lambda ticker: {"symbol": ticker},
+        downloader=lambda *args, **kwargs: frame, fundamental_downloader=_verified_growth_info,
         sender=lambda *args: sent.append(args), today=date(2026, 7, 29))
     assert result.alerts_sent == 1
-    assert result.emails_sent == 2
+    assert result.emails_sent == 1
     plain = sent[0][2]
     assert "Evento próximo; no entrar" in plain
     assert "Resultados mañana" in plain
@@ -568,10 +863,7 @@ def test_one_invalid_ticker_does_not_cancel_the_user_digest(monkeypatch) -> None
     summary = run_daily_alerts(
         journal_factory=journal_factory,
         downloader=downloader,
-        fundamental_downloader=lambda ticker: {
-            "symbol": ticker,
-            "longName": f"Empresa {ticker}",
-        },
+        fundamental_downloader=_verified_growth_info,
         sender=lambda *args: sent.append(args),
         today=date(2026, 7, 29),
     )
@@ -579,12 +871,11 @@ def test_one_invalid_ticker_does_not_cancel_the_user_digest(monkeypatch) -> None
     assert summary.users_checked == 1
     assert summary.tickers_checked == 2
     assert summary.tickers_with_prices == 2
-    assert summary.emails_sent == 2
+    assert summary.emails_sent == 1
     assert summary.alerts_sent == 1
     assert any("ddriu / BAD" in error for error in summary.errors)
-    assert len(sent) == 2
-    assert "1 alerta" in sent[0][1]
-    assert "resumen diario" in sent[1][1]
+    assert len(sent) == 1
+    assert "resumen del cierre" in sent[0][1]
     assert [state.ticker for state in user.saved_states] == ["GOOD"]
     assert user.saved_states[0].signature == "entry:growth_momentum:Entrada fuerte"
     assert user.saved_states[0].company_name == "Empresa GOOD"
@@ -666,7 +957,7 @@ def test_buy_email_waits_when_the_primary_strategy_requires_a_better_price(monke
 
     assert summary.emails_sent == 1
     assert len(sent) == 1
-    assert "resumen diario" in sent[0][1]
+    assert "resumen del cierre" in sent[0][1]
     assert user.saved_states[0].signature == "entry:growth_momentum:Esperar mejor precio"
 
 
@@ -877,5 +1168,5 @@ def test_daily_holding_email_uses_confirmations_instead_of_raw_sell_label(monkey
     assert summary.alerts_sent == 0
     assert len(sent) == 1
     assert "Esperar confirmación" in sent[0][2]
-    assert "90%" in sent[0][3]
+    assert "no equivale" in sent[0][3]
     assert user.saved_states[0].signature == "position:Esperar confirmación"

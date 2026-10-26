@@ -15,6 +15,7 @@ import json
 import math
 
 from src.instruments import resolve_analysis_ticker
+from src.analysis_data_quality import assess_analysis_data_quality
 
 
 POLICY_VERSION = "dual_strategy_v1"
@@ -376,6 +377,7 @@ def build_policy_snapshot(
     fundamental_filter: object = None, position_context: Mapping[str, object] | None = None,
     cycle_context: Mapping[str, object] | None = None, held: bool | None = None,
     config: Mapping[str, object] | None = None,
+    fundamental_info: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Devuelve metadata JSON-safe reutilizable en app, notas y correos.
 
@@ -438,6 +440,10 @@ def build_policy_snapshot(
         "primary": primary, "comparative": comparative, "position": position,
         "context": context, "disagreement": disagreement,
     }
+    if fundamental_info is not None:
+        # This independent presentation gate never edits scores or engine
+        # labels and never turns absent company data into a sell signal.
+        policy["data_quality"] = assess_analysis_data_quality(fundamental_info, as_of=policy["as_of"])
     policy["snapshot_id"] = _snapshot_id(policy)
     return policy
 
@@ -449,6 +455,7 @@ def enrich_analysis_rows(
     held_tickers: Iterable[object] = (),
     cycle_contexts: Mapping[str, Mapping[str, object]] | None = None,
     config: Mapping[str, object] | None = None,
+    fundamental_info: Mapping[str, Mapping[str, object]] | None = None,
 ) -> list[dict[str, object]]:
     """Añade columnas de presentación sin cambiar ni ordenar las filas originales."""
 
@@ -459,6 +466,7 @@ def enrich_analysis_rows(
     filters = normalize(fundamental_filters)
     positions = normalize(position_contexts)
     cycles = normalize(cycle_contexts)
+    infos = normalize(fundamental_info)
     held = {_ticker(ticker) for ticker in held_tickers if _ticker(ticker)}
     enriched = []
     for source in rows:
@@ -469,6 +477,7 @@ def enrich_analysis_rows(
             position_context=positions.get(ticker), cycle_context=cycles.get(ticker),
             held=True if ticker in held else None,
             config=config,
+            fundamental_info=infos.get(ticker) if fundamental_info is not None else None,
         )
         primary, comparative, position = policy["primary"], policy["comparative"], policy["position"]
         row.update({

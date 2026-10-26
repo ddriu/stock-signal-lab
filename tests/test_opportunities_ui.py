@@ -12,6 +12,7 @@ def test_entry_opportunities_is_independent_from_existing_radar() -> None:
 
     assert ANALYSIS_OPTIONS == [
         "Radar",
+        "Resumen diario",
         "Oportunidades",
         "Empresa",
         "Estrategias",

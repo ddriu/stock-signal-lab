@@ -23,6 +23,10 @@ from src.alerts import (
 )
 from src.favorite_tags import serialize_favorite_tags
 from src.data_sources import convert_currency
+from src.daily_digest_storage import (
+    digest_identifier, digest_market_date, digest_terminal_state,
+    normalized_digest_report,
+)
 from src.analysis_policy import (
     POSITION_PLAN_MARKER,
     POLICY_NOTE_MARKER,
@@ -1238,6 +1242,21 @@ class TradingJournal:
 
     def _initialize(self) -> None:
         with self._connect() as connection:
+            connection.execute("""CREATE TABLE IF NOT EXISTS daily_score_reports (
+                owner TEXT NOT NULL, report_id TEXT NOT NULL,
+                market_date TEXT NOT NULL, report_json TEXT NOT NULL,
+                created_at TEXT NOT NULL, PRIMARY KEY (owner, report_id),
+                UNIQUE(owner, report_id, market_date))""")
+            connection.execute("""CREATE TABLE IF NOT EXISTS daily_digest_deliveries (
+                owner TEXT NOT NULL, delivery_key TEXT NOT NULL,
+                market_date TEXT NOT NULL, report_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'reserved'
+                    CHECK (status IN ('reserved','sent','failed','uncertain')),
+                error_type TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL, finished_at TEXT,
+                PRIMARY KEY (owner, delivery_key),
+                FOREIGN KEY(owner, report_id, market_date)
+                    REFERENCES daily_score_reports(owner, report_id, market_date))""")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS operations (
@@ -2281,6 +2300,63 @@ class TradingJournal:
             connection.execute(
                 "DELETE FROM analysis_snapshots WHERE id = ?",
                 (int(snapshot_id),),
+            )
+
+    def save_daily_score_report(self, report: dict[str, object]) -> str:
+        """Append an immutable, owner-scoped report before any SMTP attempt."""
+        identifier, market_date, payload = normalized_digest_report(report)
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO daily_score_reports "
+                "(owner,report_id,market_date,report_json,created_at) VALUES (?,?,?,?,?) "
+                "ON CONFLICT(owner,report_id) DO NOTHING",
+                (self.owner, identifier, market_date, payload,
+                 datetime.now(timezone.utc).isoformat()),
+            )
+            stored = connection.execute(
+                "SELECT report_json FROM daily_score_reports WHERE owner=? AND report_id=?",
+                (self.owner, identifier),
+            ).fetchone()
+            if stored is None or stored["report_json"] != payload:
+                raise ValueError("No se pudo conservar la versión exacta del informe.")
+        return identifier
+
+    def get_daily_score_report(self, report_id: str) -> dict[str, object] | None:
+        identifier = digest_identifier(report_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT report_json FROM daily_score_reports WHERE owner=? AND report_id=?",
+                (self.owner, identifier),
+            ).fetchone()
+        if row is None:
+            return None
+        report = json.loads(row["report_json"])
+        normalized_digest_report(report)
+        return report
+
+    def claim_daily_digest(self, delivery_key: str, market_date: str, report_id: str) -> bool:
+        """At-most-once reservation. Even uncertain SMTP claims are never recycled."""
+        key = digest_identifier(delivery_key)
+        session = digest_market_date(market_date)
+        identifier = digest_identifier(report_id)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO daily_digest_deliveries "
+                "(owner,delivery_key,market_date,report_id,status,created_at) "
+                "VALUES (?,?,?,?,'reserved',?) "
+                "ON CONFLICT(owner,delivery_key) DO NOTHING",
+                (self.owner, key, session, identifier, datetime.now(timezone.utc).isoformat()),
+            )
+            return cursor.rowcount == 1
+
+    def finish_daily_digest(self, delivery_key: str, status: str, error_type: str = "") -> None:
+        key = digest_identifier(delivery_key)
+        terminal, kind = digest_terminal_state(status, error_type)
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE daily_digest_deliveries SET status=?,error_type=?,finished_at=? "
+                "WHERE owner=? AND delivery_key=? AND status='reserved'",
+                (terminal, kind, datetime.now(timezone.utc).isoformat(), self.owner, key),
             )
 
     def get_alert_preferences(self) -> AlertPreferences:

@@ -20,8 +20,6 @@ from src.alerts import (
     DailyOverviewRow,
     build_alert_candidate,
     build_alert_state,
-    build_daily_overview_content,
-    build_digest_content,
     describe_state_change,
     filter_changed_candidates,
     is_valid_email,
@@ -35,6 +33,7 @@ from src.data_loader import (
 )
 from src.data_sources import benchmark_for_ticker, sector_benchmark
 from src.email_sender import send_email
+from src.daily_digest import build_daily_score_report, render_daily_score_email, seal_daily_score_report
 from src.entry_opportunity import STATUS_BUYABLE, evaluate_entry_opportunity
 from src.fundamentals import evaluate_fundamentals
 from src.fundamental_filter import evaluate_fundamental_filter
@@ -67,6 +66,30 @@ class AlertRunSummary:
     errors: tuple[str, ...]
     tickers_with_prices: int = 0
     tickers_with_fresh_prices: int = 0
+    emails_skipped: int = 0
+
+
+def _daily_digest_delivery_key(owner: str, recipient: str, market_date: str) -> str:
+    """An owner/recipient/session key, independent of content or deployment.
+
+    Reserving this identity before SMTP gives at-most-once attempts. It cannot
+    prove delivery to a mailbox, and a failed/uncertain attempt is deliberately
+    not released for an automatic retry of the same session.
+    """
+
+    identity = [owner.strip().lower(), recipient.strip().lower(), market_date, "daily_v1"]
+    return hashlib.sha256(json.dumps(identity, ensure_ascii=False,
+        separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _finish_daily_digest(journal: object, delivery_key: str, status: str, *,
+                         errors: list[str], owner: str, error_type: str = "") -> None:
+    try:
+        journal.finish_daily_digest(delivery_key, status, error_type=error_type)
+    except Exception as exc:
+        # A post-SMTP persistence failure must never retry an accepted message.
+        errors.append(f"{owner}: no se pudo completar el registro del resumen "
+                      f"({type(exc).__name__}); no se reintentará automáticamente.")
 
 
 def _model_email_delivery_id(owner: str, kind: str, day: date,
@@ -208,6 +231,7 @@ def run_daily_alerts(
     ),
     sender: Callable[..., object] = send_email,
     today: date | None = None,
+    require_current_session: bool = False,
 ) -> AlertRunSummary:
     """Ejecuta el radar diario o una revisión manual de un solo propietario.
 
@@ -352,6 +376,7 @@ def run_daily_alerts(
     fundamental_failures: dict[str, str] = {}
     emails_sent = 0
     alerts_sent = 0
+    emails_skipped = 0
     fresh_tickers: set[str] = set()
 
     for owner, (preference, journal, scope, positions, names) in scopes.items():
@@ -369,6 +394,7 @@ def run_daily_alerts(
             )
             saved_snapshot_keys: set[tuple[str, date]] = set()
             saved_policy_keys: set[tuple[str, date, str]] = set()
+            saved_snapshots = pd.DataFrame()
             if hasattr(journal, "list_analysis_snapshots"):
                 try:
                     saved_snapshots = journal.list_analysis_snapshots()
@@ -412,8 +438,13 @@ def run_daily_alerts(
                                 and pd.notna(saved_date)
                             )
                         }
-                except Exception:
-                    saved_snapshot_keys = set()
+                except Exception as exc:
+                    errors.append(f"{owner}: no se pudo leer el historial "
+                                  f"({type(exc).__name__}); no se enviará un resumen sin verificarlo.")
+                    continue
+            else:
+                errors.append(f"{owner}: el historial diario no está disponible; no se enviará el resumen.")
+                continue
             evaluated: list[tuple[object, float, bool, str, DailyOverviewRow]] = []
             candidates: list[AlertCandidate] = []
             overview_rows: list[DailyOverviewRow] = []
@@ -614,6 +645,7 @@ def run_daily_alerts(
                         fundamental_filter=quick_fundamental,
                         position_context=context, held=held,
                         config={"growth": asdict(growth_config), "technical": asdict(config)},
+                        fundamental_info=info,
                     )
                     if not held:
                         state_signature = f"entry:growth_momentum:{policy['primary']['status']}"
@@ -681,7 +713,7 @@ def run_daily_alerts(
                             candidate = replace(
                                 candidate,
                                 timing_score=enhanced.timing.score,
-                                opportunity_score=enhanced.opportunity_score,
+                                opportunity_score=getattr(enhanced, "opportunity_score", None),
                                 opportunity_status=enhanced.status_label,
                                 preferred_entry=enhanced.zones.preferred_entry.label,
                                 event_label=enhanced.event.label,
@@ -804,7 +836,7 @@ def run_daily_alerts(
                                     relative.score if relative is not None else None
                                 ),
                                 risk_score=(risk.score if risk is not None else None),
-                                opportunity_label=enhanced.status_label,
+                                opportunity_label=str(getattr(enhanced, "status_label", "") or ""),
                                 entry_label=signal.label,
                                 position_label=signal.position_label,
                                 sector=str(
@@ -812,7 +844,7 @@ def run_daily_alerts(
                                     or info.get("sector")
                                     or ""
                                 ),
-                                explanation=enhanced.explanation,
+                                explanation=str(getattr(enhanced, "explanation", "") or policy["primary"]["entry_reading"]),
                                 note=encode_policy_note("Actualización automática del radar diario", policy),
                             )
                             saved_snapshot_keys.add(snapshot_key)
@@ -865,63 +897,158 @@ def run_daily_alerts(
                 previous_signatures,
                 only_changes=preference.only_changes,
             )
+            # Preserve raw engine scores, but do not promote an unverified
+            # fundamental photograph into a new-purchase email. Holding-risk
+            # reviews keep their independent rules and are never converted into
+            # sells merely because company data is missing or outdated.
+            blocked_entry_tickers = {candidate.ticker for candidate in candidates if (
+                not candidate.held and str(candidate.kind).lower() in {"compra", "buy"}
+                and (candidate.policy_snapshot or {}).get("data_quality", {}).get("block_entry") is not False
+            )}
+            selected = [candidate for candidate in selected if (
+                candidate.held or str(candidate.kind).lower() not in {"compra", "buy"}
+                or (candidate.policy_snapshot or {}).get("data_quality", {}).get("block_entry") is False
+            )]
+            pending_tickers = {candidate.ticker for candidate in selected} | blocked_entry_tickers
+            selected_by_ticker: dict[str, AlertCandidate] = {}
+            for candidate in sorted(selected,
+                    key=lambda c: (not c.held, c.kind not in {"Vender", "Reducir", "Venta"}, c.ticker)):
+                selected_by_ticker.setdefault(candidate.ticker, candidate)
+            selected = list(selected_by_ticker.values())[:5]
             actionable_delivered = False
-            if selected:
-                subject, plain_body, html_body = build_digest_content(
-                    owner.capitalize(),
-                    selected,
-                )
-                delivery_id = _model_email_delivery_id(owner, "alerts", resolved_today,
-                    subject, plain_body, html_body)
-                try:
-                    receipt = sender(
-                        preference.email,
-                        subject,
-                        plain_body,
-                        html_body,
-                    )
-                except Exception as exc:
-                    errors.append(
-                        f"{owner}: no se pudo enviar el correo de alertas ({exc})."
-                    )
-                    _record_model_email(journal,
-                        getattr(exc, "smtp_receipt", None) or
-                        {"status": "failed", "error_type": type(exc).__name__},
-                        delivery_id, owner=owner, errors=errors)
-                else:
-                    _record_model_email(journal, receipt, delivery_id,
-                        owner=owner, errors=errors)
-                    actionable_delivered = True
-                    emails_sent += 1
-                    alerts_sent += len(selected)
-
             if overview_rows:
-                subject, plain_body, html_body = build_daily_overview_content(
-                    owner.capitalize(),
-                    overview_rows,
-                    app_url="https://stock-signal-lab-ddriu.streamlit.app/",
-                )
-                delivery_id = _model_email_delivery_id(owner, "overview", resolved_today,
-                    subject, plain_body, html_body)
+                # Read what was actually saved, not a separate in-memory score.
+                # The application opens this exact immutable report by its ID.
                 try:
-                    receipt = sender(
-                        preference.email,
-                        subject,
-                        plain_body,
-                        html_body,
+                    stored = journal.list_analysis_snapshots()
+                    observed_dates = [pd.Timestamp(signal.as_of).date()
+                                      for signal, *_ in evaluated]
+                    report_date = max(observed_dates).isoformat() if observed_dates else resolved_today.isoformat()
+                    if require_current_session and report_date != resolved_today.isoformat():
+                        emails_skipped += 1
+                        continue
+                    if require_current_session and not evaluated:
+                        emails_skipped += 1
+                        continue
+                    persisted_ids = {str(policy.get("snapshot_id"))
+                        for saved in stored.to_dict("records")
+                        if (policy := decode_policy_note(saved.get("note"))) and policy.get("snapshot_id")}
+                    selected = [candidate for candidate in selected
+                        if not (identity := str((candidate.policy_snapshot or {}).get("snapshot_id") or ""))
+                        or identity in persisted_ids]
+                    report = build_daily_score_report(
+                        stored, tickers=scope, held_tickers=set(positions),
+                        company_names=names, as_of=report_date,
                     )
+                    report_date = str(report.get("as_of") or "")
+                    current_sessions = {(str(row.get("ticker") or ""), str(row.get("session") or ""))
+                                        for row in report.get("rows", []) if row.get("session")}
+                    if (not report_date or evaluated and not any(
+                            (str(signal.ticker), str(pd.Timestamp(signal.as_of).date())) in current_sessions
+                            for signal, *_ in evaluated)):
+                        emails_skipped += 1
+                        if manual_owner is not None:
+                            errors.append(f"{owner}: no hay un cierre nuevo verificable; "
+                                          "las cotizaciones de una sesión abierta no se envían como resumen del cierre.")
+                        continue
+                    # A persisted policy may still be intraday, superseded or
+                    # excluded by the completed-session gate. Only the exact
+                    # accepted row may supply an alert in a closing report.
+                    # Omitted candidates stay pending in notification state.
+                    accepted_rows = {
+                        (str(row.get("ticker") or ""),
+                         str(row.get("snapshot_id") or ""),
+                         str(row.get("session") or ""))
+                        for row in report.get("rows", [])
+                        if row.get("snapshot_id") and row.get("session")
+                    }
+                    if require_current_session and (
+                            report_date != resolved_today.isoformat()
+                            or not any(session == report_date for _, _, session in accepted_rows)):
+                        emails_skipped += 1
+                        continue
+                    selected = [candidate for candidate in selected if (
+                        candidate.ticker,
+                        str((candidate.policy_snapshot or {}).get("snapshot_id") or ""),
+                        str(candidate.as_of)[:10],
+                    ) in accepted_rows]
+                    report["incidents"] = [
+                        {"ticker": item.ticker, "as_of": item.as_of,
+                         "reason": item.data_note, "next_step": "Actualizar datos antes de tomar decisiones."}
+                        for item in overview_rows if item.data_note
+                    ]
+                    report["positions"] = [
+                        {"ticker": item.ticker, "reading": item.portfolio_decision,
+                         "reason": item.decision_reason, "next_step": item.next_step}
+                        for item in overview_rows if item.held and item.portfolio_decision and (
+                            item.ticker,
+                            str((item.policy_snapshot or {}).get("snapshot_id") or ""),
+                            str(item.as_of)[:10],
+                        ) in accepted_rows
+                    ]
+                    if require_current_session:
+                        selected = [candidate for candidate in selected
+                                    if str(candidate.as_of)[:10] == report_date]
+                    report["alerts"] = [
+                        {**{key: getattr(candidate, key) for key in (
+                            "ticker", "company_name", "held", "kind", "title", "change_reason",
+                            "next_step", "strategy_label", "horizon", "data_source", "data_limitations", "as_of",
+                            "opportunity_status", "event_label",
+                        )},
+                         "positive_factors": list((candidate.policy_snapshot or {}).get("primary", {}).get("positive_factors", [])),
+                         "risk_factors": list((candidate.policy_snapshot or {}).get("primary", {}).get("risk_factors", [])),
+                         "policy_version": str((candidate.policy_snapshot or {}).get("policy_version") or "")}
+                        for candidate in sorted(selected,
+                            key=lambda c: (not c.held, c.kind not in {"Vender", "Reducir", "Venta"}, c.ticker))
+                    ]
+                    report = seal_daily_score_report(report)
+                    required_methods = ("save_daily_score_report", "claim_daily_digest", "finish_daily_digest")
+                    if any(not callable(getattr(journal, name, None)) for name in required_methods):
+                        raise RuntimeError("El almacenamiento aún no tiene el control de envíos diarios")
+                    report_id = journal.save_daily_score_report(report)
+                    if report_id != report["report_id"]:
+                        raise RuntimeError("La identidad del informe guardado no coincide")
+                    subject, plain_body, html_body = render_daily_score_email(
+                        report, app_url=f"https://stock-signal-lab-ddriu.streamlit.app/?digest={report_id}",
+                    )
+                    delivery_key = _daily_digest_delivery_key(owner, preference.email, report_date)
+                    claimed = journal.claim_daily_digest(delivery_key, report_date, report_id)
                 except Exception as exc:
-                    errors.append(
-                        f"{owner}: no se pudo enviar el resumen diario ({exc})."
-                    )
-                    _record_model_email(journal,
-                        getattr(exc, "smtp_receipt", None) or
-                        {"status": "failed", "error_type": type(exc).__name__},
-                        delivery_id, owner=owner, errors=errors)
+                    errors.append(f"{owner}: no se pudo preparar o reservar el resumen diario "
+                                  f"({type(exc).__name__}); no se envió correo.")
+                    claimed = False
                 else:
-                    _record_model_email(journal, receipt, delivery_id,
-                        owner=owner, errors=errors)
-                    emails_sent += 1
+                    if not claimed:
+                        emails_skipped += 1
+                if claimed:
+                    delivery_id = _model_email_delivery_id(owner, "daily_v1", date.fromisoformat(report_date),
+                        subject, plain_body, html_body)
+                    try:
+                        receipt = sender(preference.email, subject, plain_body, html_body)
+                    except Exception as exc:
+                        receipt = getattr(exc, "smtp_receipt", None)
+                        evidence = receipt or {"status": "failed", "error_type": type(exc).__name__}
+                        accepted = getattr(receipt, "status", None) == "smtp_accepted"
+                        _finish_daily_digest(journal, delivery_key, "sent" if accepted else "uncertain",
+                            errors=errors, owner=owner, error_type=type(exc).__name__)
+                        # A transport error after DATA acceptance is not an
+                        # invitation to send a second copy of the same session.
+                        errors.append(f"{owner}: el envío del resumen requiere revisión "
+                                      f"({type(exc).__name__}); no se reintentará automáticamente.")
+                        if accepted:
+                            actionable_delivered = True
+                            emails_sent += 1
+                            alerts_sent += len(selected)
+                    else:
+                        evidence = receipt
+                        status = "sent" if getattr(receipt, "status", None) == "smtp_accepted" else "uncertain"
+                        _finish_daily_digest(journal, delivery_key, status, errors=errors, owner=owner)
+                        actionable_delivered = True
+                        emails_sent += 1
+                        alerts_sent += len(selected)
+                    _record_model_email(journal,
+                        evidence,
+                        delivery_id, owner=owner, errors=errors)
 
             notified_tickers = (
                 {candidate.ticker for candidate in selected}
@@ -950,6 +1077,7 @@ def run_daily_alerts(
                     position_label=overview.portfolio_decision or None,
                 )
                 for signal, price, held, signature, overview in evaluated
+                if signal.ticker not in (pending_tickers - notified_tickers)
             ]
             journal.upsert_alert_states(states)
         except Exception as exc:
@@ -964,4 +1092,5 @@ def run_daily_alerts(
         errors=tuple(errors),
         tickers_with_prices=len(frames),
         tickers_with_fresh_prices=len(fresh_tickers),
+        emails_skipped=emails_skipped,
     )

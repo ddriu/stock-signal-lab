@@ -9,6 +9,11 @@ from typing import Any
 import pandas as pd
 import requests
 
+from src.daily_digest_storage import (
+    digest_identifier, digest_market_date, digest_terminal_state,
+    normalized_digest_report,
+)
+
 from src.alerts import (
     ALERT_PREFERENCE_COLUMNS,
     ALERT_STATE_COLUMNS,
@@ -1218,6 +1223,69 @@ class SupabaseTradingJournal:
                 "id": f"eq.{int(snapshot_id)}",
                 "owner": f"eq.{self.owner}",
             },
+        )
+
+    def save_daily_score_report(self, report: dict[str, object]) -> str:
+        identifier, market_date, payload = normalized_digest_report(report)
+        self._request(
+            "POST", endpoint=f"{self.url}/rest/v1/daily_score_reports",
+            params={"on_conflict": "owner,report_id"},
+            headers={**self.headers, "Prefer": "resolution=ignore-duplicates,return=representation"},
+            json={"owner": self.owner, "report_id": identifier,
+                  "market_date": market_date, "report_json": json.loads(payload)},
+        )
+        stored = self.get_daily_score_report(identifier)
+        if stored is None or normalized_digest_report(stored)[2] != payload:
+            raise JournalStorageError("No se pudo conservar la versión exacta del informe diario.")
+        return identifier
+
+    def get_daily_score_report(self, report_id: str) -> dict[str, object] | None:
+        identifier = digest_identifier(report_id)
+        rows = self._request(
+            "GET", endpoint=f"{self.url}/rest/v1/daily_score_reports",
+            params={"owner": f"eq.{self.owner}", "report_id": f"eq.{identifier}",
+                    "select": "report_json", "limit": "1"},
+        ).json()
+        if not isinstance(rows, list) or len(rows) > 1:
+            raise JournalStorageError("El informe guardado no tiene un formato válido.")
+        if not rows:
+            return None
+        report = rows[0].get("report_json")
+        if isinstance(report, str):
+            report = json.loads(report)
+        normalized_digest_report(report)
+        if report.get("report_id") != identifier:
+            raise JournalStorageError("La versión del informe guardado no coincide.")
+        return report
+
+    def claim_daily_digest(self, delivery_key: str, market_date: str, report_id: str) -> bool:
+        key = digest_identifier(delivery_key)
+        session = digest_market_date(market_date)
+        identifier = digest_identifier(report_id)
+        rows = self._request(
+            "POST", endpoint=f"{self.url}/rest/v1/daily_digest_deliveries",
+            params={"on_conflict": "owner,delivery_key"},
+            headers={**self.headers, "Prefer": "resolution=ignore-duplicates,return=representation"},
+            json={"owner": self.owner, "delivery_key": key,
+                  "market_date": session, "report_id": identifier, "status": "reserved"},
+        ).json()
+        if rows == []:
+            return False
+        if (not isinstance(rows, list) or len(rows) != 1
+                or rows[0].get("owner") != self.owner
+                or rows[0].get("delivery_key") != key):
+            raise JournalStorageError("No se pudo confirmar la reserva del correo; no se enviará.")
+        return True
+
+    def finish_daily_digest(self, delivery_key: str, status: str, error_type: str = "") -> None:
+        key = digest_identifier(delivery_key)
+        terminal, kind = digest_terminal_state(status, error_type)
+        self._request(
+            "PATCH", endpoint=f"{self.url}/rest/v1/daily_digest_deliveries",
+            params={"owner": f"eq.{self.owner}", "delivery_key": f"eq.{key}",
+                    "status": "eq.reserved"},
+            json={"status": terminal, "error_type": kind,
+                  "finished_at": datetime.now(timezone.utc).isoformat()},
         )
 
     def get_alert_preferences(self) -> AlertPreferences:

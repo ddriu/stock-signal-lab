@@ -58,3 +58,6 @@ jobs:
 
       - name: Validar registro inmutable del modelo, moneda y permisos
         run: node scripts/validate_model_results_migration.mjs "$GITHUB_WORKSPACE"
+
+      - name: Validar informes diarios privados y reserva de correo
+        run: node scripts/validate_daily_digest_migration.mjs "$GITHUB_WORKSPACE"

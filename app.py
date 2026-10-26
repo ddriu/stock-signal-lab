@@ -335,6 +335,7 @@ st.set_page_config(
 MAIN_OPTIONS = ["Inicio", "Analizar", "Favoritos", "Carteras", "Más"]
 ANALYSIS_OPTIONS = [
     "Radar",
+    "Resumen diario",
     "Oportunidades",
     "Empresa",
     "Estrategias",
@@ -342,6 +343,7 @@ ANALYSIS_OPTIONS = [
 ]
 ANALYSIS_LABELS = {
     "Radar": "◎ Mi radar",
+    "Resumen diario": "◷ Cinco sesiones",
     "Oportunidades": "🎯 Entradas hoy",
     "Empresa": "↗ Empresa",
     "Estrategias": "◱ Estrategias",
@@ -362,6 +364,10 @@ VALIDATION_OPTIONS = [
     "Auditoría de estrategias",
 ]
 ANALYSIS_VIEW_DESCRIPTIONS = {
+    "Resumen diario": (
+        "Tu cartera y favoritas con las notas de cinco sesiones, cambios explicados "
+        "y el mismo informe versionado que el correo. Sin descargas al abrir."
+    ),
     "Resultados del modelo": (
         "Compara las cuatro estrategias congeladas, sus operaciones y su riesgo con índices. "
         "El seguimiento virtual está separado de tu cartera real."
@@ -6908,6 +6914,7 @@ def _enrich_current_analysis_policy(
         ],
         growth_results=growth_results,
         fundamental_filters=fundamental_filters,
+        fundamental_info=raw_fundamentals,
         position_contexts=contexts,
         held_tickers=held_tickers,
         config={
@@ -10104,6 +10111,13 @@ def render_home(
     group_favorites: pd.DataFrame,
     section: str = "Hoy",
 ) -> None:
+    st.button(
+        "Ver puntuaciones de cinco sesiones",
+        icon=":material/history:",
+        key="home_daily_score_history",
+        on_click=_request_analysis_page,
+        args=("Resumen diario",),
+    )
     stored_snapshots = pd.DataFrame()
     reconciled_report = None
     latest_snapshot = pd.DataFrame()
@@ -13419,6 +13433,7 @@ def render_growth_momentum_page(
             "Fuente": "Yahoo Finance / yfinance · cierre diario",
         },
         growth_result=selected_result,
+        fundamental_info=raw_fundamentals.get(selected, {}),
         fundamental_filter=evaluate_fundamental_filter(
             raw_fundamentals.get(selected, {}), selected
         ),
@@ -14919,6 +14934,17 @@ def main() -> None:
 
     layout_analysis_section = analysis_detail or analysis_section
     apply_section_layout(str(selected_section), layout_analysis_section)
+    requested_digest = st.query_params.get("digest")
+    if (
+        selected_section == "Analizar" and analysis_section == "Resumen diario"
+        or selected_section == "Inicio" and requested_digest
+    ):
+        from src.daily_digest_ui import render_daily_score_page
+
+        render_daily_score_page(
+            journal, report_id=str(requested_digest) if requested_digest else None,
+        )
+        return
     if (
         selected_section == "Analizar"
         and analysis_section == "Validar"

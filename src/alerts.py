@@ -125,7 +125,7 @@ class AlertCandidate:
 
 @dataclass(frozen=True)
 class DailyOverviewRow:
-    """Lecturas consolidadas de una empresa para el segundo correo diario."""
+    """Lecturas consolidadas; el resumen diario las integra en un solo envío."""
 
     ticker: str
     company_name: str
@@ -1060,7 +1060,7 @@ def _overview_change_label(row: DailyOverviewRow) -> str:
         return "NUEVA · Primera lectura"
     prefixes = {
         "improvement": "MEJORA",
-        "deterioration": "DETERIORO",
+        "deterioration": "REVISAR: PIERDE FUERZA",
         "change": "CAMBIO DE ESTADO",
     }
     prefix = prefixes.get(row.change_kind, "")

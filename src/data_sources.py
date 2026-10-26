@@ -109,7 +109,12 @@ def _fact_items(
             for unit in (*preferred_units, *units.keys()):
                 values = units.get(unit)
                 if isinstance(values, list) and values:
-                    return [item for item in values if isinstance(item, dict)]
+                    # Keep the exact selected facts and calculations while
+                    # retaining provenance for each derived metric.
+                    return [
+                        {**item, "_concept": concept, "_namespace": namespace_name, "_unit": unit}
+                        for item in values if isinstance(item, dict)
+                    ]
     return []
 
 
@@ -191,6 +196,50 @@ def _safe_ratio(numerator: float | None, denominator: float | None) -> float | N
     if numerator is None or denominator in (None, 0):
         return None
     return numerator / denominator
+
+
+def _metric_provenance(
+    *components: tuple[str, list[dict[str, Any]]],
+    periodicity: str,
+    growth_comparison: bool = False,
+    aligned_periods: bool = False,
+    prior_roles: tuple[str, ...] = (),
+) -> dict[str, object]:
+    """Describe the facts used without selecting different accounting values."""
+    evidence: list[dict[str, object]] = []
+    for role, series in components:
+        include_prior = growth_comparison or role in prior_roles
+        selected = series[-2:] if include_prior else series[-1:]
+        for offset, item in enumerate(selected):
+            evidence.append({
+                "role": role,
+                "comparison_base": bool(include_prior and len(selected) == 2 and offset == 0),
+                "start": item.get("start"), "end": item.get("end"),
+                "filed": item.get("filed"), "form": item.get("form"),
+                "unit": item.get("_unit"), "concept": item.get("_concept"),
+                "namespace": item.get("_namespace"), "value": item.get("val"),
+            })
+    current = [item for item in evidence if not item["comparison_base"]]
+    ends = {str(item["end"]) for item in current if item.get("end")}
+    units = {str(item["unit"]) for item in current if item.get("unit")}
+    complete = bool(current) and len(current) == len(components)
+    comparable = complete and (not aligned_periods or len(ends) <= 1) and len(units) <= 1
+    if growth_comparison and len(evidence) == 2:
+        # Missing annual observations must not masquerade as one-year growth.
+        try:
+            gap = (pd.Timestamp(evidence[1]["end"]) - pd.Timestamp(evidence[0]["end"])).days
+        except (TypeError, ValueError):
+            gap = 0
+        comparable = comparable and 300 <= gap <= 430
+    latest = current[0] if current else {}
+    return {
+        "source": "SEC EDGAR", "periodicity": periodicity,
+        # Oldest current component, never a newer unrelated balance sheet.
+        "period_end": min(ends) if ends else None,
+        "period_start": latest.get("start"),
+        "filed_at": max((str(item["filed"]) for item in current if item.get("filed")), default=None),
+        "comparable": comparable, "components": evidence,
+    }
 
 
 def download_sec_fundamental_snapshot(
@@ -362,6 +411,25 @@ def download_sec_fundamental_snapshot(
         "_official_source": "SEC EDGAR",
         "_official_url": f"https://www.sec.gov/edgar/browse/?CIK={cik}",
     }
+    # Provenance only: preserve the frozen annual calculations and precedence.
+    metric_periods = {
+        "revenueGrowth": _metric_provenance(("revenue", revenue), periodicity="annual", growth_comparison=True),
+        "earningsGrowth": _metric_provenance(("net_income", net_income), periodicity="annual", growth_comparison=True),
+        "operatingMargins": _metric_provenance(("operating_income", operating_income), ("revenue", revenue), periodicity="annual", aligned_periods=True),
+        "profitMargins": _metric_provenance(("net_income", net_income), ("revenue", revenue), periodicity="annual", aligned_periods=True),
+        "returnOnEquity": _metric_provenance(("net_income", net_income), ("equity", equity_annual), periodicity="annual", prior_roles=("equity",)),
+        "freeCashflow": _metric_provenance(("operating_cash", operating_cash), ("capex", capex), periodicity="annual", aligned_periods=True),
+        "operatingCashflow": _metric_provenance(("operating_cash", operating_cash), periodicity="annual"),
+        "capitalExpenditures": _metric_provenance(("capex", capex), periodicity="annual"),
+        "totalRevenue": _metric_provenance(("revenue", revenue), periodicity="annual"),
+        "currentRatio": _metric_provenance(("current_assets", current_assets), ("current_liabilities", current_liabilities), periodicity="instant", aligned_periods=True),
+        "debtToEquity": _metric_provenance(("debt_current", debt_current), ("debt_noncurrent", debt_noncurrent), ("equity", equity_latest), periodicity="instant", aligned_periods=True),
+        "totalCash": _metric_provenance(("cash", cash), periodicity="instant"),
+        "totalDebt": _metric_provenance(("debt_current", debt_current), ("debt_noncurrent", debt_noncurrent), periodicity="instant", aligned_periods=True),
+    }
+    metrics["_metric_periods"] = {
+        key: value for key, value in metric_periods.items() if metrics.get(key) is not None
+    }
     return {key: value for key, value in metrics.items() if value is not None}
 
 
@@ -376,6 +444,8 @@ def merge_fundamental_sources(
     """
 
     result = dict(yahoo)
+    raw_periods = yahoo.get("_metric_periods")
+    metric_periods = dict(raw_periods) if isinstance(raw_periods, dict) else {}
     sources = {
         key: "Yahoo Finance"
         for key, value in yahoo.items()
@@ -402,11 +472,17 @@ def merge_fundamental_sources(
         if value is not None:
             result[key] = value
             sources[key] = str(official.get("_official_source") or "Fuente oficial")
+            # A replaced value must not inherit another provider's dates.
+            metric_periods.pop(key, None)
+            provenance = official.get("_metric_periods")
+            if isinstance(provenance, dict) and isinstance(provenance.get(key), dict):
+                metric_periods[key] = dict(provenance[key])
     if not result.get("longName") and official.get("longName"):
         result["longName"] = official["longName"]
         sources["longName"] = str(official.get("_official_source") or "Fuente oficial")
     result["_sources"] = sources
     result["_providers"] = sorted(set(sources.values()))
+    result["_metric_periods"] = metric_periods
     if official.get("_official_period_end"):
         result["_official_period_end"] = official["_official_period_end"]
     if official.get("_official_url"):

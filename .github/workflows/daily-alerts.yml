@@ -3,8 +3,11 @@ name: Enviar alertas diarias
 on:
   workflow_dispatch:
   schedule:
-    # 07:15 UTC, de lunes a viernes: 08:15/09:15 en España según la época.
-    - cron: "15 7 * * 1-5"
+    # 23:00 local time, including winter/summer changes. The Python gate
+    # permits delayed starts within the 23:00 hour.
+    # The persistent claim prevents a repeated run from resending a session.
+    - cron: "0 23 * * 1-5"
+      timezone: "Europe/Madrid"
 
 concurrency:
   group: stock-signal-lab-daily-alerts

@@ -571,6 +571,39 @@ def _statement_growth(values: list[float]) -> float | None:
     return values[0] / abs(values[1]) - 1.0
 
 
+def _statement_period(frame: pd.DataFrame, labels: tuple[str, ...]) -> dict[str, object]:
+    """Period of the same yearly row used by the fallback calculations."""
+    for label in labels:
+        if label not in frame.index:
+            continue
+        row = frame.loc[label]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+        values = pd.to_numeric(row, errors="coerce").dropna()
+        try:
+            values = values.sort_index(ascending=False)
+        except TypeError:
+            pass
+        dates = pd.to_datetime(values.index, errors="coerce")
+        components = [{"role": label, "end": stamp.date().isoformat(), "value": float(value),
+                       "comparison_base": offset > 0}
+                      for offset, (stamp, value) in enumerate(zip(dates[:2], values.iloc[:2], strict=True))
+                      if pd.notna(stamp)]
+        return {"source": "Yahoo Financial Statements", "periodicity": "annual",
+                "period_end": components[0]["end"] if components else None,
+                "comparable": bool(components), "components": components}
+    return {"source": "Yahoo Financial Statements", "periodicity": "annual",
+            "period_end": None, "comparable": False, "components": []}
+
+
+def _combined_statement_period(*periods: dict[str, object]) -> dict[str, object]:
+    ends = [str(value["period_end"]) for value in periods if value.get("period_end")]
+    return {"source": "Yahoo Financial Statements", "periodicity": "annual",
+            "period_end": min(ends) if ends else None,
+            "comparable": len(ends) == len(periods) and len(set(ends)) <= 1,
+            "components": [item for value in periods for item in value.get("components", [])]}
+
+
 def _yahoo_statement_snapshot(stock: object) -> dict[str, object]:
     """Calcula un respaldo contable cuando ``get_info`` llega incompleto.
 
@@ -652,6 +685,24 @@ def _yahoo_statement_snapshot(stock: object) -> dict[str, object]:
         "capitalExpenditures": abs(capex[0]) if capex else None,
         "totalRevenue": latest_revenue,
     }
+    revenue_period = _statement_period(income, ("TotalRevenue", "OperatingRevenue"))
+    income_period = _statement_period(income, ("NetIncome", "NetIncomeCommonStockholders"))
+    equity_period = _statement_period(balance, ("StockholdersEquity", "CommonStockEquity", "TotalEquityGrossMinorityInterest"))
+    operating_period = _statement_period(income, ("OperatingIncome",))
+    cash_period = _statement_period(cashflow, ("OperatingCashFlow", "TotalCashFromOperatingActivities"))
+    capex_period = _statement_period(cashflow, ("CapitalExpenditure", "CapitalExpenditures"))
+    metrics["_metric_periods"] = {
+        "revenueGrowth": revenue_period,
+        "earningsGrowth": income_period,
+        "profitMargins": _combined_statement_period(income_period, revenue_period),
+        "operatingMargins": _combined_statement_period(operating_period, revenue_period),
+        "returnOnEquity": _combined_statement_period(income_period, equity_period),
+        "freeCashflow": (_statement_period(cashflow, ("FreeCashFlow",)) if free_cashflow
+                         else _combined_statement_period(cash_period, capex_period) if capex
+                         else cash_period),
+        "operatingCashflow": cash_period, "capitalExpenditures": capex_period,
+        "totalRevenue": revenue_period,
+    }
     return {key: value for key, value in metrics.items() if value is not None}
 
 
@@ -691,6 +742,8 @@ def download_fundamental_snapshot(ticker: str) -> dict[str, object]:
         "operatingCashflow",
         "capitalExpenditures",
         "totalRevenue",
+        "mostRecentQuarter",
+        "lastFiscalYearEnd",
         "marketCap",
         "forwardPE",
         "trailingPE",
@@ -737,9 +790,17 @@ def download_fundamental_snapshot(ticker: str) -> dict[str, object]:
             warnings.append(
                 f"Yahoo no pudo aportar estados financieros de {symbol}: {exc}"
             )
+        filled_from_statements: set[str] = set()
         for key, value in statement_metrics.items():
-            if yahoo.get(key) is None:
+            if not key.startswith("_") and yahoo.get(key) is None:
                 yahoo[key] = value
+                filled_from_statements.add(key)
+        statement_periods = statement_metrics.get("_metric_periods")
+        if isinstance(statement_periods, dict):
+            yahoo["_metric_periods"] = {
+                key: value for key, value in statement_periods.items()
+                if key in filled_from_statements
+            }
     try:
         official = download_sec_fundamental_snapshot(symbol)
     except (ExternalDataError, ValueError) as exc:
