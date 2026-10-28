@@ -1,25 +1,39 @@
-"""Local-time gate for the existing daily email job, never a second scheduler."""
+"""Resolve the closing session of the existing daily job and its recovery run."""
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 
-def daily_digest_window(*, event_name: str = "", now: datetime | None = None) -> bool:
-    """Allow one local 23:00 hour; tolerate delayed GitHub scheduled starts.
+def daily_digest_session_date(*, now: datetime | None = None) -> date | None:
+    """Return the target session for 23:00–06:00 in Europe/Madrid.
 
-    The workflow uses its supported Europe/Madrid timezone rather than a fixed
-    UTC offset. A scheduled weekend is never a new daily report. Actual quote
-    dates, not this weekday gate, decide
-    whether any tracked exchange completed a new session. Explicit manual
-    dispatches remain available and use the same persistent delivery claim.
+    After midnight a delayed/recovery run belongs to the preceding evening,
+    including Friday's report on Saturday morning. Sunday evening and Monday
+    morning are not new sessions. Exchange calendars, actual quote dates and
+    completed-session checks in the runner remain authoritative on holidays.
+
+    Returning the date (not only a boolean) prevents a delayed run from asking
+    for prices of the new day or mixing in an already-open Asian session.
+    Starts at/after 06:00 are rejected rather than sending an old digest during
+    the next trading day. The immutable per-session claim prevents duplicates.
     """
 
-    if event_name != "schedule":
-        return True
     clock = now or datetime.now(ZoneInfo("Europe/Madrid"))
     if clock.tzinfo is None or clock.utcoffset() is None:
-        return False
+        return None
     local = clock.astimezone(ZoneInfo("Europe/Madrid"))
-    return local.weekday() < 5 and local.hour == 23
+    if local.hour == 23:
+        session = local.date()
+    elif local.hour < 6:
+        session = local.date() - timedelta(days=1)
+    else:
+        return None
+    return session if session.weekday() < 5 else None
+
+
+def daily_digest_window(*, event_name: str = "", now: datetime | None = None) -> bool:
+    """Preserve explicit manual reviews; scheduled runs need a target session."""
+
+    return event_name != "schedule" or daily_digest_session_date(now=now) is not None

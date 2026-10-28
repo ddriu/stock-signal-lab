@@ -29,14 +29,28 @@ destinatarios o mensajes completos de error SMTP en las entregas.
 
 Se reutiliza el workflow existente: 23:00 en Europe/Madrid, lunes a viernes,
 adaptado al cambio horario. GitHub Actions puede retrasar la ejecución; no se
-promete entrega al minuto. Sin ninguna sesión nueva completada, no se repite
-el resumen anterior. Los push/PR no envían correos de prueba.
+promete entrega al minuto. Los arranques entre medianoche y las 05:59 conservan
+la fecha objetivo de la tarde anterior; el viernes puede completarse el sábado.
+Existe un intento de recuperación a las 01:17, de martes a sábado, en el mismo
+workflow y sujeto a la misma reserva persistente. No es un segundo resumen.
+Después de las 06:00, un arranque programado fuera de ventana termina con error
+visible en Actions, no con un falso éxito. Sin ninguna sesión nueva completada,
+no se repite el resumen anterior. Los push/PR no envían correos de prueba.
+
+La fecha objetivo limita las descargas y la actualidad de las señales. La fecha
+de generación y los controles de cierre conservan el reloj real: no se retrodata
+el informe ni se mezclan cotizaciones asiáticas de la jornada siguiente.
 
 Antes de SMTP se reserva una clave por usuario, destinatarios, sesión y tipo.
 Las reejecuciones y trabajadores concurrentes no reciclan la reserva. Si SMTP
 queda incierto, se conserva para evitar duplicados: **como máximo un intento**,
 no entrega exactamente una vez. Un fallo incierto requiere revisión manual.
 Las preferencias y destinatarios existentes se conservan.
+
+Si el primer intento falla o queda incierto **después de reservar el envío**, la
+recuperación no lo reenvía automáticamente. Así se evita duplicar un mensaje que
+SMTP pudo aceptar. El intento de recuperación cubre arranques omitidos o fallos
+anteriores a la reserva; no garantiza la entrega en la bandeja de entrada.
 
 ## Validación y publicación
 

@@ -6,19 +6,22 @@ import os
 import sys
 
 from src.alert_runner import run_daily_alerts
-from src.digest_schedule import daily_digest_window
+from src.digest_schedule import daily_digest_session_date
 
 
 def main() -> int:
     event_name = os.getenv("GITHUB_EVENT_NAME", "")
-    if not daily_digest_window(event_name=event_name):
-        print("Sin envío: fuera de la ventana de las 23:00 de Madrid.")
-        return 0
-    result = (
-        run_daily_alerts(require_current_session=True)
-        if event_name == "schedule"
-        else run_daily_alerts()
-    )
+    if event_name == "schedule":
+        session = daily_digest_session_date()
+        if session is None:
+            print("::error::No se analizó ni envió el resumen: arranque fuera de "
+                  "la ventana 23:00–06:00 de Europe/Madrid. Revisa la programación.",
+                  file=sys.stderr)
+            return 1
+        print(f"Sesión objetivo del resumen: {session.isoformat()} (Europe/Madrid).")
+        result = run_daily_alerts(today=session, require_current_session=True)
+    else:
+        result = run_daily_alerts()
     print(
         "Alertas terminadas: "
         f"{result.users_checked} usuarios, "

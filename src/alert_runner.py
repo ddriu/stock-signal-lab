@@ -238,6 +238,11 @@ def run_daily_alerts(
     Con ``owner`` sólo se consultan sus preferencias guardadas y se utiliza su
     dirección exacta: no se enumeran ni se modifican las de otros usuarios. Una
     revisión manual sin análisis frescos utilizables no envía ni marca estados.
+
+    ``today`` fija la fecha objetivo de los precios y del informe, no la hora
+    real de generación. El CLI conserva así la sesión del día anterior cuando
+    GitHub arranca después de medianoche. Los cierres y ``created_at`` siguen
+    usando el reloj real; nunca se retrodata una observación.
     """
 
     resolved_today = today or datetime.now(ZoneInfo("Europe/Madrid")).date()

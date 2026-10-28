@@ -3,10 +3,14 @@ name: Enviar alertas diarias
 on:
   workflow_dispatch:
   schedule:
-    # 23:00 local time, including winter/summer changes. The Python gate
-    # permits delayed starts within the 23:00 hour.
-    # The persistent claim prevents a repeated run from resending a session.
+    # 23:00 local time, including winter/summer changes. Delayed starts until
+    # 06:00 retain the preceding evening's target session, not the new date.
     - cron: "0 23 * * 1-5"
+      timezone: "Europe/Madrid"
+    # Recovery attempt for the same session (Tue–Sat), away from the top of
+    # the hour. The persistent claim prevents a second email, even if the
+    # first attempt was accepted by SMTP but its final status is uncertain.
+    - cron: "17 1 * * 2-6"
       timezone: "Europe/Madrid"
 
 concurrency:

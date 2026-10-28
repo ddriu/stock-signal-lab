@@ -534,6 +534,130 @@ def test_european_closing_digest_uses_exact_report_session_for_real_sqlite_claim
     assert claim[1] == "sent"
 
 
+@pytest.mark.parametrize(("session", "clock"), [
+    ("2026-10-27", "2026-10-28T00:58:19+00:00"),
+    ("2026-10-23", "2026-10-24T00:58:19+00:00"),
+])
+def test_delayed_closing_digest_keeps_the_target_session_and_actual_recording_time(
+    monkeypatch, tmp_path, session, clock,
+):
+    """A midnight delay is still the prior close, including Friday to Saturday."""
+    from src.email_sender import EmailDeliveryReceipt
+
+    user, frame = _real_closing_digest_case(monkeypatch, tmp_path, ticker="MINE", session=session,
+        created_at=clock, clock=clock)
+    calls, downloads = [], []
+
+    def downloader(ticker, start, end, **kwargs):
+        downloads.append((ticker, end))
+        return frame
+
+    def sender(*args):
+        calls.append(args)
+        return EmailDeliveryReceipt(status="smtp_accepted", smtp_code=250,
+            accepted_at=clock, receipt_hash="a" * 64, message_hash="b" * 64)
+
+    result = run_daily_alerts(owner="synthetic", journal_factory=lambda owner: user,
+        downloader=downloader, fundamental_downloader=_verified_growth_info,
+        sender=sender, today=date.fromisoformat(session), require_current_session=True)
+
+    assert result.emails_sent == result.alerts_sent == len(calls) == 1
+    assert not result.errors
+    assert downloads and all(end == date.fromisoformat(session) for _, end in downloads)
+    with user._connect() as connection:
+        report = connection.execute("SELECT market_date, report_json FROM daily_score_reports").fetchone()
+        claim = connection.execute("SELECT market_date, status FROM daily_digest_deliveries").fetchone()
+        observation = connection.execute("SELECT analyzed_at, created_at FROM analysis_snapshots").fetchone()
+    assert report[0] == claim[0] == session
+    assert claim[1] == "sent"
+    assert str(observation[0])[:10] == session
+    assert pd.Timestamp(observation[1]) == pd.Timestamp(clock)
+
+
+def test_delayed_repeat_with_a_changed_report_cannot_send_the_same_session_twice(monkeypatch, tmp_path):
+    from src.email_sender import EmailDeliveryReceipt
+
+    session, clock = "2026-10-27", "2026-10-28T00:58:19+00:00"
+    user, frame = _real_closing_digest_case(monkeypatch, tmp_path, ticker="MINE", session=session,
+        created_at=clock, clock=clock)
+    calls = []
+
+    def sender(*args):
+        calls.append(args)
+        return EmailDeliveryReceipt(status="smtp_accepted", smtp_code=250,
+            accepted_at=clock, receipt_hash="a" * 64, message_hash="b" * 64)
+
+    kwargs = dict(owner="synthetic", journal_factory=lambda owner: user,
+        downloader=lambda *args, **kwargs: frame, fundamental_downloader=_verified_growth_info,
+        sender=sender, today=date.fromisoformat(session), require_current_session=True)
+    first = run_daily_alerts(**kwargs)
+    monkeypatch.setattr("src.daily_digest._utc_clock", lambda value=None:
+        pd.Timestamp("2026-10-28T02:30:00+00:00"))
+    monkeypatch.setattr(user, "list_favorites", lambda: pd.DataFrame({"ticker": ["MINE", "NEW"]}))
+    second = run_daily_alerts(**kwargs)
+
+    assert first.emails_sent == len(calls) == 1
+    assert second.emails_sent == 0 and second.emails_skipped == 1
+    assert not first.errors and not second.errors
+    with user._connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM daily_score_reports").fetchone()[0] == 2
+        claims = connection.execute("SELECT market_date, status FROM daily_digest_deliveries").fetchall()
+    assert [tuple(row) for row in claims] == [(session, "sent")]
+
+
+def test_delayed_digest_does_not_mislabel_an_older_close_as_its_target(monkeypatch, tmp_path):
+    user, frame = _real_closing_digest_case(monkeypatch, tmp_path, ticker="MINE", session="2026-10-26",
+        created_at="2026-10-28T00:58:19+00:00", clock="2026-10-28T00:58:19+00:00")
+    result = run_daily_alerts(owner="synthetic", journal_factory=lambda owner: user,
+        downloader=lambda *args, **kwargs: frame, fundamental_downloader=_verified_growth_info,
+        sender=lambda *args: pytest.fail("An older quote is not the requested daily close"),
+        today=date(2026, 10, 27), require_current_session=True)
+    assert result.emails_sent == result.alerts_sent == 0
+    assert result.emails_skipped == 1
+    with user._connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM daily_digest_deliveries").fetchone()[0] == 0
+
+
+def test_delayed_digest_never_mixes_next_day_asian_quotes_into_the_target_close(monkeypatch, tmp_path):
+    import json
+    from src.email_sender import EmailDeliveryReceipt
+
+    session, clock = "2026-10-27", "2026-10-28T00:58:19+00:00"
+    user, frame = _real_closing_digest_case(monkeypatch, tmp_path, ticker="MINE", session=session,
+        created_at=clock, clock=clock)
+    monkeypatch.setattr(user, "list_favorites", lambda:
+        pd.DataFrame({"ticker": ["MINE", "ALK.AX"]}))
+    next_day_asian_frame = frame.copy()
+    next_day_asian_frame.index = pd.DatetimeIndex(["2026-10-28"])
+    calls = []
+
+    def downloader(ticker, start, end, **kwargs):
+        assert end == date.fromisoformat(session)
+        # Even a provider that ignores the requested end date cannot make the
+        # already-open Australian next session a signal for yesterday's close.
+        return next_day_asian_frame if ticker == "ALK.AX" else frame
+
+    def sender(*args):
+        calls.append(args)
+        return EmailDeliveryReceipt(status="smtp_accepted", smtp_code=250,
+            accepted_at=clock, receipt_hash="a" * 64, message_hash="b" * 64)
+
+    result = run_daily_alerts(owner="synthetic", journal_factory=lambda owner: user,
+        downloader=downloader, fundamental_downloader=_verified_growth_info,
+        sender=sender, today=date.fromisoformat(session), require_current_session=True)
+    assert result.emails_sent == len(calls) == 1
+    with user._connect() as connection:
+        saved = connection.execute("SELECT market_date, report_json FROM daily_score_reports").fetchone()
+        observations = connection.execute("SELECT ticker, analyzed_at FROM analysis_snapshots").fetchall()
+    assert saved[0] == session
+    report = json.loads(saved[1])
+    assert report["as_of"] == session
+    assert all(item.get("as_of", session) <= session for item in report["alerts"])
+    assert all(point["session"] <= session for row in report["rows"] for point in row["history"])
+    assert not any(ticker == "ALK.AX" and str(observed)[:10] == "2026-10-28"
+                   for ticker, observed in observations)
+
+
 def test_manual_review_reads_only_the_selected_owner_and_uses_the_stored_recipient(monkeypatch) -> None:
     preference = replace(
         normalize_alert_preferences(

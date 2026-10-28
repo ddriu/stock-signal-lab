@@ -434,8 +434,11 @@ esa temporada en dos bots validados: cualquier comparación adicional necesitar�
 registradas antes de observar resultados e historial suficiente. No se selecciona un
 ganador retrospectivamente ni se rellenan rentabilidades inexistentes.
 
-El workflow `.github/workflows/daily-alerts.yml` se ejecuta por la mañana de lunes
-a viernes y también puede iniciarse manualmente. Necesita cuatro secretos de GitHub:
+El workflow `.github/workflows/daily-alerts.yml` se programa a las 23:00 de Madrid
+de lunes a viernes, con recuperación a las 01:17 de martes a sábado. Tolera retrasos
+hasta las 05:59 conservando la fecha del cierre anterior y sin duplicar el correo
+de una misma sesión. También puede iniciarse manualmente. Véanse los límites de
+entrega en `docs/daily_score_digest.md`. Necesita cuatro secretos de GitHub:
 `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `EMAIL_SMTP_USERNAME` y
 `EMAIL_SMTP_PASSWORD` (los dos últimos corresponden al Gmail del proyecto; el host,
 el puerto y el remitente ya están resueltos en el workflow).
