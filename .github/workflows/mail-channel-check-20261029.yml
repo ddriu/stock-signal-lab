@@ -1,0 +1,95 @@
+name: Prueba individual de correo 2026-10-29
+
+on:
+  push:
+    branches: ["codex/mail-channel-check-20261029"]
+    paths: [".github/workflows/mail-channel-check-20261029.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stock-signal-lab-mail-channel-check-20261029
+  cancel-in-progress: false
+
+jobs:
+  single-recipient-test:
+    # One explicitly requested diagnostic, never an automatic SMTP retry.
+    if: github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cd5d55b203240bf9d3571f15e2dbfb16e6dd30ed
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Instalar dependencias
+        run: python -m pip install -r requirements.txt
+      - name: Probar solo el destinatario guardado del usuario solicitante
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          EMAIL_SMTP_HOST: smtp.gmail.com
+          EMAIL_SMTP_PORT: "465"
+          EMAIL_SMTP_USE_SSL: "true"
+          EMAIL_SMTP_USERNAME: ${{ secrets.EMAIL_SMTP_USERNAME }}
+          EMAIL_SMTP_PASSWORD: ${{ secrets.EMAIL_SMTP_PASSWORD }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SMTP_USERNAME }}
+          EMAIL_SENDER_NAME: Stock Signal Lab
+        run: |
+          python - <<'PY'
+          import json
+          from dataclasses import asdict
+          from datetime import date, datetime, timezone
+          from src.alerts import AlertPreferences, is_valid_email
+          from src.email_sender import EmailDeliveryReceipt, send_email
+          from src.storage import create_journal, load_supabase_config
+
+          def main():
+              if datetime.now(timezone.utc).date() != date(2026, 10, 29):
+                  raise RuntimeError("ExpiredDiagnostic")
+              if load_supabase_config() is None:
+                  raise RuntimeError("MissingBackendConfiguration")
+              preference = create_journal("ddriu").get_alert_preferences()
+              if not isinstance(preference, AlertPreferences) or preference.owner != "ddriu":
+                  raise RuntimeError("InvalidOwnerPreferences")
+              recipient = preference.email
+              if (preference.enabled is not True or not isinstance(recipient, str)
+                      or recipient != recipient.strip()
+                      or any(c in recipient for c in "\r\n")
+                      or not is_valid_email(recipient)):
+                  raise RuntimeError("InvalidRecipientPreferences")
+              subject = "Stock Signal Lab · PRUEBA de entrega · 29/10/2026"
+              plain = ("Prueba técnica de entrega solicitada el 29/10/2026.\n\n"
+                       "Este mensaje comprueba únicamente el canal de correo. "
+                       "No es un resumen de cierre ni una alerta de compra o venta. "
+                       "No se han cambiado tus preferencias ni tus posiciones.\n\n"
+                       "Si lo recibes, confirma la recepción en el chat.")
+              html = ("<html lang='es'><meta charset='utf-8'><body>"
+                      "<h2>Stock Signal Lab · prueba de entrega</h2>"
+                      "<p>Prueba técnica solicitada el 29/10/2026.</p>"
+                      "<p>No es un resumen de cierre ni una alerta de inversión. "
+                      "No se han cambiado preferencias ni posiciones.</p>"
+                      "<p>Si lo recibes, confirma la recepción en el chat.</p>"
+                      "</body></html>")
+              try:
+                  receipt = send_email(recipient, subject, plain, html)
+              except Exception as exc:
+                  receipt = getattr(exc, "smtp_receipt", None)
+                  if not isinstance(receipt, EmailDeliveryReceipt) or receipt.status != "smtp_accepted":
+                      raise
+              if not isinstance(receipt, EmailDeliveryReceipt) or receipt.status != "smtp_accepted":
+                  raise RuntimeError("UnverifiedSMTPAcceptance")
+              # Receipt fields contain no recipient, credentials, subject or body.
+              print(json.dumps(asdict(receipt), sort_keys=True))
+
+          try:
+              main()
+          except Exception as exc:
+              # Public CI: categories only, never private backend/SMTP responses.
+              print(json.dumps({"status": "test_failed", "error_type": type(exc).__name__}))
+              raise SystemExit(1)
+          PY
