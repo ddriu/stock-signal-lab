@@ -1,0 +1,44 @@
+name: Revisión individual tras corrección de datos 2026-10-30
+
+on:
+  push:
+    branches: ["codex/manual-review-provenance-20261030"]
+    paths: [".github/workflows/manual-review-20261030.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stock-signal-lab-manual-review-provenance-20261030
+  cancel-in-progress: false
+
+jobs:
+  review-and-email:
+    if: github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Instalar dependencias
+        run: python -m pip install -r requirements.txt
+      - name: Analizar y enviar exclusivamente al usuario solicitante
+        env:
+          REVIEW_SESSION: "2026-10-29"
+          MODEL_RESULTS_ENABLED: "0"
+          PYTHONPATH: .:diagnostics
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          EMAIL_SMTP_HOST: smtp.gmail.com
+          EMAIL_SMTP_PORT: "465"
+          EMAIL_SMTP_USE_SSL: "true"
+          EMAIL_SMTP_USERNAME: ${{ secrets.EMAIL_SMTP_USERNAME }}
+          EMAIL_SMTP_PASSWORD: ${{ secrets.EMAIL_SMTP_PASSWORD }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SMTP_USERNAME }}
+          EMAIL_SENDER_NAME: Stock Signal Lab
+        run: python diagnostics/manual_review_20261030.py
