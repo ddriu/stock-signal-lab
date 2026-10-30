@@ -11,6 +11,7 @@ from src.storage import JournalStorageError
 
 
 SETUP = '''
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 import pandas as pd
@@ -32,6 +33,13 @@ def result(ticker, **changes):
 def frame(end=recent):
     return pd.DataFrame(dict(close=[100.0]*220, sma_medium=[90.0]*220,
         sma_long=[80.0]*220), index=pd.bdate_range(end=end, periods=220))
+def fundamental(ticker, dated=True):
+    values = dict(symbol=ticker, quoteType="EQUITY", currency="EUR", revenueGrowth=.2, earningsGrowth=.3)
+    if dated:
+        values["_metric_periods"] = {key: dict(source="Yahoo Financial Statements",
+            periodicity="quarterly", period_end=(today-timedelta(days=31)).isoformat(),
+            comparable=True) for key in ("revenueGrowth", "earningsGrowth")}
+    return values
 '''
 
 
@@ -46,6 +54,7 @@ if {previous_group!r} and "growth_action_group" not in st.session_state:
 app.render_growth_candidate_overview(results, held_tickers=["HELD"] if not {empty!r} else [],
     universe=[] if {empty!r} else ["NEW", "HELD", "CAND", "WAIT", "OLD", "IPO"],
     names={{"NEW": "Nueva empresa", "HELD": "Empresa actual"}}, currencies={{"NEW": "EUR"}},
+    fundamental_info={{ticker: fundamental(ticker) for ticker in results}},
     portfolio_snapshot=pd.DataFrame([dict(snapshot_date="2026-09-13",
         analysis_ticker="HELD", value_eur=100, asset_type="Acción")]),
     reference_date=today, holdings_verified={not unverified!r})
@@ -53,7 +62,8 @@ app.render_growth_candidate_overview(results, held_tickers=["HELD"] if not {empt
     return AppTest.from_string(script, default_timeout=30).run()
 
 
-def _page(*, scenario: str = "fresh", manual: bool = False, full_names: bool = False) -> AppTest:
+def _page(*, scenario: str = "fresh", manual: bool = False, full_names: bool = False,
+          unrelated_holding: bool = False) -> AppTest:
     script = SETUP + f'''
 scenario = {scenario!r}
 held = ["TEST"] if scenario == "invalidated" else []
@@ -61,6 +71,12 @@ snapshot = pd.DataFrame([dict(snapshot_date=str(today), platform="Test",
     asset_name="Test company", asset_type="Acción", analysis_ticker="TEST",
     value_eur=100.0, currency="EUR",
     comments="[[SSL_TESIS_INVALIDADA]] Fraude declarado")]) if held else pd.DataFrame()
+if {unrelated_holding!r}:
+    held = ["OTHER"]
+    snapshot = pd.DataFrame([dict(snapshot_date=str(today), platform="Test",
+        asset_name="Other holding", asset_type="Acción", analysis_ticker="OTHER",
+        value_eur=100.0, currency="EUR",
+        comments="[[SSL_TESIS_INVALIDADA]] Invalidación de otra empresa")])
 reading = result("TEST")
 if scenario == "stale":
     reading = result("TEST", as_of=recent-pd.Timedelta(days=30))
@@ -83,7 +99,7 @@ class Journal:
         return snapshot
     def add_analysis_snapshot(self, **kwargs):
         st.session_state["saved_observation"] = kwargs
-fundamentals = {{key: dict(currency="EUR", revenueGrowth=.2, earningsGrowth=.3)
+fundamentals = {{key: fundamental(key, dated=scenario != "missing_periods")
     for key in prepared}}
 favorites = pd.DataFrame() if {manual!r} else pd.DataFrame([dict(ticker="TEST", name="Test company")])
 if {full_names!r}:
@@ -106,6 +122,7 @@ def test_one_table_starts_with_holdings_then_strong_candidates_and_waiting() -> 
     assert list(page.dataframe[0].value.columns) == [
         "Ticker", "Empresa", "En cartera / peso", "Señal de entrada", "Qué revisar",
         "Entrada / stop orientativos", "Motivo", "Actualizado",
+        "Verificación empresarial",
     ]
     assert json.loads(page.dataframe[0].proto.columns)["Ticker"]["hidden"]
     assert not page.toggle(key="growth_show_detail").value
@@ -186,6 +203,36 @@ def test_full_name_replaces_ticker_placeholder_in_table_and_detail_picker() -> N
     assert "saved_observation" not in page.session_state
 
 
+def test_undated_fundamentals_keep_strong_signal_visible_without_suggesting_purchase_size() -> None:
+    page = _page(scenario="missing_periods")
+    assert not page.exception
+    row = page.dataframe[0].value.iloc[0]
+    assert row["Señal de entrada"] == "Entrada fuerte"
+    assert row["Verificación empresarial"] == "Pendiente"
+    assert "verificar" in row["Qué revisar"].lower()
+    page.toggle(key="growth_show_detail").set_value(True).run()
+    assert not page.exception
+    assert any("Entrada fuerte" in metric.delta for metric in page.metric if metric.label == "Lectura dinámica")
+    assert not any(metric.label == "Entrada máxima este mes" for metric in page.metric)
+    assert any("periodo" in item.value for item in page.caption)
+    assert "saved_observation" not in page.session_state
+
+
+def test_selected_favorite_does_not_borrow_an_unrelated_holdings_invalidated_thesis() -> None:
+    page = _page(unrelated_holding=True)
+    assert not page.exception
+    assert page.dataframe[0].value["Ticker"].tolist() == ["OTHER"]
+    page.radio(key="growth_action_group").set_value("Entradas fuertes").run()
+    assert not page.exception
+    assert page.dataframe[0].value["Ticker"].tolist() == ["TEST"]
+    page.toggle(key="growth_show_detail").set_value(True).run()
+    assert not page.exception
+    assert page.selectbox(key="growth_selected_ticker").value == "TEST"
+    assert any(metric.label == "Entrada máxima este mes" for metric in page.metric)
+    assert not any("Invalidación de otra empresa" in warning.value for warning in page.warning)
+    assert "saved_observation" not in page.session_state
+
+
 def test_name_catalog_falls_back_from_missing_alias_names_to_portfolio() -> None:
     favorites = pd.DataFrame([dict(ticker="AMZ", name="AMZ"), dict(ticker="SONY", name="Sony ADR")])
     snapshot = pd.DataFrame([
@@ -201,7 +248,7 @@ def test_name_catalog_falls_back_from_missing_alias_names_to_portfolio() -> None
     }
 
 
-@pytest.mark.parametrize("scenario", ["stale", "invalidated", "wait", "unverified"])
+@pytest.mark.parametrize("scenario", ["stale", "invalidated", "wait", "unverified", "missing_periods"])
 def test_pending_or_invalidated_details_cannot_reenable_an_entry_plan(scenario: str) -> None:
     page = _page(scenario=scenario)
     assert not page.exception

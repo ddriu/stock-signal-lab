@@ -13,6 +13,7 @@ import math
 import pandas as pd
 
 from src.analysis_policy import decode_policy_note
+from src.analysis_data_quality import assess_analysis_data_quality
 from src.instruments import resolve_analysis_ticker, resolve_company_name
 from src.market_data_quality import quote_freshness
 
@@ -249,6 +250,7 @@ def build_growth_candidate_rows(
     currencies: Mapping[str, str] | None = None,
     prepared: Mapping[str, pd.DataFrame] | None = None, universe: Iterable[object] = (),
     comparison_rows: Iterable[Mapping[str, object]] | None = None, reference_date: object = None,
+    fundamental_info: Mapping[str, Mapping[str, object]] | None = None,
 ) -> list[dict[str, object]]:
     """Devuelve una fila por instrumento de resultados, universo o cartera.
 
@@ -257,6 +259,10 @@ def build_growth_candidate_rows(
     denominador del peso incluye únicamente valores positivos cotizados de la
     última fotografía; una posición sin valor comprobable mantiene peso ``None``.
     Si se aporta ``prepared``, también se comprueba el último cierre/histórico.
+    La procedencia y los periodos de los fundamentales se verifican con el
+    mismo control independiente que el resumen diario; omitirlos no acredita
+    una compra. La señal original sigue visible en su grupo, pero los datos
+    bloqueados no habilitan precio/stop ni plan.
     Todos los objetos de entrada se conservan sin mutaciones y no hay descargas.
     La cartera precede a las entradas fuertes y éstas a las candidatas; dentro
     de cada nivel de entrada sólo se ordena por la nota principal existente.
@@ -272,6 +278,7 @@ def build_growth_candidate_rows(
                 str(raw_ticker), company_names.get(ticker), source,
             )
     quote_currencies = _normalized_mapping(currencies)
+    company_info = _normalized_mapping(fundamental_info)
     held = {_ticker(value) for value in held_tickers if _ticker(value)}
     tickers = dict.fromkeys([*growth, *(_ticker(value) for value in universe), *sorted(held)])
     latest, snapshot_date = _latest_snapshot(portfolio_snapshot)
@@ -297,6 +304,19 @@ def build_growth_candidate_rows(
             result, frames.get(ticker), check_frame=prepared is not None,
             ticker=ticker, reference_date=reference_date,
         )
+        info = company_info.get(ticker)
+        info = info if isinstance(info, Mapping) else {}
+        if not info.get("quoteType") and _text(_read(result, "sector_key")) == "etf":
+            info = {**info, "quoteType": "ETF"}
+        quality = assess_analysis_data_quality(info, as_of=as_of or reference_date)
+        declared_symbol = _ticker(info.get("symbol"))
+        if declared_symbol and declared_symbol != ticker:
+            quality = {**quality, "status": "blocked", "block_entry": True,
+                "reasons": [*quality["reasons"],
+                    "Los datos empresariales pertenecen a otro instrumento; actualizar antes de comprar."]}
+        verification_blocked = quality["block_entry"] is not False
+        engine_complete = complete
+        complete = complete and not verification_blocked
         in_portfolio = ticker in held
         invalidation = invalidations.get(ticker) if in_portfolio else None
         if in_portfolio:
@@ -310,6 +330,11 @@ def build_growth_candidate_rows(
             state = "Revisión prioritaria de tesis"
             next_step = "Contrastar invalidación declarada; sin venta automática"
             reason = invalidation
+        elif verification_blocked and engine_complete:
+            state = "Gestionar según tesis" if in_portfolio else "Verificación empresarial pendiente"
+            next_step = ("Verificar datos antes de ampliar; gestionar según tesis" if in_portfolio
+                         else "Verificar datos empresariales antes de estudiar la compra")
+            reason = " ".join(quality["reasons"])
         elif not complete:
             state = "Gestionar según tesis" if in_portfolio else "Datos pendientes"
             next_step = "Completar datos; gestionar según tesis" if in_portfolio else "Completar datos antes de entrar"
@@ -356,6 +381,9 @@ def build_growth_candidate_rows(
             "Precio referencia": entry_price, "Stop orientativo": stop,
             "Datos completos": complete, "Lectura principal": _text(_read(result, "label")),
             "Nota principal": _score(_read(result, "score")), "Moneda": currency or None,
+            "Verificación empresarial": "Pendiente" if verification_blocked else "Datos suficientes",
+            "Motivos de verificación": list(quality["reasons"]),
+            "Calidad datos empresariales": quality,
         })
     group_order = {group: index for index, group in enumerate(GROWTH_CANDIDATE_GROUPS)}
 

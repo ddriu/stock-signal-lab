@@ -19,6 +19,7 @@ import pandas as pd
 import requests
 
 
+FUNDAMENTAL_PROVENANCE_VERSION = "fundamental_provenance_v2"
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_COMPANY_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
 ECB_DAILY_FX_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
@@ -221,13 +222,17 @@ def _metric_provenance(
             })
     current = [item for item in evidence if not item["comparison_base"]]
     ends = {str(item["end"]) for item in current if item.get("end")}
-    units = {str(item["unit"]) for item in current if item.get("unit")}
+    units = {str(item["unit"]) for item in evidence if item.get("unit")}
     complete = bool(current) and len(current) == len(components)
     comparable = complete and (not aligned_periods or len(ends) <= 1) and len(units) <= 1
-    if growth_comparison and len(evidence) == 2:
-        # Missing annual observations must not masquerade as one-year growth.
+    for role, _ in components:
+        if not (growth_comparison or role in prior_roles):
+            continue
+        # A growth base or average-equity denominator needs both actual,
+        # consecutive annual observations, not merely one newest date.
+        role_facts = [item for item in evidence if item["role"] == role]
         try:
-            gap = (pd.Timestamp(evidence[1]["end"]) - pd.Timestamp(evidence[0]["end"])).days
+            gap = (pd.Timestamp(role_facts[1]["end"]) - pd.Timestamp(role_facts[0]["end"])).days if len(role_facts) == 2 else 0
         except (TypeError, ValueError):
             gap = 0
         comparable = comparable and 300 <= gap <= 430
@@ -237,7 +242,7 @@ def _metric_provenance(
         # Oldest current component, never a newer unrelated balance sheet.
         "period_end": min(ends) if ends else None,
         "period_start": latest.get("start"),
-        "filed_at": max((str(item["filed"]) for item in current if item.get("filed")), default=None),
+        "filed_at": max((str(item["filed"]) for item in evidence if item.get("filed")), default=None),
         "comparable": comparable, "components": evidence,
     }
 
@@ -271,6 +276,7 @@ def download_sec_fundamental_snapshot(
             "RevenueFromContractWithCustomerExcludingAssessedTax",
             "SalesRevenueNet",
             "Revenues",
+            "RevenueFromContractsWithCustomers",
             "Revenue",
         ),
     )
@@ -417,7 +423,10 @@ def download_sec_fundamental_snapshot(
         "earningsGrowth": _metric_provenance(("net_income", net_income), periodicity="annual", growth_comparison=True),
         "operatingMargins": _metric_provenance(("operating_income", operating_income), ("revenue", revenue), periodicity="annual", aligned_periods=True),
         "profitMargins": _metric_provenance(("net_income", net_income), ("revenue", revenue), periodicity="annual", aligned_periods=True),
-        "returnOnEquity": _metric_provenance(("net_income", net_income), ("equity", equity_annual), periodicity="annual", prior_roles=("equity",)),
+        "returnOnEquity": _metric_provenance(
+            ("net_income", net_income),
+            ("equity", [item for item in equity_annual[-2:] if item.get("val") not in (None, 0)] or equity_latest[-1:]),
+            periodicity="annual", aligned_periods=True, prior_roles=("equity",)),
         "freeCashflow": _metric_provenance(("operating_cash", operating_cash), ("capex", capex), periodicity="annual", aligned_periods=True),
         "operatingCashflow": _metric_provenance(("operating_cash", operating_cash), periodicity="annual"),
         "capitalExpenditures": _metric_provenance(("capex", capex), periodicity="annual"),
@@ -447,7 +456,10 @@ def merge_fundamental_sources(
     raw_periods = yahoo.get("_metric_periods")
     metric_periods = dict(raw_periods) if isinstance(raw_periods, dict) else {}
     sources = {
-        key: "Yahoo Finance"
+        key: ("Yahoo Financial Statements"
+              if isinstance(yahoo.get("_sources"), dict)
+              and yahoo["_sources"].get(key) == "Yahoo Financial Statements"
+              else "Yahoo Finance")
         for key, value in yahoo.items()
         if value is not None and not key.startswith("_")
     }

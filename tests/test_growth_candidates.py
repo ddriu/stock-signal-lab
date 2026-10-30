@@ -25,7 +25,21 @@ def _result(**overrides: object) -> SimpleNamespace:
 
 
 def _rows(results: dict[str, object], **kwargs: object) -> list[dict[str, object]]:
+    kwargs.setdefault("fundamental_info", {
+        ticker: _fundamentals(quote_type="ETF" if getattr(result, "sector_key", None) == "etf" else "EQUITY")
+        for ticker, result in results.items()
+    })
     return build_growth_candidate_rows(results, reference_date=REFERENCE_DATE, **kwargs)
+
+
+def _fundamentals(*, quote_type: str = "EQUITY", dated: bool = True) -> dict[str, object]:
+    values = {"quoteType": quote_type, "revenueGrowth": .2, "earningsGrowth": .3}
+    if dated:
+        values["_metric_periods"] = {key: {
+            "source": "Yahoo Financial Statements", "periodicity": "quarterly",
+            "period_end": "2026-06-30", "comparable": True,
+        } for key in ("revenueGrowth", "earningsGrowth")}
+    return values
 
 
 def _frame(*, periods: int = 220, indicators: bool = True, end: str = "2026-10-14") -> pd.DataFrame:
@@ -226,6 +240,52 @@ def test_etf_can_use_its_existing_engine_result_without_company_growth_score() -
     row = _rows({"TEST": _result(growth_score=None, sector_key="etf")})[0]
     assert row["Datos completos"]
     assert row["Grupo"] == "Entradas fuertes"
+
+
+@pytest.mark.parametrize("held", [False, True])
+def test_strong_engine_signal_stays_visible_but_undated_fundamentals_cannot_enable_a_plan(held: bool) -> None:
+    result = _result()
+    info = _fundamentals(dated=False)
+    original = deepcopy(info)
+    row = _rows({"TEST": result}, held_tickers=["TEST"] if held else [],
+        fundamental_info={"TEST": info})[0]
+    assert row["Grupo"] == ("Mi cartera" if held else "Entradas fuertes")
+    assert row["Lectura principal"] == "Entrada fuerte" and row["Nota principal"] == 85
+    assert row["Verificación empresarial"] == "Pendiente"
+    assert not row["Datos completos"]
+    assert row["Precio referencia"] is None and row["Stop orientativo"] is None
+    assert any("periodo" in reason for reason in row["Motivos de verificación"])
+    assert "vender" not in row["Qué revisar"].lower()
+    assert info == original and result.label == "Entrada fuerte"
+
+
+def test_dated_matching_fundamentals_enable_study_without_changing_engine_scores() -> None:
+    row = _rows({"TEST": _result()}, fundamental_info={"TEST": _fundamentals()})[0]
+    assert row["Verificación empresarial"] == "Datos suficientes"
+    assert row["Datos completos"] and row["Precio referencia"] == 100
+    assert row["Stop orientativo"] == 90
+    assert row["Lectura principal"] == "Entrada fuerte" and row["Nota principal"] == 85
+    assert row["Estado"] == "Revisar nueva entrada"
+
+
+@pytest.mark.parametrize("info", [None, {}, {"OTHER": _fundamentals()},
+    {"TEST": {**_fundamentals(), "symbol": "OTHER"}}])
+def test_missing_or_mismatched_company_data_never_borrows_another_company_verification(info: object) -> None:
+    row = build_growth_candidate_rows({"TEST": _result()}, reference_date=REFERENCE_DATE,
+        fundamental_info=info)[0]
+    assert row["Grupo"] == "Entradas fuertes" and row["Lectura principal"] == "Entrada fuerte"
+    assert not row["Datos completos"] and row["Precio referencia"] is None
+    assert row["Verificación empresarial"] == "Pendiente"
+
+
+def test_etf_remains_exempt_from_company_accounting_dates_but_not_price_checks() -> None:
+    result = _result(growth_score=None, sector_key="etf")
+    row = _rows({"TEST": result}, fundamental_info={"TEST": {"quoteType": "ETF"}})[0]
+    assert row["Datos completos"] and row["Precio referencia"] == 100
+    assert row["Calidad datos empresariales"]["status"] == "review"
+    stale = _rows({"TEST": _result(growth_score=None, sector_key="etf", as_of="2026-10-01")},
+        fundamental_info={"TEST": {"quoteType": "ETF"}})[0]
+    assert not stale["Datos completos"] and stale["Precio referencia"] is None
 
 
 def test_plain_result_mapping_and_none_comparison_are_supported() -> None:

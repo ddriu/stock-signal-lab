@@ -13,6 +13,7 @@ import json
 import math
 
 QUALITY_VERSION = "daily_data_quality_v1"
+QUALITY_PRESENTATION_VERSION = "dated_quality_coverage_v2"
 GROWTH_METRICS = (
     "revenueGrowth", "earningsGrowth", "operatingMargins",
     "returnOnEquity", "freeCashflow",
@@ -112,6 +113,7 @@ def assess_analysis_data_quality(
     reasons: list[str] = []
     blocked = False
     unknown = False
+    undated_metrics: list[str] = []
 
     def reason(text: str, *, block: bool = False) -> None:
         nonlocal blocked
@@ -135,7 +137,8 @@ def assess_analysis_data_quality(
             periodicity = metadata["periodicity"]
             if end is None or periodicity in {"unknown", "provider_summary"}:
                 unknown = True
-                reason("No consta el periodo de cada métrica empresarial; una fecha general de la fuente no acredita su actualización.", block=True)
+                undated_metrics.append(metric)
+                blocked = True
             else:
                 age = (reference - end).days
                 if age < 0:
@@ -169,6 +172,10 @@ def assess_analysis_data_quality(
         if revenue_growth is not None and abs(revenue_growth) >= 5:
             reason("El crecimiento de ingresos es excepcional: validar adquisiciones, base de comparación y conceptos contables.", block=True)
 
+    if undated_metrics:
+        labels = ", ".join(METRIC_NAMES[key] for key in undated_metrics)
+        reason(f"Falta el periodo verificable de: {labels}. Una fecha general de la fuente no acredita estas métricas.", block=True)
+
     status = "blocked" if blocked and not unknown else "unknown" if unknown else "review" if reasons else "ok"
     fingerprint = {
         "version": QUALITY_VERSION, "quote_type": quote_type,
@@ -177,7 +184,14 @@ def assess_analysis_data_quality(
     comparability = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")).hexdigest()
     return {
         "version": QUALITY_VERSION, "status": status, "block_entry": blocked,
+        "input_version": str(snapshot.get("_snapshot_version") or "")[:80],
         "reasons": reasons, "metric_periods": periods,
+        "coverage": {"applicable": quote_type not in {"ETF", "MUTUALFUND"},
+                     "numeric_metrics": len(values),
+                     "dated_metrics": len(periods) - len(undated_metrics),
+                     "undated_metrics": undated_metrics,
+                     "missing_metrics": [key for key in GROWTH_METRICS if key not in values]
+                                        if quote_type not in {"ETF", "MUTUALFUND"} else []},
         "comparability_key": comparability, "as_of": reference.isoformat(),
         "not_a_sell_signal": True, "affects_engine_scores": False,
     }

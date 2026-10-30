@@ -387,7 +387,8 @@ def test_new_purchase_alert_is_not_promoted_with_unverified_fundamental_dates(mo
     assert summary.emails_sent == 1 and summary.alerts_sent == 0
     report = next(iter(user.reports.values()))
     assert report["alerts"] == []
-    assert "Revisar datos" in sent[0][2]
+    assert "Datos pendientes" in sent[0][2]
+    assert "Compra no confirmada" in sent[0][2]
 
 
 def test_delivery_key_is_private_and_scoped_to_owner_recipient_and_session():

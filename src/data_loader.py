@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
 from io import StringIO
+import math
 from urllib.parse import quote
 
 import pandas as pd
@@ -20,6 +21,7 @@ from src.instruments import ANALYSIS_TICKER_ALIASES, resolve_analysis_ticker
 
 
 REQUIRED_COLUMNS = ("open", "high", "low", "close", "volume")
+FUNDAMENTAL_SNAPSHOT_VERSION = "dated_statement_fallback_v2"
 STOOQ_DAILY_URL = "https://stooq.com/q/d/l/"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 STOOQ_SUFFIXES = {
@@ -546,66 +548,87 @@ def _statement_series(
 ) -> list[float]:
     """Extrae una serie anual de una tabla contable de yfinance."""
 
-    if frame is None or frame.empty:
+    return [value for _, value in _statement_observations(frame, labels)]
+
+
+def _statement_observations(
+    frame: pd.DataFrame | None,
+    labels: tuple[str, ...],
+) -> list[tuple[pd.Timestamp, float]]:
+    """Keep every value paired with its own valid statement date."""
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
         return []
     for label in labels:
         if label not in frame.index:
             continue
         row = frame.loc[label]
         if isinstance(row, pd.DataFrame):
+            if not row.nunique(dropna=False).le(1).all():
+                return []
             row = row.iloc[0]
-        values = pd.to_numeric(row, errors="coerce").dropna()
-        if values.empty:
-            return []
-        try:
-            values = values.sort_index(ascending=False)
-        except TypeError:
-            pass
-        return [float(value) for value in values.tolist()]
+        values = pd.to_numeric(row, errors="coerce")
+        dated: dict[pd.Timestamp, float] = {}
+        for raw_date, value in values.items():
+            stamp = pd.to_datetime(raw_date, errors="coerce")
+            if pd.isna(stamp) or pd.isna(value) or not math.isfinite(float(value)):
+                continue
+            # Conflicting duplicate periods are not a reproducible observation.
+            if stamp in dated and dated[stamp] != float(value):
+                return []
+            dated[stamp] = float(value)
+        if dated:
+            return sorted(dated.items(), reverse=True)
     return []
 
 
 def _statement_growth(values: list[float]) -> float | None:
     if len(values) < 2 or values[1] == 0:
         return None
-    return values[0] / abs(values[1]) - 1.0
+    growth = values[0] / abs(values[1]) - 1.0
+    return growth if math.isfinite(growth) else None
 
 
-def _statement_period(frame: pd.DataFrame, labels: tuple[str, ...]) -> dict[str, object]:
+def _statement_period(
+    frame: pd.DataFrame,
+    labels: tuple[str, ...],
+    *,
+    growth_comparison: bool = False,
+    currency: str = "",
+) -> dict[str, object]:
     """Period of the same yearly row used by the fallback calculations."""
     for label in labels:
         if label not in frame.index:
             continue
-        row = frame.loc[label]
-        if isinstance(row, pd.DataFrame):
-            row = row.iloc[0]
-        values = pd.to_numeric(row, errors="coerce").dropna()
-        try:
-            values = values.sort_index(ascending=False)
-        except TypeError:
-            pass
-        dates = pd.to_datetime(values.index, errors="coerce")
+        values = _statement_observations(frame, (label,))
+        if not values:
+            continue
         components = [{"role": label, "end": stamp.date().isoformat(), "value": float(value),
-                       "comparison_base": offset > 0}
-                      for offset, (stamp, value) in enumerate(zip(dates[:2], values.iloc[:2], strict=True))
-                      if pd.notna(stamp)]
+                       "comparison_base": offset > 0, "unit": currency}
+                      for offset, (stamp, value) in enumerate(values[:2])]
+        comparable = bool(components)
+        if growth_comparison:
+            comparable = len(values) >= 2 and 330 <= (values[0][0] - values[1][0]).days <= 400
         return {"source": "Yahoo Financial Statements", "periodicity": "annual",
                 "period_end": components[0]["end"] if components else None,
-                "comparable": bool(components), "components": components}
+                "comparable": comparable, "components": components}
     return {"source": "Yahoo Financial Statements", "periodicity": "annual",
             "period_end": None, "comparable": False, "components": []}
 
 
 def _combined_statement_period(*periods: dict[str, object]) -> dict[str, object]:
     ends = [str(value["period_end"]) for value in periods if value.get("period_end")]
+    units = {str(item.get("unit")) for value in periods for item in value.get("components", [])
+             if item.get("unit")}
     return {"source": "Yahoo Financial Statements", "periodicity": "annual",
             "period_end": min(ends) if ends else None,
-            "comparable": len(ends) == len(periods) and len(set(ends)) <= 1,
+            "comparable": (len(ends) == len(periods) and len(set(ends)) <= 1
+                           and all(value.get("comparable") is True for value in periods)
+                           and len(units) <= 1),
             "components": [item for value in periods for item in value.get("components", [])]}
 
 
-def _yahoo_statement_snapshot(stock: object) -> dict[str, object]:
-    """Calcula un respaldo contable cuando ``get_info`` llega incompleto.
+def _yahoo_statement_snapshot(stock: object, *, financial_currency: str = "") -> dict[str, object]:
+    """Calcula cifras y periodos juntos, también si faltan fechas en la ficha.
 
     Yahoo mantiene endpoints separados para ficha e informes financieros. En
     ocasiones la ficha falla en Streamlit Cloud mientras las tablas anuales sí
@@ -613,9 +636,24 @@ def _yahoo_statement_snapshot(stock: object) -> dict[str, object]:
     inventar datos.
     """
 
-    income = stock.get_income_stmt(freq="yearly")
-    balance = stock.get_balance_sheet(freq="yearly")
-    cashflow = stock.get_cash_flow(freq="yearly")
+    warnings: list[str] = []
+
+    def fetch(method: str, description: str) -> pd.DataFrame:
+        try:
+            result = getattr(stock, method)(freq="yearly")
+        except Exception as exc:
+            warnings.append(f"No se pudo recuperar {description} de Yahoo ({type(exc).__name__}).")
+            return pd.DataFrame()
+        return result if isinstance(result, pd.DataFrame) else pd.DataFrame()
+
+    income = fetch("get_income_stmt", "la cuenta de resultados")
+    balance = fetch("get_balance_sheet", "el balance")
+    cashflow = fetch("get_cash_flow", "el estado de flujos de caja")
+
+    def period(frame: pd.DataFrame, labels: tuple[str, ...], *, growth: bool = False) -> dict[str, object]:
+        # Currency of quotation must never be substituted for accounting units.
+        unit = str(frame.attrs.get("financialCurrency") or frame.attrs.get("currency") or financial_currency or "").upper()
+        return _statement_period(frame, labels, growth_comparison=growth, currency=unit)
 
     revenue = _statement_series(income, ("TotalRevenue", "OperatingRevenue"))
     net_income = _statement_series(
@@ -655,13 +693,14 @@ def _yahoo_statement_snapshot(stock: object) -> dict[str, object]:
         sum(equity[:2]) / len(equity[:2]) if equity else None
     )
     latest_fcf = free_cashflow[0] if free_cashflow else None
-    if latest_fcf is None and operating_cash:
-        latest_fcf = operating_cash[0] - abs(capex[0]) if capex else operating_cash[0]
+    if latest_fcf is None and operating_cash and capex:
+        latest_fcf = operating_cash[0] - abs(capex[0])
 
     def ratio(numerator: float | None, denominator: float | None) -> float | None:
         if numerator is None or denominator in (None, 0):
             return None
-        return numerator / denominator
+        value = numerator / denominator
+        return value if math.isfinite(value) else None
 
     metrics: dict[str, object | None] = {
         "revenueGrowth": _statement_growth(revenue),
@@ -685,24 +724,36 @@ def _yahoo_statement_snapshot(stock: object) -> dict[str, object]:
         "capitalExpenditures": abs(capex[0]) if capex else None,
         "totalRevenue": latest_revenue,
     }
-    revenue_period = _statement_period(income, ("TotalRevenue", "OperatingRevenue"))
-    income_period = _statement_period(income, ("NetIncome", "NetIncomeCommonStockholders"))
-    equity_period = _statement_period(balance, ("StockholdersEquity", "CommonStockEquity", "TotalEquityGrossMinorityInterest"))
-    operating_period = _statement_period(income, ("OperatingIncome",))
-    cash_period = _statement_period(cashflow, ("OperatingCashFlow", "TotalCashFromOperatingActivities"))
-    capex_period = _statement_period(cashflow, ("CapitalExpenditure", "CapitalExpenditures"))
+    revenue_period = period(income, ("TotalRevenue", "OperatingRevenue"))
+    income_period = period(income, ("NetIncome", "NetIncomeCommonStockholders"))
+    # ROE divides by the mean of two equity closings. A missing intervening
+    # year must not be labelled a comparable average just because the newest
+    # equity date matches the income statement.
+    equity_period = period(balance, ("StockholdersEquity", "CommonStockEquity", "TotalEquityGrossMinorityInterest"), growth=True)
+    operating_period = period(income, ("OperatingIncome",))
+    cash_period = period(cashflow, ("OperatingCashFlow", "TotalCashFromOperatingActivities"))
+    capex_period = period(cashflow, ("CapitalExpenditure", "CapitalExpenditures"))
     metrics["_metric_periods"] = {
-        "revenueGrowth": revenue_period,
-        "earningsGrowth": income_period,
+        "revenueGrowth": period(income, ("TotalRevenue", "OperatingRevenue"), growth=True),
+        "earningsGrowth": period(income, ("NetIncome", "NetIncomeCommonStockholders"), growth=True),
         "profitMargins": _combined_statement_period(income_period, revenue_period),
         "operatingMargins": _combined_statement_period(operating_period, revenue_period),
         "returnOnEquity": _combined_statement_period(income_period, equity_period),
-        "freeCashflow": (_statement_period(cashflow, ("FreeCashFlow",)) if free_cashflow
-                         else _combined_statement_period(cash_period, capex_period) if capex
-                         else cash_period),
+        "freeCashflow": (period(cashflow, ("FreeCashFlow",)) if free_cashflow
+                         else _combined_statement_period(cash_period, capex_period)),
         "operatingCashflow": cash_period, "capitalExpenditures": capex_period,
         "totalRevenue": revenue_period,
+        "currentRatio": _combined_statement_period(
+            period(balance, ("CurrentAssets", "TotalCurrentAssets")),
+            period(balance, ("CurrentLiabilities", "TotalCurrentLiabilities"))),
+        "debtToEquity": _combined_statement_period(period(balance, ("TotalDebt",)), equity_period),
+        "totalCash": period(balance, ("CashCashEquivalentsAndShortTermInvestments", "CashAndCashEquivalents", "CashFinancial")),
+        "totalDebt": period(balance, ("TotalDebt",)),
     }
+    metrics["_metric_periods"] = {key: value for key, value in metrics["_metric_periods"].items()
+                                 if metrics.get(key) is not None}
+    if warnings:
+        metrics["_warnings"] = warnings
     return {key: value for key, value in metrics.items() if value is not None}
 
 
@@ -724,6 +775,7 @@ def download_fundamental_snapshot(ticker: str) -> dict[str, object]:
         "industry",
         "quoteType",
         "currency",
+        "financialCurrency",
         "exchange",
         "fullExchangeName",
         "returnOnEquity",
@@ -781,32 +833,78 @@ def download_fundamental_snapshot(ticker: str) -> dict[str, object]:
         "debtToEquity",
         "currentRatio",
         "freeCashflow",
+        "totalCash", "totalDebt", "operatingCashflow", "capitalExpenditures", "totalRevenue",
     }
-    if sum(yahoo.get(key) is not None for key in accounting_fields) < 2:
-        try:
-            statement_metrics = _yahoo_statement_snapshot(stock)
-        except Exception as exc:
-            statement_metrics = {}
-            warnings.append(
-                f"Yahoo no pudo aportar estados financieros de {symbol}: {exc}"
-            )
-        filled_from_statements: set[str] = set()
-        for key, value in statement_metrics.items():
-            if not key.startswith("_") and yahoo.get(key) is None:
-                yahoo[key] = value
-                filled_from_statements.add(key)
-        statement_periods = statement_metrics.get("_metric_periods")
-        if isinstance(statement_periods, dict):
-            yahoo["_metric_periods"] = {
-                key: value for key, value in statement_periods.items()
-                if key in filled_from_statements
-            }
     try:
         official = download_sec_fundamental_snapshot(symbol)
     except (ExternalDataError, ValueError) as exc:
         official = {}
         warnings.append(f"SEC EDGAR no pudo validar {symbol}: {exc}")
+
+    def has_dated_value(snapshot: dict[str, object], key: str) -> bool:
+        value = snapshot.get(key)
+        try:
+            numeric = value is not None and not isinstance(value, bool) and math.isfinite(float(value))
+        except (TypeError, ValueError, OverflowError):
+            numeric = False
+        metadata = snapshot.get("_metric_periods")
+        metadata = metadata.get(key) if isinstance(metadata, dict) else None
+        return bool(numeric and isinstance(metadata, dict)
+                    and pd.notna(pd.to_datetime(metadata.get("period_end"), errors="coerce"))
+                    and metadata.get("periodicity") in {"annual", "quarterly", "interim", "ttm", "instant"}
+                    and metadata.get("comparable") is not False)
+
+    is_fund = str(yahoo.get("quoteType") or "").upper() in {"ETF", "MUTUALFUND"}
+    required_periods = (set() if is_fund else
+                        {"revenueGrowth", "earningsGrowth", "operatingMargins", "returnOnEquity", "freeCashflow"})
+    pending = sorted(key for key in required_periods
+                     if not has_dated_value(official, key) and not has_dated_value(yahoo, key))
+    recovered: list[str] = []
+    # A numerical provider summary is not evidence of a metric's fiscal period.
+    # Fetch the dated statements even if get_info returned all five ratios.
+    attempted = bool(pending)
+    if attempted:
+        try:
+            statement_metrics = _yahoo_statement_snapshot(
+                stock, financial_currency=str(yahoo.get("financialCurrency") or "")
+            )
+        except Exception as exc:
+            statement_metrics = {}
+            warnings.append(
+                f"Yahoo no pudo aportar estados financieros de {symbol} ({type(exc).__name__})."
+            )
+        warnings.extend(str(value) for value in statement_metrics.get("_warnings", []))
+        statement_periods = statement_metrics.get("_metric_periods")
+        statement_periods = statement_periods if isinstance(statement_periods, dict) else {}
+        periods = dict(yahoo.get("_metric_periods") or {})
+        sources = dict(yahoo.get("_sources") or {})
+        for key in accounting_fields:
+            value = statement_metrics.get(key)
+            metadata = statement_periods.get(key)
+            if (value is None or has_dated_value(yahoo, key) or has_dated_value(official, key)
+                    or not isinstance(metadata, dict)):
+                continue
+            # Replace the ratio AND attach its own components. Never certify an
+            # existing Yahoo summary by copying another observation's date.
+            yahoo[key] = value
+            periods[key] = dict(metadata)
+            sources[key] = "Yahoo Financial Statements"
+            recovered.append(key)
+        yahoo["_metric_periods"] = periods
+        yahoo["_sources"] = sources
     result = merge_fundamental_sources(yahoo, official)
+    result["_snapshot_version"] = FUNDAMENTAL_SNAPSHOT_VERSION
+    unresolved = sorted(key for key in required_periods if not has_dated_value(result, key))
+    result["_provenance_recovery"] = {
+        "version": FUNDAMENTAL_SNAPSHOT_VERSION, "attempted": attempted,
+        "missing_before": pending,
+        "recovered_metrics": sorted(key for key in recovered
+                                    if result["_sources"].get(key) == "Yahoo Financial Statements"),
+        "unresolved_metrics": unresolved,
+    }
+    if attempted and unresolved:
+        warnings.append("Persisten métricas sin periodo verificable tras consultar los estados financieros: "
+                        + ", ".join(unresolved) + ".")
     if warnings:
         result["_warnings"] = warnings
     return result

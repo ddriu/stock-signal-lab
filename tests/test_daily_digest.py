@@ -8,7 +8,8 @@ import pytest
 from src.analysis_policy import encode_policy_note
 from src.daily_digest import (
     _calendar_name, build_daily_score_report, render_daily_score_email,
-    seal_daily_score_report,
+    seal_daily_score_report, daily_score_reading, daily_score_coverage,
+    daily_score_sort_key,
 )
 
 
@@ -123,6 +124,73 @@ def test_blocked_fundamentals_keep_raw_score_but_never_confirm_entry():
     assert row["score"] == 88 and row["label"] == "Entrada fuerte"
     assert row["status"] == "review_data" and row["quality"]["block_entry"]
     assert "Actualizar" in row["next_step"]
+
+
+def test_pending_strong_signal_is_visible_in_email_but_not_confirmed_as_a_buy():
+    report = build_daily_score_report(pd.DataFrame([observation(quality="blocked")]), as_of="2026-10-23")
+    before = deepcopy(report)
+    _, text, html = render_daily_score_email(report)
+    assert report == before
+    assert "Motor: Entrada fuerte" in text and "Motor: Entrada fuerte" in html
+    assert "Datos pendientes" in text and "Compra no confirmada" in text
+    assert "0 entradas fuertes con datos suficientes" in text
+    assert "1 señales fuertes del motor pendientes de verificar" in text
+    assert "Fundamentales antiguos" in text
+
+
+@pytest.mark.parametrize("changes", [{"quality": None}, {"score": None}, {"status": "review_data"}])
+def test_legacy_or_inconsistent_quality_cannot_be_upgraded_by_renderer(changes):
+    row = {"score": 88, "label": "Entrada fuerte", "status": "entry_strong",
+           "quality": {"block_entry": False}, **changes}
+    reading = daily_score_reading(row)
+    assert reading["signal"] == "Entrada fuerte" and reading["blocked"]
+    assert reading["decision"] == "Compra no confirmada"
+    assert reading["reasons"]
+
+
+def test_verified_signal_remains_a_study_not_an_automatic_purchase():
+    row = {"score": 88, "label": "Entrada fuerte", "status": "entry_strong", "quality": {"block_entry": False}}
+    assert daily_score_reading(row)["decision"] == "Estudiar entrada"
+    assert daily_score_reading({**row, "held": True})["decision"] == "Revisar antes de ampliar"
+
+
+def test_counts_and_order_separate_verified_pending_and_absent_data():
+    rows = [
+        {"ticker": "PENDING", "score": 99, "label": "Entrada fuerte", "status": "review_data", "quality": {"block_entry": True}},
+        {"ticker": "VERIFIED", "score": 85, "label": "Entrada fuerte", "status": "entry_strong", "quality": {"block_entry": False}},
+        {"ticker": "HELD", "held": True, "score": 20, "status": "wait", "quality": {"block_entry": False}},
+        {"ticker": "MISSING", "score": None, "label": "Entrada fuerte", "status": "review_data"},
+    ]
+    assert [row["ticker"] for row in sorted(rows, key=daily_score_sort_key)] == ["HELD", "VERIFIED", "PENDING", "MISSING"]
+    assert daily_score_coverage(rows) == {"total": 4, "with_score": 3, "missing_score": 1,
+        "sufficient_data": 2, "pending_data": 2, "strong_verified": 1, "strong_pending": 1, "candidate_verified": 0}
+
+
+def test_new_method_changes_do_not_rewrite_or_invalidate_old_report_identity():
+    report = {"version": "daily-score-report-v1", "as_of": "2026-10-23", "rows": [
+        {"ticker": "TEST", "score": 88, "label": "Entrada fuerte", "status": "review_data", "quality": {"block_entry": True}}]}
+    sealed = seal_daily_score_report(report)
+    before = deepcopy(sealed)
+    render_daily_score_email(sealed)
+    daily_score_coverage(sealed["rows"])
+    assert sealed == before
+    assert seal_daily_score_report(sealed)["report_id"] == before["report_id"]
+
+
+def test_pending_strong_summary_is_not_hidden_when_five_position_alerts_fill_email():
+    report = build_daily_score_report(pd.DataFrame([observation("PENDING", quality="blocked")]), as_of="2026-10-23")
+    report["alerts"] = [{"ticker": f"H{index}", "held": True, "title": "Revisar exposición"} for index in range(5)]
+    _, text, html = render_daily_score_email(seal_daily_score_report(report))
+    assert "PENDING: 88/100" not in text  # always retain ticker identity in parentheses
+    assert "(PENDING): 88/100" in text
+    assert "Compra no confirmada" in html
+
+
+def test_legacy_string_score_renders_without_crashing_or_promoting_pending_data():
+    report = {"as_of": "2026-10-23", "rows": [{"ticker": "TEST", "score": "88",
+        "label": "Entrada fuerte", "status": "review_data", "quality": {"block_entry": True}}]}
+    _, text, html = render_daily_score_email(report)
+    assert "88/100" in text and "Compra no confirmada" in html
 
 
 def test_first_portfolio_then_favorites_without_leaking_private_notes_or_accounts():

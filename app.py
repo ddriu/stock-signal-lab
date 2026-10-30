@@ -19,6 +19,10 @@ import pandas as pd
 import streamlit as st
 
 from config import BacktestConfig, StrategyConfig
+from src.runtime_compat import prepare_analysis_runtime
+
+prepare_analysis_runtime()
+
 import src.analysis_policy as _analysis_policy_module
 
 # Un despliegue en caliente puede conservar las funciones anteriores en memoria.
@@ -43,6 +47,13 @@ from src.analysis_policy import (
     position_contexts_from_snapshot,
 )
 from src.alerts import normalize_alert_preferences
+# A hot deployment may retain the previous data module, without its new
+# provenance-version export. Refresh before binding it or importing consumers.
+import src.data_loader as _data_loader_module
+
+if getattr(_data_loader_module, "FUNDAMENTAL_SNAPSHOT_VERSION", "") != "dated_statement_fallback_v2":
+    _data_loader_module = importlib.reload(_data_loader_module)
+
 from src.alert_runner import run_daily_alerts
 from src.analysis_snapshots import persist_analysis_batch_snapshots
 from src.approximate_returns import build_approximate_return_report
@@ -79,6 +90,7 @@ from src.conviction import MANUAL_OPTIONS, evaluate_conviction, summarize_convic
 from src.dashboard import build_position_dashboard
 from src.data_loader import (
     DataDownloadError,
+    FUNDAMENTAL_SNAPSHOT_VERSION,
     TickerSearchResult,
     download_fundamental_snapshot,
     download_prices,
@@ -133,6 +145,7 @@ import src.growth_candidates as _growth_candidates_module
 if (
     getattr(_growth_candidates_module, "GROWTH_CANDIDATE_PRESENTATION_VERSION", "")
     != "company-names-v1"
+    or "fundamental_info" not in inspect.signature(_growth_candidates_module.build_growth_candidate_rows).parameters
 ):
     _growth_candidates_module = importlib.reload(_growth_candidates_module)
 
@@ -506,8 +519,13 @@ def cached_download(
 def cached_fundamentals(
     ticker: str,
     refresh_token: str = "",
+    source_version: str = FUNDAMENTAL_SNAPSHOT_VERSION,
 ) -> dict[str, object]:
-    """Caché de fundamentales con una clave opcional para reintentos manuales."""
+    """Versioned data cache; a provenance-method change cannot reuse old ratios.
+
+    source_version is deliberately part of Streamlit's argument hash even
+    though the downloader reads the current implementation directly.
+    """
 
     return download_fundamental_snapshot(ticker)
 
@@ -1110,7 +1128,9 @@ def load_market_data(
             errors.append(str(exc))
         if ticker in deep_tickers:
             try:
-                fundamentals[ticker] = cached_fundamentals(ticker, refresh_token)
+                fundamentals[ticker] = cached_fundamentals(
+                    ticker, refresh_token, source_version=FUNDAMENTAL_SNAPSHOT_VERSION,
+                )
             except (DataDownloadError, ValueError) as exc:
                 fundamentals[ticker] = {
                     "symbol": ticker,
@@ -12845,6 +12865,7 @@ def render_growth_candidate_overview(
     comparison_rows: list[dict[str, object]] | None = None,
     reference_date: date | None = None,
     holdings_verified: bool = True,
+    fundamental_info: dict[str, dict[str, object]] | None = None,
 ) -> tuple[list[str], list[str], bool]:
     """Una sola tabla de decisión; las notas y el plan se abren a petición."""
 
@@ -12858,6 +12879,7 @@ def render_growth_candidate_overview(
         universe=universe,
         comparison_rows=comparison_rows or [],
         reference_date=reference_date or pd.Timestamp.now(tz="Europe/Madrid").date(),
+        fundamental_info=fundamental_info,
     )
     if not holdings_verified:
         st.warning(
@@ -12889,7 +12911,8 @@ def render_growth_candidate_overview(
         "Después, Entradas fuertes: nuevas oportunidades con la señal más exigente de "
         "crecimiento y momentum; Candidatas: pasan el nivel inicial, pero no el fuerte. "
         "Esperar: precio, señal o datos pendientes. «Fuerte» no significa que la acción "
-        "esté barata ni que debas comprarla: confirma precio, costes, peso y riesgo."
+        "esté barata ni que debas comprarla: confirma precio, costes, peso y riesgo. "
+        "La señal del motor sigue visible aunque la verificación empresarial esté pendiente."
     )
     visible_rows = []
     for row in grouped[active]:
@@ -12905,13 +12928,16 @@ def render_growth_candidate_overview(
             "Empresa": row["Empresa"],
             "En cartera / peso": holding,
             "Señal de entrada": (
-                row["Lectura principal"] if row["Datos completos"] else "Pendiente de datos recientes"
+                row["Lectura principal"] if row["Datos completos"] or row["Verificación empresarial"] == "Pendiente"
+                else "Pendiente de datos recientes"
             ),
             "Qué revisar": row["Qué revisar"],
             "Entrada / stop orientativos": row["Entrada / stop orientativos"],
             "Motivo": row["Motivo"],
             "Actualizado": row.get("Fecha") or "N/D",
         })
+        if fundamental_info is not None:
+            visible_rows[-1]["Verificación empresarial"] = row["Verificación empresarial"]
     selection: list[str] = []
     if visible_rows:
         selection = render_ticker_dataframe(
@@ -12926,6 +12952,7 @@ def render_growth_candidate_overview(
                 "Empresa": st.column_config.TextColumn(width="large"),
                 "En cartera / peso": st.column_config.TextColumn(width="small"),
                 "Señal de entrada": st.column_config.TextColumn(width="small"),
+                "Verificación empresarial": st.column_config.TextColumn(width="small"),
                 "Qué revisar": st.column_config.TextColumn(width="medium"),
                 "Entrada / stop orientativos": st.column_config.TextColumn(width="medium"),
                 "Motivo": st.column_config.TextColumn(width="large"),
@@ -12963,6 +12990,20 @@ def render_growth_candidate_overview(
         key="growth_show_detail",
     )
     return [row["Ticker"] for row in grouped[active]], selection, detail
+
+
+def _accounting_metric_currency(info: dict[str, object], metric: str) -> str:
+    """Label money in its statement units, never its stock's quote currency."""
+    periods = info.get("_metric_periods")
+    metadata = periods.get(metric) if isinstance(periods, dict) else None
+    components = metadata.get("components") if isinstance(metadata, dict) else None
+    components = components if isinstance(components, (list, tuple)) else []
+    units = {str(item.get("unit") or "").strip().upper()
+             for item in components or [] if isinstance(item, dict) and item.get("unit")}
+    if len(units) > 1:
+        return ""
+    unit = next(iter(units)) if units else str(info.get("financialCurrency") or "").strip().upper()
+    return unit if len(unit) == 3 and unit.isalpha() else ""
 
 
 def render_growth_momentum_page(
@@ -13315,6 +13356,7 @@ def render_growth_momentum_page(
             universe=candidate_universe,
             comparison_rows=table_comparisons,
             holdings_verified=holdings_verified,
+            fundamental_info=raw_fundamentals,
         )
     if not show_detail:
         return
@@ -13392,14 +13434,16 @@ def render_growth_momentum_page(
             sector_override=sector_choice,
         )
 
-    selected_reading = build_growth_candidate_rows(
+    selected_readings = build_growth_candidate_rows(
         {selected: selected_result},
         held_tickers=private_held,
         portfolio_snapshot=portfolio_snapshot,
         prepared={selected: prepared[selected]},
         comparison_rows=table_comparisons,
         reference_date=pd.Timestamp.now(tz="Europe/Madrid").date(),
-    )[0]
+        fundamental_info=raw_fundamentals,
+    )
+    selected_reading = next(row for row in selected_readings if row["Ticker"] == selected)
     review_ready = selected_reading["Precio referencia"] is not None and holdings_verified
 
     score_cols = st.columns(5)
@@ -13423,6 +13467,8 @@ def render_growth_momentum_page(
             + (str(selected_reading["Motivo"]) if holdings_verified else "cartera sin verificar")
             + ". Actualiza o verifica los datos antes de preparar una compra."
         )
+        for reason in selected_reading["Motivos de verificación"]:
+            st.caption(str(reason))
     elif review_ready:
         st.success(message)
     elif selected_result.label in {"Vigilancia activa", "Esperar mejor precio"}:
@@ -13540,7 +13586,8 @@ def render_growth_momentum_page(
             elif metric_kind == "percent":
                 display_value = f"{numeric_value * 100:+.1f}%"
             else:
-                display_value = f"{numeric_value:,.0f} {str(selected_info.get('currency') or '').strip()}".strip()
+                accounting_currency = _accounting_metric_currency(selected_info, metric_key)
+                display_value = f"{numeric_value:,.0f} {accounting_currency or '· moneda contable no verificada'}"
             company_metric_rows.append(
                 {"Dato": metric_label, "Valor disponible": display_value}
             )
@@ -15265,7 +15312,7 @@ def main() -> None:
                     growth_scan_tickers
                     or portfolio_refresh_cycle
                 ),
-                refresh_fundamentals=bool(growth_scan_tickers),
+                refresh_fundamentals=bool(growth_scan_tickers or force_new_prices),
                 price_refresh_token=price_refresh_token,
             )
         if loading_daily_batch:

@@ -14,6 +14,36 @@ separado. Una nota baja para comprar no ordena vender una posición existente.
 - La periodicidad y antigüedad de las métricas se muestran sin retocar scores.
 - Una nota es una regla del modelo, no una probabilidad de ganar.
 
+## Señal y verificación, por separado
+
+La tabla principal muestra la señal original del motor, la suficiencia de sus
+datos y el siguiente paso. Una «Entrada fuerte» bloqueada sigue visible como
+señal del motor con **datos pendientes / compra no confirmada**. No se convierte
+en una candidata verificada, ni su falta de datos significa vender. Las fuertes
+con datos suficientes tampoco son órdenes: quedan pendientes de precio, evento,
+costes, peso y riesgo. Los contadores distinguen ambas situaciones.
+
+El histórico de cinco sesiones se consulta en el detalle, sin repetir cinco
+fechas en cada fila. El correo usa las mismas lecturas del informe, incluye el
+número de señales fuertes pendientes y muestra hasta tres, incluso si los avisos
+de posiciones ocupan el resumen. Las favoritas restantes están en un desplegable.
+
+La recuperación de fundamentales consulta cuentas fechadas aunque la ficha del
+proveedor ya contenga ratios. El valor recalculado y su periodo se sustituyen
+juntos; nunca se asigna una fecha general a un ratio distinto. SEC conserva
+prioridad, y el respaldo Yahoo queda identificado como **anual**, no trimestral.
+No se inventa flujo de caja libre sin inversión de capital, ni se certifican
+ratios con unidades o ejercicios incompatibles. Un dato imposible de recuperar
+permanece pendiente. La caché incorpora la versión del método, y una revisión
+manual vuelve a consultar los fundamentales junto con los precios.
+
+El método de recuperación y los periodos por métrica se conservan en las nuevas
+revisiones. Los informes archivados no se reescriben; un cambio de procedencia o
+de cifras puede impedir comparar directamente la nota con la sesión anterior.
+La vista de crecimiento comparte el control de datos del resumen y no habilita
+un plan de entrada mientras falte verificarlo. No cambian los parámetros del
+motor, sus etiquetas, umbrales ni reglas de salida.
+
 ## Versionado y privacidad
 
 El informe exacto se guarda antes del correo. Su SHA-256 cubre todo el contenido,

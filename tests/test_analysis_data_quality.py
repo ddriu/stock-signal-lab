@@ -52,6 +52,19 @@ def test_generic_snapshot_date_does_not_invent_per_metric_dates():
     result = assess_analysis_data_quality({**VALUES, "_official_period_end": "2026-09-30"}, as_of="2026-10-23")
     assert result["status"] == "unknown" and result["block_entry"]
     assert result["metric_periods"]["revenueGrowth"]["period_end"] is None
+    assert result["coverage"]["dated_metrics"] == 0
+    assert result["coverage"]["undated_metrics"] == list(VALUES)
+    assert "crecimiento de ingresos" in " ".join(result["reasons"])
+
+
+def test_partial_provenance_describes_exactly_what_is_still_missing():
+    source = info()
+    del source["_metric_periods"]["earningsGrowth"]
+    result = assess_analysis_data_quality(source, as_of="2026-10-23")
+    assert result["block_entry"] and result["coverage"]["dated_metrics"] == 4
+    assert result["coverage"]["undated_metrics"] == ["earningsGrowth"]
+    assert "Falta el periodo verificable de: crecimiento del beneficio." in " ".join(result["reasons"])
+    assert result["coverage"]["missing_metrics"] == []
 
 
 @pytest.mark.parametrize("snapshot", [None, {}, {"symbol": "TEST"}, {"revenueGrowth": True},

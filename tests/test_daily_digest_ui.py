@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
 from src.daily_digest import build_daily_score_report
-from src.daily_digest_ui import load_daily_score_report
+from src.daily_digest_ui import _display_note, _history, _table, load_daily_score_report
 
 
 def test_archived_report_is_read_exactly_without_other_reads_or_recalculation():
@@ -56,11 +56,92 @@ render_daily_score_page(Journal())
 
 def test_streamlit_page_keeps_missing_values_and_names_without_network_or_writes():
     page = AppTest.from_string(SCRIPT, default_timeout=30).run()
-    assert not page.exception and not page.error and len(page.dataframe) == 1
+    assert not page.exception and not page.error and len(page.dataframe) == 2
     table = page.dataframe[0].value
     assert table.iloc[0]["Empresa"] == "Compañía de prueba (TEST)"
-    assert "—" in table.iloc[0]["Última"] and table.iloc[0]["Última"].startswith("23/10")
-    assert table.iloc[0]["Lectura"] == "Revisar datos" and "deterioro" not in str(table).lower()
+    assert table.iloc[0]["Nota · sesión"] == "— · 23/10"
+    assert table.iloc[0]["Señal del motor"] == "Sin dato de esta sesión"
+    assert table.iloc[0]["Verificación"] == "Datos pendientes"
+    assert table.iloc[0]["Revisión de compra"] == "Compra no confirmada"
+    assert "deterioro" not in str(table).lower()
+    assert "Anterior" not in table and "-2 sesiones" not in table
+    assert len(page.dataframe[1].value) == 5
+
+
+def _row(ticker="TEST", *, blocked=True, score=93, held=False, label="Entrada fuerte", status=None):
+    return {"ticker": ticker, "company_name": f"Empresa {ticker}", "held": held,
+        "score": score, "label": label,
+        "status": status or ("review_data" if blocked else "entry_strong"),
+        "session": "2026-10-23", "recorded_at": "2026-10-23T22:30:00Z",
+        "quality": {"block_entry": blocked, "status": "unknown" if blocked else "ok",
+            "reasons": ["No consta el periodo del crecimiento de ingresos."] if blocked else []},
+        "history": [{"session": "2026-10-23", "score": score},
+            {"session": "2026-10-22", "score": None}],
+        "change": None, "source": "Yahoo Financial Statements + SEC EDGAR"}
+
+
+def test_compact_table_preserves_strong_raw_signal_without_confirming_purchase():
+    row = _row()
+    table = _table([row])
+    assert table.iloc[0]["Señal del motor"] == "Entrada fuerte"
+    assert table.iloc[0]["Nota · sesión"] == "93 · 23/10"
+    assert table.iloc[0]["Verificación"] == "Datos pendientes"
+    assert table.iloc[0]["Revisión de compra"] == "Compra no confirmada"
+    assert row["score"] == 93 and row["label"] == "Entrada fuerte"
+    assert list(table.columns) == ["Empresa", "Nota · sesión", "Cambio", "Señal del motor", "Verificación", "Revisión de compra"]
+
+
+def test_history_only_displays_recorded_sessions_and_keeps_missing_scores():
+    row = _row()
+    history = _history(row)
+    assert list(history["Sesión"]) == ["23/10", "22/10"]
+    assert list(history["Nota"]) == ["93", "—"]
+    assert _history({"history": []}).empty
+
+
+@pytest.mark.parametrize("value,expected", [("88", "88"), ("-10", "-10"), (0, "0"),
+                                           (True, "—"), (float("nan"), "—"), (None, "—")])
+def test_legacy_numeric_values_remain_consistent_with_email_without_filling_gaps(value, expected):
+    assert _display_note(value) == expected
+
+
+@pytest.mark.parametrize("legacy_quality", [None, {}, {"status": "unknown"}])
+def test_legacy_quality_never_promotes_raw_strong_signal(legacy_quality):
+    row = _row(blocked=False)
+    row["quality"] = legacy_quality
+    table = _table([row])
+    assert table.iloc[0]["Señal del motor"] == "Entrada fuerte"
+    assert table.iloc[0]["Revisión de compra"] == "Compra no confirmada"
+
+
+def test_ui_orders_held_then_verified_strong_then_pending_and_shows_provenance():
+    rows = [_row("HELD", held=True), _row("PENDING", score=99),
+        _row("VERIFIED", blocked=False, score=88),
+        _row("WAIT", blocked=False, score=70, label="Esperar", status="wait")]
+    script = '''
+from src.daily_digest import seal_daily_score_report
+from src.daily_digest_ui import render_daily_score_page
+ROWS = REPLACE_ROWS
+report = seal_daily_score_report({"as_of": "2026-10-23", "calendar_status": "complete", "rows": ROWS})
+class Journal:
+    def get_daily_score_report(self, report_id): return report
+    def __getattr__(self, name): raise AssertionError("Forbidden download, send or mutation: " + name)
+render_daily_score_page(Journal(), report_id=report["report_id"])
+'''.replace("REPLACE_ROWS", repr(rows))
+    page = AppTest.from_string(script, default_timeout=30).run()
+    assert not page.exception and not page.error
+    tables = [item.value for item in page.dataframe]
+    assert list(tables[0]["Empresa"]) == ["Empresa HELD (HELD)"]
+    assert list(tables[1]["Empresa"]) == ["Empresa VERIFIED (VERIFIED)", "Empresa PENDING (PENDING)"]
+    assert tables[1].iloc[1]["Revisión de compra"] == "Compra no confirmada"
+    assert list(tables[2]["Empresa"]) == ["Empresa WAIT (WAIT)"]
+    captions = " ".join(str(item.value) for item in page.caption)
+    assert "2 entradas fuertes del motor: 1 con datos suficientes y 1 pendientes" in captions
+    assert "No consta el periodo del crecimiento de ingresos." in captions
+    assert "Yahoo Financial Statements + SEC EDGAR" in captions
+    assert "2026-10-23T22:30:00Z" in captions
+    assert any("2 de 4" in str(item.value) for item in page.warning)
+    assert any("Compra no confirmada" in str(item.value) for item in page.info)
 
 
 MAIN_SCRIPT = '''

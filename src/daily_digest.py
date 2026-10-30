@@ -16,9 +16,10 @@ from urllib.parse import urlsplit
 import pandas as pd
 
 from src.analysis_policy import PRIMARY_STRATEGY_ID, decode_policy_note
+from src.analysis_data_quality import GROWTH_METRICS
 from src.instruments import resolve_analysis_ticker, resolve_company_name
 
-DIGEST_VERSION = "daily-score-report-v1"
+DIGEST_VERSION = "daily-score-report-v2"
 APP_URL = "https://stock-signal-lab-ddriu.streamlit.app/"
 _SUFFIX_CALENDARS = {
     ".MC": "XMAD", ".PA": "XPAR", ".AS": "XAMS", ".DE": "XETR",
@@ -134,10 +135,77 @@ def _quality(policy: Mapping[str, object] | None) -> dict[str, object]:
         return {"status": "unknown", "block_entry": True,
                 "reasons": ["El análisis guardado no acredita la fecha de los fundamentales; revisar los datos antes de comprar."]}
     reasons = quality.get("reasons", [])
-    return {"status": _text(quality.get("status")) or "unknown",
+    result = {"status": _text(quality.get("status")) or "unknown",
             "block_entry": quality.get("block_entry") is not False,
             "reasons": [_text(item) for item in reasons if _text(item)] if isinstance(reasons, (list, tuple)) else [],
-            "comparability_key": _text(quality.get("comparability_key"))}
+            "comparability_key": _text(quality.get("comparability_key")),
+            "input_version": _text(quality.get("input_version"))[:80]}
+    # Only the public, whitelisted provenance assessed by the policy belongs
+    # in this report. Never copy the provider's whole info/account payload.
+    coverage = quality.get("coverage")
+    if isinstance(coverage, Mapping):
+        result["coverage"] = {key: coverage.get(key) for key in (
+            "applicable", "numeric_metrics", "dated_metrics", "undated_metrics", "missing_metrics")}
+    periods = quality.get("metric_periods")
+    if isinstance(periods, Mapping):
+        result["metric_periods"] = {key: {field: metadata.get(field) for field in (
+            "source", "periodicity", "period_end", "filed_at", "comparable")}
+            for key, metadata in periods.items() if key in GROWTH_METRICS and isinstance(metadata, Mapping)}
+    return result
+
+
+def daily_score_reading(row: Mapping[str, object]) -> dict[str, object]:
+    """Separate engine output from data sufficiency, including saved v1 reports.
+
+    A high raw label is evidence of what the engine calculated, not permission
+    to buy. Rendering never upgrades a legacy/pending operational status.
+    """
+    quality = row.get("quality")
+    quality = quality if isinstance(quality, Mapping) else {}
+    blocked = (quality.get("block_entry") is not False or _score(row.get("score")) is None
+               or _text(row.get("status")) == "review_data")
+    raw_reasons = quality.get("reasons")
+    reasons = [_text(reason) for reason in raw_reasons if _text(reason)] if isinstance(raw_reasons, (list, tuple)) else []
+    if blocked and not reasons:
+        reasons = ["Falta una revisión completa con datos fechados; no se confirma una entrada nueva."]
+    status = _text(row.get("status"))
+    decision = ("Compra no confirmada" if blocked else
+                "Revisar antes de ampliar" if row.get("held") and status in {"entry_strong", "entry_candidate"} else
+                "Estudiar entrada" if status in {"entry_strong", "entry_candidate"} else
+                "Sin entrada nueva")
+    return {"signal": _text(row.get("label")) or "Sin señal guardada",
+            "verification": "Datos pendientes" if blocked else "Datos suficientes",
+            "decision": decision, "blocked": blocked, "reasons": reasons}
+
+
+def daily_score_sort_key(row: Mapping[str, object]) -> tuple:
+    reading = daily_score_reading(row)
+    status, raw = _text(row.get("status")), _text(row.get("label"))
+    score = _score(row.get("score"))
+    priority = (0 if not reading["blocked"] and status == "entry_strong" else
+                1 if reading["blocked"] and raw == "Entrada fuerte" and score is not None else
+                2 if not reading["blocked"] and status == "entry_candidate" else 3)
+    return (not bool(row.get("held")), priority, -(score if score is not None else -1), _text(row.get("ticker")))
+
+
+def daily_score_coverage(rows: Iterable[Mapping[str, object]]) -> dict[str, int]:
+    """Counts of the exact report, not a separate/recomputed recommendation."""
+    counts = dict(total=0, with_score=0, missing_score=0, sufficient_data=0, pending_data=0,
+                  strong_verified=0, strong_pending=0, candidate_verified=0)
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        counts["total"] += 1
+        counts["with_score" if _score(row.get("score")) is not None else "missing_score"] += 1
+        reading = daily_score_reading(row)
+        counts["pending_data" if reading["blocked"] else "sufficient_data"] += 1
+        if reading["blocked"] and row.get("label") == "Entrada fuerte" and _score(row.get("score")) is not None:
+            counts["strong_pending"] += 1
+        elif not reading["blocked"] and row.get("status") == "entry_strong":
+            counts["strong_verified"] += 1
+        elif not reading["blocked"] and row.get("status") == "entry_candidate":
+            counts["candidate_verified"] += 1
+    return counts
 
 
 def _identity(policy: Mapping[str, object]) -> str:
@@ -278,7 +346,7 @@ def build_daily_score_report(
             "calendar": calendar, "recorded_at": history[0]["recorded_at"] if history else None,
             "revision_count": revisions, "source": _text((current or {}).get("source")),
             "policy_version": _text((current or {}).get("policy_version")), "snapshot_id": (current or {}).get("snapshot_id")})
-    rows.sort(key=lambda row: (not row["held"], row["status"] != "entry_strong", -(row["score"] if row["score"] is not None else -1), row["ticker"]))
+    rows.sort(key=daily_score_sort_key)
     return seal_daily_score_report({"version": DIGEST_VERSION, "as_of": anchor,
         "session_dates": reference_dates, "calendar_status": calendar_status,
         "rows": rows, "limitations": ["Las notas son salidas observadas del modelo, no probabilidades de beneficio.",
@@ -293,6 +361,21 @@ def render_daily_score_email(report: Mapping[str, object], *, app_url: str = APP
     subject = f"Stock Signal Lab · resumen del cierre {date_label}"
     lines = [subject, "Crecimiento + momentum · las notas no son probabilidades de ganar.", ""]
     blocks = []
+    all_rows = [row for row in report.get("rows") or [] if isinstance(row, Mapping)]
+    coverage = daily_score_coverage(all_rows)
+    overview = (f"{coverage['strong_verified']} entradas fuertes con datos suficientes · "
+                f"{coverage['strong_pending']} señales fuertes del motor pendientes de verificar · "
+                f"{coverage['missing_score']} sin nota de la sesión.")
+    lines.extend([overview, "Datos suficientes no equivale a una compra autorizada.", ""])
+    blocks.append(f"<p><strong>{escape(overview)}</strong><br>Datos suficientes no equivale a una compra autorizada.</p>")
+    pending_strong = sorted((row for row in all_rows
+        if daily_score_reading(row)["blocked"] and row.get("label") == "Entrada fuerte"
+        and _score(row.get("score")) is not None), key=lambda row: (-float(row["score"]), _text(row.get("ticker"))))
+    if pending_strong:
+        pending_names = " · ".join(f"{_text(row.get('company_name')) or _text(row.get('ticker'))} ({_text(row.get('ticker'))}): {_score(row.get('score')):g}/100" for row in pending_strong[:3])
+        pending_message = "Señales fuertes pendientes: " + pending_names + ". Compra no confirmada; revisar la procedencia y las fechas de los datos."
+        lines.extend([pending_message, ""])
+        blocks.append(f"<p>{escape(pending_message)}</p>")
     incidents = {item.get("ticker"): item for item in report.get("incidents", []) if isinstance(item, Mapping)}
     positions = {item.get("ticker"): item for item in report.get("positions", []) if isinstance(item, Mapping)}
     alerts, alert_tickers = [], set()
@@ -331,7 +414,6 @@ def render_daily_score_email(report: Mapping[str, object], *, app_url: str = APP
             lines.extend([f"{name} ({_text(alert.get('ticker'))}): {title}. {reason} {step}", scope, context, extra, limitation])
             alert_html.append(f"<li><strong>{escape(name)} ({escape(_text(alert.get('ticker')))})</strong> · {scope}: {escape(title)}. {escape(reason)} {escape(step)}<br>{escape(extra)}<br><small>{escape(context)} {escape(limitation)}</small></li>")
         blocks.append("<h2>Cambios que revisar</h2><ul>" + "".join(alert_html) + "</ul>")
-    all_rows = list(report.get("rows") or [])
     eligible = [row for row in all_rows if row.get("ticker") not in alert_tickers]
     changed = [row for row in eligible if row.get("comparison_status") in {"changed", "not_comparable"} or row.get("status") in {"entry_strong", "review_data"}]
     displayed = (changed or eligible)[:max(0, 5 - len(alerts))]
@@ -339,19 +421,21 @@ def render_daily_score_email(report: Mapping[str, object], *, app_url: str = APP
     lines.append("PUNTUACIONES Y CAMBIOS")
     for row in displayed:
         name = f"{_text(row.get('company_name'))} ({_text(row.get('ticker'))})"
-        score = row.get("score")
+        score = _score(row.get("score"))
         note = f"{score:g}/100" if isinstance(score, (float, int)) else "sin dato"
-        history = " · ".join(f"{_text(item.get('session'))}: {item['score']:g}" if isinstance(item.get("score"), (int, float)) else f"{_text(item.get('session'))}: —" for item in row.get("history", []))
-        quality = row.get("quality") or {}
-        reading = "Revisar datos antes de comprar" if quality.get("block_entry") else _text(row.get("label"))
-        quality_text = " ".join(str(reason) for reason in quality.get("reasons", []))
+        history = " · ".join(f"{_text(item.get('session'))}: {_score(item.get('score')):g}"
+            if _score(item.get("score")) is not None else f"{_text(item.get('session'))}: —"
+            for item in row.get("history", []) if isinstance(item, Mapping))
+        reading = daily_score_reading(row)
+        quality_text = " ".join(reading["reasons"])
+        interpretation = f"Motor: {reading['signal']} · {reading['verification']} · {reading['decision']}"
         incident, position = incidents.get(row.get("ticker"), {}), positions.get(row.get("ticker"), {})
         extra = " ".join(filter(None, [_text(incident.get("reason")), _text(incident.get("as_of")),
             _text(incident.get("next_step")), _text(position.get("reading")), _text(position.get("reason")), _text(position.get("next_step"))]))
         source = " · ".join(filter(None, [_text(row.get("source")), _text(row.get("session")), _text(row.get("policy_version"))]))
-        lines.extend([f"{name} · {note} · {'En cartera' if row.get('held') else 'Favorita'} · {reading}",
+        lines.extend([f"{name} · {note} · {'En cartera' if row.get('held') else 'Favorita'} · {interpretation}",
             history, _text(row.get("change_reason")), _text(row.get("chart_comment")), _text(row.get("next_step")), extra, quality_text, source, ""])
-        cells.append(f"<tr><td><strong>{escape(name)}</strong><br>{'En cartera' if row.get('held') else 'Favorita'}</td><td>{escape(note)}<br>{escape(reading)}</td><td>{escape(history)}<br>{escape(_text(row.get('change_reason')))}<br>{escape(_text(row.get('chart_comment')))}<br>{escape(_text(row.get('next_step')))}<br>{escape(extra)}<br><small>{escape(quality_text)} {escape(source)}</small></td></tr>")
+        cells.append(f"<tr><td><strong>{escape(name)}</strong><br>{'En cartera' if row.get('held') else 'Favorita'}</td><td>{escape(note)}<br>Motor: {escape(reading['signal'])}<br>{escape(reading['verification'])}<br>{escape(reading['decision'])}</td><td>{escape(history)}<br>{escape(_text(row.get('change_reason')))}<br>{escape(_text(row.get('chart_comment')))}<br>{escape(_text(row.get('next_step')))}<br>{escape(extra)}<br><small>{escape(quality_text)} {escape(source)}</small></td></tr>")
     if not displayed and not alerts:
         lines.append("No hay puntuaciones guardadas para esta sesión. No se interpreta como una venta.")
     blocks.append("<h2>Puntuaciones y cambios</h2><table border='1' cellpadding='8' cellspacing='0'><thead><tr><th>Empresa</th><th>Nota del modelo</th><th>Últimas cinco sesiones y siguiente paso</th></tr></thead><tbody>" + "".join(cells) + "</tbody></table>")
