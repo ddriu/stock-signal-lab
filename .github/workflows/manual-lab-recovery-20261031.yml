@@ -1,0 +1,46 @@
+name: Recuperación individual del correo y laboratorio 2026-10-31
+
+on:
+  push:
+    branches: ["codex/manual-lab-recovery-20261031"]
+    paths: [".github/workflows/manual-lab-recovery-20261031.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stock-signal-lab-daily-alerts
+  cancel-in-progress: false
+
+jobs:
+  recover-and-email:
+    if: github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Instalar dependencias
+        run: python -m pip install -r requirements.txt
+      - name: Recuperar laboratorio y enviar exclusivamente el informe del solicitante
+        env:
+          REVIEW_SESSION: "2026-10-30"
+          MODEL_RESULTS_ENABLED: "true"
+          SCHEDULED_MODEL_SWITCH: ${{ vars.MODEL_RESULTS_ENABLED || 'true' }}
+          MODEL_RESULTS_OWNER: ${{ github.repository_owner }}
+          PYTHONPATH: .:diagnostics
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          EMAIL_SMTP_HOST: smtp.gmail.com
+          EMAIL_SMTP_PORT: "465"
+          EMAIL_SMTP_USE_SSL: "true"
+          EMAIL_SMTP_USERNAME: ${{ secrets.EMAIL_SMTP_USERNAME }}
+          EMAIL_SMTP_PASSWORD: ${{ secrets.EMAIL_SMTP_PASSWORD }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SMTP_USERNAME }}
+          EMAIL_SENDER_NAME: Stock Signal Lab
+        run: python diagnostics/manual_lab_recovery_20261031.py
