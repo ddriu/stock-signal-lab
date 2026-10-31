@@ -10,6 +10,7 @@ from src.daily_digest import (
     _calendar_name, build_daily_score_report, render_daily_score_email,
     seal_daily_score_report, daily_score_reading, daily_score_coverage,
     daily_score_sort_key,
+    virtual_tracking_lines,
 )
 
 
@@ -110,6 +111,53 @@ def test_same_session_revisions_are_deterministic_not_new_days():
     row = first["rows"][0]
     assert row["score"] == 88 and row["revision_count"] == 1
     assert len(row["history"]) == 5 and row["history"][0]["revised"]
+
+
+def test_virtual_summary_is_utf8_escaped_and_part_of_the_same_immutable_report_hash():
+    report = build_daily_score_report(pd.DataFrame([observation()]), as_of="2026-10-23")
+    report["virtual_tracking"] = dict(status="updated", available_at="2026-10-23T22:40:00Z",
+        new_proposals=2, new_fills=1, pending_proposals=2, issues=0, ledger_incidents=0,
+        ready_experiments=1, preserved_experiments=1,
+        experiments=[dict(source="technical", cohort="raw", status="frozen_engine_changed", budget_usd=6000),
+            dict(source="growth", cohort="verified", status="updated", budget_usd=6000)],
+        operations=[dict(event_type="order_proposed", side="buy", ticker="MA<script>Ñ", strategy="A",
+            mode="budget", intended_open_at="2026-10-26T13:30:00Z", is_real_execution=False),
+            dict(event_type="order_filled", side="sell", ticker="EXEL", strategy="B", mode="theoretical",
+                executed_at="2026-10-23T13:30:00Z", price_native=66.5, is_real_execution=False)])
+    sealed = seal_daily_score_report(report)
+    before = deepcopy(sealed)
+    _, text, html = render_daily_score_email(sealed)
+    assert sealed == before
+    assert "Órdenes nuevas" in text and "ejecuciones virtuales" in text and "próximas aperturas" in html
+    assert "verificación guardada entonces" in text
+    assert "Compra MA<script>Ñ · propuesta virtual" in text and "Sin ejecución ni precio confirmado" in text
+    assert "Venta EXEL · ejecutada virtualmente" in text and "Precio registrado: 66.5" in text
+    assert "registro conservado, no actualizado (versión incompatible)" in text
+    assert "<script>" not in html and "&lt;script&gt;Ñ" in html
+    assert "6,000 USD" in text and "dos modalidades independientes" in text
+    assert sealed["report_id"] in text and sealed["report_id"] in html
+    changed = deepcopy(sealed)
+    changed["virtual_tracking"]["new_fills"] += 1
+    assert seal_daily_score_report(changed)["report_id"] != sealed["report_id"]
+
+
+@pytest.mark.parametrize("status,expected", [("partial_failure", "Actualización incompleta"),
+    ("no_activation", "Sin experimento activado"), ("error", "Error de actualización")])
+def test_virtual_statuses_and_unknown_counts_are_not_rendered_as_successful_zero_operations(status, expected):
+    lines = " ".join(virtual_tracking_lines(dict(status=status, new_proposals=None,
+        new_fills=None, pending_proposals=None, issues=1, experiments=[])))
+    assert expected in lines and "N/D ejecuciones" in lines
+    assert "0 ejecuciones" not in lines
+    if status in {"partial_failure", "error"}:
+        assert "No se confirma una actualización completa" in lines
+
+
+def test_legacy_report_without_virtual_hook_keeps_its_existing_payload_and_rendering():
+    report = build_daily_score_report(pd.DataFrame([observation()]), as_of="2026-10-23")
+    before = deepcopy(report)
+    _, text, html = render_daily_score_email(report)
+    assert report == before and "virtual_tracking" not in report
+    assert "Laboratorio virtual" not in text + html
 
 
 def test_legacy_or_corrupt_policy_never_becomes_a_technical_growth_signal():

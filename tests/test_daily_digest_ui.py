@@ -37,6 +37,32 @@ def test_archived_report_rejects_mutated_payload():
         load_daily_score_report(Journal(), report_id=report["report_id"])
 
 
+def test_archived_virtual_summary_is_displayed_without_advancing_or_reading_any_ledger():
+    script = '''
+import pandas as pd
+from src.daily_digest import build_daily_score_report, seal_daily_score_report
+from src.daily_digest_ui import render_daily_score_page
+report = build_daily_score_report(pd.DataFrame(), as_of="2026-10-23")
+report["virtual_tracking"] = dict(status="partial_failure", available_at="2026-10-23T22:40:00Z",
+    new_proposals=2, new_fills=None, pending_proposals=None, issues=1, ledger_incidents=None,
+    ready_experiments=1, preserved_experiments=1, experiments=[])
+report = seal_daily_score_report(report)
+class Journal:
+    def get_daily_score_report(self, identifier):
+        assert identifier == report["report_id"]
+        return report
+    def __getattr__(self, name):
+        raise AssertionError("Forbidden collection, send or ledger access: " + name)
+render_daily_score_page(Journal(), report_id=report["report_id"])
+'''
+    page = AppTest.from_string(script, default_timeout=30).run()
+    assert not page.exception and not page.error
+    assert any("Laboratorio virtual" in item.value for item in page.markdown)
+    text = " ".join(item.value for item in page.markdown)
+    assert "Actualización incompleta" in text and "N/D ejecuciones virtuales" in text
+    assert page.warning
+
+
 SCRIPT = '''
 import pandas as pd
 import streamlit as st

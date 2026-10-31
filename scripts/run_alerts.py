@@ -9,7 +9,31 @@ from src.alert_runner import run_daily_alerts
 from src.digest_schedule import daily_digest_session_date
 
 
+def configured_virtual_tracker():
+    """Only advance the explicitly scoped deployment owner, never activate.
+
+    An absent scope fails closed even if the deployment switch is on. Other
+    recipients retain their existing report and delivery preferences.
+    """
+    from scripts.run_model_tracking import enabled
+    scope = os.getenv("MODEL_RESULTS_OWNER", "").strip()
+    if not enabled() or not scope:
+        return None
+
+    def track(journal, snapshots):
+        if getattr(journal, "owner", None) != scope:
+            return None
+        from scripts.run_model_tracking import collect_owner_models
+        return collect_owner_models(journal, snapshots)
+
+    return track
+
+
 def main() -> int:
+    kwargs = {}
+    tracker = configured_virtual_tracker()
+    if tracker is not None:
+        kwargs["virtual_tracker"] = tracker
     event_name = os.getenv("GITHUB_EVENT_NAME", "")
     if event_name == "schedule":
         session = daily_digest_session_date()
@@ -19,9 +43,9 @@ def main() -> int:
                   file=sys.stderr)
             return 1
         print(f"Sesión objetivo del resumen: {session.isoformat()} (Europe/Madrid).")
-        result = run_daily_alerts(today=session, require_current_session=True)
+        result = run_daily_alerts(today=session, require_current_session=True, **kwargs)
     else:
-        result = run_daily_alerts()
+        result = run_daily_alerts(**kwargs)
     print(
         "Alertas terminadas: "
         f"{result.users_checked} usuarios, "

@@ -19,7 +19,7 @@ _VERSIONS = {
     "src.data_sources": ("FUNDAMENTAL_PROVENANCE_VERSION", "fundamental_provenance_v2"),
     "src.data_loader": ("FUNDAMENTAL_SNAPSHOT_VERSION", "dated_statement_fallback_v2"),
     "src.analysis_data_quality": ("QUALITY_PRESENTATION_VERSION", "dated_quality_coverage_v2"),
-    "src.daily_digest": ("DIGEST_VERSION", "daily-score-report-v2"),
+    "src.daily_digest": ("DIGEST_PRESENTATION_VERSION", "virtual-summary-v1"),
 }
 _SIGNATURES = {
     "src.analysis_policy": ("build_policy_snapshot", "enrich_analysis_rows"),

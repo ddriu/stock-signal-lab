@@ -15,7 +15,8 @@ from src.signal_engine import SignalResult
 from src.storage import GROUP_PORTFOLIO_OWNER
 
 
-def _email_evidence_run(monkeypatch, *, sender, enabled=True, recorder=None):
+def _email_evidence_run(monkeypatch, *, sender, enabled=True, recorder=None,
+                        virtual_tracker=None, configure_user=None):
     """Exercise the single reserved digest with synthetic inputs and no SMTP."""
     import src.model_results_tracking as tracking
 
@@ -25,6 +26,8 @@ def _email_evidence_run(monkeypatch, *, sender, enabled=True, recorder=None):
     preference = normalize_alert_preferences(owner="ddriu", email="ddriu@example.com",
         enabled=True, include_group=False)
     user = FakeManualJournal(preference, tickers=("MINE",))
+    if configure_user is not None:
+        configure_user(user)
     frame = _manual_test_frame(monkeypatch)
     frame["open"], frame["high"], frame["low"], frame["atr_14"] = 99., 101., 98., 2.
     monkeypatch.setattr("src.alert_runner.evaluate_growth_momentum", lambda **kwargs: SimpleNamespace(
@@ -43,7 +46,7 @@ def _email_evidence_run(monkeypatch, *, sender, enabled=True, recorder=None):
         replace(candidate, policy_snapshot=decode_policy_note(user.snapshots[-1]["note"]))])
     result = run_daily_alerts(owner="ddriu", journal_factory=lambda owner: user,
         downloader=lambda *args, **kwargs: frame, fundamental_downloader=_verified_growth_info,
-        sender=sender, today=date(2026, 10, 15))
+        sender=sender, today=date(2026, 10, 15), virtual_tracker=virtual_tracker)
     return result, user, preference
 
 
@@ -88,6 +91,127 @@ def test_optional_email_tracking_is_off_by_default_and_never_initializes_ledger(
     result, _, _ = _email_evidence_run(monkeypatch, enabled=False, sender=lambda *args: None,
         recorder=lambda *args, **kwargs: pytest.fail("Disabled tracking must not touch a ledger"))
     assert result.emails_sent == 1
+
+
+def _virtual_summary(**changes):
+    value = dict(status="updated", available_at="2026-10-15T21:00:00Z", ready_experiments=1,
+        preserved_experiments=0, issues=0, ledger_incidents=0, new_proposals=2, new_fills=1,
+        pending_proposals=2, experiments=[dict(experiment_id="a" * 64, source="growth", cohort="verified",
+            status="updated", strategy_accounts=8, runs=8, budget_usd=6000)])
+    value.update(changes)
+    return value
+
+
+def test_signal_persistence_then_virtual_tracking_then_sealed_report_claim_and_smtp(monkeypatch):
+    import src.alert_runner as runner
+    from src.daily_digest import seal_daily_score_report
+    steps, holder = [], {}
+
+    def configure(user):
+        holder["user"] = user
+        for name, stage in (("add_analysis_snapshot", "signal_saved"),
+                            ("save_daily_score_report", "report_saved"), ("claim_daily_digest", "claim")):
+            original = getattr(user, name)
+            def wrapped(*args, _original=original, _stage=stage, **kwargs):
+                result = _original(*args, **kwargs)
+                steps.append(_stage)
+                return result
+            setattr(user, name, wrapped)
+
+    def tracker(journal, stored):
+        assert journal is holder["user"] and len(stored) == len(journal.snapshots) == 1
+        assert stored.iloc[0]["note"] == journal.snapshots[0]["note"]
+        steps.append("virtual")
+        return _virtual_summary()
+
+    def sealed(report):
+        assert report["virtual_tracking"]["new_fills"] == 1
+        steps.append("seal")
+        return seal_daily_score_report(report)
+
+    monkeypatch.setattr(runner, "seal_daily_score_report", sealed)
+    result, user, _ = _email_evidence_run(monkeypatch, enabled=False,
+        virtual_tracker=tracker, configure_user=configure, sender=lambda *args: steps.append("sender"))
+    assert result.emails_sent == 1 and not result.errors
+    assert steps == ["signal_saved", "virtual", "seal", "report_saved", "claim", "sender"]
+    report = next(iter(user.reports.values()))
+    assert report["virtual_tracking"]["experiments"][0]["experiment_id"] == "a" * 64
+    assert seal_daily_score_report(report)["report_id"] == report["report_id"]
+
+
+def test_virtual_collection_failure_is_explicit_without_exposing_details_or_confirming_zero_operations(monkeypatch):
+    sent = []
+    def tracker(*args):
+        raise RuntimeError("private-token secret@example.invalid")
+    result, user, _ = _email_evidence_run(monkeypatch, enabled=False,
+        virtual_tracker=tracker, sender=lambda *args: sent.append(args))
+    assert result.emails_sent == 1 and len(sent) == 1
+    virtual = next(iter(user.reports.values()))["virtual_tracking"]
+    assert virtual["status"] == "error" and virtual["issues"] == 1
+    assert virtual["new_fills"] is None and virtual["new_proposals"] is None
+    assert "Error de actualización" in sent[0][2] and "N/D ejecuciones" in sent[0][2]
+    assert "private-token" not in repr(sent) + repr(result.errors)
+    assert "secret@example.invalid" not in repr(sent) + repr(result.errors)
+
+
+def test_owner_callback_can_decline_without_changing_other_users_digest(monkeypatch):
+    result, user, _ = _email_evidence_run(monkeypatch, enabled=False,
+        virtual_tracker=lambda journal, stored: None, sender=lambda *args: None)
+    assert result.emails_sent == 1 and not result.errors
+    assert "virtual_tracking" not in next(iter(user.reports.values()))
+
+
+def test_structured_virtual_failure_is_not_hidden_as_an_error_free_run(monkeypatch):
+    result, user, _ = _email_evidence_run(monkeypatch, enabled=False,
+        virtual_tracker=lambda *args: _virtual_summary(status="partial_failure", issues=1),
+        sender=lambda *args: None)
+    assert result.emails_sent == 1 and any("seguimiento virtual comunica incidencias" in text for text in result.errors)
+    assert next(iter(user.reports.values()))["virtual_tracking"]["status"] == "partial_failure"
+
+
+def test_repeat_claim_still_blocks_same_session_after_new_virtual_summary(monkeypatch):
+    sent, tracked = [], []
+    def tracker(journal, stored):
+        tracked.append(len(stored))
+        value = _virtual_summary()
+        value["new_fills"] = len(tracked)
+        return value
+    first, user, _ = _email_evidence_run(monkeypatch, enabled=False,
+        virtual_tracker=tracker, sender=lambda *args: sent.append(args))
+    frame = _manual_test_frame(monkeypatch)
+    frame["open"], frame["high"], frame["low"], frame["atr_14"] = 99., 101., 98., 2.
+    second = run_daily_alerts(owner="ddriu", journal_factory=lambda owner: user,
+        downloader=lambda *args, **kwargs: frame, fundamental_downloader=_verified_growth_info,
+        virtual_tracker=tracker, sender=lambda *args: sent.append(args), today=date(2026, 10, 15))
+    assert first.emails_sent == 1 and second.emails_sent == 0 and second.emails_skipped == 1
+    assert len(sent) == 1 and len(tracked) == 2 and len(user.delivery_claims) == 1
+
+
+@pytest.mark.parametrize("owner,journal_owner", [("other", "other"), ("ddriu", "other"), ("other", "ddriu")])
+def test_optional_email_evidence_does_not_touch_a_different_scoped_owner(monkeypatch, owner, journal_owner):
+    import src.alert_runner as runner
+    monkeypatch.setenv("MODEL_RESULTS_ENABLED", "true")
+    monkeypatch.setenv("MODEL_RESULTS_OWNER", "ddriu")
+    monkeypatch.setattr("src.model_results_tracking.record_model_email_evidence",
+        lambda *args: pytest.fail("No ledger write for another scoped owner"))
+    errors = []
+    runner._record_model_email(SimpleNamespace(owner=journal_owner), None, "a" * 64,
+                               owner=owner, errors=errors)
+    assert errors == []
+
+
+def test_virtual_summary_whitelist_never_copies_owners_errors_or_arbitrary_provider_payload():
+    from src.alert_runner import _virtual_report_summary
+    value = _virtual_summary()
+    value.update(owner="private@example.invalid", secret="private-token", raw_error="secret trace")
+    value["experiments"][0].update(owner="private@example.invalid", payload={"secret": "private-token"})
+    value["operations"] = [dict(event_type="order_proposed", side="buy", ticker="MA", strategy="A",
+        mode="budget", intended_open_at="2026-10-16T13:30:00Z", is_real_execution=False,
+        owner="private@example.invalid", api_key="private-token")]
+    safe = _virtual_report_summary(value)
+    assert "private" not in repr(safe) and "raw_error" not in safe
+    assert safe["operations"][0]["ticker"] == "MA"
+    assert safe["operations"][0]["is_real_execution"] is False
 
 
 def test_tracking_failure_does_not_retry_or_reclassify_accepted_mail(monkeypatch) -> None:

@@ -234,11 +234,14 @@ def test_enabled_without_activation_reports_unmeasured_not_successful_returns(mo
     assert "sin experimentos activados" in capsys.readouterr().out
 
 
-def test_scheduler_exposes_flag_diagnostic_without_implicitly_enabling_measurement():
+def test_explicit_owner_deployment_has_kill_switch_and_recovery_does_not_send_mail():
     workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/model-results.yml").read_text()
-    assert "MODEL_RESULTS_ENABLED: ${{ vars.MODEL_RESULTS_ENABLED }}" in workflow
+    assert "MODEL_RESULTS_ENABLED: ${{ vars.MODEL_RESULTS_ENABLED || 'true' }}" in workflow
+    assert "MODEL_RESULTS_OWNER: ${{ github.repository_owner }}" in workflow
     assert "if: vars.MODEL_RESULTS_ENABLED == 'true'" not in workflow
     assert "EMAIL_SMTP" not in workflow
+    assert "workflow_run:" not in workflow
+    assert "group: stock-signal-lab-daily-alerts" in workflow
 
 
 def test_warm_tracking_view_refreshes_missing_readiness_api_before_binding_exports():

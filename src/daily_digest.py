@@ -20,6 +20,7 @@ from src.analysis_data_quality import GROWTH_METRICS
 from src.instruments import resolve_analysis_ticker, resolve_company_name
 
 DIGEST_VERSION = "daily-score-report-v2"
+DIGEST_PRESENTATION_VERSION = "virtual-summary-v1"
 APP_URL = "https://stock-signal-lab-ddriu.streamlit.app/"
 _SUFFIX_CALENDARS = {
     ".MC": "XMAD", ".PA": "XPAR", ".AS": "XAMS", ".DE": "XETR",
@@ -354,6 +355,80 @@ def build_daily_score_report(
             "La comparación entre empresas no incorpora comisiones, divisa ni valoración de una operación concreta."]})
 
 
+def virtual_tracking_lines(value: object) -> list[str]:
+    """Render only the sealed virtual summary, without collecting or trading."""
+    if not isinstance(value, Mapping):
+        return []
+    labels = {"updated": "Actualizado", "unchanged": "Sin cambios",
+        "waiting_for_signals": "Esperando señales nuevas", "needs_new_activation": "Requiere una activación nueva",
+        "partial_error": "Actualización incompleta", "partial_failure": "Actualización incompleta", "error": "Error de actualización",
+        "no_activated_experiments": "Sin experimento activado", "no_experiments": "Sin experimento activado",
+        "no_activation": "Sin experimento activado",
+        "disabled": "Desactivado"}
+    status = _text(value.get("status"))
+
+    def count(key):
+        raw = value.get(key)
+        try:
+            numeric = float(raw)
+        except (ValueError, TypeError, OverflowError):
+            return "N/D"
+        return f"{int(numeric)}" if not isinstance(raw, bool) and math.isfinite(numeric) and numeric >= 0 and numeric.is_integer() else "N/D"
+
+    lines = ["Laboratorio virtual · " + labels.get(status, "Estado pendiente de verificar") + ".",
+        f"Órdenes nuevas: {count('new_proposals')} propuestas · {count('new_fills')} ejecuciones virtuales. "
+        f"Propuestas pendientes para próximas aperturas: {count('pending_proposals')}.",
+        "Recuentos de A–D y dos modalidades independientes; no son operaciones de tu cartera real."]
+    if status not in {"updated", "unchanged", "waiting_for_signals", "no_activated_experiments", "no_experiments", "no_activation", "disabled"}:
+        lines.append("No se confirma una actualización completa del laboratorio; revisa sus incidencias.")
+    lines.append(f"Experimentos compatibles: {count('ready_experiments')} · Históricos conservados sin actualizar: {count('preserved_experiments')}.")
+    experiments = value.get("experiments")
+    for experiment in experiments if isinstance(experiments, (list, tuple)) else ():
+        if not isinstance(experiment, Mapping):
+            continue
+        source = "Crecimiento + momentum" if experiment.get("source") == "growth" else "Técnica original" if experiment.get("source") == "technical" else "Fuente sin verificar"
+        cohort = "verificación guardada entonces" if experiment.get("cohort") == "verified" else "motor bruto"
+        state = _text(experiment.get("status"))
+        if state not in {"updated", "unchanged", "waiting_for_signals"}:
+            reason = {"frozen_engine_changed": "versión incompatible", "inconsistent_headers": "configuración incompatible",
+                "unsupported_source_or_cohort": "cohorte incompatible", "partial_activation": "activación incompleta",
+                "collector_backlog": "recogidas atrasadas", "error": "incidencia de recogida"}.get(state, "estado pendiente de verificar")
+            lines.append(f"{source} · {cohort}: registro conservado, no actualizado ({reason}); no se confirman nuevas órdenes de este experimento.")
+            continue
+        budget = experiment.get("budget_usd")
+        try:
+            amount = float(budget)
+            funding = f" · presupuesto limitado {amount:,.0f} USD" if not isinstance(budget, bool) and math.isfinite(amount) and amount >= 0 else ""
+        except (ValueError, TypeError, OverflowError):
+            funding = ""
+        lines.append(f"{source} · {cohort}{funding}; la modalidad teórica aporta 100 USD por entrada.")
+    operations = value.get("operations")
+    for item in operations[:5] if isinstance(operations, (list, tuple)) else ():
+        if not isinstance(item, Mapping) or item.get("is_real_execution") is not False:
+            continue
+        event = item.get("event_type")
+        if event not in {"order_proposed", "order_filled"} or item.get("side") not in {"buy", "sell"}:
+            continue
+        action = "Compra" if item["side"] == "buy" else "Venta"
+        phase = "propuesta virtual" if event == "order_proposed" else "ejecutada virtualmente"
+        model = _text(item.get("strategy")) or "N/D"
+        mode = "presupuesto" if item.get("mode") == "budget" else "teórico" if item.get("mode") == "theoretical" else "N/D"
+        clock_key = "intended_open_at" if event == "order_proposed" else "executed_at"
+        clock = _text(item.get(clock_key)) or "hora N/D"
+        detail = f"{action} {_text(item.get('ticker')) or 'instrumento N/D'} · {phase} · modelo {model}/{mode} · {clock}."
+        if event == "order_proposed":
+            detail += " Sin ejecución ni precio confirmado."
+        elif (price := _text(item.get("price_native"))):
+            detail += f" Precio registrado: {price} en moneda de cotización."
+        lines.append(detail)
+    if value.get("operations_preview_truncated") is True:
+        lines.append("Vista limitada a cinco órdenes nuevas; consulta el registro completo en la aplicación.")
+    lines.append(f"Recogida: {_text(value.get('available_at')) or 'hora N/D'} · "
+                 f"Incidencias de proceso: {count('issues')} · Incidencias del registro: {count('ledger_incidents')}.")
+    lines.append("Sólo simulación: las propuestas pueden cambiar o quedar sin ejecución; no se envían órdenes al bróker.")
+    return lines
+
+
 def render_daily_score_email(report: Mapping[str, object], *, app_url: str = APP_URL) -> tuple[str, str, str]:
     """Compact, UTF-8 escaped rendering; no recalculation or transport."""
     url = app_url if urlsplit(app_url).scheme in {"http", "https"} else APP_URL
@@ -368,6 +443,10 @@ def render_daily_score_email(report: Mapping[str, object], *, app_url: str = APP
                 f"{coverage['missing_score']} sin nota de la sesión.")
     lines.extend([overview, "Datos suficientes no equivale a una compra autorizada.", ""])
     blocks.append(f"<p><strong>{escape(overview)}</strong><br>Datos suficientes no equivale a una compra autorizada.</p>")
+    virtual_lines = virtual_tracking_lines(report.get("virtual_tracking"))
+    if virtual_lines:
+        lines.extend(["LABORATORIO VIRTUAL", *virtual_lines, ""])
+        blocks.append("<h2>Laboratorio virtual</h2>" + "".join(f"<p>{escape(line)}</p>" for line in virtual_lines))
     pending_strong = sorted((row for row in all_rows
         if daily_score_reading(row)["blocked"] and row.get("label") == "Entrada fuerte"
         and _score(row.get("score")) is not None), key=lambda row: (-float(row["score"]), _text(row.get("ticker"))))

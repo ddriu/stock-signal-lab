@@ -44,6 +44,8 @@ elif scenario == "old_provider":
     sources.FUNDAMENTAL_PROVENANCE_VERSION = "previous-provider-method"
 elif scenario == "old_quality":
     del quality.QUALITY_PRESENTATION_VERSION
+elif scenario == "old_virtual_digest":
+    del digest.DIGEST_PRESENTATION_VERSION
 elif scenario == "stale_consumer_binding":
     alerts.render_daily_score_email = lambda *args, **kwargs: None
 elif scenario != "current":
@@ -86,6 +88,6 @@ with patch.object(importlib, "reload", side_effect=AssertionError("No repeated r
 
 
 @pytest.mark.parametrize("scenario", ["missing_digest_helpers", "old_provider", "old_quality",
-                                     "stale_consumer_binding", "current"])
+                                     "stale_consumer_binding", "old_virtual_digest", "current"])
 def test_ordered_runtime_repair_preserves_bindings_and_never_repeats_for_current_modules(scenario):
     _run(scenario)

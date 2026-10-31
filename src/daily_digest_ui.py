@@ -10,7 +10,7 @@ import streamlit as st
 
 from src.daily_digest import (
     build_daily_score_report, daily_score_coverage, daily_score_reading,
-    daily_score_sort_key, seal_daily_score_report,
+    daily_score_sort_key, seal_daily_score_report, virtual_tracking_lines,
 )
 from src.analysis_data_quality import METRIC_NAMES
 from src.instruments import resolve_analysis_ticker, resolve_company_name
@@ -113,6 +113,13 @@ def render_daily_score_page(journal: object, *, report_id: str | None = None) ->
     st.caption(f"Precios y señales guardados: {report.get('as_of') or 'sin sesión guardada'}. Consulta de solo lectura; no son cotizaciones en tiempo real.")
     if report_id:
         st.info("Estás viendo exactamente el informe enlazado en el correo, no un cálculo posterior.")
+    virtual_lines = virtual_tracking_lines(report.get("virtual_tracking"))
+    if virtual_lines:
+        st.markdown("#### Laboratorio virtual")
+        if report.get("virtual_tracking", {}).get("status") not in {"updated", "unchanged", "waiting_for_signals"}:
+            st.warning("El informe incluye un estado del seguimiento que requiere revisión; no se confirma una actualización completa.")
+        for line in virtual_lines:
+            st.write(line)
     rows = report.get("rows") or []
     if not rows:
         st.info("No hay empresas guardadas en tu cartera o favoritas para este resumen.")

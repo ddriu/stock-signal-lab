@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timedelta
 import hashlib
@@ -105,6 +106,10 @@ def _record_model_email(journal: object, receipt: object, delivery_id: str, *,
     """Optional evidence only; never activate a season or retry a message."""
     if os.getenv("MODEL_RESULTS_ENABLED", "0").strip().lower() not in {"1", "true", "yes", "on"}:
         return
+    scoped_owner = os.getenv("MODEL_RESULTS_OWNER", "").strip().lower()
+    if scoped_owner and (owner.strip().lower() != scoped_owner
+            or str(getattr(journal, "owner", owner)).strip().lower() != scoped_owner):
+        return
     try:
         from src.model_results_tracking import record_model_email_evidence
 
@@ -113,6 +118,84 @@ def _record_model_email(journal: object, receipt: object, delivery_id: str, *,
         # Recording must not turn an accepted email into a delivery failure or
         # expose provider errors/credentials. Existing delivery semantics stay.
         errors.append(f"{owner}: no se pudo registrar la evidencia de correo del modelo ({type(exc).__name__}); no se reintentó el envío.")
+
+
+def _virtual_report_summary(value: object) -> dict[str, object]:
+    """Copy only the public tracking contract into the private sealed digest.
+
+    Unknown counts remain unknown: a failed collection is never presented as
+    zero operations or a successful virtual execution. Raw ledger/provider
+    errors, credentials and owner identifiers do not belong in the email.
+    """
+    if not isinstance(value, Mapping) or not isinstance(value.get("status"), str):
+        raise ValueError("A structured virtual tracking status is required")
+
+    def count(raw):
+        if isinstance(raw, bool):
+            return None
+        try:
+            number = float(raw)
+        except (ValueError, TypeError, OverflowError):
+            return None
+        return int(number) if isfinite(number) and number >= 0 and number.is_integer() else None
+
+    available = pd.Timestamp(value.get("available_at"))
+    if pd.isna(available) or available.tzinfo is None:
+        raise ValueError("Virtual collection time must include its timezone")
+    output = {"status": value["status"][:80], "available_at": available.tz_convert("UTC").isoformat()}
+    for key in ("ready_experiments", "preserved_experiments", "runs", "issues", "ledger_incidents",
+                "new_proposals", "new_fills", "pending_proposals", "cumulative_proposals", "cumulative_fills"):
+        output[key] = count(value.get(key))
+    experiments = []
+    for item in value.get("experiments", ()) if isinstance(value.get("experiments"), (list, tuple)) else ():
+        if not isinstance(item, Mapping):
+            continue
+        entry = {key: str(item[key])[:128] for key in ("source", "cohort", "status") if item.get(key) is not None}
+        identity = item.get("experiment_id", item.get("id"))
+        if identity is not None:
+            entry["experiment_id"] = str(identity)[:128]
+        for key in ("strategy_accounts", "runs"):
+            entry[key] = count(item.get(key))
+        if isinstance(item.get("requires_new_experiment"), bool):
+            entry["requires_new_experiment"] = item["requires_new_experiment"]
+        try:
+            budget = float(item.get("budget_usd"))
+            entry["budget_usd"] = budget if not isinstance(item.get("budget_usd"), bool) and isfinite(budget) and budget >= 0 else None
+        except (ValueError, TypeError, OverflowError):
+            entry["budget_usd"] = None
+        experiments.append(entry)
+    output["experiments"] = experiments
+    operations = []
+    raw_operations = value.get("operations")
+    for item in raw_operations if isinstance(raw_operations, (list, tuple)) else ():
+        if (not isinstance(item, Mapping) or item.get("event_type") not in {"order_proposed", "order_filled"}
+                or item.get("side") not in {"buy", "sell"} or item.get("is_real_execution") is not False):
+            continue
+        entry = {key: str(item[key])[:80] for key in ("event_type", "ticker", "side", "strategy", "mode") if item.get(key) is not None}
+        entry["is_real_execution"] = False
+        for key in ("intended_open_at", "executed_at"):
+            if item.get(key) is None:
+                continue
+            try:
+                stamp = pd.Timestamp(item[key])
+                if pd.notna(stamp) and stamp.tzinfo is not None:
+                    entry[key] = stamp.tz_convert("UTC").isoformat()
+            except (ValueError, TypeError, OverflowError):
+                pass
+        for key in ("notional_usd", "price_native"):
+            try:
+                number = float(item.get(key))
+                if not isinstance(item.get(key), bool) and isfinite(number) and number > 0:
+                    entry[key] = number
+            except (ValueError, TypeError, OverflowError):
+                pass
+        operations.append(entry)
+        if len(operations) == 5:
+            break
+    output["operations"] = operations
+    output["operations_preview_truncated"] = value.get("operations_preview_truncated") is True
+    output["operation_unit"] = "simulated_strategy_account_orders"
+    return output
 
 
 def _favorite_names(journal: object) -> dict[str, str]:
@@ -232,6 +315,7 @@ def run_daily_alerts(
     sender: Callable[..., object] = send_email,
     today: date | None = None,
     require_current_session: bool = False,
+    virtual_tracker: Callable[[object, pd.DataFrame], object] | None = None,
 ) -> AlertRunSummary:
     """Ejecuta el radar diario o una revisión manual de un solo propietario.
 
@@ -243,6 +327,10 @@ def run_daily_alerts(
     real de generación. El CLI conserva así la sesión del día anterior cuando
     GitHub arranca después de medianoche. Los cierres y ``created_at`` siguen
     usando el reloj real; nunca se retrodata una observación.
+
+    ``virtual_tracker`` es una acción opcional explícita, después de guardar las
+    señales y antes de sellar el informe/SMTP. Nunca activa temporadas por sí
+    mismo este runner; el resultado y sus incidencias forman parte del informe.
     """
 
     resolved_today = today or datetime.now(ZoneInfo("Europe/Madrid")).date()
@@ -1006,6 +1094,25 @@ def run_daily_alerts(
                         for candidate in sorted(selected,
                             key=lambda c: (not c.held, c.kind not in {"Vender", "Reducir", "Venta"}, c.ticker))
                     ]
+                    if virtual_tracker is not None:
+                        try:
+                            virtual = virtual_tracker(journal, stored.copy(deep=True))
+                            # A configured owner-scoped callback may decline
+                            # other owners. Their existing emails stay unchanged.
+                            if virtual is not None:
+                                report["virtual_tracking"] = _virtual_report_summary(virtual)
+                                state = report["virtual_tracking"]
+                                if state["status"] in {"error", "partial_error", "partial_failure"} or (state.get("issues") or 0) > 0:
+                                    errors.append(f"{owner}: el seguimiento virtual comunica incidencias; "
+                                                  "el correo conserva ese estado sin confirmar una actualización completa.")
+                        except Exception as exc:
+                            report["virtual_tracking"] = {
+                                "status": "error", "available_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                                "experiments": [], "issues": 1, "new_proposals": None,
+                                "new_fills": None, "pending_proposals": None,
+                            }
+                            errors.append(f"{owner}: actualización virtual incompleta ({type(exc).__name__}); "
+                                          "el informe no confirma operaciones del laboratorio.")
                     report = seal_daily_score_report(report)
                     required_methods = ("save_daily_score_report", "claim_daily_digest", "finish_daily_digest")
                     if any(not callable(getattr(journal, name, None)) for name in required_methods):
