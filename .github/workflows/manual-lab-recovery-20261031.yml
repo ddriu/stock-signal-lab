@@ -1,4 +1,5 @@
 name: Recuperación individual del correo y laboratorio 2026-10-31
+# Safe stack-only diagnosis of any pre-SMTP collector failure; same stable claim.
 
 on:
   push:

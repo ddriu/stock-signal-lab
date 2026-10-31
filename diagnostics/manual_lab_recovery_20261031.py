@@ -9,6 +9,8 @@ import io
 import json
 import logging
 import os
+import traceback
+from pathlib import Path
 
 from src.alert_runner import _virtual_report_summary
 from src.alerts import AlertPreferences, is_valid_email
@@ -26,6 +28,7 @@ REQUEST_DAY = date(2026, 10, 31)
 SESSION = date(2026, 10, 30)
 SOURCE_REPORT_ID = "28c0c27e51c2c9f81a516058afc78db0295b847e6d4ddace6faacc2e3f0e000a"
 SUCCESS_STATUSES = frozenset({"updated", "unchanged", "waiting_for_signals"})
+DIAGNOSTICS = {}
 
 
 def recovery_key():
@@ -123,7 +126,23 @@ def _recover():
     validate_source(source)
     source_before = json.dumps(source, sort_keys=True, ensure_ascii=False, allow_nan=False)
     experiment = selected_experiment(journal)
-    virtual = collect_owner_models(journal, snapshots=journal.list_analysis_snapshots(), experiment_id=experiment)
+    import scripts.run_model_tracking as tracking_runner
+    original_advance = tracking_runner.advance_one
+    def diagnostic_advance(*args, **kwargs):
+        try:
+            return original_advance(*args, **kwargs)
+        except Exception as error:
+            DIAGNOSTICS["collection_error_type"] = type(error).__name__
+            DIAGNOSTICS["collection_stack"] = [dict(file=Path(frame.filename).name,
+                line=frame.lineno, function=frame.name) for frame in traceback.extract_tb(error.__traceback__)]
+            raise
+    tracking_runner.advance_one = diagnostic_advance
+    try:
+        virtual = collect_owner_models(journal, snapshots=journal.list_analysis_snapshots(), experiment_id=experiment)
+    finally:
+        tracking_runner.advance_one = original_advance
+    DIAGNOSTICS["collection_status"] = virtual.get("status")
+    DIAGNOSTICS["collection_issues"] = virtual.get("issues")
     validate_virtual(virtual, experiment)
     report = json.loads(source_before)
     report["virtual_tracking"] = _virtual_report_summary(virtual)
@@ -193,5 +212,5 @@ if __name__ == "__main__":
     try:
         execute()
     except Exception as exc:
-        print(json.dumps({"status": "recovery_requires_attention", "error_type": type(exc).__name__}))
+        print(json.dumps({"status": "recovery_requires_attention", "error_type": type(exc).__name__, **DIAGNOSTICS}))
         raise SystemExit(1)
