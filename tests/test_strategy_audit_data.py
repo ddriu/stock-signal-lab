@@ -16,6 +16,20 @@ from src.signal_engine import add_signal_columns
 from src.strategy_audit_data import normalize_audit_signals, prepare_audit_bars
 
 
+def _guarded_growth_snapshot(*, session="2026-10-15", created="2026-10-16T19:00:00Z",
+                             status="Entrada fuerte", guard=None, **changes):
+    primary = {"strategy_id": "growth_momentum", "label": "Crecimiento + momentum",
+        "status": status, "score": 88, "data_status": "complete", "entry_candidate": True,
+        "as_of": session}
+    primary.update(changes.pop("primary_changes", {}))
+    policy = {"policy_version": "dual_strategy_v1", "ticker": "OLD", "as_of": session,
+        "primary": primary, "comparative": {}, "position": {}}
+    if guard is not None:
+        policy["data_quality"] = {"version": "daily_data_quality_v1", "status": "review",
+            "block_entry": False, "as_of": session, "metric_periods": {}, **guard}
+    return _snapshot(analyzed_at=session, created_at=created, note=encode_policy_note("", policy), **changes)
+
+
 def _snapshot(**changes: object) -> dict[str, object]:
     return {
         "id": 10, "ticker": "OLD", "analyzed_at": "2026-10-15",
@@ -196,6 +210,95 @@ def test_empty_inputs_keep_typed_contract_and_invalid_source_is_rejected() -> No
     assert str(result.signals["observed_at"].dtype) == "datetime64[ns, UTC]"
     with pytest.raises(ValueError):
         normalize_audit_signals([], source="mixed")
+
+
+@pytest.mark.parametrize("source", ["technical", "growth"])
+def test_default_raw_cohort_retains_exact_signal_ids_schema_and_manifest(source):
+    snapshots = [_guarded_growth_snapshot(guard={"block_entry": True})]
+    default = normalize_audit_signals(snapshots, source=source)
+    explicit = normalize_audit_signals(snapshots, source=source, cohort="raw")
+    pd.testing.assert_frame_equal(default.signals, explicit.signals)
+    pd.testing.assert_frame_equal(default.rejected, explicit.rejected)
+    assert default.manifest == explicit.manifest and default.coverage == explicit.coverage
+    assert "selection_cohort" not in default.signals
+    assert "cohort" not in default.manifest
+    assert default.signals.iloc[0]["entry_label"] == "Entrada fuerte"
+
+
+@pytest.mark.parametrize("guard, expected", [
+    (None, "recorded_quality_missing"),
+    ({"block_entry": True}, "recorded_quality_blocked"),
+    ({"block_entry": "false"}, "recorded_quality_blocked"),
+    ({"status": "unknown"}, "recorded_quality_inconsistent"),
+    ({"version": None}, "recorded_quality_version_missing"),
+    ({"as_of": None}, "recorded_quality_as_of_missing"),
+    ({"as_of": "2026-10-16"}, "recorded_quality_session_mismatch"),
+    ({"metric_periods": {"revenueGrowth": {"filed_at": "2026-10-17"}}},
+     "recorded_quality_published_after_observation"),
+])
+def test_verified_uses_only_the_recorded_guard_and_retains_blocked_activation_state(guard, expected):
+    original = _guarded_growth_snapshot(guard=guard)
+    before = deepcopy(original)
+    report = normalize_audit_signals([original], source="growth", cohort="verified")
+    row = report.signals.iloc[0]
+    assert row["entry_label"] == "Sin entrada verificada" and row["label"] == "Sin entrada verificada"
+    assert row["raw_entry_label"] == row["growth_label"] == "Entrada fuerte"
+    assert row["entry_score"] == row["raw_entry_score"] == row["growth_score"] == 88
+    assert not row["entry_eligible"] and row["entry_eligibility_reason"] == expected
+    assert row["observed_at"] == pd.Timestamp(original["created_at"])
+    assert report.coverage["blocked_entry_observations"] == 1
+    assert report.coverage["blocked_entry_reasons"] == {expected: 1}
+    assert original == before
+
+
+def test_verified_annual_review_can_allow_an_entry_but_legacy_primary_completeness_cannot():
+    snapshot = _guarded_growth_snapshot(guard={})
+    report = normalize_audit_signals([snapshot], source="growth", cohort="verified")
+    row = report.signals.iloc[0]
+    assert row["entry_label"] == "Entrada fuerte" and row["entry_eligible"]
+    assert row["quality_observed_status"] == "review"
+    assert report.manifest["cohort"] == "verified" and report.manifest["cohort_observations_sha256"]
+    assert any("annual" in text for text in report.manifest["limitations"])
+    partial = _guarded_growth_snapshot(guard={}, primary_changes={"data_status": "partial"})
+    result = normalize_audit_signals([partial], source="growth", cohort="verified")
+    assert result.signals.iloc[0]["entry_label"] == "Sin entrada verificada"
+    assert result.signals.iloc[0]["entry_eligibility_reason"] == "growth_entry_not_complete"
+    assert normalize_audit_signals([partial], source="growth").signals.empty
+
+
+def test_verified_later_revision_never_promotes_the_first_same_session_observation():
+    first = _guarded_growth_snapshot(id=1, guard={"block_entry": True})
+    later = _guarded_growth_snapshot(id=2, created="2026-10-16T20:00:00Z", guard={})
+    before = normalize_audit_signals([first], source="growth", cohort="verified")
+    after = normalize_audit_signals([later, first, first], source="growth", cohort="verified")
+    pd.testing.assert_frame_equal(before.signals, after.signals)
+    assert after.rejected["reason"].tolist() == ["later_revision", "later_revision"]
+    assert after.manifest["cohort_observations_sha256"] == before.manifest["cohort_observations_sha256"]
+    assert any("Later same-session" in text for text in after.manifest["limitations"])
+
+
+def test_verified_cohort_has_distinct_identity_and_rejects_invalid_source_or_cohort():
+    snapshot = _guarded_growth_snapshot(guard={})
+    raw = normalize_audit_signals([snapshot], source="growth")
+    verified = normalize_audit_signals([snapshot], source="growth", cohort="verified")
+    assert raw.signals.iloc[0]["event_id"] != verified.signals.iloc[0]["event_id"]
+    assert raw.signals.iloc[0]["event_id"] == verified.signals.iloc[0]["raw_event_id"]
+    assert raw.manifest["input_sha256"] == verified.manifest["input_sha256"]
+    for kwargs in ({"source": "technical", "cohort": "verified"}, {"cohort": "mixed"}):
+        with pytest.raises(ValueError, match="cohort"):
+            normalize_audit_signals([], **kwargs)
+
+
+def test_conflicting_first_quality_records_with_identical_clock_and_id_cannot_promote_an_entry():
+    allowed = _guarded_growth_snapshot(id=1, guard={})
+    blocked = _guarded_growth_snapshot(id=1, guard={"block_entry": True})
+    first = normalize_audit_signals([allowed, blocked], source="growth", cohort="verified")
+    reversed_rows = normalize_audit_signals([blocked, allowed], source="growth", cohort="verified")
+    pd.testing.assert_frame_equal(first.signals, reversed_rows.signals)
+    assert first.signals.iloc[0]["entry_label"] == "Sin entrada verificada"
+    assert first.signals.iloc[0]["entry_eligibility_reason"] == "recorded_first_observation_ambiguous"
+    duplicates = normalize_audit_signals([allowed, allowed], source="growth", cohort="verified")
+    assert duplicates.signals.iloc[0]["entry_eligible"]
 
 
 def test_usd_bars_use_supplied_schedule_and_do_not_need_fx() -> None:

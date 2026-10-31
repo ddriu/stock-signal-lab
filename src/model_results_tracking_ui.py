@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import hashlib
+import importlib
+import inspect
 from io import BytesIO
 import json
 import os
@@ -13,9 +15,21 @@ import streamlit as st
 from src.model_results_engine import ExecutionCosts
 from src.model_results_service import public_frame, public_value
 from src.model_results_store import create_model_results_store
+import src.strategy_audit_data as _audit_data_module
+import src.model_results_tracking as _tracking_module
+
+if "cohort" not in inspect.signature(_audit_data_module.normalize_audit_signals).parameters:
+    _audit_data_module = importlib.reload(_audit_data_module)
+if (getattr(_tracking_module, "TRACKING_API_VERSION", "") != "measurement-readiness-v2"
+        or _tracking_module.normalize_audit_signals is not _audit_data_module.normalize_audit_signals):
+    _tracking_module = importlib.reload(_tracking_module)
+
 from src.model_results_tracking import (TRACKING_VERSION, activate_model_experiment,
-    advance_model_experiment, collect_model_market_bundle, resume_model_activation)
+    advance_model_experiment, collect_model_market_bundle, experiment_readiness,
+    resume_model_activation)
 from src.strategy_audit_service import BENCHMARKS, audit_universe
+
+TRACKING_PRESENTATION_VERSION = "measurement-readiness-v2"
 
 
 def export_tracking_excel(seasons, snapshots, events):
@@ -80,9 +94,25 @@ def render_model_tracking_page(journal):
         except Exception:
             st.error("No se pudo consultar el registro. Comprueba que la migración del modelo esté instalada; no se cambiaron posiciones.")
     report = report_state.get("report")
+    controls_changed = bool(report is not None and "current_run_key" in report_state
+        and report_state.get("current_run_key") != report_state.get("run_key"))
+    if report is not None:
+        cohort_label = "verificada con los datos guardados entonces" if report.manifest.get("cohort", "raw") == "verified" else "motor bruto original"
+        st.caption(f"Auditoría preparada para activar: {report.manifest.get('source', 'no documentada')} · {cohort_label}.")
+    if controls_changed:
+        st.warning("Los controles han cambiado desde la auditoría preparada. Recalcula antes de activar; no se usará un informe anterior como si correspondiera a la selección actual.")
+    pending = state.get("pending_activation")
+    pending_conflict = bool(report is not None and pending and (
+        pending.get("audit_manifest") != report.manifest
+        or pending.get("cohort", "raw") != report.manifest.get("cohort", "raw")))
+    if pending_conflict:
+        st.warning("Hay una activación pendiente con otra auditoría o cohorte; no se sustituirá su configuración. Consulta su registro o libera sólo el intento local para iniciar una activación independiente.")
+        if st.button("Liberar sólo el intento local y conservar el registro anterior", key=key + "_release_pending"):
+            state.pop("pending_activation", None)
+            st.rerun()
     acknowledged = st.checkbox("He revisado la auditoría retrospectiva y sus limitaciones; quiero iniciar un experimento virtual nuevo.",
         key=key + "_confirm_activation")
-    if right.button("Activar las cuatro estrategias virtuales", disabled=report is None or not acknowledged,
+    if right.button("Activar las cuatro estrategias virtuales", disabled=report is None or not acknowledged or pending_conflict or controls_changed,
                     key=key + "_activate_tracking"):
         try:
             # Freeze the actual report settings, not controls changed after the
@@ -91,11 +121,13 @@ def render_model_tracking_page(journal):
             charges = ExecutionCosts(**spec["costs"])
             pending = state.setdefault("pending_activation", dict(
                 now=pd.Timestamp.now(tz="UTC").isoformat(), audit_manifest=report.manifest,
-                source=report.manifest["source"], budget_usd=spec["budget_usd"], costs=asdict(charges)))
+                source=report.manifest["source"], cohort=report.manifest.get("cohort", "raw"),
+                budget_usd=spec["budget_usd"], costs=asdict(charges)))
             # Keep exact activation time/settings across a partial RPC failure;
             # replay completes the same eight headers instead of creating more.
             experiment = activate_model_experiment(journal, pending["audit_manifest"], now=pending["now"],
-                source=pending["source"], budget_usd=pending["budget_usd"], costs=ExecutionCosts(**pending["costs"]))
+                source=pending["source"], cohort=pending.get("cohort", "raw"),
+                budget_usd=pending["budget_usd"], costs=ExecutionCosts(**pending["costs"]))
             snapshots = journal.list_analysis_snapshots()
             bundle = collect_model_market_bundle(sorted(set(audit_universe(snapshots)) | set(BENCHMARKS.values())),
                 start=pd.Timestamp.now(tz="UTC").date().isoformat())
@@ -104,8 +136,8 @@ def render_model_tracking_page(journal):
             st.success("Temporadas virtuales creadas e inicializadas. Consulta el seguimiento para verlas.")
         except Exception:
             st.error("No se pudo completar la activación. Consulta el registro antes de reintentar: una cabecera ya creada se conserva y nunca se borra.")
-    if os.getenv("MODEL_RESULTS_ENABLED", "0").lower() not in {"1", "true"}:
-        st.info("El seguimiento programado aún no está habilitado en este alojamiento. Activar una temporada no acredita que el programador de GitHub esté funcionando.")
+    if os.getenv("MODEL_RESULTS_ENABLED", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+        st.info("Esta sesión no acredita que el seguimiento de GitHub esté habilitado. La variable del alojamiento y la variable del programador son distintas; activar temporadas no acredita recogidas de mercado.")
     st.caption("Despliegue: aplicar la migración del registro y habilitar MODEL_RESULTS_ENABLED=true en las variables de GitHub. El proceso separado actualiza después de las señales y a las 22:30 UTC; no tiene credenciales SMTP.")
     seasons = state.get("seasons", [])
     if not seasons:
@@ -133,8 +165,18 @@ def render_model_tracking_page(journal):
                 st.error("No se pudo completar: el motor debe coincidir con la versión congelada. No se han alterado operaciones.")
     selected = st.selectbox("Temporada virtual", list(choices), key=key + "_selected_tracking",
         format_func=lambda sid: " · ".join((choices[sid]["manifest"]["strategy_key"],
+            "verificada entonces" if choices[sid]["manifest"].get("cohort", "raw") == "verified" else "motor bruto",
             choices[sid]["manifest"]["mode"], choices[sid]["manifest"]["activation_at"][:16])))
     saved = [r for r in state.get("snapshots", []) if r["season_id"] == selected]
+    manifest = choices[selected]["manifest"]
+    readiness = experiment_readiness(groups[manifest["experiment_id"]])
+    if not readiness["ready"]:
+        st.warning("El experimento no puede avanzar con esta versión o sus cabeceras están incompletas. Se conserva el histórico; consulta la configuración y crea una temporada separada si el motor ha cambiado.")
+    initial = [row for row in saved if row["snapshot"].get("snapshot_kind") == "activation"]
+    market = [row for row in saved if row["snapshot"].get("snapshot_kind") != "activation"]
+    st.caption(f"Registros iniciales: {len(initial)} · Recogidas de mercado: {len(market)}. Son registros, no número de operaciones.")
+    if not market:
+        st.warning("Todavía no hay una recogida de mercado registrada para esta temporada. Las cabeceras y el efectivo inicial no demuestran rentabilidad ni funcionamiento diario.")
     with st.expander("Configuración congelada"):
         st.json(public_value(choices[selected]["manifest"]))
     if saved:
@@ -142,7 +184,11 @@ def render_model_tracking_page(journal):
         if not data.get("coverage_complete"):
             st.warning("Resultado todavía no concluyente: hay datos, ejecuciones pendientes o incidencias sin verificar. No se declara un ganador.")
         metrics = data.get("metrics")
-        if metrics:
+        if data.get("snapshot_kind") == "activation":
+            st.info("Sólo consta el efectivo virtual inicial. Rentabilidad: N/D, pendiente de la primera recogida de mercado; no se han simulado compras atrasadas.")
+            st.dataframe(pd.DataFrame([{"Efectivo inicial USD": (metrics or {}).get("initial_cash_usd"),
+                "Activación UTC": data.get("activation_at"), "Registro UTC": data.get("available_at")}]), hide_index=True)
+        elif metrics:
             st.dataframe(pd.DataFrame([metrics]).drop(columns=["attribution_by_ticker"], errors="ignore"), hide_index=True)
             daily = pd.DataFrame([day for row in saved for day in row["snapshot"].get("daily", [])])
             if not daily.empty:
@@ -165,7 +211,9 @@ def render_model_tracking_page(journal):
     feed = next((r for r in seasons if r["manifest"]["experiment_id"] == choices[selected]["manifest"]["experiment_id"]
         and r["manifest"]["mode"] == "theoretical" and r["manifest"]["strategy_key"] == "A"), None)
     events = [r for r in state.get("events", []) if r["season_id"] == selected or
-        feed and r["season_id"] == feed["season_id"] and r["event_type"] == "email_delivery"]
+        feed and r["season_id"] == feed["season_id"] and r["event_type"] in {"email_delivery", "incident"}]
+    if any(event.get("payload", {}).get("code") == "collector_backlog_requires_new_season" for event in events):
+        st.warning("Seguimiento pausado por varias sesiones no recogidas. No se convierten aportaciones atrasadas en compras actuales; requiere una nueva activación independiente.")
     with st.expander("Decisiones, órdenes, incidencias y evidencia de correo"):
         st.dataframe(public_frame(pd.DataFrame(events)), hide_index=True)
         st.caption("smtp_accepted confirma aceptación del servidor, no recepción en la bandeja. Sin recibo explícito sólo consta intento; una señal no acredita envío.")

@@ -27,6 +27,7 @@ from src.signal_engine import add_signal_columns
 
 
 AUDIT_DATA_VERSION = "strategy-audit-data-v3"
+VERIFIED_COHORT_VERSION = "recorded-quality-first-observation-v1"
 _GROWTH_READINGS = frozenset({
     "Entrada fuerte", "Entrada candidata", "Vigilancia activa", "No preparada",
     "Esperar mejor precio", "Pendiente de fundamentales", "Datos empresariales parciales",
@@ -42,6 +43,11 @@ _SIGNAL_COLUMNS = (
     "relative_score", "confidence_pct", "observed_price", "source_price",
     "policy_price", "price_origin", "reconstructed_price", "currency",
     "config_version", "config_snapshot", "policy_version", "limitations",
+)
+_VERIFIED_SIGNAL_COLUMNS = (
+    "selection_cohort", "raw_event_id", "raw_entry_label", "raw_entry_score", "entry_eligible",
+    "entry_eligibility_reason", "quality_observed_status", "quality_observed_as_of",
+    "quality_guard_version", "quality_comparability_key", "quality_evidence_hash",
 )
 _ISSUE_COLUMNS = ("code", "severity", "ticker", "session", "detail")
 _BAR_COLUMNS = (
@@ -131,9 +137,46 @@ def _id_key(value: object) -> tuple[int, object]:
     return (1, _text(value))
 
 
+def _recorded_entry_gate(policy: Mapping[str, object], primary: Mapping[str, object],
+                         session: pd.Timestamp, observed: pd.Timestamp) -> tuple[bool, str]:
+    """Read a saved guard, never validate it with today's financial statements.
+
+    Status ``review`` can be an explicitly disclosed annual observation, not an
+    account audit. A recorded non-blocking flag alone cannot override missing
+    provenance dates, incomplete primary fields or impossible publication clocks.
+    """
+    if not {"data_status", "entry_candidate"}.issubset(primary):
+        return False, "growth_completeness_not_recorded"
+    if primary["data_status"] != "complete" or primary["entry_candidate"] is not True:
+        return False, "growth_entry_not_complete"
+    quality = policy.get("data_quality")
+    if not isinstance(quality, Mapping):
+        return False, "recorded_quality_missing"
+    if quality.get("block_entry") is not False:
+        return False, "recorded_quality_blocked"
+    if _text(quality.get("status")) not in {"ok", "review"}:
+        return False, "recorded_quality_inconsistent"
+    if not _text(quality.get("version")):
+        return False, "recorded_quality_version_missing"
+    as_of = _session(quality.get("as_of"))
+    if as_of is None:
+        return False, "recorded_quality_as_of_missing"
+    if as_of != session:
+        return False, "recorded_quality_session_mismatch"
+    periods = quality.get("metric_periods")
+    for metadata in periods.values() if isinstance(periods, Mapping) else ():
+        if not isinstance(metadata, Mapping):
+            continue
+        filed = _session(metadata.get("filed_at"))
+        if filed is not None and filed.date() > observed.date():
+            return False, "recorded_quality_published_after_observation"
+    return True, "recorded_guard_allows_entry_review"
+
+
 def normalize_audit_signals(
     snapshots: pd.DataFrame | Iterable[Mapping[str, object]],
     source: str = "technical",
+    cohort: str = "raw",
 ) -> AuditSignalSet:
     """Normalize the entire historical universe, retaining first observations.
 
@@ -141,10 +184,18 @@ def normalize_audit_signals(
     policy values remain separately inspectable. Revisions never backdate the
     selected observation and are retained with their complete source records.
     Naive creation timestamps are rejected rather than guessing a timezone.
+    ``verified`` is a separate conservative growth cohort: only a quality guard
+    saved on that first observation can allow entry. Ineligible observations stay
+    visible as non-entries, breaking operational activation without altering the
+    raw score/label. Later same-session improvements are deliberately not used,
+    even when they preceded the next opening. This is not a replay of today's
+    latest-revision presentation policy.
     """
 
     if source not in {"technical", "growth"}:
         raise ValueError("source must be 'technical' or 'growth'")
+    if cohort not in {"raw", "verified"} or cohort == "verified" and source != "growth":
+        raise ValueError("cohort must be 'raw', or 'verified' with source='growth'")
     records = (snapshots.to_dict("records") if isinstance(snapshots, pd.DataFrame)
                else [dict(row) for row in snapshots])
     candidates: list[dict[str, object]] = []
@@ -211,8 +262,9 @@ def normalize_audit_signals(
                 ("data_status" in primary and primary["data_status"] != "complete")
                 or ("entry_candidate" in primary and primary["entry_candidate"] is not True)
             ):
-                reject(row, "growth_entry_not_complete")
-                continue
+                if cohort == "raw":
+                    reject(row, "growth_entry_not_complete")
+                    continue
             primary_session = _session(primary.get("as_of"))
             if primary_session is not None and primary_session > session:
                 reject(row, "growth_policy_after_signal_session")
@@ -240,7 +292,9 @@ def normalize_audit_signals(
         policy_price = policy_price if policy_price is not None and policy_price > 0 else None
         if raw_price is None:
             limitations.append("snapshot_price_not_recorded")
-        event_id = _digest({"source": source, "record": row})
+        event_id = _digest({"source": source, "record": row} if cohort == "raw" else
+                           {"source": source, "cohort": cohort, "cohort_version": VERIFIED_COHORT_VERSION,
+                            "record": row})
         result: dict[str, object] = {
             "event_id": event_id, "id": row.get("id"), "ticker": ticker, "source": source,
             "signal_session": session, "observed_at": observed,
@@ -262,10 +316,38 @@ def normalize_audit_signals(
         for column in ("company_score", "valuation_score", "opportunity_score", "risk_score",
                        "relative_score", "confidence_pct"):
             result[column] = _score(row.get(column))
+        if cohort == "verified":
+            quality = policy.get("data_quality")
+            quality = quality if isinstance(quality, Mapping) else {}
+            is_entry = label in {"Entrada fuerte", "Entrada candidata"}
+            allowed, gate_reason = (_recorded_entry_gate(policy, primary, session, observed)
+                                    if is_entry else (False, "not_an_entry"))
+            result.update(selection_cohort=cohort, raw_event_id=_digest({"source": source, "record": row}),
+                raw_entry_label=label, raw_entry_score=score,
+                entry_eligible=allowed, entry_eligibility_reason=gate_reason,
+                quality_observed_status=_text(quality.get("status")) or None,
+                quality_observed_as_of=_text(quality.get("as_of")) or None,
+                quality_guard_version=_text(quality.get("version")) or None,
+                quality_comparability_key=_text(quality.get("comparability_key")) or None,
+                quality_evidence_hash=_digest(quality) if quality else None)
+            if is_entry and not allowed:
+                result.update(entry_label="Sin entrada verificada", label="Sin entrada verificada",
+                    limitations=(*result["limitations"], gate_reason))
         candidates.append(result)
         raw_by_event[event_id] = row
 
     candidates.sort(key=lambda row: (row["observed_at"], _id_key(row["id"]), row["event_id"]))
+    ambiguous_first: set[tuple[object, object]] = set()
+    if cohort == "verified":
+        first_clocks: dict[tuple[object, object], tuple[object, object]] = {}
+        tied_ids: dict[tuple[object, object], set[str]] = {}
+        for row in candidates:
+            key = (row["ticker"], row["signal_session"])
+            clock = (row["observed_at"], _id_key(row["id"]))
+            first_clocks.setdefault(key, clock)
+            if clock == first_clocks[key]:
+                tied_ids.setdefault(key, set()).add(str(row["event_id"]))
+        ambiguous_first = {key for key, identities in tied_ids.items() if len(identities) > 1}
     kept: list[dict[str, object]] = []
     first: dict[tuple[object, object], str] = {}
     for row in candidates:
@@ -276,8 +358,13 @@ def normalize_audit_signals(
                    observed_at=row["observed_at"], signal_session=row["signal_session"])
         else:
             first[key] = str(row["event_id"])
+            if key in ambiguous_first and row["raw_entry_label"] in {"Entrada fuerte", "Entrada candidata"}:
+                row.update(entry_label="Sin entrada verificada", label="Sin entrada verificada",
+                    entry_eligible=False, entry_eligibility_reason="recorded_first_observation_ambiguous",
+                    limitations=(*row["limitations"], "recorded_first_observation_ambiguous"))
             kept.append(row)
-    signals = pd.DataFrame(kept, columns=_SIGNAL_COLUMNS)
+    signals = pd.DataFrame(kept, columns=(*_SIGNAL_COLUMNS,
+        *(_VERIFIED_SIGNAL_COLUMNS if cohort == "verified" else ())))
     signals["observed_at"] = pd.to_datetime(signals["observed_at"], utc=True)
     signals["signal_session"] = pd.to_datetime(signals["signal_session"])
     rejections = pd.DataFrame(rejected, columns=list(dict.fromkeys(
@@ -301,6 +388,23 @@ def normalize_audit_signals(
                         "historical_universe_is_observed_not_survivorship_free",
                         *sorted({item for row in kept for item in row["limitations"]})],
     }
+    if cohort == "verified":
+        mask = signals["raw_entry_label"].isin({"Entrada fuerte", "Entrada candidata"})
+        eligible = signals["entry_eligible"].eq(True)
+        coverage.update(cohort=cohort, entry_observations=int(mask.sum()),
+            verified_entry_observations=int((mask & eligible).sum()),
+            blocked_entry_observations=int((mask & ~eligible).sum()),
+            blocked_entry_reasons=signals.loc[mask & ~eligible, "entry_eligibility_reason"].value_counts().to_dict())
+        manifest.update(cohort=cohort, cohort_version=VERIFIED_COHORT_VERSION,
+            quality_source="Only the quality guard saved in each first observed snapshot; no current fundamentals or recomputation.",
+            entry_selection="Recorded entry plus complete primary and non-blocking dated saved quality guard; blocked observations remain non-entries.",
+            cohort_observations_sha256=_digest(kept))
+        manifest["cohort_limitations"] = [
+            "Later same-session revisions are ignored even when available before the next opening; not an exact replay of latest-revision operations.",
+            "Saved non-blocking review status may describe annual data; it is not independently audited financial information.",
+            "Conflicting first records tied on observation time and ID cannot confirm an entry; the content hash is not a publication-order clock.",
+        ]
+        manifest["limitations"].extend(manifest["cohort_limitations"])
     return AuditSignalSet(signals, rejections, coverage, manifest)
 
 

@@ -1,9 +1,13 @@
 """Explicit, owner-scoped retrospective model comparisons, without writes."""
 from __future__ import annotations
 
+MODEL_RESULTS_PRESENTATION_VERSION = "cohort-controls-v1"
+
 from dataclasses import asdict
 from datetime import timedelta
 import hashlib
+import importlib
+import inspect
 import json
 import math
 
@@ -11,6 +15,17 @@ import pandas as pd
 import streamlit as st
 
 from src.model_results_engine import ExecutionCosts, FROZEN_MODELS
+import src.strategy_audit_data as _audit_data_module
+import src.model_results_service as _service_module
+
+# A warm Streamlit deployment can retain the old APIs while this view has the
+# new cohort controls. Refresh only incompatible dependencies before binding.
+if "cohort" not in inspect.signature(_audit_data_module.normalize_audit_signals).parameters:
+    _audit_data_module = importlib.reload(_audit_data_module)
+if ("cohort" not in inspect.signature(_service_module.build_model_results).parameters
+        or _service_module.normalize_audit_signals is not _audit_data_module.normalize_audit_signals):
+    _service_module = importlib.reload(_service_module)
+
 from src.model_results_service import (
     build_model_results, export_model_results_excel, public_frame, public_value,
 )
@@ -18,6 +33,7 @@ from src.strategy_audit_data import normalize_audit_signals
 
 
 _SOURCES = {"technical": "Técnica original", "growth": "Crecimiento + momentum"}
+_COHORTS = {"raw": "Motor bruto · referencia original", "verified": "Verificación guardada · cohorte separada"}
 
 
 def _signature(value: object) -> str:
@@ -32,9 +48,86 @@ def _amount(value: object, percent: bool = False) -> str:
     return (f"{number:,.2f}" + ("%" if percent else "")) if math.isfinite(number) else "N/D"
 
 
+def _execution_runtime():
+    """Bind the optional experimental API only after an explicit action."""
+    import src.data_sources as providers
+    import src.growth_execution_review as review
+    import src.model_execution_comparison as comparison
+
+    if review.FxSnapshot is not providers.FxSnapshot:
+        review = importlib.reload(review)
+    if (comparison.AuditSignalSet is not _audit_data_module.AuditSignalSet
+            or comparison.FxSnapshot is not providers.FxSnapshot
+            or comparison.review_growth_execution is not review.review_growth_execution
+            or not callable(getattr(comparison, "fx_records_from_prepared_bars", None))):
+        comparison = importlib.reload(comparison)
+    return comparison
+
+
+def _render_execution_experiment(state, observed, *, prefix, ready, valid, run_key,
+                                 start, end, budget, charges, git_sha):
+    """Explicit read-only experiment, never assigned to the activation report."""
+    if state.get("execution_run_key") != run_key:
+        state.pop("execution_comparison", None)
+        state.pop("execution_run_key", None)
+    st.markdown("### Filtros experimentales de ejecución")
+    st.caption("Compara la referencia sin filtros nuevos con liquidez en EUR y ruptura/retest. Mismo presupuesto, costes y reglas A–D; no sustituye el motor ni activa estos filtros en el seguimiento.")
+    if st.button("Comparar filtros experimentales de ejecución", disabled=not ready or not valid,
+                 key=prefix + "_execution_compare"):
+        try:
+            execution = _execution_runtime()
+            bundle = state["bundle"]
+            fx_records = execution.fx_records_from_prepared_bars(bundle.bars,
+                fx_basis=bundle.manifest.get("fx_basis", ""))
+            with st.spinner("Comparando hipótesis predefinidas sin recalibrar el motor…"):
+                comparison = execution.build_execution_comparison(observed, bundle.bars,
+                    raw_frames=getattr(bundle, "raw_prices", None), metadata=getattr(bundle, "metadata", None),
+                    fx_records=fx_records, start=start.isoformat(), end=end.isoformat(),
+                    budget_usd=budget, costs=charges, git_sha=git_sha,
+                    benchmark_bars=bundle.bars, include_matched_hold=False)
+            state.update(execution_comparison=comparison, execution_run_key=run_key)
+        except Exception:
+            st.error("No se pudo completar la comparación experimental. Conserva la referencia original; no hubo descargas adicionales, escrituras ni correos.")
+    comparison = state.get("execution_comparison")
+    if comparison is None or state.get("execution_run_key") != run_key:
+        return
+    st.caption("FX sólo con fecha económica y disponibilidad acreditadas. Cuando la caché declara el protocolo conservador del día siguiente a las 02:00 UTC se conserva esa hipótesis, no se presenta como hora real de publicación ni se usa el cambio actual.")
+    summary = comparison.summary.copy(deep=True)
+    labels = {"baseline": "Referencia actual · sin filtro nuevo", "liquidity_eur": "Filtro de liquidez en EUR",
+              "execution_setup": "Filtro de liquidez + ruptura/retest"}
+    summary["variant"] = summary["variant"].map(lambda value: labels.get(value, value))
+    fields = [column for column in ("variant", "model", "executed_entries", "budget_rejected_entries",
+        "final_value_usd", "profit_usd", "net_return_pct", "max_drawdown_daily_approx_pct",
+        "max_simultaneous_invested_capital_usd", "cash_usd", "fees_usd", "coverage_complete") if column in summary]
+    st.dataframe(public_frame(summary.loc[:, fields].rename(columns={"variant": "Hipótesis", "model": "Modelo",
+        "executed_entries": "Compras", "budget_rejected_entries": "Rechazos capital",
+        "final_value_usd": "Patrimonio USD", "profit_usd": "Resultado USD", "net_return_pct": "Retorno neto %",
+        "max_drawdown_daily_approx_pct": "Drawdown aproximado %", "cash_usd": "Efectivo USD",
+        "fees_usd": "Costes USD", "coverage_complete": "Cobertura completa",
+        "max_simultaneous_invested_capital_usd": "Máximo capital invertido USD"})), hide_index=True, width="stretch")
+    st.warning("Comparación retrospectiva exploratoria: no declara un ganador ni demuestra mejora futura. Filtrar entradas cambia exposición y activaciones; más efectivo o menos operaciones no significa mejor predicción.")
+    decisions = comparison.decisions
+    if isinstance(decisions, pd.DataFrame) and not decisions.empty and "status" in decisions:
+        pending = int(decisions["status"].eq("blocked_data").sum())
+        if pending:
+            st.warning(f"{pending} observaciones no permiten verificar la ejecución, por datos, divisa o calendario. Negociación EUR N/D no equivale a liquidez baja ni a una señal de venta.")
+    with st.expander("Límites y decisiones del experimento"):
+        for limitation in comparison.manifest.get("limitations", []):
+            st.caption(str(limitation))
+        st.dataframe(public_frame(decisions), hide_index=True, width="stretch")
+        if not comparison.benchmarks.empty:
+            st.dataframe(public_frame(comparison.benchmarks), hide_index=True, width="stretch")
+        st.json(public_value(comparison.manifest))
+
+
 def _render_report(report, prefix: str) -> None:
     st.caption(f"Fuente independiente: {_SOURCES[report.manifest['source']]} · "
+               f"{_COHORTS[report.manifest.get('cohort', 'raw')]} · "
                f"{report.manifest['start']} → {report.manifest['end']} · importes USD.")
+    if report.manifest.get("cohort", "raw") == "verified":
+        st.info("Cohorte verificada: utiliza sólo la calidad de datos guardada en la primera observación de cada sesión. No incorpora fundamentales actuales ni mejoras de revisiones posteriores. La muestra puede ser menor y no acredita un método ganador.")
+    else:
+        st.caption("Referencia bruta: reproduce las lecturas históricas originales; no presupone que cada entrada hubiera superado la verificación empresarial actual.")
     theoretical_tab, budget_tab, provenance_tab = st.tabs([
         "Teórico · aportaciones por entrada", "Presupuesto · efectivo limitado", "Referencia original y cobertura"])
     for tab, mode, models in ((theoretical_tab, "theoretical", report.theoretical),
@@ -127,6 +220,9 @@ def render_model_results_page(journal, *, key_prefix: str = "model_results", git
     identity = str(getattr(journal, "owner", None) or getattr(journal, "path", None) or "authenticated-session")
     prefix = key_prefix + "_" + _signature(identity)[:16]
     state = st.session_state.setdefault(prefix + "_state", {})
+    # Downstream explicit activation must not interpret an old calculated
+    # report as matching a newly selected source/cohort or incomplete controls.
+    state["current_run_key"] = None
     st.markdown("## Resultados de modelos originales")
     st.caption("Retrospectivo y sólo lectura: no opera, no modifica posiciones, no guarda simulaciones ni envía correos.")
     st.warning("Una señal guardada no demuestra un correo enviado ni una operación. Seguimiento prospectivo no activado en este panel.")
@@ -153,7 +249,11 @@ def render_model_results_page(journal, *, key_prefix: str = "model_results", git
         return
     source = st.selectbox("Fuente independiente de señales", list(_SOURCES), format_func=_SOURCES.get,
                           key=prefix + "_source")
-    observed = normalize_audit_signals(snapshots, source=source)
+    cohort = (st.selectbox("Cohorte histórica", list(_COHORTS), format_func=_COHORTS.get,
+                          key=prefix + "_cohort") if source == "growth" else "raw")
+    if source == "technical":
+        st.caption("La técnica original mantiene su cohorte bruta congelada; la verificación empresarial sólo se compara en crecimiento.")
+    observed = normalize_audit_signals(snapshots, source=source, cohort=cohort)
     if observed.signals.empty:
         st.warning("Esta fuente no tiene observaciones válidas; no se sustituye por la otra ni se mezclan sus notas.")
         st.dataframe(public_frame(observed.rejected), hide_index=True, width="stretch")
@@ -193,21 +293,24 @@ def render_model_results_page(journal, *, key_prefix: str = "model_results", git
     ready = state.get("bundle") is not None and state.get("market_key") == market_key
     if state.get("bundle") is not None and not ready:
         st.info("Las fechas cambiaron: descarga explícitamente el histórico del nuevo periodo.")
-    run_key = _signature(dict(source=source, start=start, end=end, budget=budget,
+    run_key = _signature(dict(source=source, cohort=cohort, start=start, end=end, budget=budget,
         costs=asdict(charges), history=observed.manifest.get("input_sha256"),
         market=getattr(state.get("bundle"), "manifest", None)))
+    state["current_run_key"] = run_key
     if st.button("Calcular los cuatro modelos en ambas modalidades", disabled=not ready or not valid,
                  key=prefix + "_calculate"):
         try:
             bundle = state["bundle"]
             with st.spinner("Calculando cohortes, efectivo y referencias sin modificar datos…"):
                 report = build_model_results(snapshots, bundle.bars, start=start.isoformat(),
-                    end=end.isoformat(), source=source, budget_usd=budget, costs=charges,
+                    end=end.isoformat(), source=source, cohort=cohort, budget_usd=budget, costs=charges,
                     git_sha=git_sha, market_manifest=bundle.manifest, market_issues=bundle.issues)
             state.update(report=report, run_key=run_key)
             state.pop("excel", None)
         except Exception:
             st.error("No se pudo completar el cálculo. Revisa cobertura y versión de caché; no hubo escrituras ni correos.")
+    _render_execution_experiment(state, observed, prefix=prefix, ready=ready, valid=valid,
+        run_key=run_key, start=start, end=end, budget=budget, charges=charges, git_sha=git_sha)
     if state.get("report") is None:
         return
     if state.get("run_key") != run_key:
@@ -220,7 +323,7 @@ def render_model_results_page(journal, *, key_prefix: str = "model_results", git
             st.error("No se pudo preparar el Excel; los resultados siguen en pantalla.")
     if state.get("excel"):
         st.download_button("Descargar Excel privado de modelos", state["excel"],
-            file_name="resultados_modelos_originales.xlsx",
+            file_name=f"resultados_modelos_{state['report'].manifest['source']}_{state['report'].manifest.get('cohort', 'raw')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key=prefix + "_download", on_click="ignore")
     st.caption("Excel generado en memoria únicamente cuando lo solicitas; no se escribe en base de datos ni se envía por correo.")

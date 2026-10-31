@@ -15012,12 +15012,20 @@ def main() -> None:
         and analysis_section == "Validar"
         and analysis_detail == "Resultados del modelo"
     ):
-        from src.model_results_ui import render_model_results_page
-        from src.model_results_tracking_ui import render_model_tracking_page
+        import src.model_results_ui as _model_results_view
+        import src.model_results_tracking_ui as _model_tracking_view
+
+        # Existing authenticated sessions can retain the previous view modules
+        # even after their helpers have been updated on disk. Refresh the view
+        # contract before binding its renderers; never clear account state.
+        if getattr(_model_results_view, "MODEL_RESULTS_PRESENTATION_VERSION", "") != "cohort-controls-v1":
+            _model_results_view = importlib.reload(_model_results_view)
+        if getattr(_model_tracking_view, "TRACKING_PRESENTATION_VERSION", "") != "measurement-readiness-v2":
+            _model_tracking_view = importlib.reload(_model_tracking_view)
         from src.model_results_tracking import git_revision
 
-        render_model_results_page(journal, git_sha=git_revision())
-        render_model_tracking_page(journal)
+        _model_results_view.render_model_results_page(journal, git_sha=git_revision())
+        _model_tracking_view.render_model_tracking_page(journal)
         return
     # Keep the audit outside the live-radar refresh path. Reading historical
     # recommendations must never generate new snapshots or send notifications.

@@ -2,7 +2,7 @@
 
 Run: python -m scripts.run_model_results --snapshots /private/history.json
   --cache /private/prices --output /private/results --start YYYY-MM-DD
-  --end YYYY-MM-DD [--download] [--source both] [--excel]
+  --end YYYY-MM-DD [--download] [--source both] [--cohort raw|verified] [--excel]
 Only --download authorizes public market-data retrieval. Outputs stay outside
 the repository. Cached inputs must match the frozen strategy/data version.
 """
@@ -175,6 +175,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)
     parser.add_argument("--source", choices=("technical", "growth", "both"), default="technical")
+    parser.add_argument("--cohort", choices=("raw", "verified"), default="raw",
+                        help="raw preserves the original observed engine; verified requires recorded growth data-quality evidence")
     parser.add_argument("--budget-usd", type=float, default=6000.0)
     parser.add_argument("--commission-usd", type=float, default=1.0)
     parser.add_argument("--spread-bps", type=float, default=10.0)
@@ -184,6 +186,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reprepare-from", type=Path, help="Offline frozen raw cache with explicit cached FX availability")
     parser.add_argument("--excel", action="store_true")
     args = parser.parse_args(argv)
+    if args.cohort == "verified" and args.source != "growth":
+        raise ValueError("--cohort verified requires --source growth; the technical original remains raw")
     output, cache = _private_output(args.output), _private_output(args.cache)
     charges = ExecutionCosts(args.commission_usd, args.spread_bps, args.fx_bps)
     charges.validate()
@@ -210,9 +214,10 @@ def main(argv: list[str] | None = None) -> int:
     generated = []
     for source in sources:
         report = build_model_results(snapshots, bars, start=args.start, end=args.end,
-            source=source, budget_usd=args.budget_usd, costs=charges, git_sha=args.git_sha,
+            source=source, cohort=args.cohort, budget_usd=args.budget_usd, costs=charges, git_sha=args.git_sha,
             market_manifest=market_manifest, market_issues=market_issues)
-        folder = output / source
+        # A new cohort may never replace the original source's frozen files.
+        folder = output / (source if args.cohort == "raw" else source + "-verified")
         folder.mkdir(exist_ok=True, mode=0o700)
         filenames = {"Resumen": "comparison", "Evolución": "daily", "Lotes": "lots",
             "Ventas": "trades", "Atribución": "attribution", "Índices": "benchmarks",
@@ -228,12 +233,12 @@ def main(argv: list[str] | None = None) -> int:
             for mode, models in (("theoretical", report.theoretical), ("budget", report.budget))})
         if args.excel:
             (folder / "model_results.xlsx").write_bytes(export_model_results_excel(report))
-        generated.append(dict(source=source, report_hash=report.manifest["report_hash"]))
-    _json(output / "manifest.json", dict(reports=generated,
+        generated.append(dict(source=source, cohort=args.cohort, report_hash=report.manifest["report_hash"]))
+    _json(output / ("manifest.json" if args.cohort == "raw" else "manifest-verified.json"), dict(reports=generated,
         outputs="Private retrospective simulations, never real executions or sent emails",
         csv_strings="Potential spreadsheet formulas escaped with a leading apostrophe; canonical strings retained in JSON"))
     # Log no positions, prices, account identity or absolute private paths.
-    print(json.dumps(dict(status="completed", sources=list(sources), reports=len(generated))))
+    print(json.dumps(dict(status="completed", sources=list(sources), cohort=args.cohort, reports=len(generated))))
     return 0
 
 

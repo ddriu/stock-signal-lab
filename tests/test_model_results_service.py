@@ -106,6 +106,80 @@ def test_growth_source_is_not_a_technical_fallback_or_score_mix():
     assert set(growth.signals.technical_entry_score) == {60, 86}
 
 
+def _growth_cohort_inputs():
+    _, bars = inputs()
+    frame = bars["SYNTHETIC"]
+    snapshots = []
+    for index in range(5):
+        day = frame.index[index].date().isoformat()
+        primary = dict(strategy_id="growth_momentum", label="Crecimiento + momentum",
+            status="Vigilancia activa" if index == 0 else "Entrada fuerte", score=88,
+            data_status="complete", entry_candidate=index != 0, as_of=day)
+        policy = dict(policy_version="dual_strategy_v1", ticker="SYNTHETIC", as_of=day,
+            primary=primary, comparative={}, position={})
+        if index != 3:
+            policy["data_quality"] = dict(version="daily_data_quality_v1", as_of=day,
+                status="review", block_entry=index == 1, metric_periods={})
+        snapshots.append(dict(id=index + 1, ticker="SYNTHETIC", analyzed_at=day,
+            created_at=(frame.iloc[index].close_at + pd.Timedelta(minutes=1)).isoformat(),
+            entry_label="Entrada fuerte", entry_score=90, price=100.0,
+            note=encode_policy_note("", policy)))
+    return pd.DataFrame(snapshots), bars
+
+
+def test_recorded_verified_growth_cohort_has_own_entries_without_changing_raw_original_reference():
+    snapshots, bars = _growth_cohort_inputs()
+    kwargs = dict(start="2025-01-02", end="2025-01-13", source="growth",
+                  costs=ExecutionCosts(0, 0, 0))
+    raw = build_model_results(snapshots, bars, **kwargs)
+    raw_explicit = build_model_results(snapshots, bars, cohort="raw", **kwargs)
+    verified = build_model_results(snapshots, bars, cohort="verified", **kwargs)
+    assert raw.manifest == raw_explicit.manifest
+    assert raw.theoretical["A"].metrics["executed_entries"] == 4
+    assert verified.theoretical["A"].metrics["executed_entries"] == 2
+    # Ineligible observations must remain in the activation state machine.
+    assert raw.theoretical["B"].metrics["executed_entries"] == 1
+    assert verified.theoretical["B"].metrics["executed_entries"] == 2
+    assert verified.signals["entry_label"].tolist() == ["Vigilancia activa",
+        "Sin entrada verificada", "Entrada fuerte", "Sin entrada verificada", "Entrada fuerte"]
+    assert verified.observations.coverage["blocked_entry_observations"] == 2
+    assert verified.manifest["cohort"] == "verified"
+    assert "cohort" not in raw.manifest
+    assert raw.manifest["report_hash"] != verified.manifest["report_hash"]
+    assert verified.manifest["original_reference_cohort"] == "raw"
+    pd.testing.assert_frame_equal(raw.original_reference.lots, verified.original_reference.lots)
+    for model in verified.theoretical.values():
+        assert all(row.entry_at > row.observed_at for row in model.lots.itertuples())
+    assert not set(raw.theoretical["A"].lots.event_id) & set(verified.theoretical["A"].lots.event_id)
+
+
+def test_late_same_session_verification_cannot_retroactively_create_an_executable_entry():
+    snapshots, bars = _growth_cohort_inputs()
+    # Keep only a blocked first strong observation; the later same-session
+    # revision is even available before the next open, but this conservative
+    # cohort deliberately uses the identical first-observation rule as raw.
+    first = snapshots.iloc[:2].copy()
+    later = first.iloc[-1].to_dict()
+    later["id"] = 99
+    later["created_at"] = (pd.Timestamp(later["created_at"]) + pd.Timedelta(hours=1)).isoformat()
+    from src.analysis_policy import decode_policy_note
+    policy = decode_policy_note(later["note"])
+    policy["data_quality"]["block_entry"] = False
+    later["note"] = encode_policy_note("", policy)
+    kwargs = dict(start="2025-01-02", end="2025-01-13", source="growth", cohort="verified")
+    before = build_model_results(first, bars, **kwargs)
+    after = build_model_results(pd.concat([first, pd.DataFrame([later])], ignore_index=True), bars, **kwargs)
+    pd.testing.assert_frame_equal(before.signals, after.signals)
+    assert all(model.lots.empty for model in after.theoretical.values())
+    assert after.observations.rejected.iloc[0]["reason"] == "later_revision"
+    assert after.benchmarks.outperformed_benchmark.isna().all()
+
+
+def test_unknown_quality_cohort_cannot_be_used_with_the_original_technical_source():
+    with pytest.raises(ValueError, match="cohort"):
+        build(source="technical", cohort="verified")
+
+
 def test_mismatched_config_or_obsolete_preparation_rejected():
     snapshots, bars = inputs()
     bars["SYNTHETIC"].attrs["strategy_config"]["sma_long"] = 201

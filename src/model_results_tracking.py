@@ -25,20 +25,69 @@ from src.strategy_audit_engine import _safe
 
 
 TRACKING_VERSION = "prospective-frozen-feed-v1"
+TRACKING_API_VERSION = "measurement-readiness-v2"
 _ROOT = Path(__file__).resolve().parents[1]
 _ENGINE_FILES = ("config.py", "src/indicators.py", "src/signal_engine.py",
     "src/position_evaluator.py", "src/backtesting.py", "src/strategy_audit_engine.py",
     "src/strategy_audit_data.py", "src/strategy_audit_service.py", "src/model_results_engine.py",
     "src/model_results_service.py", "src/model_results_store.py", "src/model_results_tracking.py",
     "src/price_units.py", "src/instruments.py", "src/analysis_policy.py")
+_GROWTH_INPUT_FILES = ("src/growth_momentum.py", "src/fundamentals.py",
+    "src/fundamental_filter.py", "src/opportunity.py", "src/risk.py",
+    "src/analysis_data_quality.py", "src/data_loader.py", "src/data_sources.py")
 
 
-def engine_identity() -> dict:
+class ModelTrackingBacklog(ModelResultsConflict):
+    """Several missed signal sessions cannot become accumulated future buys."""
+
+
+def engine_identity(source="technical", cohort="raw") -> dict:
+    if source not in {"technical", "growth"} or cohort not in {"raw", "verified"}:
+        raise ValueError("Invalid frozen identity source/cohort")
+    if source == "technical" and cohort != "raw":
+        raise ValueError("Technical reference has only its original raw cohort")
+    names = _ENGINE_FILES + (_GROWTH_INPUT_FILES if source == "growth" else ())
     hashes = {name: hashlib.sha256((_ROOT / name).read_bytes()).hexdigest()
-              for name in _ENGINE_FILES if (_ROOT / name).is_file()}
+              for name in names if (_ROOT / name).is_file()}
     runtime = runtime_versions()
-    return {"files": hashes, "strategy_config": asdict(StrategyConfig()), "runtime_versions": runtime,
-            "signature": content_hash([hashes, asdict(StrategyConfig())])}
+    result = {"files": hashes, "strategy_config": asdict(StrategyConfig()), "runtime_versions": runtime,
+              "signature": content_hash([hashes, asdict(StrategyConfig())])}
+    if source == "growth":
+        from src.growth_momentum import GrowthMomentumConfig
+        result.update(source=source, cohort=cohort, growth_config=asdict(GrowthMomentumConfig()),
+                      identity_scope="observed-growth-and-execution-v2")
+        result["signature"] = content_hash([hashes, result["strategy_config"],
+            result["growth_config"], source, cohort])
+    return result
+
+
+def _identity_for_manifest(manifest):
+    source, cohort = manifest.get("source", "technical"), manifest.get("cohort", "raw")
+    # Preserve the legacy default call contract for the original technical
+    # reference; growth must additionally freeze its own generator and gate.
+    return engine_identity() if (source, cohort) == ("technical", "raw") else engine_identity(source, cohort)
+
+
+def experiment_readiness(headers) -> dict:
+    """Pure, public status codes; no owner, downloads or ledger writes."""
+    manifests = [row.get("manifest", {}) for row in headers]
+    expected = {(mode, model) for mode in ("theoretical", "budget") for model in FROZEN_MODELS}
+    actual = {(row.get("mode"), row.get("strategy_key")) for row in manifests}
+    if len(manifests) != 8 or actual != expected:
+        return {"status": "partial_activation", "ready": False, "requires_new_experiment": False}
+    base = manifests[0]
+    frozen = base.get("engine_identity", {}).get("signature")
+    cohort = base.get("cohort", "raw")
+    if any((row.get("source"), row.get("cohort", "raw"), row.get("engine_identity", {}).get("signature"))
+           != (base.get("source"), cohort, frozen) for row in manifests):
+        return {"status": "inconsistent_headers", "ready": False, "requires_new_experiment": True}
+    try:
+        current = _identity_for_manifest(base)["signature"]
+    except (ValueError, KeyError, TypeError):
+        return {"status": "unsupported_source_or_cohort", "ready": False, "requires_new_experiment": True}
+    if frozen != current:
+        return {"status": "frozen_engine_changed", "ready": False, "requires_new_experiment": True}
+    return {"status": "ready", "ready": True, "requires_new_experiment": False}
 
 
 def git_revision() -> str:
@@ -75,7 +124,7 @@ def _append(store, season_id, *, run_id, now, events=(), snapshot=None):
 
 
 def activate_model_experiment(journal, audit_manifest: dict, *, now=None,
-        source="technical", budget_usd=6000.0, costs: ExecutionCosts | None = None) -> str:
+        source="technical", cohort="raw", budget_usd=6000.0, costs: ExecutionCosts | None = None) -> str:
     """Explicit activation after a calculated audit; never called at import/load.
 
     Audit coverage is evidence, not a permission to claim profitability. The
@@ -87,9 +136,17 @@ def activate_model_experiment(journal, audit_manifest: dict, *, now=None,
         raise ValueError("Calculate and retain a retrospective audit manifest first")
     if source not in {"technical", "growth"} or not math.isfinite(budget_usd) or budget_usd < 100:
         raise ValueError("Invalid source or virtual budget")
+    if audit_manifest.get("source", source) != source:
+        raise ValueError("Activation source must match its retained retrospective audit")
     when, costs = _clock(now), costs or ExecutionCosts()
     costs.validate()
-    identity = engine_identity()
+    identity = _identity_for_manifest({"source": source, "cohort": cohort})
+    if audit_manifest.get("cohort", "raw") != cohort:
+        raise ValueError("Activation cohort must match its retained retrospective audit")
+    if cohort == "verified":
+        from src.strategy_audit_data import VERIFIED_COHORT_VERSION
+        if audit_manifest.get("cohort_version") != VERIFIED_COHORT_VERSION:
+            raise ValueError("Verified activation requires its matching recorded cohort version")
     experiment_id = content_hash([source, when.isoformat(), content_hash(audit_manifest), identity["signature"]])
     store = create_model_results_store(journal)
     for mode in ("theoretical", "budget"):
@@ -100,6 +157,8 @@ def activate_model_experiment(journal, audit_manifest: dict, *, now=None,
                 initial_cash_usd=budget_usd if mode == "budget" else 0.0,
                 funding_rule="initial_fixed" if mode == "budget" else "external_100_per_entry",
                 engine_version=TRACKING_VERSION, experiment_id=experiment_id, source=source,
+                cohort=cohort,
+                cohort_version=audit_manifest.get("cohort_version"),
                 frozen_spec=asdict(spec), execution_costs=asdict(costs), budget_usd=budget_usd,
                 engine_identity=identity, git_sha=git_revision(),
                 audit_manifest_hash=content_hash(audit_manifest),
@@ -108,17 +167,18 @@ def activate_model_experiment(journal, audit_manifest: dict, *, now=None,
                 limitations=["Public daily OHLC and previous daily FX, not executable bid/ask quotes",
                     "No real trades, taxes, cash dividends or broker settlement delays",
                     "D may exhaust its cash and cannot then represent the full A cohort"]))
+    initialize_model_experiment(journal, experiment_id, now=when)
     return experiment_id
 
 
-def resume_model_activation(journal, experiment_id: str):
+def resume_model_activation(journal, experiment_id: str, *, now=None):
     """Repair headers after a crash, using their original clocks/settings/SHA."""
     store = create_model_results_store(journal)
     known = [row for row in store.list_seasons() if row["manifest"].get("experiment_id") == experiment_id]
     if not known:
         raise ValueError("No activation headers found for this owner")
     base = known[0]["manifest"]
-    if base["engine_identity"]["signature"] != engine_identity()["signature"]:
+    if base["engine_identity"]["signature"] != _identity_for_manifest(base)["signature"]:
         raise ModelResultsConflict("Engine changed; partial activation cannot be resumed with different rules")
     for mode in ("theoretical", "budget"):
         for model, spec in FROZEN_MODELS.items():
@@ -127,6 +187,7 @@ def resume_model_activation(journal, experiment_id: str):
                 "initial_cash_usd": base["budget_usd"] if mode == "budget" else 0.0,
                 "funding_rule": "initial_fixed" if mode == "budget" else "external_100_per_entry"}
             store.create_season(manifest)
+    initialize_model_experiment(journal, experiment_id, now=now)
     return experiment_id
 
 
@@ -136,6 +197,43 @@ def _seasons(store, experiment_id):
     if len(by_key) != 8:
         raise ValueError("An experiment requires all eight immutable model/mode headers")
     return by_key
+
+
+def initialize_model_experiment(journal, experiment_id, *, now=None):
+    """Record only explicit activation cash at its real clock, never old NAVs.
+
+    Called by activation/resume, not by the scheduled collector. A persisted
+    manifest fixes the activation clock and cash values. Missing rows resumed
+    later retain their real later availability, never a backdated snapshot.
+    """
+    store = create_model_results_store(journal)
+    seasons = _seasons(store, experiment_id)
+    readiness = experiment_readiness(list(seasons.values()))
+    if not readiness["ready"]:
+        raise ModelResultsConflict("Activation requires matching frozen headers")
+    collected = _clock(now)
+    for (mode, model), row in seasons.items():
+        manifest, sid = row["manifest"], row["season_id"]
+        run_id = "activation-" + experiment_id
+        if any(item["run_id"] == run_id for item in store.list_snapshots(sid)):
+            continue
+        activation = _clock(manifest["activation_at"])
+        if collected < activation:
+            raise ValueError("Initial cash cannot be recorded before its explicit activation")
+        when = max(activation, collected)
+        cash = float(manifest["initial_cash_usd"])
+        snapshot = dict(available_at=when.isoformat(), snapshot_kind="activation",
+            activation_at=activation.isoformat(),
+            engine_version=TRACKING_VERSION, source=manifest["source"],
+            cohort=manifest.get("cohort", "raw"), coverage_complete=False,
+            cohort_version=manifest.get("cohort_version"),
+            metrics=dict(initial_cash_usd=cash, final_value_usd=cash,
+                         net_return_pct=None, status="awaiting_first_market_collection"),
+            daily=[], lots=[], trades=[], benchmarks=[],
+            limitations=["Initial cash only; not measured performance or a historical backfill",
+                         "No model order or real trade was executed"])
+        _append(store, sid, run_id=run_id, now=when, snapshot=snapshot)
+    return experiment_id
 
 
 def _bar_rows(bars: dict, when: pd.Timestamp):
@@ -230,20 +328,40 @@ def advance_model_experiment(journal, experiment_id: str, snapshots, bars: dict,
     seasons = _seasons(store, experiment_id)
     feed_id = seasons[("theoretical", "A")]["season_id"]
     manifest = seasons[("theoretical", "A")]["manifest"]
-    if engine_identity()["signature"] != manifest["engine_identity"]["signature"]:
+    if _identity_for_manifest(manifest)["signature"] != manifest["engine_identity"]["signature"]:
         raise ModelResultsConflict("Frozen engine changed: start a separately versioned experiment, never rewrite this one")
     activation = _clock(manifest["activation_at"])
     if when < activation:
         raise ValueError("The collector cannot run before activation")
     prior = store.list_events(feed_id)
     known = {row["event_id"]: row for row in prior}
+    if any(row["payload"].get("code") == "collector_backlog_requires_new_season" for row in prior):
+        raise ModelTrackingBacklog("Collector backlog remains paused; separately activate a new experiment")
     feed, incidents = [], []
-    signal_set = normalize_audit_signals(snapshots, source=manifest["source"])
+    cohort = manifest.get("cohort", "raw")
+    signal_set = (normalize_audit_signals(snapshots, source=manifest["source"])
+        if cohort == "raw" else normalize_audit_signals(snapshots, source=manifest["source"], cohort=cohort))
     normalized = signal_set.signals
+    if not normalized.empty:
+        # Future source rows cannot affect baseline, backlog detection or any
+        # incident at this collection clock, not merely the later order loop.
+        normalized = normalized.loc[normalized.observed_at <= when]
     first_collection = not any(row["payload"].get("feed_kind") == "signal" for row in prior)
     if not normalized.empty:
         baseline = normalized.loc[normalized.observed_at < activation].sort_values("observed_at").groupby("ticker").tail(1)
         eligible = normalized.loc[normalized.observed_at >= activation]
+        unseen = eligible.loc[eligible.event_id.map(
+            lambda source_id: deterministic_event_id("observation", ["signal", source_id]) not in known)]
+        if not unseen.empty and (unseen.groupby("ticker").signal_session.nunique() > 1).any():
+            # A missing collector cannot turn several old daily allocations
+            # into accumulated buys at today's next opening. Preserve the old
+            # experiment and require explicit operator reconciliation instead.
+            incident = _event("incident", ["collector_backlog", sorted(unseen.event_id.astype(str))], when,
+                {"code": "collector_backlog_requires_new_season", "requires_new_season": True,
+                 "uncollected_sessions": int(len(unseen)), "no_economic_backfill": True})
+            _append(store, feed_id, run_id="collector-backlog-" + incident["event_id"],
+                    now=when, events=[incident])
+            raise ModelTrackingBacklog("Several uncollected signal sessions require a separately activated experiment; no economic backfill")
         if first_collection:
             eligible = pd.concat([baseline, eligible])
         for row in eligible.to_dict("records"):
@@ -397,6 +515,8 @@ def advance_model_experiment(journal, experiment_id: str, snapshots, bars: dict,
                          "provider_revision_detected": has_revisions}))
             snapshot = dict(available_at=when.isoformat(), engine_version=TRACKING_VERSION,
                 input_hash=input_hash, git_sha=git_revision(), source=manifest["source"],
+                cohort=cohort, snapshot_kind="market_collection",
+                cohort_version=manifest.get("cohort_version"),
                 runtime_versions=runtime_versions(),
                 runtime_differs_from_activation=runtime_versions() != manifest["engine_identity"].get("runtime_versions"),
                 metrics=_safe(report.metrics) if trusted else None,
@@ -436,7 +556,7 @@ def record_model_email_evidence(journal, receipt, delivery_id, *, evaluated_at=N
     Gate is off by default, and must be enabled alongside scheduled tracking.
     Sender stubs returning None are never upgraded into confirmed SMTP events.
     """
-    if os.getenv("MODEL_RESULTS_ENABLED", "0").lower() not in {"1", "true"}:
+    if os.getenv("MODEL_RESULTS_ENABLED", "0").strip().lower() not in {"1", "true", "yes", "on"}:
         return
     store = create_model_results_store(journal)
     seasons = [row for row in store.list_seasons() if row["manifest"].get("engine_version") == TRACKING_VERSION]

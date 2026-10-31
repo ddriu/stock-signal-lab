@@ -199,11 +199,12 @@ def _matched_hold(signals: pd.DataFrame, bars: Mapping[str, pd.DataFrame], model
 
 def build_model_results(snapshots: pd.DataFrame, bars: Mapping[str, pd.DataFrame], *,
                         start: object, end: object, source: str = "technical",
+                        cohort: str = "raw",
                         budget_usd: float = 6000.0, costs: ExecutionCosts | None = None,
                         git_sha: str = "unknown", benchmark_bars: Mapping[str, pd.DataFrame] | None = None,
                         market_manifest: Mapping[str, object] | None = None,
                         market_issues: pd.DataFrame | None = None) -> ModelResultsReport:
-    """Build independent technical OR growth models; never merge their scores."""
+    """Build separate sources/cohorts; the default raw reference is unchanged."""
     if not bars:
         raise ValueError("No prepared market inputs available; do not present an unexecuted portfolio as a strategy result")
     strategy = asdict(StrategyConfig())
@@ -214,7 +215,7 @@ def build_model_results(snapshots: pd.DataFrame, bars: Mapping[str, pd.DataFrame
         version = frame.attrs.get("audit_data_version")
         if version is not None and version != AUDIT_DATA_VERSION:
             raise ValueError(f"Prepared cache version mismatch for {ticker}; download/reprepare explicitly")
-    observed = normalize_audit_signals(snapshots, source=source)
+    observed = normalize_audit_signals(snapshots, source=source, cohort=cohort)
     charges = costs or ExecutionCosts()
     theoretical = run_frozen_models(observed.signals, bars, start=start, end=end,
                                    mode="theoretical", git_sha=git_sha)
@@ -273,7 +274,9 @@ def build_model_results(snapshots: pd.DataFrame, bars: Mapping[str, pd.DataFrame
                     if comparable else "N/D: sin entradas o cobertura/valoración incompleta; no se afirma superación")
                 benchmark_rows.append(dict(mode=mode, model=model_id, benchmark=ticker,
                     benchmark_name=name, source=source, **row))
-    original = run_strategy_audit(observed.signals, bars, AuditConfig(start=start, end=end,
+    original_observations = (observed if cohort == "raw" else
+                             normalize_audit_signals(snapshots, source=source, cohort="raw"))
+    original = run_strategy_audit(original_observations.signals, bars, AuditConfig(start=start, end=end,
         amount_usd=100, entry_mode="daily", exit_policy="original"))
     legacy = _legacy_reference(bars, start, end)
     issue_tables = []
@@ -307,6 +310,12 @@ def build_model_results(snapshots: pd.DataFrame, bars: Mapping[str, pd.DataFrame
             "Fuentes técnica y crecimiento se calculan por separado, sin fusionar notas.",
             "Benchmarks presupuestarios reciben una sola aportación inicial; los teóricos, las aportaciones ejecutadas de cada modelo.",
             "Una referencia incompleta sigue N/D. No se selecciona un ganador automáticamente."])
+    if cohort != "raw":
+        manifest.update(cohort=cohort, cohort_version=observed.manifest["cohort_version"],
+            cohort_rule=observed.manifest["entry_selection"],
+            original_reference_cohort="raw",
+            original_reference_observations=original_observations.manifest)
+        manifest["limitations"].extend(observed.manifest["cohort_limitations"])
     manifest["report_hash"] = _hash(manifest)
     return ModelResultsReport(observed, theoretical, budget, pd.DataFrame(benchmark_rows),
                               original, legacy, issues, manifest, matched_hold, pd.DataFrame(hold_rows))
