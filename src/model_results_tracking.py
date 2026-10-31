@@ -285,13 +285,13 @@ def _reconstruct_feed(events):
         frame.index = pd.to_datetime(frame.index)
         for col in ("open_at", "close_at", "close_available_at", "source_close_available_at"):
             if col in frame:
-                frame[col] = pd.to_datetime(frame[col], utc=True)
+                frame[col] = pd.to_datetime(frame[col], utc=True, format="ISO8601")
         frame.attrs.update(attrs.get(ticker, {}))
         frame.attrs["display_currency"] = records[0].get("currency", "")
         bars[ticker] = frame
     signals = pd.DataFrame(observations)
     if not signals.empty:
-        signals["observed_at"] = pd.to_datetime(signals.observed_at, utc=True)
+        signals["observed_at"] = pd.to_datetime(signals.observed_at, utc=True, format="ISO8601")
     return signals, bars, proposals
 
 
