@@ -9,6 +9,8 @@ import importlib
 import inspect
 import sys
 
+RUNTIME_COMPAT_VERSION = "virtual-summary-v1"
+
 
 ANALYSIS_MODULE_ORDER = (
     "src.data_sources", "src.data_loader", "src.analysis_data_quality",

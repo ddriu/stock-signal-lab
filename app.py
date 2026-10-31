@@ -19,7 +19,11 @@ import pandas as pd
 import streamlit as st
 
 from config import BacktestConfig, StrategyConfig
-from src.runtime_compat import prepare_analysis_runtime
+import src.runtime_compat as _analysis_runtime_module
+
+if getattr(_analysis_runtime_module, "RUNTIME_COMPAT_VERSION", "") != "virtual-summary-v1":
+    _analysis_runtime_module = importlib.reload(_analysis_runtime_module)
+prepare_analysis_runtime = _analysis_runtime_module.prepare_analysis_runtime
 
 prepare_analysis_runtime()
 
