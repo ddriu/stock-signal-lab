@@ -19,6 +19,8 @@ import pandas as pd
 import streamlit as st
 
 from config import BacktestConfig, StrategyConfig
+from src.session_journal import session_journal
+from src.view_cache import get_or_build_view, invalidate_view_cache
 import src.runtime_compat as _analysis_runtime_module
 
 if getattr(_analysis_runtime_module, "RUNTIME_COMPAT_VERSION", "") != "virtual-summary-v1":
@@ -1235,6 +1237,10 @@ def load_market_data(
     # descartan sólo cuando se actualizan precios; cambiar de pestaña no obliga
     # a repetir la simulación.
     st.session_state.pop("backtest_results", None)
+    st.session_state["_market_view_revision"] = int(
+        st.session_state.get("_market_view_revision", 0)
+    ) + 1
+    invalidate_view_cache(st.session_state)
     return refreshed_tickers
 
 
@@ -5119,16 +5125,6 @@ def render_journal(
         ),
         key=f"{view_key}_fixed_fee",
     )
-    operations = journal.list_operations()
-    positions = journal.open_positions()
-    latest_prices, _ = recent_market_prices(prepared)
-    positions_dashboard, portfolio_kpis = build_position_dashboard(
-        operations,
-        positions,
-        latest_prices,
-        fx_snapshot.rates_per_eur,
-        sell_fee_eur=float(fixed_fee),
-    )
     current_portfolio_enabled = not shared
     alternative_investments_enabled = (
         current_portfolio_enabled and actor_username.strip().lower() == "ddriu"
@@ -5143,18 +5139,24 @@ def render_journal(
     ]
     if current_portfolio_enabled:
         tab_labels.append("Mi cartera actual")
-    journal_tabs = st.tabs(tab_labels)
-    (
-        positions_tab,
-        real_result_tab,
-        register_tab,
-        evolution_tab,
-        switch_tab,
-        history_tab,
-    ) = journal_tabs[:6]
-    private_tab = journal_tabs[6] if current_portfolio_enabled else None
+    selected_section = render_subnavigation(
+        "Contenido de cartera", tab_labels, key=f"{view_key}_journal_navigation"
+    )
+    if selected_section == "Comprar / vender":
+        render_operation_form(
+            journal,
+            form_key=f"{view_key}_operation_form",
+            fixed_fee=float(fixed_fee),
+            owner_label="la cartera del grupo" if shared else None,
+            flash_key=flash_key,
+            recorded_by=actor_username,
+            notes_label="Motivo o acuerdo del grupo" if shared else "Notas",
+        )
+        return
 
-    with real_result_tab:
+    operations = journal.list_operations()
+    if selected_section == "Resultado real aproximado":
+        latest_prices, _ = recent_market_prices(prepared)
         render_approximate_returns(
             operations,
             latest_prices,
@@ -5168,34 +5170,9 @@ def render_journal(
             view_key=view_key,
             recorded_by=actor_username,
         )
+        return
 
-    with register_tab:
-        render_operation_form(
-            journal,
-            form_key=f"{view_key}_operation_form",
-            fixed_fee=float(fixed_fee),
-            owner_label="la cartera del grupo" if shared else None,
-            flash_key=flash_key,
-            recorded_by=actor_username,
-            notes_label="Motivo o acuerdo del grupo" if shared else "Notas",
-        )
-
-    private_investments = pd.DataFrame()
-    portfolio_accounts = pd.DataFrame()
-    if private_tab is not None:
-        with private_tab:
-            private_investments, portfolio_accounts = render_private_investments(
-                journal,
-                actor_username=actor_username,
-                view_key=view_key,
-                operations=operations,
-                positions_dashboard=positions_dashboard,
-                prepared=prepared,
-                fx_snapshot=fx_snapshot,
-                include_alternative_investments=alternative_investments_enabled,
-            )
-
-    with history_tab:
+    if selected_section == "Historial":
         st.subheader("Histórico")
         if operations.empty:
             st.info("El diario todavía está vacío.")
@@ -5290,8 +5267,49 @@ def render_journal(
                 ):
                     st.session_state[delete_pending_key] = int(operation_id)
                     st.rerun()
+        return
 
-    with evolution_tab:
+    positions = journal.open_positions()
+    latest_prices, _ = recent_market_prices(prepared)
+    positions_dashboard, portfolio_kpis = build_position_dashboard(
+        operations,
+        positions,
+        latest_prices,
+        fx_snapshot.rates_per_eur,
+        sell_fee_eur=float(fixed_fee),
+    )
+    if selected_section == "Mi cartera actual" and current_portfolio_enabled:
+        render_private_investments(
+            journal,
+            actor_username=actor_username,
+            view_key=view_key,
+            operations=operations,
+            positions_dashboard=positions_dashboard,
+            prepared=prepared,
+            fx_snapshot=fx_snapshot,
+            include_alternative_investments=alternative_investments_enabled,
+        )
+        return
+
+    if selected_section == "Evolución por años":
+        private_investments = pd.DataFrame()
+        portfolio_accounts = pd.DataFrame()
+        if alternative_investments_enabled:
+            try:
+                private_investments = journal.list_private_investments()
+            except (JournalStorageError, AttributeError):
+                st.error(
+                    "La tabla de inversiones privadas todavía no existe en Supabase. "
+                    "Ejecuta `supabase/migration_private_investments.sql` en SQL Editor."
+                )
+        if current_portfolio_enabled:
+            try:
+                portfolio_accounts = journal.list_portfolio_accounts()
+            except (JournalStorageError, AttributeError):
+                st.error(
+                    "La tabla de cuentas todavía no existe en Supabase. "
+                    "Ejecuta `supabase/migration_portfolio_accounts.sql` en SQL Editor."
+                )
         render_portfolio_evolution(
             operations=operations,
             positions_dashboard=positions_dashboard,
@@ -5301,6 +5319,7 @@ def render_journal(
             portfolio_accounts=portfolio_accounts,
             view_key=view_key,
         )
+        return
     analysis_rows: list[dict[str, object]] = []
     details: dict[str, dict[str, object]] = {}
     dashboard_by_position = {
@@ -5412,7 +5431,7 @@ def render_journal(
             "sell_fee": sell_fee_in_position_currency,
         }
 
-    with positions_tab:
+    if selected_section == "Posiciones analizadas":
         if positions.empty:
             st.info("Registra una compra para empezar a analizar tu cartera.")
         else:
@@ -5608,7 +5627,7 @@ def render_journal(
                     st.caption(
                         "No hay suficientes casos comparables para estimar un beneficio esperado."
                     )
-    with switch_tab:
+    if selected_section == "Comparar un cambio":
         if not details:
             st.info("Registra y actualiza al menos una posición para comparar cambios.")
         else:
@@ -5886,7 +5905,7 @@ def render_admin_panel(
     summary_rows: list[dict[str, object]] = []
 
     for username in usernames:
-        journal = cached_journal(username)
+        journal = session_journal(cached_journal(username), st.session_state)
         operations = journal.list_operations()
         positions = calculate_open_positions(operations)
         portfolio_snapshot = pd.DataFrame()
@@ -6963,6 +6982,87 @@ def _enrich_current_analysis_policy(
     )
 
 
+def _analysis_view_context(raw_data, raw_fundamentals, reference_data, strategy, journal):
+    """Reuse pure analysis on navigation; fresh data/configuration invalidate it.
+
+    The owner-scoped journal reads below are small and cached separately. The
+    input history is never hashed in full on every click. Provider loads always
+    replace frames and increment _market_view_revision before returning here.
+    """
+    if not raw_data:
+        return {}, [], {}, {}, {}, {}, {}
+    positions = pd.DataFrame()
+    if hasattr(journal, "list_portfolio_snapshot_positions"):
+        try:
+            positions, _ = latest_portfolio_snapshot(journal.list_portfolio_snapshot_positions())
+        except (JournalStorageError, ValueError, AttributeError):
+            pass
+    held = _portfolio_tracking_tickers(journal)
+    position_hash = sha256(positions.to_json(date_format="iso").encode("utf-8")).hexdigest()
+    dependencies = {
+        "market_revision": int(st.session_state.get("_market_view_revision", 0)),
+        "journal_revision": int(st.session_state.get("_view_data_revision", 0)),
+        "source_objects": [id(raw_data), id(raw_fundamentals), id(reference_data)],
+        "valuation_day": date.today().isoformat(),
+        "strategy": asdict(strategy), "positions": position_hash, "held": sorted(held),
+    }
+
+    def build():
+        prepared, summary, fundamentals, valuations, relatives, risks, opportunities = prepare_data(
+            raw_data, raw_fundamentals, reference_data, strategy,
+        )
+        if summary:
+            summary = _enrich_current_analysis_policy(
+                summary, prepared, raw_fundamentals, reference_data, relatives, risks,
+                strategy=strategy, position_snapshot=positions, held_tickers=held,
+            )
+        return prepared, summary, fundamentals, valuations, relatives, risks, opportunities
+
+    result = get_or_build_view(st.session_state, owner=journal.owner,
+        view="analysis_context", dependencies=dependencies, builder=build,
+        version="fast-navigation-v1", max_entries=1)
+    st.session_state["_analysis_view_cache_hit"] = result.cache_hit
+    return result.value
+
+
+def _bind_navigation_owner(owner: str) -> None:
+    """Never reuse another authenticated account's local market/view context."""
+    previous = st.session_state.get("_navigation_view_owner")
+    if previous is not None and previous != owner:
+        invalidate_view_cache(st.session_state)
+        for key in st.session_state.get("_navigation_sidebar_values", {}):
+            st.session_state.pop(key, None)
+        for key in ("market_data", "fundamental_data", "reference_data", "price_verifications",
+                    "fx_snapshot", "backtest_results", "download_errors", "quick_mode_tickers",
+                    "_ssl_session_journal_reads", "_pending_analysis_ticker", "analysis_ticker",
+                    "_requested_analysis_ticker", "_growth_scan_tickers",
+                    "_portfolio_market_refresh_requested", "_force_all_favorite_refresh",
+                    "_navigation_sidebar_values"):
+            st.session_state.pop(key, None)
+        st.session_state["_market_view_revision"] = int(st.session_state.get("_market_view_revision", 0)) + 1
+        st.session_state["_view_data_revision"] = int(st.session_state.get("_view_data_revision", 0)) + 1
+    st.session_state["_navigation_view_owner"] = owner
+
+
+def _remember_analysis_controls(*, restore=False) -> None:
+    """Preserve controls when a page does not render their widget groups."""
+    names = {"strategy_profile", "selected_favorite_tickers", "manual_tickers",
+             "analysis_years", "analysis_end", "auto_adjust_prices", "alpha_vantage_key",
+             "home_view_navigation", "private_journal_navigation", "group_journal_navigation",
+             "analysis_navigation", "analysis_company_navigation", "analysis_strategy_navigation",
+             "analysis_validation_navigation", "portfolio_navigation", "favorite_view", "more_navigation"}
+    if restore:
+        for key, value in st.session_state.get("_navigation_sidebar_values", {}).items():
+            if key not in st.session_state:
+                st.session_state[key] = value
+    else:
+        saved = dict(st.session_state.get("_navigation_sidebar_values", {}))
+        for key in st.session_state:
+            if str(key).startswith("cfg_") or key in names:
+                saved[key] = st.session_state[key]
+        st.session_state["_navigation_sidebar_values"] = saved
+
+
 def render_automatic_review_status(username: str) -> None:
     """Muestra el avance compartido por las vistas que recorren el universo."""
 
@@ -7426,6 +7526,8 @@ def _paper_tracking_tickers(journal: object) -> list[str]:
 
 def _request_portfolio_market_refresh() -> None:
     """Solicita una descarga nueva desde Inicio o Cartera en el siguiente rerun."""
+    st.session_state.pop("_ssl_session_journal_reads", None)
+    invalidate_view_cache(st.session_state)
 
     st.session_state["_portfolio_market_refresh_requested"] = True
 
@@ -10138,6 +10240,18 @@ def render_analysis_company_picker(
                     st.rerun()
 
 
+def _render_home_shortcuts() -> None:
+    st.markdown("### Accesos directos")
+    st.caption("Elige una tarea. Aquí no se mezclan resultados ni propuestas de inversión.")
+    action_a, action_b, action_c = st.columns(3)
+    action_a.button("Abrir análisis", icon=":material/monitoring:", width="stretch",
+                    on_click=_set_navigation, args=("Analizar",))
+    action_b.button("Buscar y guardar", icon=":material/favorite:", width="stretch",
+                    on_click=_set_navigation, args=("Favoritos",))
+    action_c.button("Abrir mi cartera", icon=":material/account_balance_wallet:", width="stretch",
+                    on_click=_set_navigation, args=("Carteras", "portfolio_navigation", "Privada"))
+
+
 def render_home(
     user: AuthConfig,
     journal: object,
@@ -10157,6 +10271,14 @@ def render_home(
         on_click=_request_analysis_page,
         args=("Resumen diario",),
     )
+    home_view = render_subnavigation(
+        "Qué quieres ver en Inicio",
+        ["Resumen", "Decisiones", "Laboratorio", "Accesos"],
+        key="home_view_navigation",
+    )
+    if home_view == "Accesos":
+        _render_home_shortcuts()
+        return
     stored_snapshots = pd.DataFrame()
     reconciled_report = None
     latest_snapshot = pd.DataFrame()
@@ -10220,12 +10342,6 @@ def render_home(
             f"Hola, {user.display_name}. Tu situación y lo que merece atención · {update_text}.",
         )
 
-    home_view = render_subnavigation(
-        "Qué quieres ver en Inicio",
-        ["Resumen", "Decisiones", "Laboratorio", "Accesos"],
-        key="home_view_navigation",
-    )
-
     if home_view == "Resumen":
         render_analysis_approach_overview()
         refresh_a, refresh_b = st.columns([1.6, 1])
@@ -10238,7 +10354,8 @@ def render_home(
                 )
             st.caption(
                 "Las cantidades y costes proceden de tu cartera. Los precios cotizados "
-                "se revisan al cargar la aplicación; el correo tiene su proceso diario. "
+                "se actualizan al solicitarlo; navegar reutiliza lo ya cargado. "
+                "El correo tiene su proceso diario independiente. "
                 "Fondos e inversiones sin ticker "
                 "conservan su último valor manual."
             )
@@ -10629,35 +10746,6 @@ def render_home(
             "El laboratorio compara sólo activos cotizados. Civislend, Segofactoring, "
             "efectivo y partidas sin ticker siguen en tu patrimonio real, pero no se operan aquí."
         )
-
-    if home_view == "Accesos":
-        st.markdown("### Accesos directos")
-        st.caption(
-            "Elige una tarea. Aquí no se mezclan resultados ni propuestas de inversión."
-        )
-        action_a, action_b, action_c = st.columns(3)
-        action_a.button(
-            "Abrir análisis",
-            icon=":material/monitoring:",
-            width="stretch",
-            on_click=_set_navigation,
-            args=("Analizar",),
-        )
-        action_b.button(
-            "Buscar y guardar",
-            icon=":material/favorite:",
-            width="stretch",
-            on_click=_set_navigation,
-            args=("Favoritos",),
-        )
-        action_c.button(
-            "Abrir mi cartera",
-            icon=":material/account_balance_wallet:",
-            width="stretch",
-            on_click=_set_navigation,
-            args=("Carteras", "portfolio_navigation", "Privada"),
-        )
-
 
 def render_opportunities_page(
     raw_data: dict[str, pd.DataFrame],
@@ -14777,10 +14865,13 @@ def render_methodology() -> None:
 def main() -> None:
     apply_visual_theme()
     authenticated_user = require_login()
+    _bind_navigation_owner(authenticated_user.username)
+    _remember_analysis_controls()
+    _remember_analysis_controls(restore=True)
     accounts = load_auth_accounts()
     try:
-        journal = cached_journal(authenticated_user.username)
-        group_journal = cached_journal(GROUP_PORTFOLIO_OWNER)
+        journal = session_journal(cached_journal(authenticated_user.username), st.session_state)
+        group_journal = session_journal(cached_journal(GROUP_PORTFOLIO_OWNER), st.session_state)
     except JournalStorageError as exc:
         st.error(str(exc))
         st.stop()
@@ -15000,6 +15091,20 @@ def main() -> None:
 
     layout_analysis_section = analysis_detail or analysis_section
     apply_section_layout(str(selected_section), layout_analysis_section)
+    # These screens do not consume market analysis. Returning before the shared
+    # sidebar/load/prepare path also leaves pending explicit work for its page.
+    if selected_section == "Más" and more_section != "Administración":
+        if more_section == "Alertas por correo":
+            if persistent_journal_enabled():
+                render_email_alert_settings(journal)
+            else:
+                st.warning("Las alertas necesitan almacenamiento persistente.")
+        else:
+            render_methodology()
+        return
+    if selected_section == "Carteras" and portfolio_section == "Plan de capital":
+        render_capital_projection_page(authenticated_user.username)
+        return
     requested_digest = st.query_params.get("digest")
     if (
         selected_section == "Analizar" and analysis_section == "Resumen diario"
@@ -15010,6 +15115,27 @@ def main() -> None:
         render_daily_score_page(
             journal, report_id=str(requested_digest) if requested_digest else None,
         )
+        return
+    if selected_section == "Inicio" and st.session_state.get("home_view_navigation") == "Accesos":
+        render_home(authenticated_user, journal, group_journal, {}, {}, [],
+                    st.session_state.get("fx_snapshot", FxSnapshot(as_of=None, rates_per_eur={"EUR": 1.0})),
+                    pd.DataFrame(), pd.DataFrame(), section="Hoy")
+        return
+    if (selected_section == "Carteras" and portfolio_section in {"Privada", "Grupo"}
+            and st.session_state.get(f"{'private' if portfolio_section == 'Privada' else 'group'}_journal_navigation")
+                in {"Historial", "Comprar / vender"}
+            and not st.session_state.get("_portfolio_market_refresh_requested")):
+        if persistent_journal_enabled():
+            render_journal({}, {}, {}, StrategyConfig(),
+                st.session_state.get("fx_snapshot", FxSnapshot(as_of=None, rates_per_eur={"EUR": 1.0})),
+                journal if portfolio_section == "Privada" else group_journal,
+                view_key="private" if portfolio_section == "Privada" else "group",
+                title="Mi cartera privada" if portfolio_section == "Privada" else "Cartera del grupo",
+                description="Movimientos guardados; navegar no actualiza el mercado.",
+                actor_username=authenticated_user.username,
+                shared=portfolio_section == "Grupo", can_delete_all=authenticated_user.is_admin)
+        else:
+            st.warning("Las carteras necesitan almacenamiento persistente.")
         return
     if (
         selected_section == "Analizar"
@@ -15054,6 +15180,19 @@ def main() -> None:
         private_favorites,
         group_favorites,
     )
+    if selected_section == "Favoritos":
+        if not persistent_journal_enabled():
+            st.warning("Los favoritos necesitan almacenamiento persistente.")
+        elif favorite_storage_error:
+            st.error(favorite_storage_error)
+        else:
+            render_favorites_manager(
+                journal, group_journal, private_favorites, group_favorites,
+                actor_username=authenticated_user.username,
+                is_admin=authenticated_user.is_admin, favorite_view=favorite_view,
+            )
+        return
+    _remember_analysis_controls(restore=True)
     (
         tickers,
         start,
@@ -15064,6 +15203,7 @@ def main() -> None:
         backtest,
         load_clicked,
     ) = build_sidebar(favorite_tickers, favorite_labels)
+    _remember_analysis_controls()
     if favorite_storage_error:
         st.sidebar.warning(
             "Los favoritos todavía no están disponibles. Hay que aplicar la "
@@ -15186,13 +15326,9 @@ def main() -> None:
     auto_refresh_date_key = f"_portfolio_auto_refresh_date_{review_suffix}"
     auto_refreshed_key = f"_portfolio_auto_refreshed_{review_suffix}"
     auto_refresh_total_key = f"_portfolio_auto_refresh_total_{review_suffix}"
-    portfolio_auto_refresh = (
-        selected_section in {"Inicio", "Carteras"}
-        and daily_refresh_due(
-            st.session_state.get(auto_refresh_key),
-            today=date.today(),
-        )
-    )
+    # Navigation is read-only. The scheduled close collector and an explicit
+    # refresh button own updates; opening a new session must not fetch prices.
+    portfolio_auto_refresh = False
     portfolio_refresh_cycle = bool(
         portfolio_refresh_requested or portfolio_auto_refresh
     )
@@ -15204,6 +15340,7 @@ def main() -> None:
         or portfolio_refresh_cycle
     )
     if should_load_market:
+        invalidate_view_cache(st.session_state, owner=authenticated_user.username)
         held_tickers: list[str] = []
         owners_to_load = [authenticated_user.username, GROUP_PORTFOLIO_OWNER]
         if authenticated_user.is_admin and load_clicked:
@@ -15478,31 +15615,7 @@ def main() -> None:
         relative_results,
         risk_results,
         opportunity_results,
-    ) = (
-        prepare_data(raw_data, raw_fundamentals, reference_data, strategy)
-        if raw_data
-        else ({}, [], {}, {}, {}, {}, {})
-    )
-    if summary:
-        policy_positions = pd.DataFrame()
-        if hasattr(journal, "list_portfolio_snapshot_positions"):
-            try:
-                policy_positions, _ = latest_portfolio_snapshot(
-                    journal.list_portfolio_snapshot_positions()
-                )
-            except (JournalStorageError, ValueError, AttributeError):
-                pass
-        summary = _enrich_current_analysis_policy(
-            summary,
-            prepared,
-            raw_fundamentals,
-            reference_data,
-            relative_results,
-            risk_results,
-            strategy=strategy,
-            position_snapshot=policy_positions,
-            held_tickers=_portfolio_tracking_tickers(journal),
-        )
+    ) = _analysis_view_context(raw_data, raw_fundamentals, reference_data, strategy, journal)
     policy_snapshots = {
         str(row["Ticker"]): row["Política de análisis"]
         for row in summary

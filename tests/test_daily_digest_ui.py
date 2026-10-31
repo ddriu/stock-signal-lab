@@ -180,6 +180,7 @@ import app as application
 from src.daily_digest import build_daily_score_report
 report = build_daily_score_report(pd.DataFrame(), as_of="2026-10-23")
 class Journal:
+    owner = "test"
     def list_analysis_snapshots(self): return pd.DataFrame()
     def list_favorites(self): return pd.DataFrame()
     def open_positions(self): return pd.DataFrame()

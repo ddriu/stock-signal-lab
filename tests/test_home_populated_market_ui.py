@@ -21,6 +21,7 @@ from src.auth import AuthConfig
 from src.indicators import add_indicators
 
 class ReadOnlyJournal:
+    owner = "qa"
     def list_favorites(self): return pd.DataFrame()
     def list_portfolio_snapshot_positions(self): return pd.DataFrame()
     def __getattr__(self, name):

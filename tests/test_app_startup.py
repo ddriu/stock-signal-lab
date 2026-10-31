@@ -101,6 +101,7 @@ def test_private_portfolio_exposes_broker_reconciliation_fields(
     app.session_state["_authenticated_user"] = "ddriu"
     app.session_state["main_navigation"] = "Carteras"
     app.session_state["portfolio_navigation"] = "Privada"
+    app.session_state["private_journal_navigation"] = "Comprar / vender"
 
     app.run()
 
