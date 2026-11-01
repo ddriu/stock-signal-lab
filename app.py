@@ -21,6 +21,8 @@ import streamlit as st
 from config import BacktestConfig, StrategyConfig
 from src.session_journal import session_journal
 from src.view_cache import get_or_build_view, invalidate_view_cache
+from src.market_cache_ui import hydrate_saved_market, valuation_frames, poll_saved_market_revision
+from src.portfolio_view_context import reconcile_home_views
 import src.runtime_compat as _analysis_runtime_module
 
 if getattr(_analysis_runtime_module, "RUNTIME_COMPAT_VERSION", "") != "virtual-summary-v1":
@@ -505,7 +507,7 @@ SIDEBAR_ANALYSIS_SECTIONS = {
 def apply_visual_theme() -> None:
     """Aplica una capa visual responsive sin alterar los componentes financieros."""
 
-    st.markdown(f"<style>{APP_CSS}</style>", unsafe_allow_html=True)
+    st.markdown(f"<style>/* ssl-ui: hourly-market-cache-v1 */{APP_CSS}</style>", unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=3_600, max_entries=350, show_spinner=False)
@@ -5156,7 +5158,7 @@ def render_journal(
 
     operations = journal.list_operations()
     if selected_section == "Resultado real aproximado":
-        latest_prices, _ = recent_market_prices(prepared)
+        latest_prices, _ = recent_market_prices(_valuation_market_data(prepared))
         render_approximate_returns(
             operations,
             latest_prices,
@@ -5270,7 +5272,7 @@ def render_journal(
         return
 
     positions = journal.open_positions()
-    latest_prices, _ = recent_market_prices(prepared)
+    latest_prices, _ = recent_market_prices(_valuation_market_data(prepared))
     positions_dashboard, portfolio_kpis = build_position_dashboard(
         operations,
         positions,
@@ -7020,7 +7022,7 @@ def _analysis_view_context(raw_data, raw_fundamentals, reference_data, strategy,
 
     result = get_or_build_view(st.session_state, owner=journal.owner,
         view="analysis_context", dependencies=dependencies, builder=build,
-        version="fast-navigation-v1", max_entries=1)
+        version="fast-navigation-v1", max_entries=4)
     st.session_state["_analysis_view_cache_hit"] = result.cache_hit
     return result.value
 
@@ -7037,7 +7039,8 @@ def _bind_navigation_owner(owner: str) -> None:
                     "_ssl_session_journal_reads", "_pending_analysis_ticker", "analysis_ticker",
                     "_requested_analysis_ticker", "_growth_scan_tickers",
                     "_portfolio_market_refresh_requested", "_force_all_favorite_refresh",
-                    "_navigation_sidebar_values"):
+                    "_navigation_sidebar_values", "_persistent_market_reads",
+                    "_cached_market_quotes", "_persistent_market_status", "_persistent_market_poll"):
             st.session_state.pop(key, None)
         st.session_state["_market_view_revision"] = int(st.session_state.get("_market_view_revision", 0)) + 1
         st.session_state["_view_data_revision"] = int(st.session_state.get("_view_data_revision", 0)) + 1
@@ -7335,14 +7338,25 @@ def render_opportunity_cards(
                 )
 
 
+def _valuation_market_data(prepared):
+    return valuation_frames(prepared, st.session_state.get("_cached_market_quotes", {}))
+
+
+@st.fragment(run_every=3600)
+def _refresh_saved_market_on_timer(journal):
+    if poll_saved_market_revision(journal, st.session_state):
+        st.rerun(scope="app")
+
+
 def _portfolio_snapshot(
     journal: object,
     prepared: dict[str, pd.DataFrame],
     fx_snapshot: FxSnapshot,
+    *, use_indicative: bool = True,
 ) -> tuple[pd.DataFrame, object]:
     operations = journal.list_operations()
     positions = calculate_open_positions(operations)
-    latest_prices, _ = recent_market_prices(prepared)
+    latest_prices, _ = recent_market_prices(_valuation_market_data(prepared) if use_indicative else prepared)
     return build_position_dashboard(
         operations,
         positions,
@@ -10295,7 +10309,8 @@ def render_home(
         except (JournalStorageError, ValueError) as exc:
             st.warning(f"No se pudo leer la fotografía de cartera: {exc}")
 
-    latest_prices, price_dates = recent_market_prices(prepared)
+    valuation_prepared = _valuation_market_data(prepared) if home_view != "Laboratorio" else prepared
+    latest_prices, price_dates = recent_market_prices(valuation_prepared)
     # Thesis/plan forms update comments on the persisted baseline only. Saving
     # derived quantities/marks back to that date would replay later trades twice.
     thesis_source_snapshot = latest_snapshot.copy(deep=True)
@@ -10354,11 +10369,24 @@ def render_home(
                 )
             st.caption(
                 "Las cantidades y costes proceden de tu cartera. Los precios cotizados "
-                "se actualizan al solicitarlo; navegar reutiliza lo ya cargado. "
+                "se leen de la caché horaria cuando está disponible; navegar no descarga. "
                 "El correo tiene su proceso diario independiente. "
                 "Fondos e inversiones sin ticker "
                 "conservan su último valor manual."
             )
+            saved_status = st.session_state.get("_persistent_market_status", {})
+            if saved_status.get("status") == "saved":
+                st.caption(
+                    f"Cabeceras guardadas: {saved_status.get('quotes', 0)}/{saved_status.get('requested', 0)} "
+                    f"símbolos · consulta al proveedor: {saved_status.get('latest_retrieval')}. "
+                    "Precios indicativos y posiblemente demorados, no cotizaciones en tiempo real. "
+                    "La hora de consulta no es la hora exacta del precio; las señales usan velas cerradas."
+                )
+            elif saved_status.get("status") in {"empty", "unavailable"}:
+                st.caption(
+                    "Caché horaria todavía sin cobertura utilizable: se conserva la valoración "
+                    "guardada. Puedes actualizar explícitamente; no se fabrican precios ni señales."
+                )
         refresh_b.button(
             "Actualizar precios ahora",
             icon=":material/refresh:",
@@ -10369,11 +10397,11 @@ def render_home(
 
     try:
         private_dashboard, private_kpis = _portfolio_snapshot(
-            journal, prepared, fx_snapshot
+            journal, prepared, fx_snapshot, use_indicative=home_view != "Laboratorio"
         )
         private_operations = journal.list_operations()
         group_dashboard, group_kpis = _portfolio_snapshot(
-            group_journal, prepared, fx_snapshot
+            group_journal, prepared, fx_snapshot, use_indicative=home_view != "Laboratorio"
         )
     except JournalStorageError as exc:
         st.warning(f"No se pudo construir el resumen de carteras: {exc}")
@@ -10386,7 +10414,7 @@ def render_home(
     try:
         reconciled_report = load_reconciled_portfolio(
             journal, stored_snapshots, private_operations,
-            prepared=prepared, rates_per_eur=fx_snapshot.rates_per_eur,
+            prepared=valuation_prepared, rates_per_eur=fx_snapshot.rates_per_eur,
             reference_date=date.today(),
             sector_by_ticker={
                 str(row.get("Ticker", "")): str(row["Sector"])
@@ -10403,8 +10431,10 @@ def render_home(
         latest_snapshot = reconciled_report.positions.copy()
         market_snapshot = reconciled_report.positions.copy()
     else:
-        latest_snapshot = reconcile_current_portfolio(latest_snapshot, private_operations, private_dashboard)
-        market_snapshot = reconcile_current_portfolio(market_snapshot, private_operations, private_dashboard)
+        latest_snapshot, market_snapshot = reconcile_home_views(
+            st.session_state, owner=journal.owner, latest_snapshot=latest_snapshot,
+            market_snapshot=market_snapshot, operations=private_operations,
+            positions_dashboard=private_dashboard, reconcile=reconcile_current_portfolio)
         if not latest_snapshot.empty:
             latest_snapshot, snapshot_summary = latest_portfolio_snapshot(latest_snapshot)
         if not market_snapshot.empty:
@@ -13020,7 +13050,8 @@ def render_growth_candidate_overview(
             "Empresa": row["Empresa"],
             "En cartera / peso": holding,
             "Señal de entrada": (
-                row["Lectura principal"] if row["Datos completos"] or row["Verificación empresarial"] == "Pendiente"
+                row["Lectura principal"] if quote_freshness(row.get("Fecha"), reference_date=reference_date).fresh
+                and (row["Datos completos"] or row["Verificación empresarial"] == "Pendiente")
                 else "Pendiente de datos recientes"
             ),
             "Qué revisar": row["Qué revisar"],
@@ -15595,6 +15626,24 @@ def main() -> None:
     for error in st.session_state.get("download_errors", []):
         st.warning(error)
 
+    if not should_load_market:
+        try:
+            cached_tickers = _portfolio_tracking_tickers(journal)
+            if selected_section == "Analizar":
+                cached_tickers = list(dict.fromkeys([
+                    *cached_tickers, *(favorite_tickers if automatic_review_page else tickers),
+                    *([active_analysis_ticker] if active_analysis_ticker else []),
+                ]))
+            hydrate_saved_market(journal, st.session_state, tickers=cached_tickers,
+                history=selected_section in {"Analizar", "Carteras"} or (
+                    selected_section == "Inicio" and st.session_state.get("home_view_navigation") == "Laboratorio"),
+                auto_adjust=auto_adjust, start=start, end=end)
+        except (JournalStorageError, ValueError, AttributeError):
+            # A missing cache/migration must never turn into a provider call or
+            # prevent access to the saved portfolio and explicit refresh button.
+            pass
+
+    _refresh_saved_market_on_timer(journal)
     raw_data: dict[str, pd.DataFrame] = st.session_state.get("market_data", {})
     raw_fundamentals: dict[str, dict[str, object]] = st.session_state.get(
         "fundamental_data", {}

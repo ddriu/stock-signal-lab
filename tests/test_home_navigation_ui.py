@@ -15,6 +15,7 @@ import streamlit as st
 import app as application
 
 class EmptyJournal:
+    owner = "test"
     def list_operations(self):
         return pd.DataFrame()
     def list_portfolio_snapshot_positions(self):

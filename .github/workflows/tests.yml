@@ -61,3 +61,6 @@ jobs:
 
       - name: Validar informes diarios privados y reserva de correo
         run: node scripts/validate_daily_digest_migration.mjs "$GITHUB_WORKSPACE"
+
+      - name: Validar caché de mercado privada y protección de escrituras
+        run: node scripts/validate_market_cache_migration.mjs "$GITHUB_WORKSPACE"
