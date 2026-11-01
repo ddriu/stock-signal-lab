@@ -21,8 +21,10 @@ análisis, informes o registros del laboratorio.
   reconstruye la vista si cambió la revisión; cambiar de pestaña no consulta
   proveedores ni reinicia el reloj horario.
 
-El proceso inicial se solicita explícitamente con `bootstrap=true` en Actions
-si se quieren preparar precios fuera del horario de mercado. No envía correo.
+La publicación inicial del workflow en `main` prepara la caché incluso fuera
+del horario de mercado. Una modificación posterior de ese mismo workflow puede
+repetir esa preparación. Para solicitarla manualmente existe `bootstrap=true`
+en Actions. Nunca envía correo.
 Las consultas manuales existentes siguen siendo explícitas e independientes.
 
 ## Precio indicativo no es una señal nueva
@@ -62,7 +64,7 @@ nunca como cobertura completa. No se publican listas privadas en logs ni Git.
 2. Publicar juntos el lector, el colector, la interfaz y el workflow.
 3. Configurar `SUPABASE_URL` y `SUPABASE_SECRET_KEY` en Actions como hasta ahora;
    el propietario queda limitado al dueño del repositorio.
-4. Ejecutar una preparación inicial y comprobar los contadores de caché. No se
+4. Comprobar la preparación inicial de despliegue y los contadores de caché. No se
    modifica ninguna preferencia de alertas ni se dispara `run_alerts`.
 
 Las pruebas Python utilizan SQLite y proveedores sintéticos. La validación

@@ -1,6 +1,9 @@
 name: Actualizar caché de mercado (sin señales ni correos)
 
 on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/hourly-market-cache.yml"]
   workflow_dispatch:
     inputs:
       bootstrap:
@@ -35,8 +38,9 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           BOOTSTRAP: ${{ inputs.bootstrap }}
+          DEPLOYMENT_EVENT: ${{ github.event_name }}
         run: |
-          if [ "$BOOTSTRAP" = "true" ]; then
+          if [ "$BOOTSTRAP" = "true" ] || [ "$DEPLOYMENT_EVENT" = "push" ]; then
             python -m scripts.refresh_market_cache --bootstrap
           else
             python -m scripts.refresh_market_cache
