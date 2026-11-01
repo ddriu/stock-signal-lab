@@ -11,8 +11,8 @@ análisis, informes o registros del laboratorio.
 - Precios: como máximo una consulta por hora durante sesión y hasta 90 minutos
   después del cierre. Festivos, pausas y cambios de hora se respetan.
 - Fundamentales: como máximo cada 24 horas, en lotes de 20 empresas, priorizando
-  las ausentes y más antiguas. Una cobertura inicial completa requiere varios
-  lotes; las ausentes no se convierten en ventas.
+  las ausentes y más antiguas. La preparación inicial puede cubrir todo el
+  universo acotado de hasta 200 empresas; las ausentes no se convierten en ventas.
 - Divisas: referencia diaria BCE, con fecha económica propia.
 - Inicio: cabeceras y última cotización guardada, sin descargar históricos.
 - Análisis: históricos comprimidos por instrumento y versiones fundamentales

@@ -108,7 +108,7 @@ def refresh_market_cache(journal, *, now=None, bootstrap=False, max_symbols=200,
     if now.tzinfo is None or pd.isna(now):
         raise ValueError("Refresh requires an aware clock")
     now = now.tz_convert("UTC")
-    if not 1 <= max_symbols <= 200 or not 0 <= fundamental_limit <= 25:
+    if not 1 <= max_symbols <= 200 or not 0 <= fundamental_limit <= (200 if bootstrap else 25):
         raise ValueError("Invalid collection limits")
     clock = clock or (lambda: pd.Timestamp.now(tz="UTC"))
     price_loader = price_loader or download_prices

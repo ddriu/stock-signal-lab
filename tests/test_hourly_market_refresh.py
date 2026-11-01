@@ -133,6 +133,21 @@ def test_weekend_is_inert_but_explicit_bootstrap_can_seed_closed_market(journal)
     assert saved["metadata"]["completed_price_date"] == "2026-10-30"
 
 
+def test_initial_bootstrap_can_cover_the_full_bounded_fundamental_universe(journal):
+    for number in range(30):
+        journal.add_favorite(f"SYN{number}")
+    providers = Providers()
+    with pytest.raises(ValueError):
+        providers.run(journal, fundamental_limit=200)
+    assert not providers.fundamental_calls
+    initial = providers.run(journal, now=WEEKEND, bootstrap=True, fundamental_limit=200)
+    assert initial.fundamentals_saved == 30
+    assert len(providers.fundamental_calls) == 30
+    repeated = providers.run(journal, now=WEEKEND, bootstrap=True, fundamental_limit=200)
+    assert repeated.fundamentals_saved == 0
+    assert len(providers.fundamental_calls) == 30
+
+
 def test_fundamentals_rotate_twenty_then_missing_then_oldest_after_twenty_four_hours(journal):
     tickers = [f"T{index:03}" for index in range(25)]
     for ticker in tickers:
@@ -401,7 +416,7 @@ def test_public_cli_requires_explicit_scope_and_never_prints_owner_or_errors(mon
     monkeypatch.setattr(cli, "refresh_market_cache", refresh)
     assert cli.main(["--bootstrap"]) == 0
     assert created == [owner]
-    assert refreshed == [(sentinel, {"bootstrap": True})]
+    assert refreshed == [(sentinel, {"bootstrap": True, "fundamental_limit": 200})]
     output = capsys.readouterr()
     assert owner not in output.out + output.err
     assert "private watchlist" not in output.out + output.err

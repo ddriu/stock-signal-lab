@@ -17,7 +17,8 @@ def main(argv=None):
         print("Market cache: missing explicit backend scope/configuration; no work performed.")
         return 1
     try:
-        result = refresh_market_cache(create_journal(owner), bootstrap=args.bootstrap)
+        result = refresh_market_cache(create_journal(owner), bootstrap=args.bootstrap,
+                                      fundamental_limit=200 if args.bootstrap else 20)
     except Exception as exc:
         # Never print owners, symbols, backend responses or credentials in a
         # public workflow. Detailed provider strings are not needed here.
