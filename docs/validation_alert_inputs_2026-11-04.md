@@ -56,3 +56,13 @@ Las pruebas de interfaz cubren revisión ausente, parcial, completa, precios
 antiguos, errores de análisis y conservación del histórico. El arranque público
 en producción es una comprobación distinta de navegar dentro de una cuenta
 autenticada y no demuestra entrega de correo en una bandeja de entrada.
+
+## Limitación de almacenamiento pendiente
+
+La tabla heredada exige una puntuación comparativa no nula para guardar un
+análisis. Si ese comparador falla, todavía puede impedir guardar el análisis
+principal. Esta revisión no sustituye esa puntuación por cero ni mezcla notas
+de estrategias diferentes. La separación completa requiere una migración
+coordinada de SQLite y PostgreSQL y revisar sus consumidores. Los fallos de
+guardado se registran ahora por clase de excepción, sin publicar el mensaje
+privado; una observación no guardada no se presenta como un resultado de cero.

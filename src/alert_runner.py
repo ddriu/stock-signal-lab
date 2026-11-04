@@ -971,7 +971,11 @@ def run_daily_alerts(
                             )
                             saved_snapshot_keys.add(snapshot_key)
                             saved_policy_keys.add(policy_key)
-                        except Exception:
+                        except Exception as exc:
+                            errors.append(
+                                f"{owner} / {ticker}: no se pudo guardar el análisis "
+                                f"({type(exc).__name__}); no se confirma una señal persistida."
+                            )
                             data_notes.append("historial no guardado")
                             overview_row = replace(
                                 overview_row,
