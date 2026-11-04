@@ -1,0 +1,42 @@
+name: Revisión corregida individual solicitada 2026-11-04
+on:
+  push:
+    branches: ["codex/manual-corrected-review-20261104"]
+    paths: [".github/workflows/manual-corrected-review-20261104.yml"]
+permissions:
+  contents: read
+concurrency:
+  group: stock-signal-lab-daily-alerts
+  cancel-in-progress: false
+jobs:
+  corrected-review:
+    if: github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Comprobar límites de la revisión sin SMTP
+        env:
+          PYTHONPATH: .:diagnostics
+        run: python -m pytest -q diagnostics/test_manual_corrected_review_20261104.py
+      - name: Revisar el último cierre y enviar una corrección sólo al solicitante
+        env:
+          MODEL_RESULTS_ENABLED: "false"
+          PYTHONPATH: .:diagnostics
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          EMAIL_SMTP_HOST: smtp.gmail.com
+          EMAIL_SMTP_PORT: "465"
+          EMAIL_SMTP_USE_SSL: "true"
+          EMAIL_SMTP_USERNAME: ${{ secrets.EMAIL_SMTP_USERNAME }}
+          EMAIL_SMTP_PASSWORD: ${{ secrets.EMAIL_SMTP_PASSWORD }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SMTP_USERNAME }}
+          EMAIL_SENDER_NAME: Stock Signal Lab
+        run: python diagnostics/manual_corrected_review_20261104.py
