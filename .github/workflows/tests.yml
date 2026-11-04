@@ -64,3 +64,6 @@ jobs:
 
       - name: Validar caché de mercado privada y protección de escrituras
         run: node scripts/validate_market_cache_migration.mjs "$GITHUB_WORKSPACE"
+
+      - name: Validar guardado principal independiente y conservación del historial
+        run: node scripts/validate_primary_snapshot_migration.mjs "$GITHUB_WORKSPACE"

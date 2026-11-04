@@ -27,6 +27,7 @@ import src.growth_candidates as growth
 import src.daily_digest as digest
 import src.daily_digest_ui as ui
 import src.alert_runner as alerts
+import src.analysis_snapshots as snapshots
 
 app.st.session_state["runtime_compat_sentinel"] = {"quantity": 3}
 if scenario == "missing_digest_helpers":
@@ -46,6 +47,8 @@ elif scenario == "old_quality":
     del quality.QUALITY_PRESENTATION_VERSION
 elif scenario == "old_virtual_digest":
     del digest.DIGEST_PRESENTATION_VERSION
+elif scenario == "old_snapshot_storage":
+    del snapshots.PRIMARY_PERSISTENCE_VERSION
 elif scenario == "missing_coverage_helper":
     del digest.daily_score_overview
     sys.modules.pop("src.daily_digest_ui")
@@ -91,6 +94,8 @@ assert policy.assess_analysis_data_quality is quality.assess_analysis_data_quali
 assert growth.assess_analysis_data_quality is quality.assess_analysis_data_quality
 assert ui.daily_score_reading is digest.daily_score_reading
 assert ui.daily_score_overview is digest.daily_score_overview
+assert snapshots.PRIMARY_PERSISTENCE_VERSION == "independent-primary-storage-v1"
+assert app.persist_analysis_batch_snapshots is snapshots.persist_analysis_batch_snapshots
 assert app.run_daily_alerts is alerts.run_daily_alerts
 assert alerts.render_daily_score_email is digest.render_daily_score_email
 assert alerts.download_fundamental_snapshot is loader.download_fundamental_snapshot
@@ -105,6 +110,6 @@ with patch.object(importlib, "reload", side_effect=AssertionError("No repeated r
 
 
 @pytest.mark.parametrize("scenario", ["missing_digest_helpers", "old_provider", "old_quality",
-                                     "stale_consumer_binding", "old_virtual_digest", "missing_coverage_helper", "old_compat", "current"])
+                                     "stale_consumer_binding", "old_virtual_digest", "old_snapshot_storage", "missing_coverage_helper", "old_compat", "current"])
 def test_ordered_runtime_repair_preserves_bindings_and_never_repeats_for_current_modules(scenario):
     _run(scenario)

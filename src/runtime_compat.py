@@ -9,19 +9,20 @@ import importlib
 import inspect
 import sys
 
-RUNTIME_COMPAT_VERSION = "coverage-availability-v2"
+RUNTIME_COMPAT_VERSION = "independent-primary-storage-v1"
 
 
 ANALYSIS_MODULE_ORDER = (
     "src.data_sources", "src.data_loader", "src.analysis_data_quality",
     "src.analysis_policy", "src.growth_candidates", "src.daily_digest",
-    "src.daily_digest_ui", "src.alert_runner",
+    "src.daily_digest_ui", "src.analysis_snapshots", "src.alert_runner",
 )
 _VERSIONS = {
     "src.data_sources": ("FUNDAMENTAL_PROVENANCE_VERSION", "fundamental_provenance_v2"),
     "src.data_loader": ("FUNDAMENTAL_SNAPSHOT_VERSION", "dated_statement_fallback_v2"),
     "src.analysis_data_quality": ("QUALITY_PRESENTATION_VERSION", "dated_quality_coverage_v2"),
     "src.daily_digest": ("DIGEST_PRESENTATION_VERSION", "coverage-availability-v2"),
+    "src.analysis_snapshots": ("PRIMARY_PERSISTENCE_VERSION", "independent-primary-storage-v1"),
 }
 _SIGNATURES = {
     "src.analysis_policy": ("build_policy_snapshot", "enrich_analysis_rows"),

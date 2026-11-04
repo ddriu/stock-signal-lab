@@ -25,7 +25,7 @@ from src.market_cache_ui import hydrate_saved_market, valuation_frames, poll_sav
 from src.portfolio_view_context import reconcile_home_views
 import src.runtime_compat as _analysis_runtime_module
 
-if getattr(_analysis_runtime_module, "RUNTIME_COMPAT_VERSION", "") != "coverage-availability-v2":
+if getattr(_analysis_runtime_module, "RUNTIME_COMPAT_VERSION", "") != "independent-primary-storage-v1":
     _analysis_runtime_module = importlib.reload(_analysis_runtime_module)
 prepare_analysis_runtime = _analysis_runtime_module.prepare_analysis_runtime
 
@@ -508,7 +508,7 @@ SIDEBAR_ANALYSIS_SECTIONS = {
 def apply_visual_theme() -> None:
     """Aplica una capa visual responsive sin alterar los componentes financieros."""
 
-    st.markdown(f"<style>/* ssl-ui: coverage-availability-v2 */{APP_CSS}</style>", unsafe_allow_html=True)
+    st.markdown(f"<style>/* ssl-ui: independent-primary-storage-v1 */{APP_CSS}</style>", unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=3_600, max_entries=350, show_spinner=False)

@@ -57,12 +57,17 @@ antiguos, errores de análisis y conservación del histórico. El arranque públ
 en producción es una comprobación distinta de navegar dentro de una cuenta
 autenticada y no demuestra entrega de correo en una bandeja de entrada.
 
-## Limitación de almacenamiento pendiente
+## Guardado principal independiente
 
-La tabla heredada exige una puntuación comparativa no nula para guardar un
-análisis. Si ese comparador falla, todavía puede impedir guardar el análisis
-principal. Esta revisión no sustituye esa puntuación por cero ni mezcla notas
-de estrategias diferentes. La separación completa requiere una migración
-coordinada de SQLite y PostgreSQL y revisar sus consumidores. Los fallos de
-guardado se registran ahora por clase de excepción, sin publicar el mensaje
-privado; una observación no guardada no se presenta como un resultado de cero.
+La migración `allow_primary_only_analysis` elimina la exigencia heredada de
+una puntuación comparativa no nula. SQLite migra de forma atómica y PostgreSQL
+relaja sólo esa restricción; se conservan el historial, los controles 0–100 y
+los permisos privados. Una comparación ausente permanece `NULL`, nunca se
+sustituye por cero ni por la nota de otra estrategia.
+
+El proceso diario y el productor por lotes pueden guardar crecimiento válido
+aunque falle el comparador. El lote exige política principal completa y
+versionada, identidad y fecha coherentes. Los errores del comparador siguen
+visibles por separado. Si tampoco existe un principal válido no se fabrica
+ninguna señal. Las pruebas cubren ambos fallos por separado y en conjunto,
+repetición sin duplicados y conservación de fechas reales.

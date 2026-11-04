@@ -23,6 +23,7 @@ from src.analysis_policy import decode_policy_note, encode_policy_note
 
 
 DEFAULT_BATCH_SNAPSHOT_NOTE = "Seguimiento automático del análisis por lote"
+PRIMARY_PERSISTENCE_VERSION = "independent-primary-storage-v1"
 
 
 class AnalysisSnapshotJournal(Protocol):
@@ -101,6 +102,30 @@ def _price_at_signal(frame: pd.DataFrame, analyzed_at: object) -> float:
     return price
 
 
+def _has_observed_primary(policy: object, ticker: str) -> bool:
+    """A sealed, complete primary may be stored without auxiliary results."""
+    if not isinstance(policy, Mapping):
+        return False
+    try:
+        checked = decode_policy_note(encode_policy_note("", policy))
+    except (TypeError, ValueError, AttributeError, OverflowError):
+        return False
+    if not checked or checked.get("snapshot_id") != policy.get("snapshot_id"):
+        return False
+    primary = checked["primary"]
+    score = primary.get("score")
+    try:
+        usable_score = not isinstance(score, bool) and math.isfinite(float(score)) and 0 <= float(score) <= 100
+    except (TypeError, ValueError, OverflowError):
+        usable_score = False
+    return (
+        str(checked.get("ticker") or "").strip().upper() == ticker
+        and (primary.get("strategy_id") or primary.get("id")) == "growth_momentum"
+        and primary.get("data_status") == "complete"
+        and usable_score
+    )
+
+
 def persist_analysis_batch_snapshots(
     journal: AnalysisSnapshotJournal,
     tickers: Iterable[str],
@@ -115,7 +140,7 @@ def persist_analysis_batch_snapshots(
     note: str = DEFAULT_BATCH_SNAPSHOT_NOTE,
     policy_snapshots: Mapping[str, Mapping[str, object]] | None = None,
 ) -> BatchAnalysisSnapshotResult:
-    """Guarda como máximo una fotografía completa por ticker y sesión.
+    """Guarda una fotografía observada por ticker, sesión y versión.
 
     La fecha relevante es la de la última señal válida, no la fecha en la que
     se ejecuta el proceso. El historial se consulta una sola vez para que los
@@ -124,6 +149,10 @@ def persist_analysis_batch_snapshots(
 
     Si no puede leerse el historial, la excepción se propaga: escribir sin esa
     comprobación rompería la garantía de una sola fotografía diaria.
+
+    Una política principal completa y sellada no depende de que el comparador
+    opcional haya terminado. Las notas auxiliares ausentes permanecen NULL;
+    nunca se sustituyen por cero, por la nota técnica o por crecimiento.
     """
 
     requested_tickers = tuple(
@@ -164,8 +193,10 @@ def persist_analysis_batch_snapshots(
     )
 
     for ticker in requested_tickers:
-        missing = [name for name, values in sources if ticker not in values]
-        if missing:
+        policy = policies.get(ticker)
+        independent_primary = _has_observed_primary(policy, ticker)
+        missing = [name for name, values in sources if ticker not in values or values[ticker] is None]
+        if missing and (not independent_primary or "prepared" in missing):
             failures.append(
                 AnalysisSnapshotFailure(
                     ticker,
@@ -175,17 +206,18 @@ def persist_analysis_batch_snapshots(
             continue
 
         frame = prepared_by_ticker[ticker]
-        fundamentals = fundamentals_by_ticker[ticker]
-        valuation = valuations_by_ticker[ticker]
-        relative = relatives_by_ticker[ticker]
-        risk = risks_by_ticker[ticker]
-        opportunity = opportunities_by_ticker[ticker]
+        fundamentals = fundamentals_by_ticker.get(ticker)
+        valuation = valuations_by_ticker.get(ticker)
+        relative = relatives_by_ticker.get(ticker)
+        risk = risks_by_ticker.get(ticker)
+        opportunity = opportunities_by_ticker.get(ticker)
 
         try:
             signal = evaluate_latest_signal(frame, strategy, ticker=ticker)
             analyzed_date = pd.Timestamp(signal.as_of).date()
             snapshot_key = (ticker, analyzed_date)
-            policy = policies.get(ticker)
+            if missing and _snapshot_date((policy or {}).get("as_of")) != analyzed_date:
+                raise ValueError("La política principal no corresponde a la sesión de la señal.")
             identity = str(policy.get("snapshot_id") or "") if policy else ""
             versioned_key = (ticker, analyzed_date, identity)
             duplicate = (versioned_key in versioned_keys) if identity else (snapshot_key in existing_keys)
@@ -197,22 +229,23 @@ def persist_analysis_batch_snapshots(
                 ticker=ticker,
                 analyzed_at=signal.as_of,
                 price=_price_at_signal(frame, signal.as_of),
-                opportunity_score=opportunity.score,
-                confidence_pct=opportunity.confidence_pct,
-                company_score=fundamentals.score,
+                opportunity_score=getattr(opportunity, "score", None),
+                confidence_pct=getattr(opportunity, "confidence_pct", None),
+                company_score=getattr(fundamentals, "score", None),
                 entry_score=signal.score,
-                valuation_score=valuation.score,
-                relative_score=relative.score,
-                risk_score=risk.score,
-                opportunity_label=opportunity.label,
+                valuation_score=getattr(valuation, "score", None),
+                relative_score=getattr(relative, "score", None),
+                risk_score=getattr(risk, "score", None),
+                opportunity_label=getattr(opportunity, "label", "") or "",
                 entry_label=signal.label,
                 position_label=signal.position_label,
                 expected_return_pct=None,
                 positive_rate_pct=None,
                 expected_price=None,
                 horizon_days=None,
-                sector=fundamentals.sector or "",
-                explanation=opportunity.explanation,
+                sector=getattr(fundamentals, "sector", "") or "",
+                explanation=(getattr(opportunity, "explanation", "")
+                    or str((policy or {}).get("primary", {}).get("entry_reading") or "Análisis principal observado; comparador no disponible.")),
                 note=encode_policy_note(note, policy) if policy else note,
             )
         except Exception as exc:

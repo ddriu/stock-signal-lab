@@ -71,7 +71,7 @@ create table if not exists public.analysis_snapshots (
     ticker text not null,
     analyzed_at timestamptz not null,
     price double precision not null check (price > 0),
-    opportunity_score integer not null check (opportunity_score between 0 and 100),
+    opportunity_score integer check (opportunity_score between 0 and 100),
     confidence_pct integer check (confidence_pct between 0 and 100),
     company_score integer check (company_score between 0 and 100),
     entry_score integer not null check (entry_score between 0 and 100),
@@ -94,6 +94,11 @@ create table if not exists public.analysis_snapshots (
 
 create index if not exists analysis_snapshots_owner_ticker_date_idx
     on public.analysis_snapshots (owner, ticker, analyzed_at desc, id desc);
+
+-- Keep primary strategy observations even if the optional comparison failed.
+alter table public.analysis_snapshots alter column opportunity_score drop not null;
+comment on column public.analysis_snapshots.opportunity_score is
+  'Optional comparative evaluator score (0-100). NULL means unavailable; independent primary strategy output remains in the versioned policy note.';
 
 alter table public.analysis_snapshots enable row level security;
 revoke all on table public.analysis_snapshots from anon, authenticated;

@@ -694,6 +694,7 @@ def run_daily_alerts(
                         data_notes.append("crecimiento parcial")
 
                     enhanced = None
+                    opportunity_error = ""
                     fundamental = None
                     valuation = None
                     required_for_opportunity = {
@@ -736,9 +737,14 @@ def run_daily_alerts(
                                 ),
                                 market=fundamental.country or "",
                             )
-                        except (KeyError, TypeError, ValueError):
+                        except (KeyError, TypeError, ValueError) as exc:
+                            opportunity_error = (
+                                "Comparador de oportunidad no disponible "
+                                f"({type(exc).__name__}); no sustituye la nota principal."
+                            )
                             data_notes.append("oportunidad parcial")
                     else:
+                        opportunity_error = "Comparador de oportunidad sin histórico suficiente."
                         data_notes.append("oportunidad sin histórico suficiente")
 
                     confidence = (
@@ -760,7 +766,7 @@ def run_daily_alerts(
                         "Riesgo controlado": getattr(risk, "score", None),
                         "Cobertura fundamental": getattr(fundamental, "coverage_pct", None),
                         "Incidencia principal": growth_error,
-                        "Incidencia comparativa": fundamental_error,
+                        "Incidencia comparativa": fundamental_error or opportunity_error,
                     }
                     policy = build_policy_snapshot(
                         policy_row, growth_result=growth,
@@ -931,7 +937,7 @@ def run_daily_alerts(
                     policy_key = (*snapshot_key, str(policy["snapshot_id"]))
                     if (
                         policy_key not in saved_policy_keys
-                        and enhanced is not None
+                        and (growth is not None or enhanced is not None)
                         and hasattr(journal, "add_analysis_snapshot")
                     ):
                         try:
@@ -939,7 +945,9 @@ def run_daily_alerts(
                                 ticker=ticker,
                                 analyzed_at=signal.as_of,
                                 price=price,
-                                opportunity_score=enhanced.opportunity_score,
+                                # A missing independent comparator stays NULL;
+                                # never replace it by zero or the primary score.
+                                opportunity_score=getattr(enhanced, "opportunity_score", None),
                                 confidence_pct=getattr(
                                     enhanced, "confidence_pct", None
                                 ),

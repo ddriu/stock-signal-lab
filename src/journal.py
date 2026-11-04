@@ -719,7 +719,7 @@ def normalize_analysis_snapshot(
     ticker: str,
     analyzed_at: date | datetime | str,
     price: float,
-    opportunity_score: int,
+    opportunity_score: int | None,
     confidence_pct: int | float | None = None,
     company_score: int | None,
     entry_score: int,
@@ -1240,7 +1240,149 @@ class TradingJournal:
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
+    @staticmethod
+    def _nullable_snapshot_ddl(sql: str, temporary_name: str) -> str:
+        """Change one column constraint, preserving the rest of a legacy DDL.
+
+        Only unquoted SQL keywords are considered. A default string/comment
+        containing ``NOT NULL`` must never be mistaken for the constraint.
+        """
+        tokens = []
+        position, depth = 0, 0
+        while position < len(sql):
+            start = position
+            character = sql[position]
+            if sql.startswith("--", position):
+                position = sql.find("\n", position)
+                if position < 0:
+                    break
+            elif sql.startswith("/*", position):
+                end = sql.find("*/", position + 2)
+                if end < 0:
+                    raise ValueError("Invalid analysis snapshot schema comment")
+                position = end + 2
+            elif character in "'\"`[":
+                closing = "]" if character == "[" else character
+                position += 1
+                identifier = []
+                while position < len(sql):
+                    if sql[position] == closing:
+                        if position + 1 < len(sql) and sql[position + 1] == closing:
+                            identifier.append(closing)
+                            position += 2
+                            continue
+                        position += 1
+                        break
+                    identifier.append(sql[position])
+                    position += 1
+                else:
+                    raise ValueError("Invalid analysis snapshot schema quote")
+                if character != "'":
+                    tokens.append(("".join(identifier), start, position, depth, True))
+            elif character.isalpha() or character == "_":
+                position += 1
+                while position < len(sql) and (sql[position].isalnum() or sql[position] in "_$"):
+                    position += 1
+                tokens.append((sql[start:position], start, position, depth, False))
+            else:
+                if character == "(":
+                    depth += 1
+                elif character == ")":
+                    depth -= 1
+                if character in ",()":
+                    tokens.append((character, start, start + 1, depth, False))
+                position += 1
+        table = next((token for token in tokens
+                      if token[3] == 0 and token[0].casefold() == "analysis_snapshots"), None)
+        column = next((index for index, token in enumerate(tokens)
+                       if token[3] == 1 and token[0].casefold() == "opportunity_score"), None)
+        if table is None or column is None:
+            raise ValueError("Unsupported legacy analysis snapshot schema")
+        constraints = []
+        for index in range(column + 1, len(tokens) - 1):
+            token, following = tokens[index:index + 2]
+            if token[3] < 1 or token[0] == "," and token[3] == 1:
+                break
+            if (token[3] == following[3] == 1 and not token[4] and not following[4]
+                    and token[0].upper() == "NOT" and following[0].upper() == "NULL"):
+                start = token[1]
+                if (index >= column + 3 and tokens[index - 2][0].upper() == "CONSTRAINT"
+                        and not tokens[index - 2][4] and tokens[index - 2][3] == tokens[index - 1][3] == 1):
+                    start = tokens[index - 2][1]
+                end = following[2]
+                if index + 4 < len(tokens):
+                    conflict = tokens[index + 2:index + 5]
+                    if ([item[0].upper() for item in conflict[:2]] == ["ON", "CONFLICT"]
+                            and all(item[3] == 1 and not item[4] for item in conflict)):
+                        end = conflict[-1][2]
+                constraints.append((start, end, ""))
+        if not constraints:
+            raise ValueError("Legacy analysis snapshot constraint was not found")
+        edits = [(table[1], table[2], '"' + temporary_name + '"'), *constraints]
+        for start, end, replacement in sorted(edits, reverse=True):
+            sql = sql[:start] + replacement + sql[end:]
+        return sql
+
+    def _migrate_primary_snapshot_storage(self) -> None:
+        """Relax only the optional comparative score, atomically and once.
+
+        SQLite 3.53+ supports this ALTER directly. Older runtimes use SQLite's
+        create/copy/drop/rename procedure; unlike renaming the old table first,
+        it retains inbound references, custom columns and associated objects.
+        No historical score, note, identity or knowledge timestamp is changed.
+        """
+        with self._connect() as connection:
+            columns = connection.execute("PRAGMA table_xinfo(analysis_snapshots)").fetchall()
+            if not any(row["name"] == "opportunity_score" and row["notnull"] for row in columns):
+                return
+            foreign_keys = int(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+            legacy_alter = int(connection.execute("PRAGMA legacy_alter_table").fetchone()[0])
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("PRAGMA legacy_alter_table = ON")
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                # Another initializer may already have completed the migration.
+                columns = connection.execute("PRAGMA table_xinfo(analysis_snapshots)").fetchall()
+                if not any(row["name"] == "opportunity_score" and row["notnull"] for row in columns):
+                    connection.commit()
+                    return
+                before_violations = set(map(tuple, connection.execute("PRAGMA foreign_key_check")))
+                if sqlite3.sqlite_version_info >= (3, 53, 0):
+                    connection.execute("ALTER TABLE analysis_snapshots ALTER COLUMN opportunity_score DROP NOT NULL")
+                else:
+                    temporary = "__analysis_snapshots_nullable_v1"
+                    if connection.execute("SELECT 1 FROM sqlite_schema WHERE name = ?", (temporary,)).fetchone():
+                        raise ValueError("Analysis snapshot migration name is already in use")
+                    schema = connection.execute("SELECT sql FROM sqlite_schema WHERE type='table' AND name='analysis_snapshots'").fetchone()[0]
+                    objects = connection.execute("SELECT sql FROM sqlite_schema WHERE tbl_name='analysis_snapshots' AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY type,name").fetchall()
+                    has_sequence = connection.execute("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='sqlite_sequence'").fetchone()
+                    sequence = (connection.execute("SELECT seq FROM sqlite_sequence WHERE name='analysis_snapshots'").fetchone()
+                                if has_sequence else None)
+                    names = [row["name"] for row in columns if row["hidden"] == 0]
+                    quoted = ", ".join('"' + name.replace('"', '""') + '"' for name in names)
+                    connection.execute(self._nullable_snapshot_ddl(schema, temporary))
+                    connection.execute(f'INSERT INTO "{temporary}" ({quoted}) SELECT {quoted} FROM analysis_snapshots')
+                    connection.execute("DROP TABLE analysis_snapshots")
+                    connection.execute(f'ALTER TABLE "{temporary}" RENAME TO analysis_snapshots')
+                    for item in objects:
+                        connection.execute(item[0])
+                    if sequence is not None:
+                        connection.execute("UPDATE sqlite_sequence SET seq=max(seq,?) WHERE name='analysis_snapshots'", (sequence[0],))
+                migrated = connection.execute("PRAGMA table_xinfo(analysis_snapshots)").fetchall()
+                if any(row["name"] == "opportunity_score" and row["notnull"] for row in migrated):
+                    raise ValueError("Analysis snapshot migration did not remove the constraint")
+                if set(map(tuple, connection.execute("PRAGMA foreign_key_check"))) != before_violations:
+                    raise ValueError("Analysis snapshot migration changed foreign-key integrity")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.execute(f"PRAGMA legacy_alter_table = {legacy_alter}")
+                connection.execute(f"PRAGMA foreign_keys = {foreign_keys}")
+
     def _initialize(self) -> None:
+        self._migrate_primary_snapshot_storage()
         with self._connect() as connection:
             connection.execute("""CREATE TABLE IF NOT EXISTS daily_score_reports (
                 owner TEXT NOT NULL, report_id TEXT NOT NULL,
@@ -1339,7 +1481,7 @@ class TradingJournal:
                     ticker TEXT NOT NULL,
                     analyzed_at TEXT NOT NULL,
                     price REAL NOT NULL CHECK (price > 0),
-                    opportunity_score INTEGER NOT NULL
+                    opportunity_score INTEGER
                         CHECK (opportunity_score BETWEEN 0 AND 100),
                     confidence_pct INTEGER
                         CHECK (confidence_pct BETWEEN 0 AND 100),
