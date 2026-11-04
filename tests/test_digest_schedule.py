@@ -20,6 +20,9 @@ from src.digest_schedule import daily_digest_session_date, daily_digest_window
     ("2026-10-28T00:58:19+00:00", "2026-10-27"),
     ("2026-10-28T04:59:59+00:00", "2026-10-27"),
     ("2026-10-28T05:00:00+00:00", None),
+    # Delayed recovery starts seen in production remain outside the safe window.
+    ("2026-11-03T06:57:20+00:00", None),
+    ("2026-11-04T06:39:27+00:00", None),
     # Friday's report can finish on Saturday, not Sunday or Monday morning.
     ("2026-10-23T22:00:00+00:00", "2026-10-23"),
     ("2026-10-24T03:59:59+00:00", "2026-10-23"),
@@ -46,15 +49,45 @@ def test_schedule_rejects_unzoned_clock_and_keeps_explicit_dispatch():
     assert daily_digest_window(event_name="workflow_dispatch", now=datetime(2026, 10, 26, 10, tzinfo=timezone.utc))
 
 
-def test_cli_rejects_wrong_slot_visibly_before_accessing_any_owner(monkeypatch, capsys):
+def test_cli_skips_wrong_slot_visibly_before_accessing_any_owner(monkeypatch, capsys):
     import scripts.run_alerts as cli
     monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
     monkeypatch.setattr(cli, "daily_digest_session_date", lambda: None)
+    monkeypatch.setattr(cli, "configured_virtual_tracker", lambda: pytest.fail("No tracking setup outside schedule window"))
     monkeypatch.setattr(cli, "run_daily_alerts", lambda **kwargs: pytest.fail("No access outside schedule window"))
+    assert cli.main() == 0
+    captured = capsys.readouterr()
+    assert "::warning::" in captured.err
+    assert "::error::" not in captured.err
+    assert "06:00" in captured.err
+    assert "omitido_fuera_de_horario" in captured.out
+    assert "Sin revisión ni intento de envío" in captured.out
+    assert "Alertas terminadas" not in captured.out
+
+
+@pytest.mark.parametrize("summary", [
+    # An in-window run that cannot obtain fresh prices is still a failure.
+    dict(users_checked=1, tickers_checked=1, emails_sent=0, alerts_sent=0,
+         errors=(), tickers_with_prices=1, tickers_with_fresh_prices=0),
+    # A real delivery error must not become a green safety skip.
+    dict(users_checked=1, tickers_checked=1, emails_sent=0, alerts_sent=0,
+         errors=("private transport detail",), tickers_with_prices=1,
+         tickers_with_fresh_prices=1),
+    dict(users_checked=0, tickers_checked=0, emails_sent=0, alerts_sent=0,
+         errors=("private backend detail",)),
+])
+def test_cli_keeps_real_in_window_failures_visible(monkeypatch, capsys, summary):
+    import scripts.run_alerts as cli
+    from src.alert_runner import AlertRunSummary
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+    monkeypatch.setattr(cli, "daily_digest_session_date", lambda: date(2026, 11, 3))
+    monkeypatch.setattr(cli, "configured_virtual_tracker", lambda: None)
+    monkeypatch.setattr(cli, "run_daily_alerts", lambda **kwargs: AlertRunSummary(**summary))
     assert cli.main() == 1
     captured = capsys.readouterr()
-    assert "::error::" in captured.err
-    assert "06:00" in captured.err
+    assert "omitido_fuera_de_horario" not in captured.out
+    assert "private transport detail" not in captured.err
+    assert "private backend detail" not in captured.err
 
 
 @pytest.mark.parametrize("session", [date(2026, 10, 27), date(2026, 10, 23)])

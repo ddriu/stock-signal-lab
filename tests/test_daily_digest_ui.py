@@ -162,7 +162,8 @@ render_daily_score_page(Journal(), report_id=report["report_id"])
     assert tables[1].iloc[1]["Revisión de compra"] == "Compra no confirmada"
     assert list(tables[2]["Empresa"]) == ["Empresa WAIT (WAIT)"]
     captions = " ".join(str(item.value) for item in page.caption)
-    assert "2 entradas fuertes del motor: 1 con datos suficientes y 1 pendientes" in captions
+    assert "Entre las 3 empresas con nota: 1 entradas fuertes con datos suficientes" in captions
+    assert "1 señales fuertes del motor pendientes de verificar" in captions
     assert "No consta el periodo del crecimiento de ingresos." in captions
     assert "Yahoo Financial Statements + SEC EDGAR" in captions
     assert "2026-10-23T22:30:00Z" in captions

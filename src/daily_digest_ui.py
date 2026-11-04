@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 
 from src.daily_digest import (
-    build_daily_score_report, daily_score_coverage, daily_score_reading,
+    build_daily_score_report, daily_score_coverage, daily_score_reading, daily_score_overview,
     daily_score_sort_key, seal_daily_score_report, virtual_tracking_lines,
 )
 from src.analysis_data_quality import METRIC_NAMES
@@ -127,6 +127,12 @@ def render_daily_score_page(journal: object, *, report_id: str | None = None) ->
     if report.get("calendar_status") != "complete":
         st.warning("No se pudo verificar todo el calendario de sesiones; no se rellenan días ni notas ausentes.")
     coverage = daily_score_coverage(rows)
+    overview = daily_score_overview(rows)
+    if overview["status"] in {"unavailable", "partial"}:
+        st.warning(overview["coverage_text"])
+    else:
+        st.caption(overview["coverage_text"])
+    st.caption(overview["counts_text"])
     unavailable, pending = coverage["missing_score"], coverage["pending_data"]
     if unavailable or pending:
         st.warning(f"{pending} de {len(rows)} empresas tienen la compra sin confirmar por datos pendientes; {unavailable} de ellas no tienen nota de la última sesión. No son señales de venta.")
@@ -138,16 +144,22 @@ def render_daily_score_page(journal: object, *, report_id: str | None = None) ->
     else:
         st.caption("Sin posiciones guardadas en este informe.")
     st.markdown("#### Favoritas · señales de entrada")
-    favorite_coverage = daily_score_coverage(favorites)
-    verified, strong_pending = favorite_coverage["strong_verified"], favorite_coverage["strong_pending"]
-    st.caption(f"{verified + strong_pending} entradas fuertes del motor: {verified} con datos suficientes y {strong_pending} pendientes de verificar. Una candidatura no es una orden de compra.")
+    favorite_overview = daily_score_overview(favorites)
+    if favorite_overview["status"] in {"unavailable", "partial"}:
+        st.caption(favorite_overview["coverage_text"])
+    st.caption(favorite_overview["counts_text"] + " Una candidatura no es una orden de compra.")
     featured = [row for row in favorites if daily_score_reading(row)["signal"] == "Entrada fuerte" and row.get("score") is not None
         or not daily_score_reading(row)["blocked"] and row.get("status") == "entry_candidate"]
     others = [row for row in favorites if row not in featured]
     if featured:
         st.dataframe(_table(featured), hide_index=True, width="stretch")
     else:
-        st.info("No hay entradas fuertes ni candidatas verificadas en este informe. Los datos pendientes no demuestran que no existan oportunidades.")
+        st.info(
+            "No hay notas disponibles para contar entradas en las favoritas."
+            if favorite_overview["status"] == "unavailable" else
+            "No se han identificado entradas fuertes ni candidatas verificadas entre las "
+            "empresas con nota. Las pendientes no demuestran ausencia de oportunidades."
+        )
     if others:
         with st.expander(f"Otras favoritas · {len(others)}"):
             st.dataframe(_table(others), hide_index=True, width="stretch")

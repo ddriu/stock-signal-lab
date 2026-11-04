@@ -30,18 +30,27 @@ def configured_virtual_tracker():
 
 
 def main() -> int:
+    event_name = os.getenv("GITHUB_EVENT_NAME", "")
+    session = None
+    if event_name == "schedule":
+        session = daily_digest_session_date()
+        if session is None:
+            # GitHub can start the recovery job hours after its scheduled slot.
+            # A deliberate safety skip is not an SMTP failure, nor a successful
+            # review. Do not access owners, advance simulations or try old mail.
+            print("::warning::Ejecución programada omitida: arranque fuera de "
+                  "la ventana 23:00–06:00 de Europe/Madrid. "
+                  "No se ha analizado ni intentado enviar correo.",
+                  file=sys.stderr)
+            print("Estado: omitido_fuera_de_horario. "
+                  "Sin revisión ni intento de envío; no se amplía la ventana de seguridad.")
+            return 0
+
     kwargs = {}
     tracker = configured_virtual_tracker()
     if tracker is not None:
         kwargs["virtual_tracker"] = tracker
-    event_name = os.getenv("GITHUB_EVENT_NAME", "")
     if event_name == "schedule":
-        session = daily_digest_session_date()
-        if session is None:
-            print("::error::No se analizó ni envió el resumen: arranque fuera de "
-                  "la ventana 23:00–06:00 de Europe/Madrid. Revisa la programación.",
-                  file=sys.stderr)
-            return 1
         print(f"Sesión objetivo del resumen: {session.isoformat()} (Europe/Madrid).")
         result = run_daily_alerts(today=session, require_current_session=True, **kwargs)
     else:

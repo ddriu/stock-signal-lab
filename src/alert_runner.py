@@ -56,6 +56,7 @@ from src.analysis_policy import (
     encode_policy_note,
     position_contexts_from_snapshot,
 )
+from src.alert_market_inputs import OwnerAlertMarketInputs
 
 
 @dataclass(frozen=True)
@@ -440,7 +441,7 @@ def run_daily_alerts(
     reference_frames: dict[str, pd.DataFrame | None] = dict(frames)
     reference_start = resolved_today - timedelta(days=550)
 
-    def reference_frame(symbol: str | None) -> pd.DataFrame | None:
+    def downloaded_reference_frame(symbol: str | None) -> pd.DataFrame | None:
         """Descarga cada referencia una sola vez sin sumarla al universo analizado."""
 
         if not symbol:
@@ -471,9 +472,18 @@ def run_daily_alerts(
     alerts_sent = 0
     emails_skipped = 0
     fresh_tickers: set[str] = set()
+    priced_tickers: set[str] = set(frames)
 
     for owner, (preference, journal, scope, positions, names) in scopes.items():
         try:
+            owner_inputs = OwnerAlertMarketInputs(journal, scope, target_date=resolved_today)
+
+            def reference_frame(symbol: str | None) -> pd.DataFrame | None:
+                if not symbol:
+                    return None
+                frame, _ = owner_inputs.select(symbol.strip().upper(), downloaded_reference_frame(symbol))
+                return frame
+
             previous = journal.list_alert_states()
             previous_signatures = (
                 dict(zip(previous["ticker"], previous["signature"]))
@@ -542,7 +552,11 @@ def run_daily_alerts(
             candidates: list[AlertCandidate] = []
             overview_rows: list[DailyOverviewRow] = []
             for ticker in sorted(scope):
-                frame = frames.get(ticker)
+                frame, from_saved_cache = owner_inputs.select(ticker, frames.get(ticker))
+                if from_saved_cache:
+                    source_attrs = dict(frame.attrs)
+                    frame = add_indicators(frame, config)
+                    frame.attrs.update(source_attrs)
                 if frame is None or frame.empty:
                     overview_row = DailyOverviewRow(
                             ticker=ticker,
@@ -557,6 +571,7 @@ def run_daily_alerts(
                         )
                     overview_rows.append(overview_row)
                     continue
+                priced_tickers.add(ticker)
                 try:
                     held = ticker in positions
                     signal = evaluate_latest_signal(
@@ -605,6 +620,12 @@ def run_daily_alerts(
                         or ticker
                     ).strip()
                     data_notes: list[str] = []
+                    if from_saved_cache:
+                        data_notes.append(
+                            "cierre guardado más reciente: fecha "
+                            f"{frame.attrs.get('alert_input_completed_price_date')}, observado UTC "
+                            f"{frame.attrs.get('alert_input_observed_at')}; descarga retrasada"
+                        )
                     if ticker in fundamental_failures:
                         data_notes.append("fundamentales no disponibles")
                     elif info.get("_warnings"):
@@ -633,6 +654,14 @@ def run_daily_alerts(
                     )
                     broad_market = reference_frame(broad_name)
                     sector_market = reference_frame(sector_name)
+                    for reference, label in ((broad_market, "general"), (sector_market, "sectorial")):
+                        if reference is not None and not reference.empty:
+                            reference_date = pd.Timestamp(reference.index[-1]).date()
+                            if reference_date < pd.Timestamp(signal.as_of).date():
+                                data_notes.append(
+                                    f"referencia {label} retrasada: cierre {reference_date.isoformat()}, "
+                                    f"anterior a la señal {pd.Timestamp(signal.as_of).date().isoformat()}"
+                                )
                     relative = None
                     try:
                         relative = evaluate_relative_strength(
@@ -1202,7 +1231,7 @@ def run_daily_alerts(
         emails_sent=emails_sent,
         alerts_sent=alerts_sent,
         errors=tuple(errors),
-        tickers_with_prices=len(frames),
+        tickers_with_prices=len(priced_tickers),
         tickers_with_fresh_prices=len(fresh_tickers),
         emails_skipped=emails_skipped,
     )

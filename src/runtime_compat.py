@@ -9,7 +9,7 @@ import importlib
 import inspect
 import sys
 
-RUNTIME_COMPAT_VERSION = "virtual-summary-v1"
+RUNTIME_COMPAT_VERSION = "coverage-availability-v2"
 
 
 ANALYSIS_MODULE_ORDER = (
@@ -21,21 +21,22 @@ _VERSIONS = {
     "src.data_sources": ("FUNDAMENTAL_PROVENANCE_VERSION", "fundamental_provenance_v2"),
     "src.data_loader": ("FUNDAMENTAL_SNAPSHOT_VERSION", "dated_statement_fallback_v2"),
     "src.analysis_data_quality": ("QUALITY_PRESENTATION_VERSION", "dated_quality_coverage_v2"),
-    "src.daily_digest": ("DIGEST_PRESENTATION_VERSION", "virtual-summary-v1"),
+    "src.daily_digest": ("DIGEST_PRESENTATION_VERSION", "coverage-availability-v2"),
 }
 _SIGNATURES = {
     "src.analysis_policy": ("build_policy_snapshot", "enrich_analysis_rows"),
     "src.growth_candidates": ("build_growth_candidate_rows",),
 }
 _FUNCTIONS = {
-    "src.daily_digest": ("daily_score_reading", "daily_score_coverage", "daily_score_sort_key"),
-    "src.daily_digest_ui": ("daily_score_reading", "daily_score_coverage", "daily_score_sort_key"),
+    "src.daily_digest": ("daily_score_reading", "daily_score_coverage", "daily_score_sort_key", "daily_score_overview"),
+    "src.daily_digest_ui": ("daily_score_reading", "daily_score_coverage", "daily_score_sort_key", "daily_score_overview"),
 }
 _BINDINGS = (
     ("src.data_loader", "download_sec_fundamental_snapshot", "src.data_sources"),
     ("src.analysis_policy", "assess_analysis_data_quality", "src.analysis_data_quality"),
     ("src.growth_candidates", "assess_analysis_data_quality", "src.analysis_data_quality"),
     ("src.daily_digest_ui", "daily_score_reading", "src.daily_digest"),
+    ("src.daily_digest_ui", "daily_score_overview", "src.daily_digest"),
     ("src.alert_runner", "download_fundamental_snapshot", "src.data_loader"),
     ("src.alert_runner", "build_daily_score_report", "src.daily_digest"),
     ("src.alert_runner", "render_daily_score_email", "src.daily_digest"),

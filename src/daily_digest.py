@@ -20,7 +20,7 @@ from src.analysis_data_quality import GROWTH_METRICS
 from src.instruments import resolve_analysis_ticker, resolve_company_name
 
 DIGEST_VERSION = "daily-score-report-v2"
-DIGEST_PRESENTATION_VERSION = "virtual-summary-v1"
+DIGEST_PRESENTATION_VERSION = "coverage-availability-v2"
 APP_URL = "https://stock-signal-lab-ddriu.streamlit.app/"
 _SUFFIX_CALENDARS = {
     ".MC": "XMAD", ".PA": "XPAR", ".AS": "XAMS", ".DE": "XETR",
@@ -34,6 +34,10 @@ _SUFFIX_CALENDARS = {
     ".JO": "XJSE", ".IS": "XIST", ".US": "XNYS",
 }
 _US_SHARE_CLASSES = {"BRK.A", "BRK.B", "BF.A", "BF.B"}
+_MISSING_ANALYSIS_REASON = (
+    "No hay análisis guardado para esta sesión; primero hay que completar o registrar "
+    "la revisión. Esto no acredita un fallo de los fundamentales."
+)
 
 
 def _text(value: object) -> str:
@@ -131,6 +135,9 @@ def _sessions(ticker: str, anchor: str, reference_time: object | None = None) ->
 
 
 def _quality(policy: Mapping[str, object] | None) -> dict[str, object]:
+    if policy is None:
+        return {"status": "unknown", "block_entry": True,
+                "reasons": [_MISSING_ANALYSIS_REASON]}
     quality = policy.get("data_quality") if policy else None
     if not isinstance(quality, Mapping):
         return {"status": "unknown", "block_entry": True,
@@ -167,6 +174,15 @@ def daily_score_reading(row: Mapping[str, object]) -> dict[str, object]:
                or _text(row.get("status")) == "review_data")
     raw_reasons = quality.get("reasons")
     reasons = [_text(reason) for reason in raw_reasons if _text(reason)] if isinstance(raw_reasons, (list, tuple)) else []
+    if _score(row.get("score")) is None:
+        # A display correction for archived reports, not a change to their seal
+        # or stored data. The missing analysis must not be blamed on a provider
+        # or fundamental metric that may never have been assessed that session.
+        reasons = [_MISSING_ANALYSIS_REASON, *(
+            reason for reason in reasons
+            if reason != _MISSING_ANALYSIS_REASON
+            and not reason.startswith("El análisis guardado no acredita la fecha de los fundamentales")
+        )]
     if blocked and not reasons:
         reasons = ["Falta una revisión completa con datos fechados; no se confirma una entrada nueva."]
     status = _text(row.get("status"))
@@ -207,6 +223,46 @@ def daily_score_coverage(rows: Iterable[Mapping[str, object]]) -> dict[str, int]
         elif not reading["blocked"] and row.get("status") == "entry_candidate":
             counts["candidate_verified"] += 1
     return counts
+
+
+def daily_score_overview(rows: Iterable[Mapping[str, object]]) -> dict[str, object]:
+    """One read-only coverage explanation shared by the page and email.
+
+    A count among observed scores is not a complete universe result when the
+    remaining session analyses are missing. Raw strong signals and verified
+    purchase candidacies remain separate, using their existing classification.
+    """
+    coverage = daily_score_coverage(rows)
+    total, available = coverage["total"], coverage["with_score"]
+    status = "unavailable" if not available else "partial" if available < total else "complete"
+    if not total:
+        coverage_text = "Revisión no disponible: no hay empresas incluidas en este informe."
+    elif not available:
+        coverage_text = (
+            f"Revisión no disponible: 0/{total} empresas con nota de la sesión. "
+            "La ausencia de análisis no es un recuento de cero oportunidades."
+        )
+    elif available < total:
+        coverage_text = (
+            f"Revisión parcial: {available}/{total} empresas con nota de la sesión; "
+            "no es un recuento completo del universo."
+        )
+    else:
+        coverage_text = (
+            f"Notas disponibles: {available}/{total} empresas de la sesión. "
+            "La verificación empresarial se indica por separado."
+        )
+    if available:
+        counts_text = (
+            f"Entre las {available} empresas con nota: {coverage['strong_verified']} "
+            "entradas fuertes con datos suficientes · "
+            f"{coverage['strong_pending']} señales fuertes del motor pendientes de verificar · "
+            f"{coverage['candidate_verified']} candidatas con datos suficientes."
+        )
+    else:
+        counts_text = "Entradas fuertes y candidatas: N/D; no hay notas disponibles para medirlas."
+    return {"status": status, "coverage": coverage, "coverage_text": coverage_text,
+            "counts_text": counts_text, "text": coverage_text + " " + counts_text}
 
 
 def _identity(policy: Mapping[str, object]) -> str:
@@ -437,10 +493,7 @@ def render_daily_score_email(report: Mapping[str, object], *, app_url: str = APP
     lines = [subject, "Crecimiento + momentum · las notas no son probabilidades de ganar.", ""]
     blocks = []
     all_rows = [row for row in report.get("rows") or [] if isinstance(row, Mapping)]
-    coverage = daily_score_coverage(all_rows)
-    overview = (f"{coverage['strong_verified']} entradas fuertes con datos suficientes · "
-                f"{coverage['strong_pending']} señales fuertes del motor pendientes de verificar · "
-                f"{coverage['missing_score']} sin nota de la sesión.")
+    overview = daily_score_overview(all_rows)["text"]
     lines.extend([overview, "Datos suficientes no equivale a una compra autorizada.", ""])
     blocks.append(f"<p><strong>{escape(overview)}</strong><br>Datos suficientes no equivale a una compra autorizada.</p>")
     virtual_lines = virtual_tracking_lines(report.get("virtual_tracking"))

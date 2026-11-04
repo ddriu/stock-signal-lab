@@ -46,6 +46,15 @@ elif scenario == "old_quality":
     del quality.QUALITY_PRESENTATION_VERSION
 elif scenario == "old_virtual_digest":
     del digest.DIGEST_PRESENTATION_VERSION
+elif scenario == "missing_coverage_helper":
+    del digest.daily_score_overview
+    sys.modules.pop("src.daily_digest_ui")
+    try:
+        importlib.import_module("src.daily_digest_ui")
+    except ImportError:
+        pass
+    else:
+        raise AssertionError("The old digest unexpectedly supported coverage UI")
 elif scenario == "old_compat":
     import src.runtime_compat as compat
     del compat.RUNTIME_COMPAT_VERSION
@@ -69,7 +78,7 @@ with patch("requests.sessions.Session.request", side_effect=AssertionError("No n
     real_reload(app)
 
 expected = [] if scenario == "current" else [name for name in ANALYSIS_MODULE_ORDER
-    if not (scenario == "missing_digest_helpers" and name == "src.daily_digest_ui")]
+    if not (scenario in {"missing_digest_helpers", "missing_coverage_helper"} and name == "src.daily_digest_ui")]
 if scenario == "old_compat":
     expected.insert(0, "src.runtime_compat")
 assert reloaded == expected, (reloaded, expected)
@@ -81,6 +90,7 @@ assert loader.download_sec_fundamental_snapshot is sources.download_sec_fundamen
 assert policy.assess_analysis_data_quality is quality.assess_analysis_data_quality
 assert growth.assess_analysis_data_quality is quality.assess_analysis_data_quality
 assert ui.daily_score_reading is digest.daily_score_reading
+assert ui.daily_score_overview is digest.daily_score_overview
 assert app.run_daily_alerts is alerts.run_daily_alerts
 assert alerts.render_daily_score_email is digest.render_daily_score_email
 assert alerts.download_fundamental_snapshot is loader.download_fundamental_snapshot
@@ -95,6 +105,6 @@ with patch.object(importlib, "reload", side_effect=AssertionError("No repeated r
 
 
 @pytest.mark.parametrize("scenario", ["missing_digest_helpers", "old_provider", "old_quality",
-                                     "stale_consumer_binding", "old_virtual_digest", "old_compat", "current"])
+                                     "stale_consumer_binding", "old_virtual_digest", "missing_coverage_helper", "old_compat", "current"])
 def test_ordered_runtime_repair_preserves_bindings_and_never_repeats_for_current_modules(scenario):
     _run(scenario)

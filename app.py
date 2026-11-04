@@ -25,7 +25,7 @@ from src.market_cache_ui import hydrate_saved_market, valuation_frames, poll_sav
 from src.portfolio_view_context import reconcile_home_views
 import src.runtime_compat as _analysis_runtime_module
 
-if getattr(_analysis_runtime_module, "RUNTIME_COMPAT_VERSION", "") != "virtual-summary-v1":
+if getattr(_analysis_runtime_module, "RUNTIME_COMPAT_VERSION", "") != "coverage-availability-v2":
     _analysis_runtime_module = importlib.reload(_analysis_runtime_module)
 prepare_analysis_runtime = _analysis_runtime_module.prepare_analysis_runtime
 
@@ -200,6 +200,7 @@ from src.navigation import (
     sanitize_favorite_selection,
 )
 from src.opportunity_catalog import build_opportunity_catalog
+from src.opportunity_status import measured_count_label, opportunity_coverage
 import src.paper_simulation as _paper_simulation_module
 
 # Streamlit puede volver a ejecutar ``app.py`` sin invalidar módulos ya cargados.
@@ -507,7 +508,7 @@ SIDEBAR_ANALYSIS_SECTIONS = {
 def apply_visual_theme() -> None:
     """Aplica una capa visual responsive sin alterar los componentes financieros."""
 
-    st.markdown(f"<style>/* ssl-ui: hourly-market-cache-v1 */{APP_CSS}</style>", unsafe_allow_html=True)
+    st.markdown(f"<style>/* ssl-ui: coverage-availability-v2 */{APP_CSS}</style>", unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=3_600, max_entries=350, show_spinner=False)
@@ -10825,26 +10826,61 @@ def render_opportunities_page(
         )
         return
 
-    current_rows = [
-        row
-        for row in catalog_summary
+    coverage = opportunity_coverage(catalog_summary)
+    # Recalculation time is not the price date. Keep old values for reference
+    # without labelling a stale/error result as an updated present-day reading.
+    catalog_summary = [
+        {
+            **row,
+            "Comprobación": (
+                "Datos históricos; pendiente de actualizar"
+                if not quote_freshness(
+                    row.get("Fecha"), reference_date=pd.Timestamp.now(tz="Europe/Madrid").date(),
+                ).fresh and quote_freshness(
+                    row.get("Fecha"), reference_date=pd.Timestamp.now(tz="Europe/Madrid").date(),
+                ).business_age is not None
+                else "Lectura no disponible"
+            ),
+        }
         if row.get("Comprobación") == "Actualizado en esta sesión"
+        and row.get("Ticker") not in coverage["tickers"]
+        else row
+        for row in catalog_summary
     ]
-    updated_count = len(current_rows)
-    pending_count = len(catalog_summary) - updated_count
-    strong_count = sum(
-        row.get("Lectura entrada") == "Entrada fuerte" for row in current_rows
+    updated_count = coverage["available"]
+    pending_count = coverage["pending"]
+    strong_count = coverage["strong"]
+    candidate_count = coverage["candidate"]
+    waiting_count = coverage["waiting"]
+    count_label = lambda value: measured_count_label(
+        value, available=updated_count, total=coverage["total"],
     )
-    candidate_count = sum(
-        row.get("Lectura entrada") in {"Entrada interesante", "Entrada candidata"}
-        for row in current_rows
-    )
-    waiting_count = max(updated_count - strong_count - candidate_count, 0)
     radar_metrics = st.columns(4)
-    radar_metrics[0].metric("Revisadas hoy", updated_count, f"de {len(catalog_summary)}")
-    radar_metrics[1].metric("Entradas fuertes", strong_count)
-    radar_metrics[2].metric("Candidatas", candidate_count)
-    radar_metrics[3].metric("En espera / pendientes", waiting_count + pending_count)
+    radar_metrics[0].metric("Con lectura reciente", updated_count, f"de {len(catalog_summary)}")
+    radar_metrics[1].metric("Entradas fuertes", count_label(strong_count))
+    radar_metrics[2].metric("Candidatas", count_label(candidate_count))
+    radar_metrics[3].metric("Pendientes de revisar", pending_count)
+    if coverage["status"] == "unavailable":
+        st.warning(
+            "Revisión no disponible: no hay cálculos recientes suficientes para contar "
+            "entradas. N/D no significa cero oportunidades. Las notas guardadas siguen "
+            "visibles como históricas; actualiza los datos o revisa la incidencia de carga."
+        )
+    elif coverage["status"] == "partial":
+        st.warning(
+            f"Revisión parcial: {updated_count}/{coverage['total']} empresas con lectura "
+            "reciente. ≥ indica un mínimo observado; N/D no confirma ausencia de "
+            "oportunidades en las pendientes. No es una señal de venta."
+        )
+    if coverage["oldest_date"] is not None:
+        start_date, end_date = coverage["oldest_date"], coverage["newest_date"]
+        dates = start_date.strftime("%d/%m/%Y")
+        if start_date != end_date:
+            dates += " – " + end_date.strftime("%d/%m/%Y")
+        st.caption(
+            f"Fechas de precio utilizadas: {dates}. Son fechas del dato, no la hora "
+            f"de revisión ni cotizaciones en tiempo real. En espera con lectura: {waiting_count}."
+        )
     st.caption(
         "Una empresa en espera sigue formando parte del radar. «Entrada fuerte» describe "
         "el momento técnico; «Entradas hoy» comprueba además precio, evento y beneficio/riesgo."
@@ -10869,21 +10905,24 @@ def render_opportunities_page(
         default="Todas",
         key="opportunity_radar_view",
         label_visibility="collapsed",
-        format_func=lambda value: f"{value} · {view_counts[value]}",
+        format_func=lambda value: f"{value} · " + (
+            count_label(view_counts[value]) if value in {"Entradas fuertes", "Candidatas"}
+            else str(view_counts[value])
+        ),
     )
     if radar_view == "Entradas fuertes":
         visible_catalog = [
             row
             for row in catalog_summary
             if row.get("Lectura entrada") == "Entrada fuerte"
-            and row.get("Comprobación") == "Actualizado en esta sesión"
+            and row.get("Ticker") in coverage["tickers"]
         ]
     elif radar_view == "Candidatas":
         visible_catalog = [
             row
             for row in catalog_summary
             if row.get("Lectura entrada") in {"Entrada interesante", "Entrada candidata"}
-            and row.get("Comprobación") == "Actualizado en esta sesión"
+            and row.get("Ticker") in coverage["tickers"]
         ]
     elif radar_view == "Mi cartera":
         visible_catalog = [
@@ -13015,6 +13054,20 @@ def render_growth_candidate_overview(
                 row["Entrada / stop orientativos"] = "Pendiente de verificar cartera"
     groups = list(GROWTH_CANDIDATE_GROUPS)
     grouped = {group: [row for row in rows if row["Grupo"] == group] for group in groups}
+    recent_growth_reading = any(
+        _numeric_score(row.get("Nota principal")) is not None
+        and quote_freshness(
+            row.get("Fecha"),
+            reference_date=reference_date or pd.Timestamp.now(tz="Europe/Madrid").date(),
+        ).fresh
+        for row in rows
+    )
+    if not recent_growth_reading:
+        st.warning(
+            "Crecimiento y momentum no disponibles con datos recientes. Los grupos "
+            "de entrada muestran N/D, no cero oportunidades. Las empresas pendientes "
+            "siguen visibles en Esperar y en Mi cartera; no es una señal de venta."
+        )
     if st.session_state.get("growth_action_group") not in groups:
         st.session_state["growth_action_group"] = next(
             (group for group in groups if grouped[group]), "Mi cartera"
@@ -13024,7 +13077,10 @@ def render_growth_candidate_overview(
         "Qué quieres revisar",
         groups,
         horizontal=True,
-        format_func=lambda group: f"{group} · {len(grouped[group])}",
+        format_func=lambda group: f"{group} · " + (
+            "N/D" if not recent_growth_reading and group in {"Entradas fuertes", "Candidatas"}
+            else str(len(grouped[group]))
+        ),
         key="growth_action_group",
         label_visibility="collapsed",
     )
