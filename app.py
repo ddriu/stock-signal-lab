@@ -19,6 +19,10 @@ import pandas as pd
 import streamlit as st
 
 from config import BacktestConfig, StrategyConfig
+from src.investment_runtime import prepare_investment_runtime
+
+prepare_investment_runtime()
+
 from src.session_journal import session_journal
 from src.view_cache import get_or_build_view, invalidate_view_cache
 from src.market_cache_ui import hydrate_saved_market, valuation_frames, poll_saved_market_revision
@@ -362,6 +366,11 @@ from src.visualization import (
     staircase_range_chart,
 )
 
+# Bind the simplified views only after compatibility repairs have refreshed
+# the legacy analysis/company-name dependencies they also consume.
+from src.investment_workspace_ui import render_investment_home, render_investment_workspace
+from src.investment_results_ui import render_investment_results
+
 
 st.set_page_config(
     page_title="Stock Signal Lab",
@@ -369,7 +378,7 @@ st.set_page_config(
     layout="wide",
 )
 
-MAIN_OPTIONS = ["Inicio", "Analizar", "Favoritos", "Carteras", "Más"]
+MAIN_OPTIONS = ["Inicio", "Invertir", "Carteras", "Favoritos", "Resultados", "Analizar", "Más"]
 ANALYSIS_OPTIONS = [
     "Radar",
     "Resumen diario",
@@ -377,6 +386,7 @@ ANALYSIS_OPTIONS = [
     "Empresa",
     "Estrategias",
     "Validar",
+    "Panel anterior",
 ]
 ANALYSIS_LABELS = {
     "Radar": "◎ Mi radar",
@@ -385,6 +395,7 @@ ANALYSIS_LABELS = {
     "Empresa": "↗ Empresa",
     "Estrategias": "◱ Estrategias",
     "Validar": "✓ Validar método",
+    "Panel anterior": "▦ Panel anterior",
 }
 COMPANY_OPTIONS = ["Análisis individual", "Comparar empresas"]
 STRATEGY_OPTIONS = [
@@ -508,7 +519,7 @@ SIDEBAR_ANALYSIS_SECTIONS = {
 def apply_visual_theme() -> None:
     """Aplica una capa visual responsive sin alterar los componentes financieros."""
 
-    st.markdown(f"<style>/* ssl-ui: independent-primary-storage-v1 */{APP_CSS}</style>", unsafe_allow_html=True)
+    st.markdown(f"<style>/* ssl-ui: investment-workspace-v1 */{APP_CSS}</style>", unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=3_600, max_entries=350, show_spinner=False)
@@ -579,7 +590,7 @@ def speculative_candidate_memory() -> dict[str, object]:
 
 @st.cache_resource(show_spinner=False)
 def cached_journal(owner: str):
-    """Reutiliza el cliente SQLite/Supabase entre reruns de navegación."""
+    """Reuse a current read-adapter client across navigation (workspace v1)."""
 
     return create_journal(owner)
 
@@ -7033,12 +7044,16 @@ def _bind_navigation_owner(owner: str) -> None:
     previous = st.session_state.get("_navigation_view_owner")
     if previous is not None and previous != owner:
         invalidate_view_cache(st.session_state)
+        for key in list(st.session_state):
+            if str(key).startswith(("investment_", "_investment_", "_requested_plan_")):
+                st.session_state.pop(key, None)
         for key in st.session_state.get("_navigation_sidebar_values", {}):
             st.session_state.pop(key, None)
         for key in ("market_data", "fundamental_data", "reference_data", "price_verifications",
                     "fx_snapshot", "backtest_results", "download_errors", "quick_mode_tickers",
                     "_ssl_session_journal_reads", "_pending_analysis_ticker", "analysis_ticker",
                     "_requested_analysis_ticker", "_growth_scan_tickers",
+                    "home_thesis_ticker",
                     "_portfolio_market_refresh_requested", "_force_all_favorite_refresh",
                     "_navigation_sidebar_values", "_persistent_market_reads",
                     "_cached_market_quotes", "_persistent_market_status", "_persistent_market_poll"):
@@ -7055,6 +7070,7 @@ def _remember_analysis_controls(*, restore=False) -> None:
              "home_view_navigation", "private_journal_navigation", "group_journal_navigation",
              "analysis_navigation", "analysis_company_navigation", "analysis_strategy_navigation",
              "analysis_validation_navigation", "portfolio_navigation", "favorite_view", "more_navigation"}
+    names.add("investment_horizon")
     if restore:
         for key, value in st.session_state.get("_navigation_sidebar_values", {}).items():
             if key not in st.session_state:
@@ -9553,6 +9569,7 @@ def _render_thesis_override(
     held_tickers: list[str],
     *,
     actor_username: str,
+    expanded: bool = False,
 ) -> None:
     """Permite declarar o restablecer una ruptura de tesis sin fingir automatismo."""
 
@@ -9562,7 +9579,7 @@ def _render_thesis_override(
     contexts = position_contexts_from_snapshot(snapshot.to_dict("records"))
     with st.expander(
         "Revisión manual de tesis",
-        expanded=False,
+        expanded=expanded,
         icon=":material/fact_check:",
     ):
         st.caption(
@@ -9577,6 +9594,7 @@ def _render_thesis_override(
         position_context = contexts.get(selected, {})
         strategy_options = {
             "previous_thesis": "Mantener tesis / estrategia previa",
+            "technical": "Momento técnico original",
             PRIMARY_STRATEGY_ID: "Crecimiento y momentum",
             COMPARATIVE_STRATEGY_ID: "Calidad, valoración, tesis y riesgo",
         }
@@ -9731,6 +9749,85 @@ def _request_analysis_page(page: str) -> None:
 
     st.session_state["_requested_main_navigation"] = "Analizar"
     st.session_state["_requested_analysis_navigation"] = page
+
+
+def _investment_workspace_action(action: str, value: str | None = None) -> None:
+    """Passive navigation, except the explicit company-analysis/review actions."""
+    if action == "horizon" and value in {"days", "weeks", "long_term"}:
+        _set_navigation("Invertir")
+        st.session_state["investment_horizon"] = value
+    elif action == "company" and value:
+        _open_ticker_analysis(value)
+    elif action == "portfolio":
+        _set_navigation("Carteras", "portfolio_navigation", "Privada")
+    elif action == "plan":
+        _set_navigation("Carteras", "portfolio_navigation", "Plan por posición")
+        st.session_state["_requested_plan_ticker"] = value
+    elif action == "results":
+        _set_navigation("Resultados")
+    elif action == "refresh":
+        _request_all_favorite_refresh("Crecimiento y momentum")
+    elif action == "model_details":
+        _request_analysis_page("Validar")
+        st.session_state["_requested_analysis_validation_navigation"] = "Resultados del modelo"
+    elif action == "real_returns":
+        _set_navigation("Carteras", "portfolio_navigation", "Privada")
+        st.session_state["private_journal_navigation"] = "Resultado real aproximado"
+
+
+def _saved_investment_context(journal: object, *, with_snapshots: bool = False):
+    """One sealed report and, only in Invertir, its bounded exact observations."""
+    reader = getattr(journal, "get_latest_daily_score_report", None)
+    report = reader() if callable(reader) else None
+    if not isinstance(report, dict):
+        return {}, None
+    snapshots = None
+    if with_snapshots:
+        sessions = set()
+        for row in report.get("rows", []):
+            try:
+                sessions.add(date.fromisoformat(str(row.get("session"))).isoformat())
+            except (ValueError, TypeError, AttributeError):
+                continue
+        bounded_reader = getattr(journal, "list_analysis_snapshots_for_sessions", None)
+        if sessions and callable(bounded_reader):
+            try:
+                snapshots = bounded_reader(sorted(sessions, reverse=True)[:5])
+            except (JournalStorageError, ValueError, AttributeError):
+                st.warning("La revisión de crecimiento está disponible, pero falta enlazar "
+                    "el contexto técnico y los planes. Esos apartados quedan pendientes, no son señales de venta.")
+    return report, snapshots
+
+
+def _render_investment_position_plan(journal: object, *, actor_username: str) -> None:
+    """Explicit plan editor; never revalues, reconciles or changes quantities on open."""
+    st.subheader("Plan por posición")
+    st.write("Define para qué mantienes cada posición y qué hecho te haría salir.")
+    st.caption("Sólo el botón Guardar cambia el plan. No ejecuta compras o ventas. "
+        "El informe diario conservará el plan que conocía al generarse; el nuevo aparecerá en la próxima revisión.")
+    try:
+        snapshot, _ = latest_portfolio_snapshot(journal.list_portfolio_snapshot_positions())
+    except (JournalStorageError, ValueError, AttributeError):
+        st.error("No se pudo consultar la fotografía privada. No se ha modificado nada.")
+        return
+    eligible = _rotation_eligible_snapshot(snapshot)
+    tickers = set()
+    for value in eligible.get("analysis_ticker", pd.Series(dtype=str)).dropna():
+        if str(value).strip():
+            try:
+                tickers.add(resolve_analysis_ticker(str(value)))
+            except ValueError:
+                continue
+    tickers = sorted(tickers)
+    if not tickers:
+        st.info("No hay posiciones con ticker en la fotografía guardada. Revisa primero tu cartera.")
+        return
+    requested = st.session_state.pop("_requested_plan_ticker", None)
+    if requested in tickers:
+        st.session_state["home_thesis_ticker"] = requested
+    elif st.session_state.get("home_thesis_ticker") not in tickers:
+        st.session_state["home_thesis_ticker"] = tickers[0]
+    _render_thesis_override(journal, snapshot, tickers, actor_username=actor_username, expanded=True)
 
 
 def _request_all_favorite_refresh(destination: str = "Radar") -> None:
@@ -15045,6 +15142,7 @@ def main() -> None:
         "Privada",
         "Grupo",
         "Plan de capital",
+        "Plan por posición",
     }:
         st.session_state["portfolio_navigation"] = requested_portfolio_navigation
     if requested_more_navigation in {
@@ -15071,10 +15169,12 @@ def main() -> None:
             label_visibility="collapsed",
             format_func=lambda value: {
                 "Inicio": "⌂  Inicio",
-                "Analizar": "↗  Analizar",
+                "Invertir": "↗  Invertir",
+                "Resultados": "✓  Resultados",
+                "Analizar": "⚒  Herramientas",
                 "Favoritos": "♡  Favoritos",
                 "Carteras": "▱  Cartera",
-                "Más": "···  Más",
+                "Más": "⚙  Ajustes",
             }[value],
         )
     analysis_section = ""
@@ -15145,7 +15245,7 @@ def main() -> None:
             ),
         )
     elif selected_section == "Carteras":
-        portfolio_options = ["Privada", "Grupo", "Plan de capital"]
+        portfolio_options = ["Privada", "Plan por posición", "Grupo", "Plan de capital"]
         if st.session_state.get("portfolio_navigation") not in portfolio_options:
             st.session_state["portfolio_navigation"] = "Privada"
         portfolio_section = render_subnavigation(
@@ -15156,6 +15256,7 @@ def main() -> None:
                 "Privada": "▱ Mi cartera",
                 "Grupo": "◎ Grupo",
                 "Plan de capital": "↗ Planificar",
+                "Plan por posición": "✓ Plan por posición",
             }[value],
         )
     elif selected_section == "Más":
@@ -15192,6 +15293,9 @@ def main() -> None:
     if selected_section == "Carteras" and portfolio_section == "Plan de capital":
         render_capital_projection_page(authenticated_user.username)
         return
+    if selected_section == "Carteras" and portfolio_section == "Plan por posición":
+        _render_investment_position_plan(journal, actor_username=authenticated_user.username)
+        return
     requested_digest = st.query_params.get("digest")
     if (
         selected_section == "Analizar" and analysis_section == "Resumen diario"
@@ -15203,10 +15307,17 @@ def main() -> None:
             journal, report_id=str(requested_digest) if requested_digest else None,
         )
         return
-    if selected_section == "Inicio" and st.session_state.get("home_view_navigation") == "Accesos":
-        render_home(authenticated_user, journal, group_journal, {}, {}, [],
-                    st.session_state.get("fx_snapshot", FxSnapshot(as_of=None, rates_per_eur={"EUR": 1.0})),
-                    pd.DataFrame(), pd.DataFrame(), section="Hoy")
+    if selected_section in {"Inicio", "Invertir"}:
+        try:
+            report, snapshots = _saved_investment_context(journal, with_snapshots=selected_section == "Invertir")
+        except (JournalStorageError, ValueError, AttributeError):
+            st.error("No se pudo consultar la revisión guardada. No se ejecutó ninguna operación ni envío.")
+            return
+        renderer = render_investment_home if selected_section == "Inicio" else render_investment_workspace
+        renderer(journal, report=report, snapshots=snapshots, on_action=_investment_workspace_action)
+        return
+    if selected_section == "Resultados":
+        render_investment_results(journal, on_action=_investment_workspace_action)
         return
     if (selected_section == "Carteras" and portfolio_section in {"Privada", "Grupo"}
             and st.session_state.get(f"{'private' if portfolio_section == 'Privada' else 'group'}_journal_navigation")
@@ -15772,7 +15883,7 @@ def main() -> None:
         # conserva la favorita y el aviso de descarga explica cómo corregirla.
         st.session_state.pop("_requested_analysis_ticker", None)
 
-    if selected_section == "Inicio":
+    if selected_section == "Analizar" and analysis_section == "Panel anterior":
         render_home(
             authenticated_user,
             journal,

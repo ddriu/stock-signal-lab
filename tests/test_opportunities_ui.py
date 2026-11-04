@@ -17,6 +17,7 @@ def test_entry_opportunities_is_independent_from_existing_radar() -> None:
         "Empresa",
         "Estrategias",
         "Validar",
+        "Panel anterior",
     ]
     assert "Oportunidades" not in LEGACY_ANALYSIS_ROUTES
     assert "Comparar empresas" in COMPANY_OPTIONS

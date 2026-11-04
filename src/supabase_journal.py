@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
+from collections.abc import Sequence
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
@@ -39,6 +40,7 @@ from src.journal import (
     calculate_open_positions,
     historical_closure_operations,
     normalize_analysis_snapshot,
+    normalize_analysis_sessions,
     normalize_favorite,
     normalize_operation,
     normalize_paper_daily_run,
@@ -1215,6 +1217,53 @@ class SupabaseTradingJournal:
                 frame[column] = None
         return frame.loc[:, ANALYSIS_SNAPSHOT_COLUMNS]
 
+    def list_analysis_snapshots_for_sessions(self, sessions: Sequence[str]) -> pd.DataFrame:
+        """One bounded owner-filtered query; no pagination of the full history."""
+        days = normalize_analysis_sessions(sessions)
+        frame = pd.DataFrame(columns=ANALYSIS_SNAPSHOT_COLUMNS)
+        if days:
+            try:
+                ranges = [
+                    f"and(analyzed_at.gte.{day}T00:00:00Z,"
+                    f"analyzed_at.lt.{(date.fromisoformat(day) + timedelta(days=1)).isoformat()}T00:00:00Z)"
+                    for day in days
+                ]
+            except OverflowError as exc:
+                raise ValueError("La fecha de sesión queda fuera del rango permitido.") from exc
+            params = {
+                "owner": f"eq.{self.owner}",
+                "select": "owner," + ",".join(ANALYSIS_SNAPSHOT_COLUMNS),
+                "or": "(" + ",".join(ranges) + ")",
+                "order": "analyzed_at.desc,id.desc", "limit": "1000",
+            }
+            try:
+                rows = self._request("GET", endpoint=self.analysis_endpoint, params=params).json()
+            except JournalStorageError as exc:
+                if not self._is_missing_columns_error(exc, {"confidence_pct"}):
+                    raise
+                params["select"] = "owner," + ",".join(LEGACY_ANALYSIS_SNAPSHOT_COLUMNS)
+                rows = self._request("GET", endpoint=self.analysis_endpoint, params=params).json()
+            if (not isinstance(rows, list) or len(rows) > 1000
+                    or any(not isinstance(row, dict) or row.get("owner") != self.owner
+                           for row in rows)):
+                raise JournalStorageError("El contexto de análisis guardado no tiene un propietario o formato válido.")
+            if rows:
+                frame = pd.DataFrame(rows)
+                if ("analyzed_at" not in frame
+                        or any(not isinstance(value, str) for value in frame["analyzed_at"])):
+                    raise JournalStorageError("El contexto de análisis guardado no tiene fechas válidas.")
+                dates = pd.to_datetime(frame["analyzed_at"], format="ISO8601", utc=True,
+                                       errors="coerce").dt.strftime("%Y-%m-%d")
+                if not dates.isin(days).all():
+                    raise JournalStorageError("El contexto guardado contiene sesiones no solicitadas.")
+                for column in ANALYSIS_SNAPSHOT_COLUMNS:
+                    if column not in frame:
+                        frame[column] = None
+                frame = frame.loc[:, ANALYSIS_SNAPSHOT_COLUMNS]
+        frame.attrs.update(requested_sessions=list(days), bounded_limit=1000,
+                           possibly_truncated=len(frame) >= 1000)
+        return frame
+
     def delete_analysis_snapshot(self, snapshot_id: int) -> None:
         self._request(
             "DELETE",
@@ -1255,6 +1304,32 @@ class SupabaseTradingJournal:
             report = json.loads(report)
         normalized_digest_report(report)
         if report.get("report_id") != identifier:
+            raise JournalStorageError("La versión del informe guardado no coincide.")
+        return report
+
+    def get_latest_daily_score_report(self) -> dict[str, object] | None:
+        """Fetch only this owner's latest immutable report, never raw analysis."""
+        rows = self._request(
+            "GET", endpoint=f"{self.url}/rest/v1/daily_score_reports",
+            params={"owner": f"eq.{self.owner}",
+                    "select": "owner,report_id,market_date,report_json",
+                    "order": "market_date.desc,created_at.desc,report_id.desc", "limit": "1"},
+        ).json()
+        if not isinstance(rows, list) or len(rows) > 1:
+            raise JournalStorageError("El informe guardado no tiene un formato válido.")
+        if not rows:
+            return None
+        row = rows[0]
+        if not isinstance(row, dict) or row.get("owner") != self.owner:
+            raise JournalStorageError("No se pudo verificar el propietario del informe.")
+        try:
+            report = row.get("report_json")
+            if isinstance(report, str):
+                report = json.loads(report)
+            identifier, market_date, _ = normalized_digest_report(report)
+        except (TypeError, ValueError) as exc:
+            raise JournalStorageError("El informe guardado no tiene un formato válido.") from exc
+        if row.get("report_id") != identifier or row.get("market_date") != market_date:
             raise JournalStorageError("La versión del informe guardado no coincide.")
         return report
 

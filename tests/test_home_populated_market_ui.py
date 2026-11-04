@@ -1,4 +1,4 @@
-"""Authenticated Home must enrich a populated cache without external effects.
+"""The legacy advanced panel enriches a populated cache without external effects.
 
 Empty-journal startup tests do not enter the policy-enrichment path. These
 fixtures exercise that real path while forbidding downloads, persistence and
@@ -56,7 +56,8 @@ if WITH_PERIODS:
         for key in ("revenueGrowth", "earningsGrowth", "operatingMargins", "returnOnEquity", "freeCashflow")
     }
 
-st.session_state["main_navigation"] = "Inicio"
+st.session_state["main_navigation"] = "Analizar"
+st.session_state["analysis_navigation"] = "Panel anterior"
 st.session_state["_portfolio_auto_refresh_done_qa"] = date.today().isoformat()
 st.session_state["market_data"] = {"TEST": raw}
 st.session_state["reference_data"] = {"SPY": raw}

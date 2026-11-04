@@ -22,11 +22,21 @@ def symbol(owner): return "ALPHA" if owner == "qa_a" else "BETA"
 
 class Journal:
     def __init__(self, owner): self.owner = owner
+    def get_latest_daily_score_report(self):
+        st.session_state["qa_reads"][self.owner]["latest"] += 1
+        return {"owner_marker": self.owner, "report_id": ("a" if self.owner == "qa_a" else "b") * 64,
+                "rows": [{"ticker": symbol(self.owner), "session": date.today().isoformat()}]}
+    def list_analysis_snapshots_for_sessions(self, sessions):
+        assert sessions == [date.today().isoformat()], "Only the saved report's sessions may be read"
+        st.session_state["qa_reads"][self.owner]["bounded"] += 1
+        return pd.DataFrame([{"ticker": symbol(self.owner), "owner_marker": self.owner}])
     def list_favorites(self):
         return pd.DataFrame() if self.owner == GROUP_PORTFOLIO_OWNER else pd.DataFrame([
             {"ticker": symbol(self.owner), "name": "Company for " + self.owner}])
     def list_portfolio_snapshot_positions(self): return pd.DataFrame()
-    def list_analysis_snapshots(self): return pd.DataFrame()
+    def list_analysis_snapshots(self):
+        st.session_state["qa_reads"][self.owner]["snapshots"] += 1
+        return pd.DataFrame()
     def list_operations(self): return pd.DataFrame()
     def open_positions(self): return pd.DataFrame()
     def __getattr__(self, name):
@@ -43,6 +53,8 @@ if "qa_initialized" not in st.session_state:
     st.session_state["qa_initialized"] = True
     st.session_state["qa_owner"] = "qa_a"
     st.session_state["qa_counts"] = {"prepare": 0, "enrich": 0, "load": 0}
+    st.session_state["qa_reads"] = {owner: {"latest": 0, "bounded": 0, "snapshots": 0}
+        for owner in ("qa_a", "qa_b", GROUP_PORTFOLIO_OWNER)}
     st.session_state["qa_compute_budget"] = INITIAL_BUDGET
     st.session_state["qa_load_budget"] = 0
     st.session_state["_navigation_view_owner"] = "qa_a"
@@ -50,8 +62,11 @@ if "qa_initialized" not in st.session_state:
     st.session_state["reference_data"] = {"SPY": raw()}
     st.session_state["fundamental_data"] = {"ALPHA": {"symbol": "ALPHA", "currency": "USD"}}
     st.session_state["main_navigation"] = INITIAL_ROUTE
+    st.session_state["analysis_navigation"] = INITIAL_ANALYSIS
     st.session_state["more_navigation"] = INITIAL_MORE
     st.session_state["portfolio_navigation"] = INITIAL_PORTFOLIO
+    if INITIAL_DIGEST:
+        st.query_params["digest"] = INITIAL_DIGEST
     st.session_state["qa_journals"] = {owner: Journal(owner) for owner in ("qa_a", "qa_b", GROUP_PORTFOLIO_OWNER)}
     for owner in ("qa_a", "qa_b"):
         st.session_state["_portfolio_auto_refresh_done_" + owner] = date.today().isoformat()
@@ -109,6 +124,34 @@ def home(current, journal, group, prepared, references, summary, *args, **kwargs
     st.write("HOME " + owner)
     st.write("TICKERS " + ",".join(row["Ticker"] for row in summary))
 
+def saved_workspace(journal, *, report, snapshots=None, on_action=None, view):
+    assert journal.owner == owner and report["owner_marker"] == owner, "Saved report leaked across owners"
+    assert report["rows"][0]["ticker"] == symbol(owner)
+    if view == "Inicio":
+        assert snapshots is None, "Inicio must not read historical analysis"
+    else:
+        assert snapshots.owner_marker.tolist() == [owner], "Snapshot context leaked across owners"
+    st.write("SAVED " + view + " " + owner + " " + symbol(owner))
+    if view == "Inicio":
+        for horizon in ("days", "weeks", "long_term"):
+            st.button("QA open " + horizon, key="qa_horizon_" + horizon,
+                on_click=on_action, args=("horizon", horizon))
+        st.button("QA review plan", key="qa_plan", on_click=on_action, args=("plan", symbol(owner)))
+        st.button("QA results", key="qa_results", on_click=on_action, args=("results", None))
+
+def saved_results(journal, *, on_action=None):
+    assert journal.owner == owner, "Results leaked across owners"
+    st.write("SAVED Resultados " + owner)
+
+def plan(journal, *, actor_username):
+    assert journal.owner == actor_username == owner
+    assert st.session_state.get("_requested_plan_ticker") == symbol(owner)
+    st.write("PLAN " + owner)
+
+def digest(journal, *, report_id=None):
+    assert journal.owner == owner and report_id == INITIAL_DIGEST
+    st.write("DIGEST " + owner + " " + report_id)
+
 def favorites(journal, group, private, shared, **kwargs):
     assert journal.owner == owner and private.ticker.tolist() == [symbol(owner)]
     st.write("FAVORITES " + owner)
@@ -133,9 +176,16 @@ with ExitStack() as patches:
     patches.enter_context(patch.object(application, "load_market_data", side_effect=load))
     patches.enter_context(patch.object(application, "prepare_data", side_effect=prepare))
     patches.enter_context(patch.object(application, "_enrich_current_analysis_policy", side_effect=enrich))
-    patches.enter_context(patch.object(application, "_portfolio_tracking_tickers", side_effect=lambda journal: [] if journal.owner == GROUP_PORTFOLIO_OWNER else [symbol(journal.owner)]))
+    patches.enter_context(patch.object(application, "_portfolio_tracking_tickers", side_effect=lambda journal, *, strict=False: [] if journal.owner == GROUP_PORTFOLIO_OWNER else [symbol(journal.owner)]))
     patches.enter_context(patch.object(application, "_paper_tracking_tickers", return_value=[]))
     patches.enter_context(patch.object(application, "render_home", side_effect=home))
+    patches.enter_context(patch.object(application, "render_investment_home",
+        side_effect=lambda *args, **kwargs: saved_workspace(*args, view="Inicio", **kwargs)))
+    patches.enter_context(patch.object(application, "render_investment_workspace",
+        side_effect=lambda *args, **kwargs: saved_workspace(*args, view="Invertir", **kwargs)))
+    patches.enter_context(patch.object(application, "render_investment_results", side_effect=saved_results))
+    patches.enter_context(patch.object(application, "_render_investment_position_plan", side_effect=plan))
+    patches.enter_context(patch("src.daily_digest_ui.render_daily_score_page", side_effect=digest))
     patches.enter_context(patch.object(application, "render_favorites_manager", side_effect=favorites))
     patches.enter_context(patch.object(application, "render_methodology", side_effect=lambda: st.write("GUIDE")))
     patches.enter_context(patch.object(application, "render_email_alert_settings", side_effect=lambda journal: st.write("MAIL_SETTINGS " + journal.owner)))
@@ -147,9 +197,11 @@ with ExitStack() as patches:
 '''
 
 
-def page(route="Inicio", *, more="Guía y riesgos", portfolio="Plan de capital", pending=False):
-    script = (SCRIPT.replace("INITIAL_BUDGET", "1" if route == "Inicio" else "0")
+def page(route="Inicio", *, analysis="Panel anterior", more="Guía y riesgos",
+         portfolio="Plan de capital", pending=False, digest=None):
+    script = (SCRIPT.replace("INITIAL_BUDGET", "1" if route == "Analizar" else "0")
         .replace("INITIAL_ROUTE", repr(route)).replace("INITIAL_MORE", repr(more))
+        .replace("INITIAL_ANALYSIS", repr(analysis)).replace("INITIAL_DIGEST", repr(digest))
         .replace("INITIAL_PORTFOLIO", repr(portfolio)).replace("PENDING_FLAGS", repr(pending)))
     return AppTest.from_string(script, default_timeout=30).run()
 
@@ -159,7 +211,8 @@ def assert_ok(current):
     assert not current.error
 
 
-@pytest.mark.parametrize("route,more", [("Favoritos", "Guía y riesgos"), ("Más", "Guía y riesgos"),
+@pytest.mark.parametrize("route,more", [("Inicio", "Guía y riesgos"), ("Invertir", "Guía y riesgos"),
+    ("Resultados", "Guía y riesgos"), ("Favoritos", "Guía y riesgos"), ("Más", "Guía y riesgos"),
     ("Más", "Alertas por correo"), ("Carteras", "Guía y riesgos")])
 def test_light_routes_never_prepare_enrich_download_or_run_models(route, more):
     current = page(route, more=more)
@@ -170,28 +223,118 @@ def test_light_routes_never_prepare_enrich_download_or_run_models(route, more):
     assert current.session_state["qa_counts"] == {"prepare": 0, "enrich": 0, "load": 0}
 
 
-@pytest.mark.parametrize("route", ["Favoritos", "Más"])
+@pytest.mark.parametrize("route", ["Inicio", "Invertir", "Resultados", "Favoritos", "Más"])
 def test_light_routes_ignore_pending_market_work_instead_of_running_it(route):
     current = page(route, pending=True)
     assert_ok(current)
     assert current.session_state["qa_counts"] == {"prepare": 0, "enrich": 0, "load": 0}
+    assert current.session_state["_pending_analysis_ticker"] == "ALPHA"
+    assert current.session_state["_growth_scan_tickers"] == ["ALPHA"]
+    assert current.session_state["_portfolio_market_refresh_requested"] is True
+    current.run()
+    assert_ok(current)
+    assert current.session_state["qa_counts"] == {"prepare": 0, "enrich": 0, "load": 0}
 
 
-def test_repeated_home_and_roundtrip_tabs_reuse_prepared_analysis_without_recalculation():
+@pytest.mark.parametrize("route,bounded", [("Inicio", 0), ("Invertir", 1), ("Resultados", 0)])
+def test_saved_screens_read_only_owner_report_and_bounded_context(route, bounded):
+    current = page(route)
+    assert_ok(current)
+    current.run()
+    assert_ok(current)
+    assert current.session_state["qa_reads"]["qa_a"] == {
+        "latest": int(route != "Resultados"), "bounded": bounded, "snapshots": 0}
+    assert current.session_state["qa_reads"]["qa_b"] == {"latest": 0, "bounded": 0, "snapshots": 0}
+    assert any("SAVED " + route + " qa_a" in str(item.value) for item in current.markdown)
+
+
+@pytest.mark.parametrize("horizon", ["days", "weeks", "long_term"])
+def test_home_horizon_action_opens_investing_without_market_work(horizon):
     current = page()
+    current.button(key="qa_horizon_" + horizon).click().run()
+    assert_ok(current)
+    assert current.session_state["main_navigation"] == "Invertir"
+    assert current.session_state["investment_horizon"] == horizon
+    assert current.session_state["qa_counts"] == {"prepare": 0, "enrich": 0, "load": 0}
+    assert current.session_state["qa_reads"]["qa_a"] == {"latest": 1, "bounded": 1, "snapshots": 0}
+
+
+def test_home_plan_action_targets_own_position_without_saving_or_market_work():
+    current = page()
+    current.button(key="qa_plan").click().run()
+    assert_ok(current)
+    assert current.session_state["main_navigation"] == "Carteras"
+    assert current.session_state["portfolio_navigation"] == "Plan por posición"
+    assert current.session_state["_requested_plan_ticker"] == "ALPHA"
+    assert any("PLAN qa_a" in str(item.value) for item in current.markdown)
+    assert current.session_state["qa_counts"] == {"prepare": 0, "enrich": 0, "load": 0}
+
+
+def test_home_results_action_opens_saved_results_without_market_work():
+    current = page()
+    current.button(key="qa_results").click().run()
+    assert_ok(current)
+    assert current.session_state["main_navigation"] == "Resultados"
+    assert any("SAVED Resultados qa_a" in str(item.value) for item in current.markdown)
+    assert current.session_state["qa_counts"] == {"prepare": 0, "enrich": 0, "load": 0}
+
+
+def test_archived_digest_link_remains_read_only_in_home():
+    current = page(digest="d" * 64, pending=True)
+    assert_ok(current)
+    current.run()
+    assert_ok(current)
+    assert any("DIGEST qa_a " + "d" * 64 in str(item.value) for item in current.markdown)
+    assert current.session_state["qa_reads"]["qa_a"] == {"latest": 0, "bounded": 0, "snapshots": 0}
+    assert current.session_state["qa_counts"] == {"prepare": 0, "enrich": 0, "load": 0}
+
+
+@pytest.mark.parametrize("route", ["Inicio", "Invertir", "Resultados"])
+def test_owner_switch_clears_new_workspace_state_and_reads_only_new_owners_report(route):
+    current = page(route, pending=True)
+    assert_ok(current)
+    current.session_state["investment_private_context"] = {"ticker": "ALPHA"}
+    current.session_state["_investment_old_report"] = {"owner_marker": "qa_a"}
+    current.session_state["_requested_plan_ticker"] = "ALPHA"
+    current.button(key="qa_switch").click().run()
+    assert_ok(current)
+    assert current.session_state["qa_owner"] == "qa_b"
+    for key in ("investment_private_context", "_investment_old_report", "_requested_plan_ticker",
+                "_pending_analysis_ticker", "_growth_scan_tickers", "_portfolio_market_refresh_requested"):
+        assert key not in current.session_state
+    assert current.session_state["qa_counts"] == {"prepare": 0, "enrich": 0, "load": 0}
+    assert current.session_state["qa_reads"]["qa_b"] == {
+        "latest": int(route != "Resultados"), "bounded": int(route == "Invertir"), "snapshots": 0}
+    assert any("SAVED " + route + " qa_b" in str(item.value) for item in current.markdown)
+    assert not any("SAVED " + route + " qa_a" in str(item.value) for item in current.markdown)
+
+
+def test_all_main_destinations_roundtrip_without_repeated_analysis_or_smtp():
+    current = page("Analizar")
+    assert_ok(current)
+    for destination in ("Inicio", "Invertir", "Carteras", "Favoritos", "Resultados", "Más", "Analizar"):
+        current.segmented_control(key="main_navigation").set_value(destination).run()
+        assert_ok(current)
+        assert current.session_state["qa_counts"] == {"prepare": 1, "enrich": 1, "load": 0}
+    assert current.session_state["qa_reads"]["qa_a"]["latest"] == 1
+    assert current.session_state["qa_reads"]["qa_a"]["bounded"] == 1
+
+
+def test_repeated_legacy_panel_and_roundtrip_tabs_reuse_prepared_analysis_without_recalculation():
+    current = page("Analizar")
     assert_ok(current)
     assert current.session_state["qa_counts"] == {"prepare": 1, "enrich": 1, "load": 0}
     current.run()
     assert_ok(current)
     current.segmented_control(key="main_navigation").set_value("Favoritos").run()
     assert_ok(current)
-    current.segmented_control(key="main_navigation").set_value("Inicio").run()
+    current.segmented_control(key="main_navigation").set_value("Analizar").run()
     assert_ok(current)
     assert current.session_state["qa_counts"] == {"prepare": 1, "enrich": 1, "load": 0}
 
 
 def test_explicit_refresh_invalidates_once_and_later_navigation_remains_fast():
-    current = page()
+    current = page("Analizar")
     assert_ok(current)
     current.button(key="qa_refresh").click().run()
     assert_ok(current)
@@ -200,18 +343,21 @@ def test_explicit_refresh_invalidates_once_and_later_navigation_remains_fast():
     assert_ok(current)
     current.segmented_control(key="main_navigation").set_value("Más").run()
     assert_ok(current)
-    current.segmented_control(key="main_navigation").set_value("Inicio").run()
+    current.segmented_control(key="main_navigation").set_value("Analizar").run()
     assert_ok(current)
     assert current.session_state["qa_counts"] == {"prepare": 2, "enrich": 2, "load": 1}
 
 
 def test_account_switch_cannot_reuse_previous_owners_market_or_policy_cache():
-    current = page()
+    current = page("Analizar")
     assert_ok(current)
     current.button(key="qa_switch").click().run()
     assert_ok(current)
     assert current.session_state["qa_owner"] == "qa_b"
     assert "market_data" not in current.session_state or "ALPHA" not in current.session_state["market_data"]
+    # Account rebinding deliberately drops the previous owner's analysis view.
+    current.segmented_control(key="analysis_navigation").set_value("Panel anterior").run()
+    assert_ok(current)
     current.button(key="qa_refresh").click().run()
     assert_ok(current)
     assert current.session_state["qa_counts"] == {"prepare": 2, "enrich": 2, "load": 1}
@@ -220,8 +366,9 @@ def test_account_switch_cannot_reuse_previous_owners_market_or_policy_cache():
 
 
 def test_analysis_controls_survive_a_page_without_the_sidebar():
-    script = SCRIPT.replace("INITIAL_BUDGET", "1").replace("INITIAL_ROUTE", repr("Inicio"))
+    script = SCRIPT.replace("INITIAL_BUDGET", "1").replace("INITIAL_ROUTE", repr("Analizar"))
     script = script.replace("INITIAL_MORE", repr("Guía y riesgos")).replace("INITIAL_PORTFOLIO", repr("Privada"))
+    script = script.replace("INITIAL_ANALYSIS", repr("Panel anterior")).replace("INITIAL_DIGEST", "None")
     script = script.replace("PENDING_FLAGS", "False")
     current = AppTest.from_string(script, default_timeout=30)
     current.session_state['cfg_stop_loss'] = 13.0
@@ -230,7 +377,7 @@ def test_analysis_controls_survive_a_page_without_the_sidebar():
     assert current.slider(key='cfg_stop_loss').value == 13.0
     current.segmented_control(key='main_navigation').set_value('Favoritos').run()
     assert_ok(current)
-    current.segmented_control(key='main_navigation').set_value('Inicio').run()
+    current.segmented_control(key='main_navigation').set_value('Analizar').run()
     assert_ok(current)
     assert current.slider(key='cfg_stop_loss').value == 13.0
     assert current.session_state['qa_counts'] == {'prepare': 1, 'enrich': 1, 'load': 0}

@@ -29,6 +29,8 @@ _READ_METHODS = frozenset({
     "list_portfolio_imports", "list_private_investments",
     "list_portfolio_accounts", "list_portfolio_snapshot_positions",
     "list_favorites", "list_analysis_snapshots", "get_daily_score_report",
+    "get_latest_daily_score_report",
+    "list_analysis_snapshots_for_sessions",
     "get_alert_preferences", "list_alert_states", "list_paper_simulations",
     "list_paper_daily_runs",
 })

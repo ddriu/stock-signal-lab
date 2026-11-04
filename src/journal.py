@@ -714,6 +714,20 @@ def normalize_favorite(
     }
 
 
+def normalize_analysis_sessions(sessions: Sequence[str]) -> tuple[str, ...]:
+    """Strict UTC calendar dates for a small, read-only workspace lookup."""
+    if isinstance(sessions, (str, bytes)) or not isinstance(sessions, Sequence):
+        raise ValueError("Las sesiones deben ser una lista de fechas ISO.")
+    normalized: set[str] = set()
+    for session in sessions:
+        if not isinstance(session, str):
+            raise ValueError("Las sesiones deben ser fechas ISO completas.")
+        normalized.add(digest_market_date(session))
+        if len(normalized) > 5:
+            raise ValueError("La consulta admite como máximo cinco sesiones distintas.")
+    return tuple(sorted(normalized, reverse=True))
+
+
 def normalize_analysis_snapshot(
     *,
     ticker: str,
@@ -2437,6 +2451,27 @@ class TradingJournal:
         with self._connect() as connection:
             return pd.read_sql_query(query, connection, params=parameters)
 
+    def list_analysis_snapshots_for_sessions(self, sessions: Sequence[str]) -> pd.DataFrame:
+        """Read at most 1,000 existing observations from up to five UTC dates.
+
+        Legacy SQLite analysis is isolated by database file, not an owner column.
+        This never rebuilds observations or substitutes adjacent sessions.
+        """
+        days = normalize_analysis_sessions(sessions)
+        frame = pd.DataFrame(columns=ANALYSIS_SNAPSHOT_COLUMNS)
+        if days:
+            placeholders = ",".join("?" for _ in days)
+            with self._connect() as connection:
+                frame = pd.read_sql_query(
+                    f"SELECT {','.join(ANALYSIS_SNAPSHOT_COLUMNS)} FROM analysis_snapshots "
+                    f"WHERE date(analyzed_at) IN ({placeholders}) "
+                    "ORDER BY analyzed_at DESC,id DESC LIMIT 1000",
+                    connection, params=days,
+                )
+        frame.attrs.update(requested_sessions=list(days), bounded_limit=1000,
+                           possibly_truncated=len(frame) >= 1000)
+        return frame
+
     def delete_analysis_snapshot(self, snapshot_id: int) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -2474,6 +2509,23 @@ class TradingJournal:
             return None
         report = json.loads(row["report_json"])
         normalized_digest_report(report)
+        return report
+
+    def get_latest_daily_score_report(self) -> dict[str, object] | None:
+        """Read one sealed report, without rebuilding analysis or changing history."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT owner,report_id,market_date,report_json FROM daily_score_reports "
+                "WHERE owner=? ORDER BY market_date DESC,created_at DESC,report_id DESC LIMIT 1",
+                (self.owner,),
+            ).fetchone()
+        if row is None:
+            return None
+        report = json.loads(row["report_json"])
+        identifier, market_date, _ = normalized_digest_report(report)
+        if (row["owner"] != self.owner or row["report_id"] != identifier
+                or row["market_date"] != market_date):
+            raise ValueError("La versión del informe guardado no coincide.")
         return report
 
     def claim_daily_digest(self, delivery_key: str, market_date: str, report_id: str) -> bool:
