@@ -19,7 +19,11 @@ import pandas as pd
 import streamlit as st
 
 from config import BacktestConfig, StrategyConfig
-from src.investment_runtime import prepare_investment_runtime
+import src.investment_runtime as _investment_runtime_module
+
+if getattr(_investment_runtime_module, "INVESTMENT_RUNTIME_VERSION", "") != "compact-workspace-v2":
+    _investment_runtime_module = importlib.reload(_investment_runtime_module)
+prepare_investment_runtime = _investment_runtime_module.prepare_investment_runtime
 
 prepare_investment_runtime()
 
@@ -29,7 +33,7 @@ from src.market_cache_ui import hydrate_saved_market, valuation_frames, poll_sav
 from src.portfolio_view_context import reconcile_home_views
 import src.runtime_compat as _analysis_runtime_module
 
-if getattr(_analysis_runtime_module, "RUNTIME_COMPAT_VERSION", "") != "independent-primary-storage-v1":
+if getattr(_analysis_runtime_module, "RUNTIME_COMPAT_VERSION", "") != "compact-mobile-v3":
     _analysis_runtime_module = importlib.reload(_analysis_runtime_module)
 prepare_analysis_runtime = _analysis_runtime_module.prepare_analysis_runtime
 
@@ -519,7 +523,7 @@ SIDEBAR_ANALYSIS_SECTIONS = {
 def apply_visual_theme() -> None:
     """Aplica una capa visual responsive sin alterar los componentes financieros."""
 
-    st.markdown(f"<style>/* ssl-ui: investment-workspace-v1 */{APP_CSS}</style>", unsafe_allow_html=True)
+    st.markdown(f"<style>/* ssl-ui: compact-workspace-v2 */{APP_CSS}</style>", unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=3_600, max_entries=350, show_spinner=False)
@@ -15163,20 +15167,26 @@ def main() -> None:
     with st.container(key="main_navigation_container"):
         selected_section = st.segmented_control(
             "Navegación principal",
-            MAIN_OPTIONS,
+            ["Inicio", "Carteras", "Más"] + ([st.session_state["main_navigation"]]
+                if st.session_state.get("main_navigation") not in {"Inicio", "Carteras", "Más"} else []),
             key="main_navigation",
             required=True,
             label_visibility="collapsed",
             format_func=lambda value: {
-                "Inicio": "⌂  Inicio",
+                "Inicio": "⌂  Hoy",
                 "Invertir": "↗  Invertir",
                 "Resultados": "✓  Resultados",
                 "Analizar": "⚒  Herramientas",
                 "Favoritos": "♡  Favoritos",
                 "Carteras": "▱  Cartera",
-                "Más": "⚙  Ajustes",
+                "Más": "⚙  Gestionar y herramientas",
             }[value],
         )
+    with st.expander("Abrir herramientas y resultados"):
+        destination = st.selectbox("Ir a", MAIN_OPTIONS, index=MAIN_OPTIONS.index(selected_section), key="compact_destination")
+        if st.button("Abrir sección", key="compact_open"):
+            st.session_state["_requested_main_navigation"] = destination
+            st.rerun()
     analysis_section = ""
     analysis_detail = ""
     favorite_view = ""
@@ -15348,7 +15358,7 @@ def main() -> None:
         # contract before binding its renderers; never clear account state.
         if getattr(_model_results_view, "MODEL_RESULTS_PRESENTATION_VERSION", "") != "cohort-controls-v1":
             _model_results_view = importlib.reload(_model_results_view)
-        if getattr(_model_tracking_view, "TRACKING_PRESENTATION_VERSION", "") != "measurement-readiness-v2":
+        if getattr(_model_tracking_view, "TRACKING_PRESENTATION_VERSION", "") != "measurement-recovery-v3":
             _model_tracking_view = importlib.reload(_model_tracking_view)
         from src.model_results_tracking import git_revision
 

@@ -29,11 +29,12 @@ def test_scope_cannot_advance_another_recipient(monkeypatch):
     collect.assert_called_once_with(journal, ["saved"])
 
 
-def test_cli_passes_tracker_to_same_analysis_send_pipeline(monkeypatch):
+def test_cli_keeps_tracker_out_of_analysis_send_pipeline(monkeypatch):
     callback = Mock()
     monkeypatch.setattr(cli, "configured_virtual_tracker", lambda: callback)
     monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
     run = Mock(return_value=AlertRunSummary(0, 0, 0, 0, ()))
     monkeypatch.setattr(cli, "run_daily_alerts", run)
     assert cli.main() == 0
-    run.assert_called_once_with(virtual_tracker=callback)
+    run.assert_called_once_with()
+    callback.assert_not_called()

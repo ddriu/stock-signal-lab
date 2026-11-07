@@ -12,7 +12,7 @@ from src.investment_workspace import build_investment_workspace
 
 
 HORIZON_LABELS = {"days": "Días", "weeks": "Semanas", "long_term": "Largo plazo"}
-WORKSPACE_UI_VERSION = "investment-workspace-ui-v1"
+WORKSPACE_UI_VERSION = "investment-workspace-ui-v2"
 def _load_workspace(journal, report, snapshots, holdings, reference_date):
     # A provided report (including {}) is authoritative: no additional reads.
     if report is None:
@@ -42,8 +42,24 @@ def _note(value):
         return "N/D"
 
 
+def _saved_growth_note(row):
+    """A compact archived reading, separate from the position's own strategy."""
+    reading = row.get("saved_growth_reading") or {}
+    comparison = reading.get("comparison_status")
+    change = reading.get("change")
+    delta = f"{change:+g}" if comparison in {"stable", "changed"} and change is not None else (
+        "no comparable" if comparison == "not_comparable" else "—")
+    session = reading.get("as_of")
+    try:
+        session = datetime.fromisoformat(session).strftime("%d/%m")
+    except (TypeError, ValueError):
+        session = "sin fecha"
+    text = f"{_note(reading.get('score'))} · {delta} · {session}"
+    return text if reading.get("verified") else text + " · sin verificar"
+
+
 def _header(workspace):
-    st.subheader("Tu plan de inversión")
+    st.subheader("Hoy · cartera y posibles entradas")
     st.write("Primero lo que ya tienes. Después, posibles entradas según el plazo.")
     st.caption(f"Cierre guardado: {workspace.get('as_of') or 'sin fecha'} · "
         f"Informe: {str(workspace.get('report_id') or 'N/D')[:12]}. "
@@ -68,6 +84,9 @@ def _card(row, on_action, key):
         note = kind if kind == "Sin nota conjunta" else kind + " " + _note(row.get("score"))
         st.caption(f"{row.get('strategy') or 'Estrategia pendiente'} · "
             f"{row.get('horizon') or 'Plazo sin definir'} · {note}")
+        if row.get("held") and row.get("saved_growth_reading"):
+            st.caption("Crecimiento + momentum guardado: " + _saved_growth_note(row) +
+                ". Lectura independiente del plan y de la nota de calidad; no decide una salida.")
         components = [("Calidad", "quality_score"), ("Valoración", "valuation_score"),
                       ("Riesgo controlado", "risk_score")]
         observed_components = [label + " " + _note(row[field]) for label, field in components
@@ -123,7 +142,7 @@ def _actions(on_action, *, prefix):
 
 def render_investment_home(journal, *, report=None, on_action=None,
         snapshots=None, holdings=None, reference_date=None):
-    """Light overview: at most three priorities and three horizon entrances."""
+    """One portfolio table and at most three candidates, without recalculation."""
     try:
         workspace = _load_workspace(journal, report, snapshots, holdings, reference_date)
     except Exception:
@@ -132,29 +151,23 @@ def render_investment_home(journal, *, report=None, on_action=None,
     _header(workspace)
     portfolio = workspace.get("portfolio") or []
     st.markdown("### Qué revisar primero")
-    priorities = portfolio[:3]
-    if portfolio and all(row.get("plan_status") == "unverified" for row in portfolio):
-        st.info(f"Hay {len(portfolio)} posiciones cuyos planes no están incluidos en este resumen. "
-            "Comprueba su plazo y tesis en la cartera antes de plantear cambios.")
-        st.caption("No es una señal de venta ni significa que esas posiciones no tengan un plan guardado.")
-        if callable(on_action):
-            st.button("Revisar planes", key="investment_home_plans", on_click=_navigate,
-                args=(on_action, "plan", None), width="stretch")
-    elif priorities:
-        for index, row in enumerate(priorities):
-            _card(row, on_action, f"investment_home_priority_{index}")
+    if portfolio:
+        st.dataframe([{"Empresa": row.get("company_name") or row.get("ticker"),
+            "Crecimiento": _saved_growth_note(row),
+            "Qué revisar": row.get("action"),
+            "Motivo": row.get("reason")} for row in portfolio], hide_index=True,
+            width="stretch")
+        st.caption("Crecimiento: nota guardada de crecimiento + momentum · cambio comparable · sesión. "
+            "Es independiente del plan de cada posición; no es una nota de calidad ni una indicación de salida.")
+        with st.expander("Detalle de una posición"):
+            _one_more(portfolio, on_action, "home_position_detail")
     else:
         st.info("No hay posiciones incluidas en este informe. Puedes revisar las posibles entradas por plazo.")
-    for column, horizon in zip(st.columns(3), HORIZON_LABELS):
-        view = workspace.get("horizons", {}).get(horizon, {})
-        with column:
-            st.markdown("### " + HORIZON_LABELS[horizon])
-            st.write(view.get("description") or "Pendiente de revisión.")
-            label = view.get("opportunity_count_label", "N/D")
-            st.caption(f"Posibilidades que revisar: {label}")
-            if callable(on_action):
-                st.button("Abrir " + HORIZON_LABELS[horizon].lower(), key=f"investment_home_{horizon}",
-                    on_click=_navigate, args=(on_action, "horizon", horizon), width="stretch")
+    horizon = st.radio("Plazo", list(HORIZON_LABELS), format_func=HORIZON_LABELS.get,
+        horizontal=True, index=1, key="home_horizon_filter")
+    view = workspace.get("horizons", {}).get(horizon, {})
+    _section("Posibles entradas · máximo tres", (view.get("opportunities") or [])[:3],
+        on_action, "home_candidates", empty="No hay entradas verificadas para este plazo. No se rebajan los filtros para rellenar la lista.")
     _actions(on_action, prefix="investment_home")
     st.caption("Revisar cada día no obliga a operar cada día.")
     return workspace

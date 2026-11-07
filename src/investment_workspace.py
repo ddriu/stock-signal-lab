@@ -19,7 +19,7 @@ from src.instruments import resolve_analysis_ticker, resolve_company_name
 from src.market_data_quality import quote_freshness
 
 
-WORKSPACE_VERSION = "investment-workspace-v1"
+WORKSPACE_VERSION = "investment-workspace-v2"
 _HORIZONS = {
     "days": ("Días", "Revisión diaria de operaciones de varios días", "Momento técnico"),
     "weeks": ("Semanas", "Crecimiento y momentum, sin mezclar las otras notas", "Crecimiento + momentum"),
@@ -179,6 +179,32 @@ def _strategy_kind(position: Mapping) -> str | None:
     return None
 
 
+def _saved_growth_reading(row: Mapping, dated: bool) -> dict:
+    """Expose the archived growth reading, never the position's strategy score.
+
+    The report already decided whether sessions/methods can be compared. Do
+    not recalculate a delta from a different snapshot or infer a position plan.
+    """
+    score = _score(row.get("score"))
+    comparison = _text(row.get("comparison_status"))
+    change = None
+    if score is not None and comparison in {"stable", "changed"}:
+        value = row.get("change")
+        if not isinstance(value, bool):
+            try:
+                number = float(value)
+                if isfinite(number) and -100 <= number <= 100:
+                    change = int(number) if number.is_integer() else number
+            except (ValueError, TypeError, OverflowError):
+                pass
+    reading = daily_score_reading(row)
+    session = _day(row.get("session"))
+    return {"score": score, "change": change, "comparison_status": comparison,
+            "as_of": session.isoformat() if session else None,
+            "verified": bool(dated and not reading["blocked"]),
+            "signal": reading["signal"], "limitations": list(reading["reasons"])}
+
+
 def _portfolio_row(base: dict, row: Mapping, policy: Mapping | None, dated: bool,
                    record: Mapping | None = None) -> dict:
     position = policy.get("position", {}) if policy else {}
@@ -186,7 +212,8 @@ def _portfolio_row(base: dict, row: Mapping, policy: Mapping | None, dated: bool
     output = {**base, "strategy": _text(position.get("strategy_label")) or "Sin estrategia asignada",
               "horizon": _text(position.get("horizon")) or "Sin plazo definido",
               "horizon_key": _horizon(position), "score": _score(row.get("score")),
-              "score_kind": "Crecimiento + momentum", "priority": 3}
+              "score_kind": "Crecimiento + momentum", "priority": 3,
+              "saved_growth_reading": _saved_growth_reading(row, dated)}
     output["plan_status"] = ("unverified" if policy is None else
                              "missing" if output["horizon_key"] is None else "documented")
     kind = _strategy_kind(position)

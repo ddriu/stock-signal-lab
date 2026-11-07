@@ -41,7 +41,7 @@ jobs:
         env:
           # Owner explicitly enabled this virtual deployment. A configured
           # false/0 remains a kill switch; unrelated owners are never tracked.
-          MODEL_RESULTS_ENABLED: ${{ vars.MODEL_RESULTS_ENABLED || 'true' }}
+          MODEL_RESULTS_ENABLED: 'false'
           MODEL_RESULTS_OWNER: ${{ github.repository_owner }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}

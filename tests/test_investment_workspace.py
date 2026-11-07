@@ -227,6 +227,63 @@ def test_missing_context_is_not_the_same_as_a_missing_plan():
     assert complete["unverified_portfolio"] == []
 
 
+def test_archived_growth_reading_survives_missing_position_plan_without_inventing_one():
+    row, snapshot = observed(held=True, horizon="Largo plazo", thesis="Plan privado", score=88)
+    row.update(change=3, comparison_status="changed")
+    source = report(row)
+    before_report, before_snapshot = deepcopy(source), deepcopy(snapshot)
+    view = build_investment_workspace(source, reference_date=REFERENCE)
+    position = view["portfolio"][0]
+    assert position["saved_growth_reading"] == {
+        "score": 88, "change": 3, "comparison_status": "changed", "as_of": DAY,
+        "verified": True, "signal": "Entrada fuerte", "limitations": [],
+    }
+    assert position["score"] is None and position["score_kind"] == "Sin nota conjunta"
+    assert position["plan_status"] == "unverified" and position["horizon_key"] is None
+    assert position["action"] == "Comprobar plan"
+    assert all(not horizon["portfolio"] for horizon in view["horizons"].values())
+    assert source == before_report and snapshot == before_snapshot
+
+
+@pytest.mark.parametrize("strategy,expected_score", [("quality_value_thesis_risk", None), ("technical", 20)])
+def test_saved_growth_note_never_replaces_a_quality_or_technical_position_score(strategy, expected_score):
+    pair = observed(held=True, horizon="Días", strategy_id=strategy,
+        score=88, technical_score=20, technical_label="Esperar")
+    original_policy = deepcopy(pair[1])
+    view = workspace(pair)
+    position = view["portfolio"][0]
+    assert position["score"] == expected_score
+    assert position["saved_growth_reading"]["score"] == 88
+    assert position["saved_growth_reading"]["as_of"] == DAY
+    assert pair[1] == original_policy
+
+
+@pytest.mark.parametrize("comparison,score,change,expected", [
+    ("changed", 88, 3, 3), ("stable", 0, 0, 0), ("stable", 88, -1, -1),
+    ("not_comparable", 88, 35, None), ("new", 88, 35, None),
+    ("changed", None, 3, None), ("changed", 88, True, None),
+    ("changed", 88, "Infinity", None), ("changed", 88, 101, None),
+])
+def test_saved_growth_change_uses_only_the_reports_finite_comparable_delta(comparison, score, change, expected):
+    row, _ = observed(held=True, score=score)
+    row.update(comparison_status=comparison, change=change)
+    source = report(row)
+    view = build_investment_workspace(source, reference_date=REFERENCE)
+    assert view["portfolio"][0]["saved_growth_reading"]["change"] == expected
+
+
+def test_archived_growth_note_remains_explicitly_unverified_when_data_is_blocked():
+    row, _ = observed(held=True, score=88, blocked=True)
+    source = report(row)
+    before = deepcopy(source)
+    view = build_investment_workspace(source, reference_date=REFERENCE)
+    reading = view["portfolio"][0]["saved_growth_reading"]
+    assert reading["score"] == 88 and reading["verified"] is False
+    assert "Periodo contable pendiente" in reading["limitations"][0]
+    assert view["portfolio"][0]["action"] == "Comprobar plan"
+    assert source == before
+
+
 @pytest.mark.parametrize("recorded",["2026-11-04T20:00:00Z", "2026-11-06T00:00:00Z"])
 def test_sealed_but_intraday_or_future_record_does_not_enable_an_entry(recorded):
     row, snapshot = observed(recorded=recorded)

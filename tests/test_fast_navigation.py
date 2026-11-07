@@ -211,6 +211,17 @@ def assert_ok(current):
     assert not current.error
 
 
+def open_compact_destination(current, destination):
+    """Use the real compact menu instead of assuming every route is a top tab."""
+
+    current.selectbox(key="compact_destination").set_value(destination).run()
+    assert_ok(current)
+    current.button(key="compact_open").click().run()
+    assert_ok(current)
+    assert current.session_state["main_navigation"] == destination
+    return current
+
+
 @pytest.mark.parametrize("route,more", [("Inicio", "Guía y riesgos"), ("Invertir", "Guía y riesgos"),
     ("Resultados", "Guía y riesgos"), ("Favoritos", "Guía y riesgos"), ("Más", "Guía y riesgos"),
     ("Más", "Alertas por correo"), ("Carteras", "Guía y riesgos")])
@@ -313,11 +324,34 @@ def test_all_main_destinations_roundtrip_without_repeated_analysis_or_smtp():
     current = page("Analizar")
     assert_ok(current)
     for destination in ("Inicio", "Invertir", "Carteras", "Favoritos", "Resultados", "Más", "Analizar"):
-        current.segmented_control(key="main_navigation").set_value(destination).run()
-        assert_ok(current)
+        open_compact_destination(current, destination)
         assert current.session_state["qa_counts"] == {"prepare": 1, "enrich": 1, "load": 0}
     assert current.session_state["qa_reads"]["qa_a"]["latest"] == 1
     assert current.session_state["qa_reads"]["qa_a"]["bounded"] == 1
+
+
+def test_home_has_three_primary_tabs_and_advanced_route_roundtrips_without_market_work():
+    current = page("Inicio")
+    assert_ok(current)
+    primary_options = current.segmented_control(key="main_navigation").options
+    assert len(primary_options) == 3
+    assert all(
+        any(label in option for option in primary_options)
+        for label in ("Hoy", "Cartera", "Gestionar y herramientas")
+    )
+    assert "Favoritos" in current.selectbox(key="compact_destination").options
+
+    open_compact_destination(current, "Favoritos")
+    advanced_options = current.segmented_control(key="main_navigation").options
+    assert len(advanced_options) == 4
+    assert any("Favoritos" in option for option in advanced_options)
+    assert current.session_state["qa_counts"] == {"prepare": 0, "enrich": 0, "load": 0}
+
+    open_compact_destination(current, "Inicio")
+    returned_options = current.segmented_control(key="main_navigation").options
+    assert len(returned_options) == 3
+    assert not any("Favoritos" in option for option in returned_options)
+    assert current.session_state["qa_counts"] == {"prepare": 0, "enrich": 0, "load": 0}
 
 
 def test_repeated_legacy_panel_and_roundtrip_tabs_reuse_prepared_analysis_without_recalculation():
@@ -326,10 +360,8 @@ def test_repeated_legacy_panel_and_roundtrip_tabs_reuse_prepared_analysis_withou
     assert current.session_state["qa_counts"] == {"prepare": 1, "enrich": 1, "load": 0}
     current.run()
     assert_ok(current)
-    current.segmented_control(key="main_navigation").set_value("Favoritos").run()
-    assert_ok(current)
-    current.segmented_control(key="main_navigation").set_value("Analizar").run()
-    assert_ok(current)
+    open_compact_destination(current, "Favoritos")
+    open_compact_destination(current, "Analizar")
     assert current.session_state["qa_counts"] == {"prepare": 1, "enrich": 1, "load": 0}
 
 
@@ -341,10 +373,8 @@ def test_explicit_refresh_invalidates_once_and_later_navigation_remains_fast():
     assert current.session_state["qa_counts"] == {"prepare": 2, "enrich": 2, "load": 1}
     current.run()
     assert_ok(current)
-    current.segmented_control(key="main_navigation").set_value("Más").run()
-    assert_ok(current)
-    current.segmented_control(key="main_navigation").set_value("Analizar").run()
-    assert_ok(current)
+    open_compact_destination(current, "Más")
+    open_compact_destination(current, "Analizar")
     assert current.session_state["qa_counts"] == {"prepare": 2, "enrich": 2, "load": 1}
 
 
@@ -375,9 +405,7 @@ def test_analysis_controls_survive_a_page_without_the_sidebar():
     current.run()
     assert_ok(current)
     assert current.slider(key='cfg_stop_loss').value == 13.0
-    current.segmented_control(key='main_navigation').set_value('Favoritos').run()
-    assert_ok(current)
-    current.segmented_control(key='main_navigation').set_value('Analizar').run()
-    assert_ok(current)
+    open_compact_destination(current, 'Favoritos')
+    open_compact_destination(current, 'Analizar')
     assert current.slider(key='cfg_stop_loss').value == 13.0
     assert current.session_state['qa_counts'] == {'prepare': 1, 'enrich': 1, 'load': 0}

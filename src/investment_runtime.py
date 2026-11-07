@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib
 import sys
 
+INVESTMENT_RUNTIME_VERSION = "compact-workspace-v2"
 
 def prepare_investment_runtime() -> tuple[str, ...]:
     refreshed = []
@@ -24,4 +25,13 @@ def prepare_investment_runtime() -> tuple[str, ...]:
             getattr(module, "_READ_METHODS", ())):
         importlib.reload(module)
         refreshed.append("src.session_journal")
+    workspace = sys.modules.get("src.investment_workspace")
+    ui = sys.modules.get("src.investment_workspace_ui")
+    workspace_changed = workspace is not None and getattr(workspace, "WORKSPACE_VERSION", "") != "investment-workspace-v2"
+    if workspace_changed:
+        importlib.reload(workspace)
+        refreshed.append("src.investment_workspace")
+    if ui is not None and (workspace_changed or getattr(ui, "WORKSPACE_UI_VERSION", "") != "investment-workspace-ui-v2"):
+        importlib.reload(ui)
+        refreshed.append("src.investment_workspace_ui")
     return tuple(refreshed)

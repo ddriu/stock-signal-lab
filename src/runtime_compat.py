@@ -9,7 +9,7 @@ import importlib
 import inspect
 import sys
 
-RUNTIME_COMPAT_VERSION = "independent-primary-storage-v1"
+RUNTIME_COMPAT_VERSION = "compact-mobile-v3"
 
 
 ANALYSIS_MODULE_ORDER = (
@@ -21,7 +21,7 @@ _VERSIONS = {
     "src.data_sources": ("FUNDAMENTAL_PROVENANCE_VERSION", "fundamental_provenance_v2"),
     "src.data_loader": ("FUNDAMENTAL_SNAPSHOT_VERSION", "dated_statement_fallback_v2"),
     "src.analysis_data_quality": ("QUALITY_PRESENTATION_VERSION", "dated_quality_coverage_v2"),
-    "src.daily_digest": ("DIGEST_PRESENTATION_VERSION", "coverage-availability-v2"),
+    "src.daily_digest": ("DIGEST_PRESENTATION_VERSION", "compact-mobile-v3"),
     "src.analysis_snapshots": ("PRIMARY_PERSISTENCE_VERSION", "independent-primary-storage-v1"),
 }
 _SIGNATURES = {

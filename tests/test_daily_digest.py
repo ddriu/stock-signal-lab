@@ -304,7 +304,7 @@ def test_email_escape_utf8_limit_and_exact_payload_identity():
     assert report == before and "Compañía" in text and "exposición" in text and "sesiones" in html
     assert "<script>" not in html and "&lt;script&gt;" in html
     assert "javascript:" not in html and "https://stock-signal-lab" in html
-    assert html.count("<tr><td>") == 4
+    assert html.count("<tr><td style=") == 5  # Alerts no longer hide the score table.
     assert report["report_id"] in html and report["report_id"] in text
     assert "CAMBIOS QUE REVISAR" in text
     changed = deepcopy(report)

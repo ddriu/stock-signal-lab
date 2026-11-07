@@ -31,10 +31,11 @@ class Journal:
 class Store:
     def list_seasons(self):
         count("season_reads")
-        if scenario == "initial":
+        if scenario == "initial" or scenario.startswith("backlog"):
+            source, cohort = ("growth", "verified") if scenario.startswith("backlog") else ("technical", "raw")
             return [dict(season_id=mode+"-"+model, manifest=dict(engine_version=ui.TRACKING_VERSION,
-                source="technical", cohort="raw", strategy_key=model, mode=mode,
-                engine_identity=ui._tracking_module.engine_identity(),
+                source=source, cohort=cohort, strategy_key=model, mode=mode,
+                engine_identity=ui._tracking_module.engine_identity(source, cohort),
                 activation_at="2026-10-20T21:00:00Z", experiment_id="experiment-a"))
                 for mode in ("theoretical", "budget") for model in "ABCD"]
         return [dict(season_id="season-a", manifest=dict(engine_version=ui.TRACKING_VERSION,
@@ -43,7 +44,7 @@ class Store:
     def select(self, kind):
         count(kind + "_reads")
         if kind == "snapshots":
-            if scenario == "initial":
+            if scenario == "initial" or scenario.startswith("backlog"):
                 return [dict(season_id=mode+"-"+model, snapshot=dict(snapshot_kind="activation",
                     available_at="2026-10-20T21:00:00Z", activation_at="2026-10-20T21:00:00Z",
                     coverage_complete=False, metrics=dict(initial_cash_usd=6000 if mode=="budget" else 0,
@@ -51,6 +52,9 @@ class Store:
                     for mode in ("theoretical", "budget") for model in "ABCD"]
             return [dict(season_id="season-a", snapshot=dict(available_at="2026-10-21T21:00:00Z",
                 coverage_complete=False, metrics=None))]
+        if scenario.startswith("backlog"):
+            return [dict(season_id="theoretical-A", event_type="incident", owner=private_owner,
+                payload=dict(code="collector_backlog_requires_new_season", no_economic_backfill=True))]
         return [dict(season_id="season-a", event_type="email_delivery", owner=private_owner,
             payload=dict(status="attempted", detail="Legacy sender: " + private_owner))]
 
@@ -60,6 +64,7 @@ def factory(journal):
 
 def activate(journal, manifest, **kwargs):
     count("activations")
+    st.session_state["activation_at"] = kwargs["now"]
     st.session_state["activation_config"] = dict(source=kwargs["source"],
         cohort=kwargs.get("cohort", "raw"), budget_usd=kwargs["budget_usd"], costs=asdict(kwargs["costs"]))
     return "new-experiment"
@@ -75,22 +80,26 @@ def advance(journal, experiment, snapshots, bars):
     assert snapshots.ticker.tolist() == ["HIST"]
     assert list(bars) == ["HIST"]
 
-if scenario in {"prepared", "verified", "pending-other", "stale-controls"}:
+if scenario in {"prepared", "verified", "pending-other", "stale-controls", "backlog-prepared", "backlog-stale", "backlog-invalid", "backlog-pending"}:
     costs = dict(commission_fixed_usd=2.0, spread_bps=3.0, fx_bps=4.0, verified=True)
     manifest = dict(source="growth", report_hash="frozen-report")
-    if scenario in {"verified", "pending-other"}:
+    if scenario in {"verified", "pending-other", "backlog-prepared", "backlog-stale", "backlog-invalid", "backlog-pending"}:
         manifest.update(cohort="verified", cohort_version="recorded-quality-first-observation-v1")
+    if scenario == "backlog-invalid":
+        manifest.pop("report_hash")
     report = SimpleNamespace(manifest=manifest,
-        budget={"A":SimpleNamespace(manifest=dict(costs=costs, budget_usd=7000))})
+        budget={"A":SimpleNamespace(manifest=dict(costs=costs,
+            budget_usd=8000 if st.session_state.get("changed_audit") else 7000))})
     st.session_state["model_results_" + _signature(private_owner)[:16] + "_state"] = {"report":report}
-    if scenario == "stale-controls":
+    if scenario in {"stale-controls", "backlog-stale"}:
         st.session_state["model_results_" + _signature(private_owner)[:16] + "_state"].update(
             run_key="original-raw-controls", current_run_key="new-verified-controls")
-if scenario == "pending-other":
+if scenario in {"pending-other", "backlog-pending"}:
     tracking_key="model_results_"+ui.hashlib.sha256(private_owner.encode()).hexdigest()[:16]+"_tracking"
     if tracking_key not in st.session_state:
-        st.session_state[tracking_key] = {"pending_activation":dict(audit_manifest={"source":"growth"},
-            source="growth",cohort="raw")}
+        st.session_state[tracking_key] = {"pending_activation":dict(
+            audit_manifest=manifest if scenario == "backlog-pending" else {"source":"growth"},
+            source="growth",cohort="verified" if scenario == "backlog-pending" else "raw")}
 
 with (patch.object(ui,"create_model_results_store",side_effect=factory),
       patch.object(ui,"activate_model_experiment",side_effect=activate),
@@ -200,3 +209,102 @@ def test_controls_changed_after_report_cannot_activate_the_previous_selection():
     assert "Recalcula antes de activar" in visible(app)
     assert "motor bruto original" in visible(app)
     assert "activations" not in app.session_state and "market_reads" not in app.session_state
+
+
+def tracking_state(app):
+    import hashlib
+    key = "model_results_" + hashlib.sha256(b"private-owner@example.invalid").hexdigest()[:16] + "_tracking"
+    return app.session_state[key]
+
+
+def test_backlog_without_retained_audit_explains_exact_steps_and_stays_read_only():
+    app = page("backlog")
+    button(app, "Consultar seguimiento guardado").click().run()
+    assert not app.exception
+    assert "Seguimiento pausado" in visible(app)
+    assert "sólo el hash de su auditoría" in visible(app)
+    for step in ("Cargar historial de modelos", "Descargar precios de modelos e índices",
+                 "Calcular los cuatro modelos en ambas modalidades"):
+        assert step in visible(app)
+    assert button(app, "Preparar nueva temporada desde la próxima sesión").disabled
+    for counter in ("activations", "history_reads", "market_reads", "advances"):
+        assert counter not in app.session_state
+    assert "private-owner@example.invalid" not in visible(app)
+
+
+def test_backlog_preparation_is_local_and_confirmation_uses_actual_click_time():
+    from copy import deepcopy
+    import pandas as pd
+    app = page("backlog-prepared")
+    button(app, "Consultar seguimiento guardado").click().run()
+    app.checkbox[0].check().run()
+    assert button(app, "Activar las cuatro estrategias virtuales").disabled
+    app.checkbox[0].uncheck().run()
+    before = deepcopy(tracking_state(app))
+    button(app, "Preparar nueva temporada desde la próxima sesión").click().run()
+    assert not app.exception and not app.error
+    state = tracking_state(app)
+    for name in ("seasons", "snapshots", "events"):
+        assert state[name] == before[name]
+    prepared_at = state["recovery_preparation"]["prepared_at"]
+    assert state["recovery_preparation"]["prior_experiment_id"] == "experiment-a"
+    assert "Preparación local lista" in visible(app) and "hora UTC real de ese clic" in visible(app)
+    assert button(app, "Activar las cuatro estrategias virtuales").disabled
+    for counter in ("activations", "history_reads", "market_reads", "advances"):
+        assert counter not in app.session_state
+    app.checkbox[0].check().run()
+    start = pd.Timestamp.now(tz="UTC")
+    button(app, "Activar las cuatro estrategias virtuales").click().run()
+    end = pd.Timestamp.now(tz="UTC")
+    assert not app.exception and not app.error
+    assert app.session_state["activations"] == app.session_state["advances"] == 1
+    assert start <= pd.Timestamp(app.session_state["activation_at"]) <= end
+    assert pd.Timestamp(app.session_state["activation_at"]) > pd.Timestamp(prepared_at)
+    assert app.session_state["activation_config"] == dict(source="growth", cohort="verified", budget_usd=7000,
+        costs=dict(commission_fixed_usd=2.0, spread_bps=3.0, fx_bps=4.0, verified=True))
+
+
+def test_backlog_with_changed_controls_or_invalid_audit_cannot_prepare_or_activate():
+    for scenario in ("backlog-stale", "backlog-invalid"):
+        app = page(scenario)
+        button(app, "Consultar seguimiento guardado").click().run()
+        app.checkbox[0].check().run()
+        assert not app.exception
+        assert button(app, "Preparar nueva temporada desde la próxima sesión").disabled
+        assert button(app, "Activar las cuatro estrategias virtuales").disabled
+        for counter in ("activations", "history_reads", "market_reads", "advances"):
+            assert counter not in app.session_state
+
+
+def test_changing_settings_after_local_preparation_requires_preparing_again():
+    app = page("backlog-prepared")
+    button(app, "Consultar seguimiento guardado").click().run()
+    button(app, "Preparar nueva temporada desde la próxima sesión").click().run()
+    app.checkbox[0].check().run()
+    app.session_state["changed_audit"] = True
+    app.run()
+    assert not app.exception
+    assert "cambiaron después de preparar" in visible(app)
+    assert button(app, "Activar las cuatro estrategias virtuales").disabled
+    button(app, "Preparar nueva temporada desde la próxima sesión").click().run()
+    assert not app.exception
+    assert not button(app, "Activar las cuatro estrategias virtuales").disabled
+    assert "activations" not in app.session_state and "market_reads" not in app.session_state
+
+
+def test_backlog_pending_attempt_must_be_explicitly_released_without_erasing_saved_seasons():
+    from copy import deepcopy
+    app = page("backlog-pending")
+    button(app, "Consultar seguimiento guardado").click().run()
+    original = deepcopy(tracking_state(app))
+    app.checkbox[0].check().run()
+    assert button(app, "Preparar nueva temporada desde la próxima sesión").disabled
+    assert button(app, "Activar las cuatro estrategias virtuales").disabled
+    button(app, "Liberar sólo el intento local para preparar otra temporada").click().run()
+    assert not app.exception and not app.error
+    assert "pending_activation" not in tracking_state(app)
+    for name in ("seasons", "snapshots", "events"):
+        assert tracking_state(app)[name] == original[name]
+    assert not button(app, "Preparar nueva temporada desde la próxima sesión").disabled
+    for counter in ("activations", "history_reads", "market_reads", "advances"):
+        assert counter not in app.session_state

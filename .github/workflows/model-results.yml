@@ -8,9 +8,9 @@ on:
     - cron: "30 22 * * 1-5"
 
 concurrency:
-  # Serialize recovery with the signal->virtual->mail job: no stale competing
-  # collector can race the owner-scoped pre-mail update.
-  group: stock-signal-lab-daily-alerts
+  # Model writers remain serialized, but never queue email behind simulations.
+  # The email workflow no longer advances virtual experiments.
+  group: stock-signal-lab-model-results
   cancel-in-progress: false
 
 permissions:
@@ -33,6 +33,7 @@ jobs:
         env:
           MODEL_RESULTS_ENABLED: ${{ vars.MODEL_RESULTS_ENABLED || 'true' }}
           MODEL_RESULTS_OWNER: ${{ github.repository_owner }}
+          MODEL_RESULTS_EXPERIMENT: ${{ secrets.MODEL_RESULTS_EXPERIMENT }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
         run: python -m scripts.run_model_tracking

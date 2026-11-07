@@ -145,6 +145,111 @@ def test_scheduler_owner_filter_is_applied_server_side_and_locally(monkeypatch):
     collect.assert_called_once_with(owner_journal)
 
 
+def test_selected_experiment_requires_explicit_owner_before_any_storage_access(monkeypatch, capsys):
+    monkeypatch.setenv("MODEL_RESULTS_ENABLED", "true")
+    monkeypatch.setenv("MODEL_RESULTS_EXPERIMENT", "private-experiment")
+    monkeypatch.delenv("MODEL_RESULTS_OWNER", raising=False)
+    factory = Mock(side_effect=AssertionError("must fail before storage access"))
+    monkeypatch.setattr(runner, "create_journal", factory)
+    assert runner.main() == 1
+    factory.assert_not_called()
+    output = capsys.readouterr()
+    assert "MODEL_RESULTS_OWNER explícito" in output.err
+    assert "private-experiment" not in output.err + output.out
+
+
+def test_scheduler_passes_only_explicit_selected_experiment_and_keeps_history_private(monkeypatch, capsys):
+    monkeypatch.setenv("MODEL_RESULTS_ENABLED", "true")
+    monkeypatch.setenv("MODEL_RESULTS_OWNER", "private-user")
+    monkeypatch.setenv("MODEL_RESULTS_EXPERIMENT", "private-new")
+    backend = SimpleNamespace(url="https://example.invalid", _list_rows=Mock(return_value=[
+        {"owner": "other-user", "season_id": "foreign"},
+        {"owner": "private-user", "season_id": "old"},
+        {"owner": "private-user", "season_id": "new"}]))
+    journal = object()
+    monkeypatch.setattr(runner, "create_journal", lambda owner:
+        backend if owner == runner.GROUP_PORTFOLIO_OWNER else journal)
+    collect = Mock(return_value={"runs": 8, "issues": 0, "preserved_experiments": 0,
+        "ready_experiments": 1,
+        "experiments": [{"experiment_id": "private-new", "status": "updated"}]})
+    monkeypatch.setattr(runner, "collect_owner_models", collect)
+    assert runner.main() == 0
+    collect.assert_called_once_with(journal, experiment_id="private-new")
+    assert backend._list_rows.call_args.kwargs["params"]["owner"] == "eq.private-user"
+    output = capsys.readouterr()
+    assert "8 resultados nuevos" in output.out
+    assert "private-" not in output.out + output.err
+
+
+def test_unknown_incompatible_or_partial_selected_experiment_never_reports_success(monkeypatch, capsys):
+    monkeypatch.setenv("MODEL_RESULTS_ENABLED", "true")
+    monkeypatch.setenv("MODEL_RESULTS_OWNER", "private-user")
+    monkeypatch.setenv("MODEL_RESULTS_EXPERIMENT", "private-selected")
+    backend = SimpleNamespace(url="https://example.invalid", _list_rows=Mock(return_value=[
+        {"owner": "private-user", "season_id": "old"}]))
+    monkeypatch.setattr(runner, "create_journal", lambda owner:
+        backend if owner == runner.GROUP_PORTFOLIO_OWNER else object())
+    for status in (None, "frozen_engine_changed", "partial_activation"):
+        selected = [] if status is None else [{"experiment_id": "private-selected", "status": status}]
+        collect = Mock(return_value={"runs": 0, "issues": int(status == "partial_activation"),
+            "preserved_experiments": int(status == "frozen_engine_changed"), "ready_experiments": 0,
+            "experiments": selected})
+        monkeypatch.setattr(runner, "collect_owner_models", collect)
+        assert runner.main() == 1
+        output = capsys.readouterr()
+        assert "No se sustituyó por otra temporada" in output.err
+        assert "private-" not in output.out + output.err
+    backend._list_rows.return_value = []
+    assert runner.main() == 1
+    assert "No se encontró una activación" in capsys.readouterr().err
+
+
+def test_scheduler_explains_backlog_recovery_without_hiding_failure_or_private_ids(monkeypatch, capsys):
+    monkeypatch.setenv("MODEL_RESULTS_ENABLED", "true")
+    monkeypatch.setenv("MODEL_RESULTS_OWNER", "private-user")
+    backend = SimpleNamespace(url="https://example.invalid", _list_rows=Mock(return_value=[
+        {"owner": "private-user", "season_id": "private-season"}]))
+    journal = object()
+    monkeypatch.setattr(runner, "create_journal", lambda owner:
+        backend if owner == runner.GROUP_PORTFOLIO_OWNER else journal)
+    collect = Mock(return_value={"runs": 8, "issues": 1, "preserved_experiments": 0,
+        "experiments": [
+            {"experiment_id": "private-experiment", "status": "collector_backlog"},
+            {"experiment_id": "private-active", "status": "updated"},
+        ]})
+    monkeypatch.setattr(runner, "collect_owner_models", collect)
+
+    assert runner.main() == 1
+    collect.assert_called_once_with(journal)
+    output = capsys.readouterr()
+    assert "8 resultados nuevos, 1 incidencias de proceso" in output.out
+    assert "1 con recogidas atrasadas. No se enviaron correos." in output.out
+    assert "Laboratorio pausado por sesiones no recogidas" in output.err
+    assert "nueva activación independiente" in output.err and "fecha actual" in output.err
+    assert "no se borran registros" in output.err and "ni se inventan compras atrasadas" in output.err
+    assert "No es un fallo de envío SMTP" in output.err
+    assert "private-" not in output.out + output.err
+
+
+def test_scheduler_does_not_prescribe_new_activation_for_an_unrelated_error(monkeypatch, capsys):
+    monkeypatch.setenv("MODEL_RESULTS_ENABLED", "true")
+    monkeypatch.setenv("MODEL_RESULTS_OWNER", "private-user")
+    backend = SimpleNamespace(url="https://example.invalid", _list_rows=Mock(return_value=[
+        {"owner": "private-user", "season_id": "private-season"}]))
+    monkeypatch.setattr(runner, "create_journal", lambda owner:
+        backend if owner == runner.GROUP_PORTFOLIO_OWNER else object())
+    monkeypatch.setattr(runner, "collect_owner_models", Mock(return_value={
+        "runs": 0, "issues": 1, "preserved_experiments": 0,
+        "experiments": [{"status": "error", "error_type": "RuntimeError"}],
+    }))
+
+    assert runner.main() == 1
+    output = capsys.readouterr()
+    assert "0 con recogidas atrasadas" in output.out
+    assert "Laboratorio pausado" not in output.err
+    assert "nueva activación" not in output.err
+
+
 def test_experiment_filter_keeps_manual_review_on_one_frozen_activation(monkeypatch):
     headers = _headers("current") + _headers("other")
     store = SimpleNamespace(list_seasons=lambda: headers, list_events=lambda season: [])

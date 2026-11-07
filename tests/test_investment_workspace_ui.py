@@ -37,6 +37,7 @@ from unittest.mock import patch
 import streamlit as st
 from src.investment_workspace_ui import FUNCTION
 REPORT = CONTENTS
+before_report = deepcopy(REPORT)
 class Journal:
     def get_latest_daily_score_report(self):
         st.session_state['reads'] = st.session_state.get('reads', 0) + 1
@@ -54,8 +55,36 @@ with patch('requests.sessions.Session.request', side_effect=AssertionError('No n
      patch('src.growth_momentum.evaluate_growth_momentum', side_effect=AssertionError('No new growth')):
     FUNCTION(Journal(), report=None if READ else REPORT, on_action=on_action,
         snapshots=SNAPSHOTS, reference_date=date(2026,11,5))
+assert REPORT == before_report
 '''.replace("FUNCTION", function).replace("CONTENTS", repr(contents)).replace("FAILURE", repr(failure)).replace("READ", repr(read)).replace("SNAPSHOTS", repr(snapshots))
     return AppTest.from_string(script, default_timeout=25).run()
+
+
+def test_home_shows_archived_growth_for_twenty_positions_without_verifying_or_changing_plans():
+    contents = report(portfolio=20, favorites=5)
+    for row in contents["rows"]:
+        row.update(change=3, comparison_status="changed")
+    contents = seal_daily_score_report(contents)
+    before = deepcopy(contents)
+    page = screen(contents, home=True)
+    assert not page.exception and not page.error
+    table = page.dataframe[0].value
+    assert len(table) == 20 and list(table.columns) == ["Empresa", "Crecimiento", "Qué revisar", "Motivo"]
+    assert set(table["Crecimiento"]) == {"88/100 · +3 · 04/11"}
+    assert set(table["Qué revisar"]) == {"Comprobar plan"}
+    assert all("no incluye" in reason for reason in table["Motivo"])
+    assert "Nota del enfoque" not in table.columns
+    assert any("no es una nota de calidad" in item.value for item in page.caption)
+    assert len(page.text) <= 4 and len(page.radio) == 1
+    assert contents == before and page.session_state["actions"] == []
+
+
+def test_home_does_not_show_a_growth_delta_when_saved_methods_are_not_comparable():
+    contents = report(portfolio=1, favorites=0)
+    contents["rows"][0].update(change=39, comparison_status="not_comparable")
+    page = screen(seal_daily_score_report(contents), home=True)
+    assert not page.exception
+    assert page.dataframe[0].value.iloc[0]["Crecimiento"] == "88/100 · no comparable · 04/11"
 
 
 def test_workspace_uses_one_saved_report_without_any_other_journal_reads_or_side_effects():
@@ -78,12 +107,12 @@ def test_workspace_uses_one_saved_report_without_any_other_journal_reads_or_side
 def test_home_has_three_priorities_and_three_horizon_entrances_not_the_whole_workspace():
     page = screen(report(portfolio=20, favorites=20, waiting=100), home=True)
     assert not page.exception and not page.error
-    assert not page.text  # One concise plan notice, not three identical warnings.
-    assert any("20 posiciones" in item.value for item in page.info)
-    assert not page.radio and not page.dataframe
+    assert len(page.text) <= 4
+    assert len(page.dataframe[0].value) == 20
+    assert len(page.radio) == 1
     labels = [button.label for button in page.button]
-    assert all(label in labels for label in ["Abrir días", "Abrir semanas", "Abrir largo plazo"])
-    assert not any("Posibles entradas" in item.value for item in page.markdown)
+    assert not any(label.startswith("Abrir días") for label in labels)
+    assert any("Posibles entradas" in item.value for item in page.markdown)
     assert page.session_state["actions"] == []
 
 
@@ -107,9 +136,9 @@ def test_callbacks_only_request_navigation_and_preserve_the_selected_company():
 
 def test_home_horizon_callback_carries_the_horizon_key_only():
     page = screen(report(), home=True)
-    page.button(key="investment_home_days").click().run()
+    page.radio(key="home_horizon_filter").set_value("days").run()
     assert not page.exception
-    assert page.session_state["actions"] == [("horizon","days")]
+    assert page.session_state["actions"] == []
 
 
 def test_unverified_holding_can_request_its_plan_without_saving_anything():
@@ -121,9 +150,9 @@ def test_unverified_holding_can_request_its_plan_without_saving_anything():
 
 def test_home_can_request_all_unverified_plans_without_saving_anything():
     page = screen(report(portfolio=20), home=True)
-    page.button(key="investment_home_plans").click().run()
+    page.button(key="home_position_detail_company_plan").click().run()
     assert not page.exception
-    assert page.session_state["actions"] == [("plan", None)]
+    assert page.session_state["actions"] == [("plan", "HELD0")]
 
 
 def test_long_term_research_is_separate_from_buy_candidates_and_has_no_combined_score():
@@ -164,7 +193,8 @@ def test_missing_report_is_unavailable_instead_of_zero_opportunities():
     page = screen({}, home=True)
     assert not page.exception and not page.error
     assert any("N/D" in warning.value and "no cero" in warning.value for warning in page.warning)
-    assert sum("Posibilidades que revisar: N/D" in caption.value for caption in page.caption) == 3
+    assert not page.dataframe
+    assert any("No hay entradas verificadas" in caption.value for caption in page.caption)
 
 
 def test_failed_saved_read_does_not_show_credentials_or_reconstruct_another_report():

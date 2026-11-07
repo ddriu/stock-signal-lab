@@ -20,7 +20,7 @@ from src.analysis_data_quality import GROWTH_METRICS
 from src.instruments import resolve_analysis_ticker, resolve_company_name
 
 DIGEST_VERSION = "daily-score-report-v2"
-DIGEST_PRESENTATION_VERSION = "coverage-availability-v2"
+DIGEST_PRESENTATION_VERSION = "compact-mobile-v3"
 APP_URL = "https://stock-signal-lab-ddriu.streamlit.app/"
 _SUFFIX_CALENDARS = {
     ".MC": "XMAD", ".PA": "XPAR", ".AS": "XAMS", ".DE": "XETR",
@@ -485,6 +485,32 @@ def virtual_tracking_lines(value: object) -> list[str]:
     return lines
 
 
+def _email_excerpt(value: object, maximum: int = 170) -> str:
+    """Bound presentation only; the sealed report retains the full evidence."""
+    text = " ".join(_text(value).split())
+    if len(text) <= maximum:
+        return text
+    # Never clip halfway through a qualification/negation and reverse its sense.
+    for separator in (". ", "; "):
+        first = text.split(separator, 1)[0]
+        if len(first) <= maximum:
+            return first + ". Más detalle en el informe."
+    return "Motivo extenso: consulta la explicación completa antes de decidir."
+
+
+def _email_delta(row: Mapping[str, object]) -> str:
+    if row.get("comparison_status") not in {"changed", "stable"}:
+        return "Sin comparación"
+    value = row.get("change")
+    try:
+        change = float(value)
+    except (ValueError, TypeError, OverflowError):
+        return "Sin comparación"
+    if isinstance(value, bool) or not math.isfinite(change) or abs(change) > 100:
+        return "Sin comparación"
+    return f"{change:+g} puntos" + (" · estable" if row.get("comparison_status") == "stable" else "")
+
+
 def render_daily_score_email(report: Mapping[str, object], *, app_url: str = APP_URL) -> tuple[str, str, str]:
     """Compact, UTF-8 escaped rendering; no recalculation or transport."""
     url = app_url if urlsplit(app_url).scheme in {"http", "https"} else APP_URL
@@ -518,59 +544,80 @@ def render_daily_score_email(report: Mapping[str, object], *, app_url: str = APP
         if ticker and ticker not in alert_tickers:
             alerts.append(alert)
             alert_tickers.add(ticker)
-        if len(alerts) == 5:
-            break
+    alerts.sort(key=lambda alert: (not bool(alert.get("held")),
+        alert.get("kind") not in {"Venta", "Revisión de tesis", "Revisión de riesgo"}))
+    other_alerts = alerts[3:]
+    alerts = alerts[:3]
     if alerts:
         lines.append("CAMBIOS QUE REVISAR")
         alert_html = []
         for alert in alerts:
             name = resolve_company_name(_symbol(alert.get("ticker")) or "SIN-DATO", alert.get("company_name"))
             title = _text(alert.get("title")) or "Revisar posición"
-            reason = _text(alert.get("change_reason"))
+            reason = _email_excerpt(alert.get("change_reason"))
             step = _text(alert.get("next_step")) or "Revisar la evidencia; no se ejecuta ninguna orden."
             context = " · ".join(filter(None, [_text(alert.get("strategy_label")), _text(alert.get("horizon")),
                 _text(alert.get("as_of")), _text(alert.get("data_source")), _text(alert.get("policy_version"))]))
             auxiliary = " · ".join(filter(None, [_text(alert.get("opportunity_status")), _text(alert.get("event_label"))]))
-            factors = []
-            for key in ("positive_factors", "risk_factors"):
-                values = alert.get(key)
-                if isinstance(values, (list, tuple)) and values:
-                    factors.append(_text(values[0]))
-            position, incident = positions.get(alert.get("ticker"), {}), incidents.get(alert.get("ticker"), {})
-            extra = " ".join(filter(None, [auxiliary, *factors, _text(position.get("reading")),
-                _text(position.get("reason")), _text(position.get("next_step")), _text(incident.get("reason")),
-                _text(incident.get("as_of")), _text(incident.get("next_step"))]))
+            risks = alert.get("risk_factors")
+            risk = _text(risks[0]) if isinstance(risks, (list, tuple)) and risks else ""
+            positives = alert.get("positive_factors")
+            positive = _text(positives[0]) if isinstance(positives, (list, tuple)) and positives else ""
+            incident = incidents.get(alert.get("ticker"), {})
+            extra = " · ".join(filter(None, [auxiliary, _email_excerpt(positive),
+                _email_excerpt(risk), _email_excerpt(incident.get("reason"))]))
             limitation = _text(alert.get("data_limitations"))
             held = bool(alert.get("held")) or any(row.get("ticker") == alert.get("ticker") and row.get("held") for row in report.get("rows", []))
             scope = "En cartera" if held else "Favorita / posible entrada nueva"
             lines.extend([f"{name} ({_text(alert.get('ticker'))}): {title}. {reason} {step}", scope, context, extra, limitation])
-            alert_html.append(f"<li><strong>{escape(name)} ({escape(_text(alert.get('ticker')))})</strong> · {scope}: {escape(title)}. {escape(reason)} {escape(step)}<br>{escape(extra)}<br><small>{escape(context)} {escape(limitation)}</small></li>")
-        blocks.append("<h2>Cambios que revisar</h2><ul>" + "".join(alert_html) + "</ul>")
-    eligible = [row for row in all_rows if row.get("ticker") not in alert_tickers]
-    changed = [row for row in eligible if row.get("comparison_status") in {"changed", "not_comparable"} or row.get("status") in {"entry_strong", "review_data"}]
-    displayed = (changed or eligible)[:max(0, 5 - len(alerts))]
+            alert_html.append(f"<li style='margin:0 0 12px'><strong>{escape(name)} ({escape(_text(alert.get('ticker')))}) · {escape(title)}</strong><br>{scope}: {escape(reason)}<br>Siguiente paso: {escape(step)}<br>{escape(extra)}<br><small style='color:#64748b'>{escape(context)} {escape(limitation)}</small></li>")
+        blocks.append("<h2 style='font-size:18px'>Cambios que revisar</h2><ul style='padding-left:20px'>" + "".join(alert_html) + "</ul>")
+        if other_alerts:
+            remaining = f"Otros {len(other_alerts)} avisos en el informe completo: " + ", ".join(_text(item.get("ticker")) for item in other_alerts)
+            lines.append(remaining)
+            blocks.append(f"<p style='font-size:13px'>{escape(remaining)}</p>")
+    # An alert must not consume the score-table quota or hide its company's note.
+    eligible = sorted(all_rows, key=daily_score_sort_key)
+    displayed = eligible[:5]
     cells = []
     lines.append("PUNTUACIONES Y CAMBIOS")
     for row in displayed:
         name = f"{_text(row.get('company_name'))} ({_text(row.get('ticker'))})"
         score = _score(row.get("score"))
         note = f"{score:g}/100" if isinstance(score, (float, int)) else "sin dato"
-        history = " · ".join(f"{_text(item.get('session'))}: {_score(item.get('score')):g}"
-            if _score(item.get("score")) is not None else f"{_text(item.get('session'))}: —"
-            for item in row.get("history", []) if isinstance(item, Mapping))
+        delta = _email_delta(row)
         reading = daily_score_reading(row)
         quality_text = " ".join(reading["reasons"])
         interpretation = f"Motor: {reading['signal']} · {reading['verification']} · {reading['decision']}"
-        incident, position = incidents.get(row.get("ticker"), {}), positions.get(row.get("ticker"), {})
-        extra = " ".join(filter(None, [_text(incident.get("reason")), _text(incident.get("as_of")),
-            _text(incident.get("next_step")), _text(position.get("reading")), _text(position.get("reason")), _text(position.get("next_step"))]))
         source = " · ".join(filter(None, [_text(row.get("source")), _text(row.get("session")), _text(row.get("policy_version"))]))
-        lines.extend([f"{name} · {note} · {'En cartera' if row.get('held') else 'Favorita'} · {interpretation}",
-            history, _text(row.get("change_reason")), _text(row.get("chart_comment")), _text(row.get("next_step")), extra, quality_text, source, ""])
-        cells.append(f"<tr><td><strong>{escape(name)}</strong><br>{'En cartera' if row.get('held') else 'Favorita'}</td><td>{escape(note)}<br>Motor: {escape(reading['signal'])}<br>{escape(reading['verification'])}<br>{escape(reading['decision'])}</td><td>{escape(history)}<br>{escape(_text(row.get('change_reason')))}<br>{escape(_text(row.get('chart_comment')))}<br>{escape(_text(row.get('next_step')))}<br>{escape(extra)}<br><small>{escape(quality_text)} {escape(source)}</small></td></tr>")
+        reason = _email_excerpt(quality_text if reading["blocked"] else row.get("change_reason") or row.get("chart_comment"))
+        position, incident = positions.get(row.get("ticker"), {}), incidents.get(row.get("ticker"), {})
+        review = " · ".join(filter(None, [_text(position.get("reading")),
+            _email_excerpt(position.get("reason")), _text(incident.get("as_of")),
+            _text(incident.get("next_step"))]))
+        scope = 'En cartera' if row.get('held') else 'Favorita'
+        lines.extend([f"{name} · {note} · {delta} · {scope}", interpretation,
+            reason, review, source, ""])
+        cells.append(f"<tr><td style='padding:10px 8px;border-bottom:1px solid #e2e8f0;vertical-align:top;width:43%;overflow-wrap:anywhere'><strong>{escape(name)}</strong><br><span style='color:#475569'>{escape(note)} · {escape(delta)}</span><br><small>{scope}</small></td><td style='padding:10px 8px;border-bottom:1px solid #e2e8f0;vertical-align:top;overflow-wrap:anywhere'><strong>{escape(reading['decision'])}</strong><br><span>Motor: {escape(reading['signal'])} · {escape(reading['verification'])}</span><br>{escape(reason)}<br>{escape(review)}<br><small style='color:#64748b'>{escape(source)}</small></td></tr>")
     if not displayed and not alerts:
         lines.append("No hay puntuaciones guardadas para esta sesión. No se interpreta como una venta.")
-    blocks.append("<h2>Puntuaciones y cambios</h2><table border='1' cellpadding='8' cellspacing='0'><thead><tr><th>Empresa</th><th>Nota del modelo</th><th>Últimas cinco sesiones y siguiente paso</th></tr></thead><tbody>" + "".join(cells) + "</tbody></table>")
+    blocks.append("<h2 style='font-size:18px;margin:18px 0 8px'>Puntuaciones y cambios</h2><p style='font-size:13px;color:#64748b'>Extracto de hasta 5 empresas; primero tu cartera. Cinco sesiones y explicación completa en la aplicación.</p><table role='table' style='width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;line-height:1.4'><thead><tr><th style='text-align:left;padding:8px'>Empresa · nota</th><th style='text-align:left;padding:8px'>Qué revisar</th></tr></thead><tbody>" + "".join(cells) + "</tbody></table>")
+    candidates = [row for row in eligible if not row.get("held")
+        and row.get("status") == "entry_strong" and not daily_score_reading(row)["blocked"]][:3]
+    lines.extend(["", "POSIBLES ENTRADAS · HASTA TRES"])
+    candidate_html = []
+    for row in candidates:
+        title = f"{_text(row.get('company_name')) or _text(row.get('ticker'))} ({_text(row.get('ticker'))}) · {_score(row.get('score')):g}/100"
+        # Keep the condition complete; do not truncate a negation or risk gate.
+        condition = _text(row.get("next_step")) or "Confirmar precio, próximo evento, riesgo y tamaño antes de comprar."
+        source = " · ".join(filter(None, [_text(row.get("source")), _text(row.get("session"))]))
+        lines.extend([title, condition, source])
+        candidate_html.append(f"<li style='margin-bottom:10px'><strong>{escape(title)}</strong><br>{escape(condition)}<br><small>{escape(source)}</small></li>")
+    if not candidates:
+        lines.append("No hay entradas fuertes verificadas en este informe; no equivale a vender tu cartera.")
+    blocks.append("<h2 style='font-size:18px'>Posibles entradas · hasta tres</h2>" +
+        ("<ul style='padding-left:20px'>" + "".join(candidate_html) + "</ul>" if candidates else
+         "<p>No hay entradas fuertes verificadas en este informe; no equivale a vender tu cartera.</p>"))
     used = alert_tickers | {row.get("ticker") for row in displayed}
     pending = [item for ticker, item in incidents.items() if ticker not in used][:max(0, 5 - len(used))]
     if pending:
@@ -585,5 +632,5 @@ def render_daily_score_email(report: Mapping[str, object], *, app_url: str = APP
     lines.extend([f"Historial completo de {len(all_rows)} empresas: {url}",
         "Una entrada nueva no equivale a mantener o vender una posición existente. No se ejecutan órdenes.",
         f"Informe de puntuaciones: {identifier}"])
-    html = "<!doctype html><html lang='es'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'></head><body style='font-family:Arial,sans-serif;color:#17253c'>" + f"<h1>{escape(subject)}</h1><p>Crecimiento + momentum. Las notas no son probabilidades de ganar.</p>" + "".join(blocks) + f"<p><a href='{escape(url, quote=True)}'>Ver el historial completo de {len(all_rows)} empresas</a></p><p>Una entrada nueva no equivale a mantener o vender una posición existente. No se ejecutan órdenes.</p><small>Informe de puntuaciones: {escape(identifier)}</small></body></html>"
+    html = "<!doctype html><html lang='es'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'></head><body style='margin:0;padding:12px;background:#ffffff;font-family:Arial,sans-serif;color:#17253c'><div style='max-width:600px;margin:auto;font-size:14px;line-height:1.45'>" + f"<h1 style='font-size:21px;margin:8px 0'>Stock Signal Lab · cierre {escape(date_label)}</h1><p>Crecimiento + momentum · notas sobre 100, no probabilidad de ganar.</p>" + "".join(blocks) + f"<p><a href='{escape(url, quote=True)}'>Ver las {len(all_rows)} empresas y su detalle</a></p><p style='font-size:12px;color:#64748b'>Una mala entrada no obliga a vender lo que ya tienes. No se ejecutan órdenes. Las lecturas de otros enfoques siguen separadas en la aplicación.</p><small style='overflow-wrap:anywhere'>Informe: {escape(identifier)}</small></div></body></html>"
     return subject, "\n".join(lines), html

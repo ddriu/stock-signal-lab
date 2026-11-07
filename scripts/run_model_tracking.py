@@ -246,6 +246,12 @@ def main() -> int:
         print("::warning::Seguimiento virtual desactivado: MODEL_RESULTS_ENABLED no está habilitado. "
               "No se han medido resultados ni hubo escrituras o correos. Activar temporadas no habilita el programador.")
         return 0
+    requested_owner = os.getenv("MODEL_RESULTS_OWNER", "").strip()
+    requested_experiment = os.getenv("MODEL_RESULTS_EXPERIMENT", "").strip()
+    if requested_experiment and not requested_owner:
+        print("::error::La selección de experimento requiere MODEL_RESULTS_OWNER explícito. "
+              "No se consultaron ni actualizaron temporadas.", file=sys.stderr)
+        return 1
     # The backend service key already owns this table. Discover only activated
     # owners server-side, without publishing a private owner allow-list in Git.
     backend = create_journal(GROUP_PORTFOLIO_OWNER)
@@ -253,7 +259,6 @@ def main() -> int:
         print("El proceso programado requiere almacenamiento remoto configurado.", file=sys.stderr)
         return 1
     try:
-        requested_owner = os.getenv("MODEL_RESULTS_OWNER", "").strip()
         params = {"select": "owner,season_id", "namespace": "eq.model-original-v1", "order": "owner.asc,season_id.asc"}
         if requested_owner:
             params["owner"] = "eq." + requested_owner
@@ -265,11 +270,25 @@ def main() -> int:
                     if not requested_owner or row.get("owner") == requested_owner})
     count, failures, waiting, unchanged, backlogs = 0, 0, 0, 0, 0
     if not owners:
+        if requested_experiment:
+            print("::error::No se encontró una activación del propietario seleccionado. "
+                  "No se eligió otra temporada automáticamente.", file=sys.stderr)
+            return 1
         print("::warning::Seguimiento habilitado sin experimentos activados; no hay resultados que actualizar ni rentabilidad medida.")
     for owner in owners:
         try:
             journal = create_journal(owner)
-            result = collect_owner_models(journal)
+            result = (collect_owner_models(journal, experiment_id=requested_experiment)
+                if requested_experiment else collect_owner_models(journal))
+            if requested_experiment:
+                selected = result.get("experiments", [])
+                if (len(selected) != 1 or selected[0].get("experiment_id") != requested_experiment
+                        or result.get("ready_experiments") != 1):
+                    print("::error::El experimento seleccionado no existe para esta cuenta, es incompatible "
+                          "o su activación está incompleta. No se sustituyó por otra temporada ni se borró el histórico.",
+                          file=sys.stderr)
+                    failures += max(1, result.get("issues", 0))
+                    continue
             count += result["runs"]
             failures += result["issues"]
             waiting += sum(item.get("status") == "waiting_for_signals" for item in result["experiments"])
@@ -287,6 +306,15 @@ def main() -> int:
             failures += 1
     print(f"Seguimiento virtual: {count} resultados nuevos, {failures} incidencias de proceso, "
           f"{waiting} esperando señales, {unchanged} sin cambios y {backlogs} con recogidas atrasadas. No se enviaron correos.")
+    if backlogs:
+        # A persisted backlog is a deliberate stop, not a transient SMTP error.
+        # Explain recovery without exposing private experiment IDs or changing
+        # the collector's counts, immutable ledger or failure exit status.
+        print("::error::Laboratorio pausado por sesiones no recogidas. "
+              "Revisa la última recogida en el panel privado y autoriza una nueva activación independiente "
+              "con fecha actual para retomar el seguimiento. El histórico se conserva: no se borran registros "
+              "ni se inventan compras atrasadas. No es un fallo de envío SMTP: este proceso no envía correos.",
+              file=sys.stderr)
     return int(failures > 0)
 
 

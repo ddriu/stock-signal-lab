@@ -241,7 +241,8 @@ def test_explicit_owner_deployment_has_kill_switch_and_recovery_does_not_send_ma
     assert "if: vars.MODEL_RESULTS_ENABLED == 'true'" not in workflow
     assert "EMAIL_SMTP" not in workflow
     assert "workflow_run:" not in workflow
-    assert "group: stock-signal-lab-daily-alerts" in workflow
+    assert "group: stock-signal-lab-model-results" in workflow
+    assert "MODEL_RESULTS_EXPERIMENT: ${{ secrets.MODEL_RESULTS_EXPERIMENT }}" in workflow
 
 
 def test_warm_tracking_view_refreshes_missing_readiness_api_before_binding_exports():

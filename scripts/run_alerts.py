@@ -47,9 +47,8 @@ def main() -> int:
             return 0
 
     kwargs = {}
-    tracker = configured_virtual_tracker()
-    if tracker is not None:
-        kwargs["virtual_tracker"] = tracker
+    # Model collection belongs to model-results.yml. Never put simulations or
+    # their additional quote downloads on the critical path of email delivery.
     if event_name == "schedule":
         print(f"Sesión objetivo del resumen: {session.isoformat()} (Europe/Madrid).")
         result = run_daily_alerts(today=session, require_current_session=True, **kwargs)

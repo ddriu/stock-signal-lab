@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from copy import deepcopy
 import hashlib
 import importlib
 import inspect
 from io import BytesIO
 import json
+import math
 import os
 
 import pandas as pd
@@ -29,7 +31,26 @@ from src.model_results_tracking import (TRACKING_VERSION, activate_model_experim
     resume_model_activation)
 from src.strategy_audit_service import BENCHMARKS, audit_universe
 
-TRACKING_PRESENTATION_VERSION = "measurement-readiness-v2"
+TRACKING_PRESENTATION_VERSION = "measurement-recovery-v3"
+
+
+def _activation_settings(report):
+    """Reuse a retained calculated audit, never synthesize one from a season."""
+    manifest = report.manifest
+    source, cohort = manifest.get("source"), manifest.get("cohort", "raw")
+    if (not manifest.get("report_hash") or source not in {"technical", "growth"}
+            or cohort not in {"raw", "verified"} or source == "technical" and cohort != "raw"):
+        raise ValueError("A retained calculated audit with supported source/cohort is required")
+    if cohort == "verified" and manifest.get("cohort_version") != _audit_data_module.VERIFIED_COHORT_VERSION:
+        raise ValueError("The retained verified audit uses another cohort version")
+    spec = report.budget["A"].manifest
+    charges = ExecutionCosts(**spec["costs"])
+    charges.validate()
+    budget = float(spec["budget_usd"])
+    if not math.isfinite(budget) or budget < 100:
+        raise ValueError("A valid virtual budget of at least USD100 is required")
+    return dict(audit_manifest=deepcopy(manifest), source=source, cohort=cohort,
+        budget_usd=budget, costs=asdict(charges))
 
 
 def export_tracking_excel(seasons, snapshots, events):
@@ -94,6 +115,12 @@ def render_model_tracking_page(journal):
         except Exception:
             st.error("No se pudo consultar el registro. Comprueba que la migración del modelo esté instalada; no se cambiaron posiciones.")
     report = report_state.get("report")
+    activation_settings = None
+    if report is not None:
+        try:
+            activation_settings = _activation_settings(report)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            st.warning("La auditoría retenida no tiene una configuración válida para activar. Recalcula los cuatro modelos antes de continuar.")
     controls_changed = bool(report is not None and "current_run_key" in report_state
         and report_state.get("current_run_key") != report_state.get("run_key"))
     if report is not None:
@@ -110,19 +137,22 @@ def render_model_tracking_page(journal):
         if st.button("Liberar sólo el intento local y conservar el registro anterior", key=key + "_release_pending"):
             state.pop("pending_activation", None)
             st.rerun()
+    recovery = state.get("recovery_preparation")
+    recovery_conflict = bool(recovery and recovery.get("settings") != activation_settings)
+    backlog_known = any(event.get("payload", {}).get("code") == "collector_backlog_requires_new_season"
+        for event in state.get("events", []))
+    recovery_unprepared = backlog_known and (not recovery or recovery_conflict)
+    if recovery_conflict:
+        st.warning("La auditoría o los costes cambiaron después de preparar la nueva temporada. Vuelve a prepararla; no se sustituirá silenciosamente su configuración.")
     acknowledged = st.checkbox("He revisado la auditoría retrospectiva y sus limitaciones; quiero iniciar un experimento virtual nuevo.",
         key=key + "_confirm_activation")
-    if right.button("Activar las cuatro estrategias virtuales", disabled=report is None or not acknowledged or pending_conflict or controls_changed,
+    if right.button("Activar las cuatro estrategias virtuales", disabled=activation_settings is None or not acknowledged or pending_conflict or controls_changed or recovery_conflict or recovery_unprepared,
                     key=key + "_activate_tracking"):
         try:
             # Freeze the actual report settings, not controls changed after the
             # report was calculated. Each activation is a separately named run.
-            spec = report.budget["A"].manifest
-            charges = ExecutionCosts(**spec["costs"])
             pending = state.setdefault("pending_activation", dict(
-                now=pd.Timestamp.now(tz="UTC").isoformat(), audit_manifest=report.manifest,
-                source=report.manifest["source"], cohort=report.manifest.get("cohort", "raw"),
-                budget_usd=spec["budget_usd"], costs=asdict(charges)))
+                now=pd.Timestamp.now(tz="UTC").isoformat(), **deepcopy(activation_settings)))
             # Keep exact activation time/settings across a partial RPC failure;
             # replay completes the same eight headers instead of creating more.
             experiment = activate_model_experiment(journal, pending["audit_manifest"], now=pending["now"],
@@ -134,6 +164,8 @@ def render_model_tracking_page(journal):
             advance_model_experiment(journal, experiment, snapshots, bundle.bars)
             state.clear()
             st.success("Temporadas virtuales creadas e inicializadas. Consulta el seguimiento para verlas.")
+            st.info("Para que el programador siga sólo esta nueva temporada y conserve la antigua pausada, configura su identificador en el secreto de GitHub MODEL_RESULTS_EXPERIMENT. Después verifica una recogida completa; activar por sí solo no confirma el seguimiento diario.")
+            st.code(experiment, language=None)
         except Exception:
             st.error("No se pudo completar la activación. Consulta el registro antes de reintentar: una cabecera ya creada se conserva y nunca se borra.")
     if os.getenv("MODEL_RESULTS_ENABLED", "0").strip().lower() not in {"1", "true", "yes", "on"}:
@@ -214,6 +246,33 @@ def render_model_tracking_page(journal):
         feed and r["season_id"] == feed["season_id"] and r["event_type"] in {"email_delivery", "incident"}]
     if any(event.get("payload", {}).get("code") == "collector_backlog_requires_new_season" for event in events):
         st.warning("Seguimiento pausado por varias sesiones no recogidas. No se convierten aportaciones atrasadas en compras actuales; requiere una nueva activación independiente.")
+        st.caption("La temporada anterior conserva su histórico y sólo el hash de su auditoría: ese hash no permite reconstruir ni dar por calculada una retrospectiva.")
+        matching_audit = bool(activation_settings is not None and not controls_changed
+            and activation_settings["source"] == manifest.get("source", "technical")
+            and activation_settings["cohort"] == manifest.get("cohort", "raw"))
+        if not matching_audit:
+            st.info("Para preparar otra temporada, usa el bloque de resultados de arriba: 1. Cargar historial de modelos. "
+                "2. Elegir la misma fuente y cohorte que la temporada pausada. 3. Descargar precios de modelos e índices. "
+                "4. Calcular los cuatro modelos en ambas modalidades. Después vuelve aquí; no se usará una auditoría inventada.")
+        if state.get("pending_activation"):
+            st.warning("Hay un intento local de activación pendiente. Antes de preparar otra temporada, consulta su registro y libera sólo ese intento local; sus cabeceras guardadas no se borrarán.")
+            if st.button("Liberar sólo el intento local para preparar otra temporada", key=key + "_release_recovery_pending"):
+                state.pop("pending_activation", None)
+                st.rerun()
+        if st.button("Preparar nueva temporada desde la próxima sesión",
+                disabled=not matching_audit or bool(state.get("pending_activation")), key=key + "_prepare_recovery"):
+            # Local preparation is not activation. In particular, its clock is
+            # never reused as the activation time or an invented historical fill.
+            state["recovery_preparation"] = dict(prior_experiment_id=manifest["experiment_id"],
+                prepared_at=pd.Timestamp.now(tz="UTC").isoformat(), settings=deepcopy(activation_settings))
+            st.rerun()
+        recovery = state.get("recovery_preparation")
+        if (matching_audit and recovery and recovery.get("prior_experiment_id") == manifest["experiment_id"]
+                and recovery.get("settings") == activation_settings):
+            st.success("Preparación local lista; todavía no se ha activado ninguna temporada nueva ni cambiado la anterior.")
+            st.caption(f"Se reutilizarán la auditoría calculada, su fuente/cohorte y el presupuesto virtual de USD{activation_settings['budget_usd']:,.2f} con sus costes guardados. "
+                "Para confirmar, marca arriba la revisión de la auditoría y pulsa Activar las cuatro estrategias virtuales. "
+                "La activación tendrá la hora UTC real de ese clic; sólo podrán simularse ejecuciones posteriores en una sesión habilitada, nunca compras atrasadas.")
     with st.expander("Decisiones, órdenes, incidencias y evidencia de correo"):
         st.dataframe(public_frame(pd.DataFrame(events)), hide_index=True)
         st.caption("smtp_accepted confirma aceptación del servidor, no recepción en la bandeja. Sin recibo explícito sólo consta intento; una señal no acredita envío.")
