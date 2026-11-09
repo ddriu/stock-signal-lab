@@ -11,7 +11,7 @@ def _authenticated_app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AppTe
     monkeypatch.setenv("STOCK_SIGNAL_LAB_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("STOCK_SIGNAL_LAB_USERNAME", "ddriu")
     monkeypatch.setenv("STOCK_SIGNAL_LAB_PASSWORD_HASH", "test-only-hash")
-    app = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    app = AppTest.from_string("import app; app.main()", default_timeout=30)
     app.session_state["_authenticated_user"] = "ddriu"
     return app
 

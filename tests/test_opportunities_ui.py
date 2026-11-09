@@ -215,4 +215,4 @@ render_analysis_company_picker(
         == "Análisis individual"
     )
     assert app.session_state["_requested_analysis_ticker"] == "MA"
-    assert app.session_state["_pending_analysis_ticker"] == "MA"
+    assert "_pending_analysis_ticker" not in app.session_state

@@ -22,6 +22,7 @@ import pandas as pd
 
 
 HOURLY_MARKET_SCHEDULE_VERSION = "exchange-hourly-completed-daily-v1"
+RADAR_CLOSE_CONTRACT_VERSION = "radar-close-v1"
 REFRESH_INTERVAL = pd.Timedelta(hours=1)
 FINAL_REFRESH_WINDOW = pd.Timedelta(minutes=90)
 DAILY_CLOSE_PUBLICATION_MARGIN = pd.Timedelta(minutes=20)

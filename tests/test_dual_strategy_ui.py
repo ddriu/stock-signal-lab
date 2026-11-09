@@ -64,18 +64,18 @@ def test_primary_is_default_strategy_without_removing_comparative_routes() -> No
     )
 
 
-def test_first_analysis_visit_defaults_to_primary_with_no_remote_data(monkeypatch, tmp_path: Path) -> None:
+def test_first_analysis_visit_defaults_to_radar_with_no_remote_data(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("STOCK_SIGNAL_LAB_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("STOCK_SIGNAL_LAB_USERNAME", "test")
     monkeypatch.setenv("STOCK_SIGNAL_LAB_PASSWORD_HASH", "test-only-hash")
-    page = AppTest.from_file(str(Path(application.__file__)), default_timeout=30)
+    page = AppTest.from_string("import app; app.main()", default_timeout=30)
     page.session_state["_authenticated_user"] = "test"
     page.session_state["main_navigation"] = "Analizar"
     with patch.object(application, "download_prices", side_effect=AssertionError("No remote download")):
         page.run()
     assert not page.exception
     assert not page.error
-    assert page.session_state["analysis_navigation"] == "Estrategias"
+    assert page.session_state["analysis_navigation"] == "Radar"
     assert page.session_state["analysis_strategy_navigation"] == "Crecimiento y momentum"
 
 

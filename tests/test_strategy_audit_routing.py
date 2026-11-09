@@ -1,7 +1,5 @@
 """Exercise the real application router, not only the isolated audit renderer."""
 
-from pathlib import Path
-
 from streamlit.testing.v1 import AppTest
 
 
@@ -18,7 +16,7 @@ def test_audit_route_does_not_enter_live_refresh_or_write_analysis(monkeypatch, 
     monkeypatch.setattr(src.data_loader, "download_prices", forbidden)
     monkeypatch.setattr(src.journal.TradingJournal, "add_analysis_snapshot", forbidden)
     monkeypatch.setattr(src.journal.TradingJournal, "list_analysis_snapshots", forbidden)
-    app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=30)
+    app = AppTest.from_string("import app; app.main()", default_timeout=30)
     app.session_state["_authenticated_user"] = "ddriu"
     app.session_state["main_navigation"] = "Analizar"
     app.session_state["analysis_navigation"] = "Validar"

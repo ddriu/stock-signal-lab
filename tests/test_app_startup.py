@@ -38,8 +38,7 @@ def test_analysis_company_page_exposes_explicit_new_company_search(
 ) -> None:
     monkeypatch.setenv("STOCK_SIGNAL_LAB_DATA_DIR", str(tmp_path))
     _configure_test_account(monkeypatch, "ddriu")
-    app_path = Path(__file__).resolve().parents[1] / "app.py"
-    app = AppTest.from_file(str(app_path), default_timeout=30)
+    app = AppTest.from_string("import app; app.main()", default_timeout=30)
     app.session_state["_authenticated_user"] = "ddriu"
     app.session_state["main_navigation"] = "Analizar"
     app.session_state["analysis_navigation"] = "Empresa"
@@ -59,8 +58,7 @@ def test_each_favorite_list_has_a_visible_add_company_action(
 ) -> None:
     monkeypatch.setenv("STOCK_SIGNAL_LAB_DATA_DIR", str(tmp_path))
     _configure_test_account(monkeypatch, "ddriu")
-    app_path = Path(__file__).resolve().parents[1] / "app.py"
-    app = AppTest.from_file(str(app_path), default_timeout=30)
+    app = AppTest.from_string("import app; app.main()", default_timeout=30)
     app.session_state["_authenticated_user"] = "ddriu"
     app.session_state["main_navigation"] = "Favoritos"
     app.session_state["favorite_view"] = "Mis listas"
@@ -77,8 +75,7 @@ def test_favorite_add_page_searches_by_name_or_symbol(
 ) -> None:
     monkeypatch.setenv("STOCK_SIGNAL_LAB_DATA_DIR", str(tmp_path))
     _configure_test_account(monkeypatch, "ddriu")
-    app_path = Path(__file__).resolve().parents[1] / "app.py"
-    app = AppTest.from_file(str(app_path), default_timeout=30)
+    app = AppTest.from_string("import app; app.main()", default_timeout=30)
     app.session_state["_authenticated_user"] = "ddriu"
     app.session_state["main_navigation"] = "Favoritos"
     app.session_state["favorite_view"] = "Añadir empresa"
@@ -96,8 +93,7 @@ def test_private_portfolio_exposes_broker_reconciliation_fields(
 ) -> None:
     monkeypatch.setenv("STOCK_SIGNAL_LAB_DATA_DIR", str(tmp_path))
     _configure_test_account(monkeypatch, "ddriu")
-    app_path = Path(__file__).resolve().parents[1] / "app.py"
-    app = AppTest.from_file(str(app_path), default_timeout=30)
+    app = AppTest.from_string("import app; app.main()", default_timeout=30)
     app.session_state["_authenticated_user"] = "ddriu"
     app.session_state["main_navigation"] = "Carteras"
     app.session_state["portfolio_navigation"] = "Privada"
@@ -122,8 +118,7 @@ def test_analysis_overview_pages_open_without_market_data(
 ) -> None:
     monkeypatch.setenv("STOCK_SIGNAL_LAB_DATA_DIR", str(tmp_path))
     _configure_test_account(monkeypatch, "ddriu")
-    app_path = Path(__file__).resolve().parents[1] / "app.py"
-    app = AppTest.from_file(str(app_path), default_timeout=30)
+    app = AppTest.from_string("import app; app.main()", default_timeout=30)
     app.session_state["_authenticated_user"] = "ddriu"
     app.session_state["main_navigation"] = "Analizar"
     app.session_state["analysis_navigation"] = analysis_page

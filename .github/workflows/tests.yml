@@ -19,6 +19,9 @@ jobs:
     steps:
       - name: Descargar código
         uses: actions/checkout@v4
+        with:
+          # The warm-deploy regression loads the previously published source.
+          fetch-depth: 0
 
       - name: Configurar Python
         uses: actions/setup-python@v5

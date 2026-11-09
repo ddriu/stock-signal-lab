@@ -57,19 +57,22 @@ from src.journal import (
 )
 
 
-class JournalStorageError(RuntimeError):
-    """Error recuperable al leer o escribir el diario remoto."""
+# Earlier consumers imported this exception directly. Preserve its identity
+# on a targeted backend reload so existing except clauses keep working.
+if "JournalStorageError" not in globals():
+    class JournalStorageError(RuntimeError):
+        """Error recuperable al leer o escribir el diario remoto."""
 
-    def __init__(
-        self,
-        message: str,
-        *,
-        status_code: int | None = None,
-        response_body: str = "",
-    ) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.response_body = response_body
+        def __init__(
+            self,
+            message: str,
+            *,
+            status_code: int | None = None,
+            response_body: str = "",
+        ) -> None:
+            super().__init__(message)
+            self.status_code = status_code
+            self.response_body = response_body
 
 
 LEGACY_OPERATION_COLUMNS = [

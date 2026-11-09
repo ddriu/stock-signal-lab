@@ -59,7 +59,7 @@ render_benchmark_outperformance_page(
     assert app.dataframe
     assert any("tres preguntas distintas" in item.value for item in app.info)
     assert any("Corto · 1–3 meses" in control.options for control in app.segmented_control)
-    refresh = next(button for button in app.button if button.label == "Revisar todo el universo")
+    refresh = next(button for button in app.button if button.label == "Actualizar la comparación con el mercado")
     refresh.click().run()
     assert app.session_state["_force_all_favorite_refresh"] is True
     assert app.session_state["_requested_analysis_navigation"] == "Estrategias"

@@ -22,6 +22,9 @@ from src.price_units import resolve_quote_unit
 from src.view_cache import invalidate_view_cache
 
 
+MARKET_CACHE_UI_VERSION = "radar-session-provenance-v1"
+
+
 def _observed_at(value, *, now):
     """Ignore unknown, naive or implausibly future in-session provenance."""
     if value is None:

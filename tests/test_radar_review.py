@@ -59,7 +59,7 @@ class _Container:
 
 def _browser(monkeypatch, state=None):
     def rerun():
-        raise _Rerun
+        pytest.fail("Radar must not request a full rerun between batches")
 
     st = SimpleNamespace(
         session_state=dict(state or {}),
@@ -84,8 +84,13 @@ def test_review_saves_each_batch_survives_reconnect_and_retries_only_missing(tmp
     browser = _browser(monkeypatch, {"_force_all_favorite_refresh": True})
     failed = {missing}
     frames = pd.DataFrame({"close": [30.0]}, index=pd.DatetimeIndex(["2026-11-06"]))
+    interrupted = False
 
     def load(tickers, *_args, **kwargs):
+        nonlocal interrupted
+        if len(calls) == 1 and not interrupted:
+            interrupted = True
+            raise _Rerun
         calls.append(tuple(tickers))
         price_tokens.append(kwargs["price_refresh_token"])
         good = set(tickers).difference(failed)
@@ -124,7 +129,7 @@ def test_review_saves_each_batch_survives_reconnect_and_retries_only_missing(tmp
     assert len(first.outcomes) == BATCH_SIZE
     assert first.outcomes[missing].status == "no_data"
     assert tuple(stored[0]) == tuple(ticker for ticker in universe[:BATCH_SIZE] if ticker != missing)
-    assert "_radar_review_active" in browser
+    assert not first.worker
 
     # A new browser has no market/cache data or continuation flag.
     browser = _browser(monkeypatch)
@@ -132,9 +137,6 @@ def test_review_saves_each_batch_survives_reconnect_and_retries_only_missing(tmp
     assert len(calls) == 1
     assert TradingJournal(path, owner="second").get_radar_review_checkpoint() is None
     browser["_radar_review_resume"] = True
-    while len(calls) * BATCH_SIZE < len(universe) - BATCH_SIZE:
-        with pytest.raises(_Rerun):
-            step()
     final, _ = step()
     assert not final.pending
     assert final.retryable == (missing,)
@@ -164,6 +166,24 @@ def test_failed_batch_releases_lease_and_keeps_pending(tmp_path, monkeypatch):
     assert not saved.outcomes
     assert saved.lease_until is None
     assert "_radar_review_active" not in browser
+
+
+def test_page_switch_releases_inflight_batch_without_marking_it_complete(tmp_path, monkeypatch):
+    journal = TradingJournal(tmp_path / "switched.sqlite", owner="owner")
+    _browser(monkeypatch, {"_force_all_favorite_refresh": True})
+
+    def interrupted(*args, **kwargs):
+        raise _Rerun
+
+    monkeypatch.setattr(app, "load_market_data", interrupted)
+    with pytest.raises(_Rerun):
+        app._radar_review_step(
+            journal, ["ONE"], strategy=StrategyConfig(), history_days=400, auto_adjust=True,
+        )
+    review = RadarReview.from_checkpoint(journal.get_radar_review_checkpoint())
+    assert review.pending == ("ONE",)
+    assert review.lease_until is None
+    assert not review.outcomes
 
 
 def test_reference_is_not_allowed_to_see_future_market_dates():

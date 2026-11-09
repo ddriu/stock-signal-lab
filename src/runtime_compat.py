@@ -8,8 +8,15 @@ from __future__ import annotations
 import importlib
 import inspect
 import sys
+from threading import RLock
 
-RUNTIME_COMPAT_VERSION = "home-review-v4"
+RUNTIME_COMPAT_VERSION = "radar-runtime-v1"
+JOURNAL_RESOURCE_VERSION = "radar-checkpoints-v1"
+
+# Keep one lock for concurrent app reruns, including when this module itself
+# was reloaded during a deployment.
+if "_RADAR_RUNTIME_LOCK" not in globals():
+    _RADAR_RUNTIME_LOCK = RLock()
 
 
 ANALYSIS_MODULE_ORDER = (
@@ -94,4 +101,74 @@ def prepare_analysis_runtime() -> tuple[str, ...]:
         else:
             importlib.reload(module)
         refreshed.append(name)
+    return tuple(refreshed)
+
+
+def _takes_keyword(function, name: str) -> bool:
+    try:
+        parameter = inspect.signature(function).parameters[name]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return parameter.kind in (parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY)
+
+
+def _radar_journal_contract(cls) -> bool:
+    return (
+        callable(getattr(cls, "get_radar_review_checkpoint", None))
+        and _takes_keyword(getattr(cls, "save_radar_review_checkpoint", None), "expected_revision")
+        and _takes_keyword(getattr(cls, "list_analysis_snapshots_for_sessions", None), "tickers")
+    )
+
+
+def prepare_radar_runtime() -> tuple[str, ...]:
+    """Bind Radar to current APIs without touching I/O or unrelated modules.
+
+    Streamlit can rerun the new entrypoint while old imports and backend
+    instances remain in memory. Check only loaded contracts and repair their
+    consumers in dependency order. The app's versioned resource key handles
+    old backend instances; no global cache or session is cleared here.
+    """
+    refreshed = []
+
+    def repair(name, needs_reload):
+        module = sys.modules.get(name)
+        if module is not None and needs_reload(module):
+            importlib.reload(module)
+            refreshed.append(name)
+
+    with _RADAR_RUNTIME_LOCK:
+        repair("src.journal", lambda m: not _radar_journal_contract(getattr(m, "TradingJournal", None)))
+        repair("src.supabase_journal", lambda m: (
+            not _radar_journal_contract(getattr(m, "SupabaseTradingJournal", None))
+            or ("src.journal" in sys.modules and
+                getattr(m, "radar_checkpoint_json", None) is not
+                getattr(sys.modules["src.journal"], "radar_checkpoint_json", None))
+        ))
+        repair("src.storage", lambda m: any(
+            source in sys.modules and getattr(m, symbol, None) is not
+            getattr(sys.modules[source], symbol, None)
+            for source, symbol in (("src.journal", "TradingJournal"),
+                                   ("src.supabase_journal", "SupabaseTradingJournal"))
+        ))
+        repair("src.session_journal", lambda m: (
+            "get_radar_review_checkpoint" not in getattr(m, "_UNCACHED_READ_METHODS", ())
+        ))
+        repair("src.hourly_market_schedule", lambda m: (
+            getattr(m, "RADAR_CLOSE_CONTRACT_VERSION", "") != "radar-close-v1"
+        ))
+        repair("src.market_cache_ui", lambda m: (
+            getattr(m, "MARKET_CACHE_UI_VERSION", "") != "radar-session-provenance-v1"
+            or ("src.hourly_market_schedule" in sys.modules and
+                getattr(m, "completed_daily_prices", None) is not
+                getattr(sys.modules["src.hourly_market_schedule"], "completed_daily_prices", None))
+        ))
+        repair("src.analysis_snapshots", lambda m: not _takes_keyword(
+            getattr(m, "persist_analysis_batch_snapshots", None), "existing_snapshots"
+        ))
+        repair("src.opportunity_catalog", lambda m: not _takes_keyword(
+            getattr(m, "build_opportunity_catalog", None), "verified_review"
+        ))
+        repair("src.opportunity_status", lambda m: (
+            getattr(m, "VERIFIED_RADAR_READING", None) != "Revisado y guardado"
+        ))
     return tuple(refreshed)

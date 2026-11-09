@@ -9,7 +9,9 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_main_navigation_has_a_stable_scoped_container() -> None:
     source = (ROOT / "app.py").read_text(encoding="utf-8")
 
-    assert 'st.container(key="main_navigation_container")' in source
+    assert 'key="main_navigation_container" if primary' in source
+    assert '.st-key-main_navigation_container [data-testid="stHorizontalBlock"]' in APP_CSS
+    assert "grid-template-columns: repeat(3, minmax(0, 1fr))" in APP_CSS
 
 
 def test_mobile_navigation_uses_horizontal_touch_rails() -> None:

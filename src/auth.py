@@ -217,11 +217,6 @@ def require_login() -> AuthConfig:
     authenticated_user = st.session_state.get("_authenticated_user")
     account = accounts.get(str(authenticated_user).lower())
     if account is not None:
-        role_text = "Administrador" if account.is_admin else "Usuario"
-        st.sidebar.caption(f"Sesión: {account.display_name} · {role_text}")
-        if st.sidebar.button("Cerrar sesión", width="stretch"):
-            st.session_state.pop("_authenticated_user", None)
-            st.rerun()
         return account
 
     st.markdown(

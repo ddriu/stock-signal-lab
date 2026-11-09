@@ -29,17 +29,20 @@ prepare_investment_runtime = _investment_runtime_module.prepare_investment_runti
 
 prepare_investment_runtime()
 
-from src.session_journal import session_journal
 from src.view_cache import get_or_build_view, invalidate_view_cache
-from src.market_cache_ui import hydrate_saved_market, valuation_frames, poll_saved_market_revision
 from src.portfolio_view_context import reconcile_home_views
 import src.runtime_compat as _analysis_runtime_module
 
-if getattr(_analysis_runtime_module, "RUNTIME_COMPAT_VERSION", "") != "home-review-v4":
+if getattr(_analysis_runtime_module, "RUNTIME_COMPAT_VERSION", "") != "radar-runtime-v1":
     _analysis_runtime_module = importlib.reload(_analysis_runtime_module)
 prepare_analysis_runtime = _analysis_runtime_module.prepare_analysis_runtime
 
 prepare_analysis_runtime()
+_analysis_runtime_module.prepare_radar_runtime()
+_JOURNAL_RESOURCE_VERSION = _analysis_runtime_module.JOURNAL_RESOURCE_VERSION
+
+from src.session_journal import session_journal
+from src.market_cache_ui import hydrate_saved_market, valuation_frames, poll_saved_market_revision
 
 import src.analysis_policy as _analysis_policy_module
 
@@ -199,6 +202,7 @@ from src.journal import (
     PORTFOLIO_ACCOUNT_STATUSES,
 )
 from src.msn_research import build_msn_research_links
+from src.app_routes import LOCAL_ROUTES, PRIMARY_ROUTES, ROUTES, TOOLS_GROUPS, Route, route_for_state
 from src.navigation import (
     analysis_refresh_tickers,
     daily_refresh_due,
@@ -510,22 +514,10 @@ LEGACY_ANALYSIS_ROUTES = {
         "Backtest técnico",
     ),
 }
-SIDEBAR_ANALYSIS_SECTIONS = {
-    "Radar",
-    "Oportunidades",
-    "Crecimiento y momentum",
-    "Calidad fundamental",
-    "Ventaja relativa",
-    "Especulativas",
-    "Comparar empresas",
-    "Backtest técnico",
-}
-
-
 def apply_visual_theme() -> None:
     """Aplica una capa visual responsive sin alterar los componentes financieros."""
 
-    st.markdown(f"<style>/* ssl-ui: home-review-v3 */ /* ssl-ui: radar-checkpoint-v1 */{APP_CSS}</style>", unsafe_allow_html=True)
+    st.markdown(f"<style>/* ssl-ui: native-navigation-v1 */{APP_CSS}</style>", unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=3_600, max_entries=350, show_spinner=False)
@@ -595,17 +587,17 @@ def speculative_candidate_memory() -> dict[str, object]:
 
 
 @st.cache_resource(show_spinner=False)
-def cached_journal(owner: str):
-    """Reuse a current read-adapter client across navigation (workspace v1)."""
-
+def _cached_journal_for_runtime(owner: str, contract_version: str):
+    """Key journal resources by owner and backend contract, not process age."""
     return create_journal(owner)
 
 
-def apply_section_layout(section: str, analysis_section: str = "") -> None:
-    """Reserva la barra lateral completa para la zona que realmente la necesita."""
+def cached_journal(owner: str):
+    return _cached_journal_for_runtime(owner, _JOURNAL_RESOURCE_VERSION)
 
-    if section == "Analizar" and analysis_section in SIDEBAR_ANALYSIS_SECTIONS:
-        return
+
+def apply_section_layout(section: str, analysis_section: str = "") -> None:
+    """No se monta una barra lateral de trabajo en ninguna ruta."""
     st.markdown(
         """
         <style>
@@ -699,6 +691,8 @@ def _apply_selected_profile() -> None:
 def build_sidebar(
     favorite_tickers: list[str] | None = None,
     favorite_labels: dict[str, str] | None = None,
+    *,
+    allow_batch: bool = True,
 ) -> tuple[
     list[str],
     date,
@@ -720,53 +714,55 @@ def build_sidebar(
         # Versiones anteriores introducían aquí tickers temporales abiertos desde
         # el buscador. Streamlit rechaza valores que no existen en ``options``.
         st.session_state["selected_favorite_tickers"] = safe_selection
-    st.sidebar.markdown("## Actualizar datos")
-    st.sidebar.caption(
-        "Elige qué conjunto quieres recalcular. Para abrir una empresa concreta usa "
-        "«Empresa» en la pantalla principal."
-    )
-    st.sidebar.markdown("### 1 · Empresas")
-    selected_favorites = st.sidebar.multiselect(
-        "Empresas que quieres actualizar",
-        options=favorite_tickers,
-        format_func=lambda ticker: favorite_labels.get(ticker, ticker),
-        max_selections=25,
-        help=(
-            "Puedes guardar hasta 300 favoritas y analizar hasta 25 en profundidad "
-            "cada vez. Las posiciones abiertas se actualizan automáticamente."
-        ),
-        key="selected_favorite_tickers",
-    )
-    with st.sidebar.expander("Modo avanzado: ticker exacto"):
-        manual_value = st.text_area(
-            "Símbolos bursátiles",
-            "",
-            height=78,
-            placeholder="AAPL, SAN.MC, 7974.T…",
-            help=(
-                "Sólo es necesario si el buscador no encuentra la empresa. Ejemplos: "
-                "SAN.MC (Madrid), 7974.T (Tokio) o KAP.IL (Londres internacional)."
-            ),
-            key="manual_tickers",
+    if allow_batch:
+        st.markdown("### Selección para el análisis avanzado")
+        st.caption(
+            "Selecciona valores solo si quieres preparar una comparación o una prueba."
         )
-        manual_tickers = parse_tickers(manual_value)
-        alias_changes = []
-        for value in manual_value.replace(";", ",").replace("\n", ",").split(","):
-            requested = value.strip().upper()
-            if requested:
-                resolved = resolve_analysis_ticker(requested)
-                if requested != resolved:
-                    alias_changes.append(f"{requested} → {resolved}")
-        if alias_changes:
-            st.info("Usaremos la cotización de análisis: " + ", ".join(alias_changes))
+        st.markdown("### 1 · Empresas")
+        selected_favorites = st.multiselect(
+            "Empresas que quieres actualizar",
+            options=favorite_tickers,
+            format_func=lambda ticker: favorite_labels.get(ticker, ticker),
+            max_selections=25,
+            help=(
+                "Puedes guardar hasta 300 favoritas y analizar hasta 25 en profundidad "
+                "cada vez. Sólo se consultan al pulsar la actualización."
+            ),
+            key="selected_favorite_tickers",
+        )
+        with st.expander("Modo avanzado: ticker exacto"):
+            manual_value = st.text_area(
+                "Símbolos bursátiles",
+                "",
+                height=78,
+                placeholder="AAPL, SAN.MC, 7974.T…",
+                help=(
+                    "Sólo es necesario si el buscador no encuentra la empresa. Ejemplos: "
+                    "SAN.MC (Madrid), 7974.T (Tokio) o KAP.IL (Londres internacional)."
+                ),
+                key="manual_tickers",
+            )
+            manual_tickers = parse_tickers(manual_value)
+            alias_changes = []
+            for value in manual_value.replace(";", ",").replace("\n", ",").split(","):
+                requested = value.strip().upper()
+                if requested:
+                    resolved = resolve_analysis_ticker(requested)
+                    if requested != resolved:
+                        alias_changes.append(f"{requested} → {resolved}")
+            if alias_changes:
+                st.info("Usaremos la cotización de análisis: " + ", ".join(alias_changes))
+    else:
+        selected_favorites, manual_tickers = [], []
     selected_analysis_tickers = [
         resolve_analysis_ticker(ticker) for ticker in selected_favorites
     ]
     tickers = list(dict.fromkeys([*selected_analysis_tickers, *manual_tickers]))
 
-    st.sidebar.divider()
-    st.sidebar.markdown("### 2 · Lectura")
-    years = st.sidebar.select_slider(
+    st.divider()
+    st.markdown("### 2 · Lectura")
+    years = st.select_slider(
         "Historial utilizado",
         options=[1, 2, 3, 5, 10],
         value=5,
@@ -774,7 +770,7 @@ def build_sidebar(
         help="Cinco años es el punto de partida recomendado.",
         key="analysis_years",
     )
-    profile_name = st.sidebar.selectbox(
+    profile_name = st.selectbox(
         "Estilo de análisis",
         PROFILE_NAMES,
         index=0,
@@ -786,7 +782,7 @@ def build_sidebar(
         ),
     )
     defaults = strategy_profile_defaults(profile_name)
-    st.sidebar.caption(
+    st.caption(
         {
             "Equilibrado": "Señales equilibradas para empezar.",
             "Crecimiento": "Más tolerancia a empresas aceleradas y horizonte más largo.",
@@ -795,8 +791,8 @@ def build_sidebar(
         }[profile_name]
     )
 
-    st.sidebar.markdown("#### Riesgo básico")
-    quick_a, quick_b = st.sidebar.columns(2)
+    st.markdown("#### Riesgo básico")
+    quick_a, quick_b = st.columns(2)
     stop_loss = quick_a.slider(
         "Stop",
         1.0,
@@ -817,7 +813,7 @@ def build_sidebar(
         help="Capital total que aceptarías perder si se alcanza el stop.",
         key="cfg_max_risk",
     )
-    with st.sidebar.expander("Objetivo y prueba histórica"):
+    with st.expander("Objetivo y prueba histórica"):
         forward_horizon = st.selectbox(
             "Horizonte de la estimación",
             options=[10, 20, 40, 60],
@@ -838,9 +834,9 @@ def build_sidebar(
             ),
         )
 
-    st.sidebar.divider()
-    st.sidebar.markdown("### 3 · Ajustes opcionales")
-    with st.sidebar.expander("Periodo y fuentes"):
+    st.divider()
+    st.markdown("### 3 · Ajustes opcionales")
+    with st.expander("Periodo y fuentes"):
         end = st.date_input(
             "Analizar hasta",
             value=date.today(),
@@ -864,7 +860,7 @@ def build_sidebar(
             key="alpha_vantage_key",
         )
 
-    with st.sidebar.expander("Configuración técnica avanzada"):
+    with st.expander("Configuración técnica avanzada"):
         col_a, col_b, col_c = st.columns(3)
         sma_short = col_a.number_input(
             "Corta",
@@ -996,7 +992,7 @@ def build_sidebar(
             key="cfg_volume_surge",
         )
 
-    with st.sidebar.expander("Riesgo y costes avanzados"):
+    with st.expander("Riesgo y costes avanzados"):
         trailing_stop = st.slider(
             "Protección dinámica de beneficios",
             0.0,
@@ -1028,23 +1024,25 @@ def build_sidebar(
             key="cfg_slippage",
         )
 
-    selected_count = len(tickers)
-    st.sidebar.divider()
-    st.sidebar.caption(
-        f"Selección manual: {selected_count} empresas. También se añadirán las "
-        "posiciones abiertas de la cartera."
-    )
-    load_clicked = st.sidebar.button(
-        (
-            f"Actualizar ahora {selected_count} empresas"
-            if selected_count
-            else "Actualizar ahora las posiciones"
-        ),
-        type="primary",
-        width="stretch",
-        icon=":material/refresh:",
-        help="Fuerza una consulta nueva de precios; no reutiliza la caché anterior.",
-    )
+    load_clicked = False
+    if allow_batch:
+        selected_count = len(tickers)
+        st.divider()
+        st.caption(
+            f"Selección manual: {selected_count} empresas. También se añadirán las "
+            "posiciones abiertas de la cartera."
+        )
+        load_clicked = st.button(
+            (
+                f"Actualizar ahora {selected_count} empresas"
+                if selected_count
+                else "Actualizar ahora las posiciones"
+            ),
+            type="primary",
+            width="stretch",
+            icon=":material/refresh:",
+            help="Fuerza una consulta nueva de precios; no reutiliza la caché anterior.",
+        )
     start = end - timedelta(days=365 * int(years))
     strategy = StrategyConfig(
         sma_short=int(sma_short),
@@ -1104,10 +1102,10 @@ def load_market_data(
     review_clock: pd.Timestamp | None = None,
 ) -> set[str]:
     if not tickers:
-        st.sidebar.error("Elige al menos una favorita o registra una posición.")
+        st.error("Elige al menos una favorita o registra una posición.")
         return set()
     if len(tickers) > 200:
-        st.sidebar.error(
+        st.error(
             "La actualización admite hasta 200 empresas simultáneas. "
             "Reduce temporalmente la selección de favoritos."
         )
@@ -1159,7 +1157,7 @@ def load_market_data(
         deep_tickers = set(
             [ticker for ticker in tickers if ticker in deep_tickers][:25]
         )
-        st.sidebar.warning(
+        st.warning(
             "Se hará análisis empresarial profundo de las primeras 25 empresas. "
             "Las demás conservarán valoración rápida de precio y tendencia."
         )
@@ -6807,9 +6805,11 @@ def _score_text(value: object) -> str:
 
 
 def _logout_current_user() -> None:
-    st.session_state.pop("_authenticated_user", None)
-    st.session_state.pop("_investment_manual_review", None)
-    st.session_state.pop("_investment_review_requested", None)
+    # No pending actions, selections, private records or filters survive an
+    # explicit sign-out. The page address remains available for the next login.
+    st.session_state.clear()
+    st.query_params.pop("ticker", None)
+    st.query_params.pop("digest", None)
 
 
 def render_app_header(user: AuthConfig) -> None:
@@ -7156,14 +7156,16 @@ def _bind_navigation_owner(owner: str) -> None:
     if previous is not None and previous != owner:
         invalidate_view_cache(st.session_state)
         for key in list(st.session_state):
-            if str(key).startswith(("investment_", "_investment_", "_requested_plan_", "_radar_review_")):
+            if str(key).startswith(("investment_", "_investment_", "_requested_plan_", "_radar_review_",
+                                    "analysis_picker_", "favorite_search_", "favorite_list_search_")):
                 st.session_state.pop(key, None)
         for key in st.session_state.get("_navigation_sidebar_values", {}):
             st.session_state.pop(key, None)
         for key in ("market_data", "fundamental_data", "reference_data", "price_verifications",
                     "fx_snapshot", "backtest_results", "download_errors", "quick_mode_tickers",
                     "_ssl_session_journal_reads", "_pending_analysis_ticker", "analysis_ticker",
-                    "_requested_analysis_ticker", "_growth_scan_tickers",
+                    "_requested_analysis_ticker", "_growth_scan_tickers", "_growth_scan_completed",
+                    "recent_analysis_tickers", "_comparison_seed_tickers", "_last_price_refresh",
                     "home_thesis_ticker",
                     "_portfolio_market_refresh_requested", "_force_all_favorite_refresh",
                     "_navigation_sidebar_values", "_persistent_market_reads",
@@ -7181,7 +7183,7 @@ def _remember_analysis_controls(*, restore=False) -> None:
              "home_view_navigation", "private_journal_navigation", "group_journal_navigation",
              "analysis_navigation", "analysis_company_navigation", "analysis_strategy_navigation",
              "analysis_validation_navigation", "portfolio_navigation", "favorite_view", "more_navigation"}
-    names.add("investment_horizon")
+    names.update({"investment_horizon", "home_horizon_filter"})
     if restore:
         for key, value in st.session_state.get("_navigation_sidebar_values", {}).items():
             if key not in st.session_state:
@@ -7258,6 +7260,7 @@ def _run_radar_batch(
     claimed = review.claim(worker, datetime.now(timezone.utc))
     _save_radar_checkpoint(journal, claimed)
     batch = claimed.pending[:RADAR_BATCH_SIZE]
+    committed = False
     try:
         clock = pd.Timestamp(claimed.started_at)
         end = clock.tz_convert("Europe/Madrid").date()
@@ -7335,15 +7338,17 @@ def _run_radar_batch(
                 )
         checkpoint = claimed.release(outcomes)
         _save_radar_checkpoint(journal, checkpoint)
+        committed = True
         return checkpoint
-    except Exception:
-        # Do not mark an interrupted batch as checked. Successful earlier
-        # checkpoints survive, and analysis snapshots are idempotent on retry.
-        try:
-            _save_radar_checkpoint(journal, claimed.release())
-        except (JournalStorageError, ValueError, AttributeError):
-            pass
-        raise
+    finally:
+        # Streamlit interrupts a page switch with a BaseException. Release the
+        # unfinished batch as well as on ordinary errors; CAS protects another
+        # worker if the lease already expired. Confirmed batches stay saved.
+        if not committed:
+            try:
+                _save_radar_checkpoint(journal, claimed.release())
+            except (JournalStorageError, ValueError, AttributeError):
+                pass
 
 
 def _radar_review_step(
@@ -7358,7 +7363,6 @@ def _radar_review_step(
     ).encode()).hexdigest()
     start_requested = bool(st.session_state.pop("_force_all_favorite_refresh", False))
     resume_requested = bool(st.session_state.pop("_radar_review_resume", False))
-    running = st.session_state.get("_radar_review_active")
     review = None
     try:
         review = RadarReview.from_checkpoint(journal.get_radar_review_checkpoint())
@@ -7385,29 +7389,25 @@ def _radar_review_step(
                 _save_radar_checkpoint(journal, candidate)
                 review = candidate
                 st.session_state.pop("_radar_review_references", None)
-            running = (review.run_id, uuid4().hex)
-            st.session_state["_radar_review_active"] = running
-        if not (compatible and review.pending and running and running[0] == review.run_id):
-            st.session_state.pop("_radar_review_active", None)
+        if not (start_requested or resume_requested) or not compatible or not review.pending:
             return review, compatible
-        if review.busy(now, running[1]):
-            st.session_state.pop("_radar_review_active", None)
-            return review, compatible
+        worker = uuid4().hex
         progress = st.empty()
-        with progress.container():
-            render_automatic_review_status(review, compatible=True, now=now, working=True)
-        review = _run_radar_batch(
-            journal, review, running[1], history_days=history_days,
-            auto_adjust=auto_adjust, strategy=strategy, alpha_vantage_key=alpha_vantage_key,
-        )
+        # Emit progress between durable batches instead of requesting a full
+        # rerun, which can compete with a navigation event for a different page.
+        # Streamlit can interrupt this run at the progress or data yield points;
+        # a new page/session cannot keep it running without explicit resume.
+        while review.pending:
+            with progress.container():
+                render_automatic_review_status(review, compatible=True, now=now, working=True)
+            review = _run_radar_batch(
+                journal, review, worker, history_days=history_days,
+                auto_adjust=auto_adjust, strategy=strategy, alpha_vantage_key=alpha_vantage_key,
+            )
         progress.empty()
-        if review.pending:
-            st.rerun()
-        st.session_state.pop("_radar_review_active", None)
         return review, True
     except Exception as exc:
-        st.session_state.pop("_radar_review_active", None)
-        if start_requested or resume_requested or running:
+        if start_requested or resume_requested:
             logging.getLogger(__name__).warning("Revisión de Radar pausada: %s", type(exc).__name__)
             st.warning("Revisión pausada. Lo ya guardado se conserva. "
                        "Si el bloque estaba reservado, espera unos minutos antes de reanudar.")
@@ -7419,6 +7419,8 @@ def _radar_review_step(
 def render_market_data_status(
     raw_data: dict[str, pd.DataFrame],
     favorite_tickers: list[str],
+    *,
+    show_refresh: bool = True,
 ) -> None:
     """Hace visible la frescura del mercado en todas las vistas de análisis."""
 
@@ -7428,7 +7430,7 @@ def render_market_data_status(
             "Precios sin cargar. El Radar conserva tus favoritas, pero ninguna lectura "
             "es actual hasta pulsar «Actualizar ahora»."
         )
-        if favorite_tickers:
+        if favorite_tickers and show_refresh:
             st.button(
                 "Actualizar ahora todas mis favoritas",
                 icon=":material/refresh:",
@@ -7483,7 +7485,7 @@ def render_market_data_status(
                     "Última vela": st.column_config.DateColumn(format="DD/MM/YYYY"),
                 },
             )
-        if favorite_set:
+        if favorite_set and show_refresh:
             st.button(
                 "Actualizar ahora todas mis favoritas",
                 icon=":material/refresh:",
@@ -10218,7 +10220,7 @@ def _continue_search_in_favorites(
 
 
 def _open_ticker_analysis(ticker: str) -> None:
-    """Abre una favorita y solicita sus datos sin obligar a volver a escribirla."""
+    """Abre una ficha con los datos guardados, sin lanzar una descarga."""
 
     if not ticker.strip():
         return
@@ -10236,8 +10238,13 @@ def _open_ticker_analysis(ticker: str) -> None:
         "Análisis individual"
     )
     st.session_state["_requested_analysis_ticker"] = normalized
-    st.session_state["_pending_analysis_ticker"] = normalized
     _reset_analysis_company_picker()
+
+
+def _request_company_market(ticker: str) -> None:
+    """Solicita actualizar una sola ficha mediante su botón explícito."""
+    _open_ticker_analysis(ticker)
+    st.session_state["_pending_analysis_ticker"] = resolve_analysis_ticker(ticker)
 
 
 def _open_ticker_comparison(tickers: list[str]) -> None:
@@ -10667,18 +10674,21 @@ def render_home(
     group_favorites: pd.DataFrame,
     section: str = "Hoy",
 ) -> None:
-    st.button(
-        "Ver puntuaciones de cinco sesiones",
-        icon=":material/history:",
-        key="home_daily_score_history",
-        on_click=_request_analysis_page,
-        args=("Resumen diario",),
-    )
-    home_view = render_subnavigation(
-        "Qué quieres ver en Inicio",
-        ["Resumen", "Decisiones", "Laboratorio", "Accesos"],
-        key="home_view_navigation",
-    )
+    if section == "Laboratorio":
+        home_view = "Laboratorio"
+    else:
+        st.button(
+            "Ver puntuaciones de cinco sesiones",
+            icon=":material/history:",
+            key="home_daily_score_history",
+            on_click=_request_analysis_page,
+            args=("Resumen diario",),
+        )
+        home_view = render_subnavigation(
+            "Qué quieres ver en Inicio",
+            ["Resumen", "Decisiones", "Laboratorio", "Accesos"],
+            key="home_view_navigation",
+        )
     if home_view == "Accesos":
         _render_home_shortcuts()
         return
@@ -11183,21 +11193,22 @@ def render_opportunities_page(
     favorite_tickers: list[str],
     include_company_detail: bool = True,
     radar_review: RadarReview | None = None,
+    show_entries_shortcut: bool = True,
 ) -> None:
     render_page_intro(
         "RADAR COMPARATIVO",
         "Todas mis empresas",
-        "Aquí aparecen todas tus favoritas: entradas, empresas en espera y pendientes. "
-        "La pestaña «Entradas hoy» aplica después el filtro de precio actual. "
-        "Estas notas complementan, pero no sustituyen, crecimiento y momentum.",
+        "Favoritas con lectura guardada, en espera o pendientes. "
+        "«Entradas hoy» añade los filtros de precio y riesgo.",
     )
-    st.button(
-        "Ver sólo las entradas que pasan el filtro de hoy",
-        icon=":material/target:",
-        key="radar_open_entries",
-        on_click=_request_analysis_page,
-        args=("Oportunidades",),
-    )
+    if show_entries_shortcut:
+        st.button(
+            "Ver sólo las entradas que pasan el filtro de hoy",
+            icon=":material/target:",
+            key="radar_open_entries",
+            on_click=_request_analysis_page,
+            args=("Oportunidades",),
+        )
     try:
         saved_snapshots = journal.list_analysis_snapshots()
     except JournalStorageError as exc:
@@ -12283,6 +12294,7 @@ def render_company_analysis_page(
     journal: object,
     *,
     policy_snapshots: dict[str, dict[str, object]] | None = None,
+    summary_rows: list[dict[str, object]] | None = None,
 ) -> None:
     """Muestra sólo la empresa activa; el radar no repite este detalle."""
 
@@ -12291,17 +12303,60 @@ def render_company_analysis_page(
         st.info("Elige una empresa arriba para ver su lectura completa.")
         return
     selected = resolve_analysis_ticker(selected_value)
+    st.button(
+        f"Actualizar datos de {selected}",
+        icon=":material/refresh:",
+        key="company_contextual_refresh",
+        on_click=_request_company_market,
+        args=(selected,),
+    )
     if selected not in prepared:
-        st.info(
-            f"{selected} está seleccionada, pero todavía no tiene datos suficientes. "
-            "Vuelve al Radar, abre «Actualizar datos» y prueba de nuevo."
-        )
+        try:
+            saved = journal.list_analysis_snapshots(selected)
+        except (JournalStorageError, AttributeError):
+            saved = pd.DataFrame()
+        if saved.empty:
+            st.info(f"{selected} no tiene una lectura guardada. Actualiza sus datos para analizarla.")
+        else:
+            row = saved.iloc[0]
+            observed = pd.to_datetime(row.get("analyzed_at"), errors="coerce", utc=True)
+            st.caption(
+                "Última lectura guardada · "
+                + (observed.strftime("%d/%m/%Y") if pd.notna(observed) else "fecha no disponible")
+                + " · no se ha consultado el mercado al abrir la ficha."
+            )
+            policy = decode_policy_note(row.get("note")) or {}
+            st.write("**Para una nueva entrada:** " + str(
+                policy.get("primary", {}).get("entry_reading") or row.get("entry_label") or "Sin lectura",
+            ))
+            st.write("**Si ya la tienes:** " + str(
+                policy.get("position", {}).get("management_reading") or row.get("position_label") or "Sin lectura",
+            ))
+            confidence = _numeric_score(row.get("confidence_pct"))
+            st.caption(f"Cobertura registrada: {confidence:.0f}%" if confidence is not None
+                       else "Cobertura no disponible para esta lectura.")
         return
     recent = st.session_state.get("recent_analysis_tickers", [])
     st.session_state["recent_analysis_tickers"] = merge_analysis_ticker_sources(
         [selected],
         recent if isinstance(recent, list) else [],
     )[:20]
+    policy = (policy_snapshots or {}).get(selected, {})
+    reading = next((row for row in summary_rows or [] if row.get("Ticker") == selected), {})
+    observed = pd.to_datetime(reading.get("Fecha"), errors="coerce")
+    date_label = observed.strftime("%d/%m/%Y") if pd.notna(observed) else "fecha no disponible"
+    st.caption(f"Vela utilizada: {date_label} · no es cotización en directo.")
+    st.write("**Para una nueva entrada:** " + str(
+        policy.get("primary", {}).get("entry_reading") or reading.get("Lectura entrada") or "Sin lectura",
+    ))
+    st.write("**Si ya la tienes:** " + str(
+        policy.get("position", {}).get("management_reading") or reading.get("Si ya la tienes") or "Sin lectura",
+    ))
+    confidence = _numeric_score(policy.get("primary", {}).get("confidence_pct"))
+    st.caption(f"Cobertura de la lectura principal: {confidence:.0f}%" if confidence is not None
+               else "Cobertura de la lectura principal no disponible.")
+    if not st.toggle("Mostrar gráficos e indicadores", key=f"company_detail_{selected}"):
+        return
     render_analysis(
         selected,
         prepared[selected],
@@ -12317,7 +12372,7 @@ def render_company_analysis_page(
         journal,
         opportunity_results,
         fundamental_results,
-        policy_snapshot=(policy_snapshots or {}).get(selected),
+        policy_snapshot=policy,
     )
 
 
@@ -12850,14 +12905,14 @@ def render_benchmark_outperformance_page(
         )
     with controls_b:
         st.button(
-            "Revisar todo el universo",
+            "Actualizar la comparación con el mercado",
             icon=":material/refresh:",
             type="primary",
             width="stretch",
             key="benchmark_refresh_all",
             on_click=_request_all_favorite_refresh,
             args=("Ventaja relativa",),
-            help="Actualiza cartera y favoritas en bloques de 25 para no saturar los proveedores.",
+            help="Actualiza el universo de esta comparación. Guarda cada bloque antes de continuar.",
         )
     selected_horizon = str(selected_horizon or "medium")
     benchmark_frame = reference_data.get("SPY")
@@ -15343,13 +15398,71 @@ def render_methodology() -> None:
     )
 
 
-def main() -> None:
+def _route_query(*, ticker: str | None = None) -> dict[str, str]:
+    params = {}
+    release = st.query_params.get("release")
+    if isinstance(release, str) and 0 < len(release) <= 64 and release.replace("-", "").isalnum():
+        params["release"] = release
+    if ticker:
+        params["ticker"] = ticker
+    return params
+
+
+def _render_route_links(keys, pages, *, selected: str, primary: bool = False) -> None:
+    with st.container(key="main_navigation_container" if primary else f"local_navigation_{selected}"):
+        columns = st.columns(len(keys), gap="small")
+        for column, key in zip(columns, keys):
+            label = ROUTES[key].label
+            if not primary:
+                label = {"hoy": "Resumen", "radar": "Resumen", "cartera": "Mi cartera",
+                         "favoritas": "Mis listas"}.get(key, label)
+            with column:
+                with st.container(key=f"{'main' if primary else 'local'}_link_{key}_{'active' if selected == key else 'idle'}"):
+                    st.page_link(pages[key], label=label, width="stretch", query_params=_route_query())
+
+
+def _render_more_routes(pages, *, is_admin: bool) -> None:
+    st.header("Más")
+    st.caption("Resultados, métodos y ajustes. Tu revisión diaria y tus favoritas están en la barra principal.")
+    for title, keys in TOOLS_GROUPS:
+        st.subheader(title)
+        for key in keys:
+            st.page_link(pages[key], width="content", query_params=_route_query())
+    if is_admin:
+        st.subheader("Configuración")
+        st.page_link(pages["administracion"], width="content", query_params=_route_query())
+    with st.expander("Guía y riesgos"):
+        render_methodology()
+
+
+def run_app() -> None:
+    """Use native page addresses so the browser owns history and deep links."""
+    pages = {}
+
+    def renderer(route: Route):
+        def render():
+            main(route=route, pages=pages)
+        return render
+
+    for key, route in ROUTES.items():
+        pages[key] = st.Page(
+            renderer(route), title=route.label, url_path=route.path, default=key == "hoy",
+        )
+    st.navigation(list(pages.values()), position="hidden").run()
+
+
+def main(*, route: Route | None = None, pages=None) -> None:
     apply_visual_theme()
     authenticated_user = require_login()
     _bind_navigation_owner(authenticated_user.username)
     _remember_analysis_controls()
     _remember_analysis_controls(restore=True)
     accounts = load_auth_accounts()
+    if route and route.admin and not authenticated_user.is_admin:
+        render_app_header(authenticated_user)
+        _render_route_links(PRIMARY_ROUTES, pages, selected="mas", primary=True)
+        st.warning("Esta página requiere una cuenta de administración.")
+        return
     try:
         journal = session_journal(cached_journal(authenticated_user.username), st.session_state)
         group_journal = session_journal(cached_journal(GROUP_PORTFOLIO_OWNER), st.session_state)
@@ -15357,6 +15470,16 @@ def main() -> None:
         st.error(str(exc))
         st.stop()
     render_app_header(authenticated_user)
+    if route is not None:
+        st.session_state["main_navigation"] = route.section
+        for key, value in route.selection:
+            st.session_state[key] = value
+        if route.key == "empresa":
+            direct = direct_ticker_from_query(st.query_params.get("ticker", ""))
+            if direct:
+                st.session_state["analysis_ticker"] = resolve_analysis_ticker(direct)
+        if route.key == "favoritas-anadir" and st.session_state.pop("_return_to_favorite_lists", False):
+            st.switch_page(pages["favoritas"], query_params=_route_query())
     requested_main_navigation = st.session_state.pop(
         "_requested_main_navigation", None
     )
@@ -15385,8 +15508,9 @@ def main() -> None:
     )
     if st.session_state.get("main_navigation") not in MAIN_OPTIONS:
         st.session_state["main_navigation"] = "Inicio"
-    requested_route = requested_analysis_navigation or st.session_state.get(
-        "analysis_navigation"
+    requested_route = requested_analysis_navigation or (
+        "Radar" if route is not None and requested_main_navigation == "Analizar"
+        else st.session_state.get("analysis_navigation")
     )
     if requested_route == "Más análisis":
         legacy_tool = str(st.session_state.get("analysis_tool_navigation", ""))
@@ -15420,7 +15544,7 @@ def main() -> None:
     elif requested_route in ANALYSIS_OPTIONS:
         st.session_state["analysis_navigation"] = requested_route
     else:
-        st.session_state["analysis_navigation"] = "Estrategias"
+        st.session_state["analysis_navigation"] = "Radar"
     if requested_analysis_company_navigation in COMPANY_OPTIONS:
         st.session_state["analysis_company_navigation"] = (
             requested_analysis_company_navigation
@@ -15455,13 +15579,30 @@ def main() -> None:
     if st.session_state.get("analysis_validation_navigation") not in VALIDATION_OPTIONS:
         st.session_state["analysis_validation_navigation"] = VALIDATION_OPTIONS[0]
 
-    # La navegación se dibuja antes de cualquier descarga o cálculo. Así permanece
-    # estable y responde al instante incluso cuando actualizar el mercado tarda.
-    with st.container(key="main_navigation_container"):
+    if route is not None and requested_main_navigation in MAIN_OPTIONS:
+        destination = route_for_state(st.session_state, admin=authenticated_user.is_admin)
+        ticker = (
+            direct_ticker_from_query(st.session_state.get("_requested_analysis_ticker", ""))
+            if destination.key == "empresa" else None
+        )
+        if destination.key != route.key or (
+            destination.key == "empresa" and ticker and ticker != st.query_params.get("ticker")
+        ):
+            st.switch_page(pages[destination.key], query_params=_route_query(ticker=ticker))
+
+    # Native navigation is the single source of truth in the browser.
+    # main() without a native page is also usable by Streamlit AppTest.
+    if route is not None:
+        _render_route_links(PRIMARY_ROUTES, pages, selected=route.group, primary=True)
+        if route.group in LOCAL_ROUTES:
+            _render_route_links(LOCAL_ROUTES[route.group], pages, selected=route.key)
+        elif route.key != "mas":
+            st.caption(f"Más / {route.label}")
+        selected_section = route.section
+    else:
         selected_section = st.segmented_control(
             "Navegación principal",
-            ["Inicio", "Carteras", "Más"] + ([st.session_state["main_navigation"]]
-                if st.session_state.get("main_navigation") not in {"Inicio", "Carteras", "Más"} else []),
+            MAIN_OPTIONS,
             key="main_navigation",
             required=True,
             label_visibility="collapsed",
@@ -15469,23 +15610,28 @@ def main() -> None:
                 "Inicio": "⌂  Hoy",
                 "Invertir": "↗  Invertir",
                 "Resultados": "✓  Resultados",
-                "Analizar": "⚒  Herramientas",
+                "Analizar": "◎  Radar",
                 "Favoritos": "♡  Favoritos",
                 "Carteras": "▱  Cartera",
-                "Más": "⚙  Gestionar y herramientas",
+                "Más": "⚙  Más",
             }[value],
         )
-    with st.expander("Abrir herramientas y resultados"):
-        destination = st.selectbox("Ir a", MAIN_OPTIONS, index=MAIN_OPTIONS.index(selected_section), key="compact_destination")
-        if st.button("Abrir sección", key="compact_open"):
-            st.session_state["_requested_main_navigation"] = destination
-            st.rerun()
     analysis_section = ""
     analysis_detail = ""
     favorite_view = ""
     portfolio_section = ""
     more_section = ""
-    if selected_section == "Analizar":
+    if route is not None:
+        analysis_section = str(st.session_state.get("analysis_navigation", "")) if selected_section == "Analizar" else ""
+        if analysis_section in {"Empresa", "Estrategias", "Validar"}:
+            analysis_detail = str(st.session_state.get({
+                "Empresa": "analysis_company_navigation", "Estrategias": "analysis_strategy_navigation",
+                "Validar": "analysis_validation_navigation",
+            }[analysis_section], ""))
+        favorite_view = str(st.session_state.get("favorite_view", "")) if selected_section == "Favoritos" else ""
+        portfolio_section = str(st.session_state.get("portfolio_navigation", "")) if selected_section == "Carteras" else ""
+        more_section = str(st.session_state.get("more_navigation", "")) if selected_section == "Más" else ""
+    elif selected_section == "Analizar":
         analysis_section = render_subnavigation(
             "Qué quieres hacer",
             ANALYSIS_OPTIONS,
@@ -15581,13 +15727,24 @@ def main() -> None:
         )
 
     layout_analysis_section = analysis_detail or analysis_section
-    radar_route = (selected_section, analysis_section, analysis_detail)
-    if st.session_state.get("_radar_review_route") != radar_route:
-        st.session_state.pop("_radar_review_active", None)
-        st.session_state["_radar_review_route"] = radar_route
+    if route is not None and route.key != "empresa":
+        st.session_state.pop("_pending_analysis_ticker", None)
+    if route is not None and route.group != "cartera":
+        st.session_state.pop("_portfolio_market_refresh_requested", None)
     apply_section_layout(str(selected_section), layout_analysis_section)
     # These screens do not consume market analysis. Returning before the shared
     # sidebar/load/prepare path also leaves pending explicit work for its page.
+    requested_digest = st.query_params.get("digest")
+    if requested_digest or (selected_section == "Analizar" and analysis_section == "Resumen diario"):
+        from src.daily_digest_ui import render_daily_score_page
+
+        if requested_digest:
+            st.button("Volver a Hoy", key="exit_archived_digest", on_click=_open_current_investment_home)
+        render_daily_score_page(journal, report_id=str(requested_digest) if requested_digest else None)
+        return
+    if route is not None and route.key == "mas":
+        _render_more_routes(pages, is_admin=authenticated_user.is_admin)
+        return
     if selected_section == "Más" and more_section != "Administración":
         if more_section == "Alertas por correo":
             if persistent_journal_enabled():
@@ -15602,20 +15759,6 @@ def main() -> None:
         return
     if selected_section == "Carteras" and portfolio_section == "Plan por posición":
         _render_investment_position_plan(journal, actor_username=authenticated_user.username)
-        return
-    requested_digest = st.query_params.get("digest")
-    if (
-        selected_section == "Analizar" and analysis_section == "Resumen diario"
-        or selected_section == "Inicio" and requested_digest
-    ):
-        from src.daily_digest_ui import render_daily_score_page
-
-        if requested_digest:
-            st.button("Volver a Hoy", key="exit_archived_digest",
-                      on_click=_open_current_investment_home)
-        render_daily_score_page(
-            journal, report_id=str(requested_digest) if requested_digest else None,
-        )
         return
     if selected_section in {"Inicio", "Invertir"}:
         new_preview = None
@@ -15727,19 +15870,16 @@ def main() -> None:
             )
         return
     _remember_analysis_controls(restore=True)
-    (
-        tickers,
-        start,
-        end,
-        auto_adjust,
-        alpha_vantage_key,
-        strategy,
-        backtest,
-        load_clicked,
-    ) = build_sidebar(favorite_tickers, favorite_labels)
+    allow_batch = selected_section == "Analizar" and (
+        analysis_section in {"Estrategias", "Validar"} or analysis_detail == "Comparar empresas"
+    )
+    with st.popover("Ajustes de análisis", icon=":material/tune:"):
+        (
+            tickers, start, end, auto_adjust, alpha_vantage_key, strategy, backtest, load_clicked,
+        ) = build_sidebar(favorite_tickers, favorite_labels, allow_batch=allow_batch)
     _remember_analysis_controls()
     if favorite_storage_error:
-        st.sidebar.warning(
+        st.warning(
             "Los favoritos todavía no están disponibles. Hay que aplicar la "
             "actualización de la base de datos."
         )
@@ -15750,6 +15890,10 @@ def main() -> None:
         st.error(f"Configuración inválida: {exc}")
         st.stop()
 
+    if selected_section == "Analizar" and analysis_detail == "Análisis individual":
+        requested = st.session_state.get("_requested_analysis_ticker")
+        if isinstance(requested, str) and requested:
+            st.session_state["analysis_ticker"] = requested
     requested_pending_ticker = str(
         st.session_state.get("_pending_analysis_ticker", "")
     ).strip().upper()
@@ -15865,7 +16009,7 @@ def main() -> None:
                     else cached_journal(owner)
                 )
             except JournalStorageError as exc:
-                st.sidebar.warning(
+                st.warning(
                     f"No se pudo consultar la cartera de {owner}: {exc}"
                 )
                 continue
@@ -15911,7 +16055,9 @@ def main() -> None:
         loading_daily_batch = False
         if growth_scan_tickers:
             tickers_to_load = growth_scan_tickers
-        elif load_clicked or pending_analysis_ticker:
+        elif pending_analysis_ticker and not load_clicked:
+            tickers_to_load = [pending_analysis_ticker]
+        elif load_clicked:
             tickers_to_load = analysis_refresh_tickers(
                 base_tickers,
                 held_tickers,
@@ -15969,6 +16115,7 @@ def main() -> None:
                 merge_existing=bool(
                     growth_scan_tickers
                     or portfolio_refresh_cycle
+                    or pending_analysis_ticker
                 ),
                 refresh_fundamentals=bool(growth_scan_tickers or force_new_prices),
                 price_refresh_token=price_refresh_token,
@@ -16000,7 +16147,7 @@ def main() -> None:
                 # fallos se reintentan sin descargar otra vez todo el universo.
                 st.rerun()
             else:
-                st.sidebar.warning(
+                st.warning(
                     "La actualización diaria se ha pausado por el límite del "
                     "proveedor. Se reintentará sólo lo pendiente en el próximo rerun."
                 )
@@ -16068,7 +16215,8 @@ def main() -> None:
     for error in st.session_state.get("download_errors", []):
         st.warning(error)
 
-    if not should_load_market:
+    passive_catalog = route is not None and route.key == "radar" and not should_load_market
+    if not should_load_market and not passive_catalog:
         try:
             cached_tickers = _portfolio_tracking_tickers(journal)
             if selected_section == "Analizar":
@@ -16085,7 +16233,8 @@ def main() -> None:
             # prevent access to the saved portfolio and explicit refresh button.
             pass
 
-    _refresh_saved_market_on_timer(journal)
+    if not passive_catalog:
+        _refresh_saved_market_on_timer(journal)
     raw_data: dict[str, pd.DataFrame] = st.session_state.get("market_data", {})
     raw_fundamentals: dict[str, dict[str, object]] = st.session_state.get(
         "fundamental_data", {}
@@ -16106,7 +16255,9 @@ def main() -> None:
         relative_results,
         risk_results,
         opportunity_results,
-    ) = _analysis_view_context(raw_data, raw_fundamentals, reference_data, strategy, journal)
+    ) = ({}, [], {}, {}, {}, {}, {}) if passive_catalog else _analysis_view_context(
+        raw_data, raw_fundamentals, reference_data, strategy, journal,
+    )
     policy_snapshots = {
         str(row["Ticker"]): row["Política de análisis"]
         for row in summary
@@ -16165,11 +16316,19 @@ def main() -> None:
             fx_snapshot,
             private_favorites,
             group_favorites,
-            section="Hoy",
+            section="Laboratorio" if route and route.key == "laboratorio" else "Hoy",
         )
 
     elif selected_section == "Analizar":
-        render_market_data_status(raw_data, favorite_tickers)
+        if route is not None and analysis_section == "Radar":
+            st.button(
+                "Actualizar ahora todas mis favoritas", key="radar_primary_refresh",
+                icon=":material/refresh:", type="primary", disabled=not favorite_tickers,
+                on_click=_request_all_favorite_refresh,
+            )
+            st.caption("Consulta los cierres y guarda el avance por bloques. Abrir Radar muestra lo guardado sin descargar.")
+        elif analysis_section in {"Radar", "Oportunidades", "Estrategias"}:
+            render_market_data_status(raw_data, favorite_tickers, show_refresh=analysis_section == "Radar")
         if automatic_review_page:
             render_automatic_review_status(
                 radar_review, compatible=radar_compatible, now=datetime.now(timezone.utc),
@@ -16192,6 +16351,7 @@ def main() -> None:
                 favorite_tickers,
                 include_company_detail=False,
                 radar_review=radar_review if radar_compatible else None,
+                show_entries_shortcut=route is None,
             )
         elif analysis_section == "Oportunidades":
             render_entry_opportunities_page(
@@ -16253,6 +16413,7 @@ def main() -> None:
                 price_verifications,
                 journal,
                 policy_snapshots=policy_snapshots,
+                summary_rows=summary,
             )
         elif (
             analysis_section == "Empresa"
@@ -16457,4 +16618,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_app()
