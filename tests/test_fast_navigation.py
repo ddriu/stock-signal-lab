@@ -25,6 +25,7 @@ class Journal:
     def get_latest_daily_score_report(self):
         st.session_state["qa_reads"][self.owner]["latest"] += 1
         return {"owner_marker": self.owner, "report_id": ("a" if self.owner == "qa_a" else "b") * 64,
+                "as_of": date.today().isoformat(),
                 "rows": [{"ticker": symbol(self.owner), "session": date.today().isoformat()}]}
     def list_analysis_snapshots_for_sessions(self, sessions):
         assert sessions == [date.today().isoformat()], "Only the saved report's sessions may be read"
@@ -127,10 +128,7 @@ def home(current, journal, group, prepared, references, summary, *args, **kwargs
 def saved_workspace(journal, *, report, snapshots=None, on_action=None, view):
     assert journal.owner == owner and report["owner_marker"] == owner, "Saved report leaked across owners"
     assert report["rows"][0]["ticker"] == symbol(owner)
-    if view == "Inicio":
-        assert snapshots is None, "Inicio must not read historical analysis"
-    else:
-        assert snapshots.owner_marker.tolist() == [owner], "Snapshot context leaked across owners"
+    assert snapshots.owner_marker.tolist() == [owner], "Snapshot context leaked across owners"
     st.write("SAVED " + view + " " + owner + " " + symbol(owner))
     if view == "Inicio":
         for horizon in ("days", "weeks", "long_term"):
@@ -138,6 +136,18 @@ def saved_workspace(journal, *, report, snapshots=None, on_action=None, view):
                 on_click=on_action, args=("horizon", horizon))
         st.button("QA review plan", key="qa_plan", on_click=on_action, args=("plan", symbol(owner)))
         st.button("QA results", key="qa_results", on_click=on_action, args=("results", None))
+        st.button("QA review", key="qa_home_refresh", on_click=on_action, args=("refresh", None))
+
+def preview_run(*, owner, journal_factory, review_receiver):
+    assert owner == st.session_state["qa_owner"]
+    assert journal_factory(owner).owner == owner
+    st.session_state["qa_preview_runs"] = st.session_state.get("qa_preview_runs", 0) + 1
+    if st.session_state.get("qa_preview_failure"):
+        return
+    review_receiver({"owner_marker": owner, "as_of": st.session_state.get("qa_preview_as_of", date.today().isoformat()),
+        "review_mode": "manual_preview", "review_observed_count": 1,
+        "rows": [{"ticker": symbol(owner), "session": date.today().isoformat()}]},
+        pd.DataFrame([{"ticker": symbol(owner), "owner_marker": owner}]))
 
 def saved_results(journal, *, on_action=None):
     assert journal.owner == owner, "Results leaked across owners"
@@ -190,7 +200,8 @@ with ExitStack() as patches:
     patches.enter_context(patch.object(application, "render_methodology", side_effect=lambda: st.write("GUIDE")))
     patches.enter_context(patch.object(application, "render_email_alert_settings", side_effect=lambda journal: st.write("MAIL_SETTINGS " + journal.owner)))
     patches.enter_context(patch.object(application, "render_capital_projection_page", side_effect=lambda selected: st.write("CAPITAL " + selected)))
-    for name in ("persist_analysis_batch_snapshots", "run_daily_alerts", "evaluate_growth_momentum",
+    patches.enter_context(patch.object(application, "run_daily_alerts", side_effect=preview_run))
+    for name in ("persist_analysis_batch_snapshots", "evaluate_growth_momentum",
                  "evaluate_latest_signal", "run_backtest"):
         patches.enter_context(patch.object(application, name, side_effect=forbidden))
     application.main()
@@ -247,7 +258,7 @@ def test_light_routes_ignore_pending_market_work_instead_of_running_it(route):
     assert current.session_state["qa_counts"] == {"prepare": 0, "enrich": 0, "load": 0}
 
 
-@pytest.mark.parametrize("route,bounded", [("Inicio", 0), ("Invertir", 1), ("Resultados", 0)])
+@pytest.mark.parametrize("route,bounded", [("Inicio", 1), ("Invertir", 1), ("Resultados", 0)])
 def test_saved_screens_read_only_owner_report_and_bounded_context(route, bounded):
     current = page(route)
     assert_ok(current)
@@ -298,6 +309,46 @@ def test_archived_digest_link_remains_read_only_in_home():
     assert any("DIGEST qa_a " + "d" * 64 in str(item.value) for item in current.markdown)
     assert current.session_state["qa_reads"]["qa_a"] == {"latest": 0, "bounded": 0, "snapshots": 0}
     assert current.session_state["qa_counts"] == {"prepare": 0, "enrich": 0, "load": 0}
+    current.button(key="exit_archived_digest").click().run()
+    assert_ok(current)
+    assert "digest" not in current.query_params
+    assert any("SAVED Inicio qa_a" in str(item.value) for item in current.markdown)
+    assert "qa_preview_runs" not in current.session_state
+
+
+def test_home_refresh_reuses_same_screen_without_legacy_navigation_or_archive_writes():
+    current = page()
+    assert "qa_preview_runs" not in current.session_state
+    current.button(key="qa_home_refresh").click().run()
+    assert_ok(current)
+    assert current.session_state["main_navigation"] == "Inicio"
+    assert current.session_state["qa_preview_runs"] == 1
+    assert any("Revisión manual · 1/1" in item.value for item in current.info)
+    current.run()
+    assert_ok(current)
+    assert current.session_state["qa_preview_runs"] == 1
+    current.button(key="qa_switch").click().run()
+    assert_ok(current)
+    assert "_investment_manual_review" not in current.session_state
+    assert not any("Revisión manual" in item.value for item in current.info)
+
+
+def test_failed_home_refresh_keeps_last_saved_report_visible():
+    current = page()
+    current.session_state["qa_preview_failure"] = True
+    current.button(key="qa_home_refresh").click().run()
+    assert_ok(current)
+    assert any("Se conserva la última lectura" in item.value for item in current.warning)
+    assert any("SAVED Inicio qa_a" in str(item.value) for item in current.markdown)
+
+
+def test_older_manual_close_does_not_displace_saved_report():
+    current = page()
+    current.session_state["qa_preview_as_of"] = "2020-01-01"
+    current.button(key="qa_home_refresh").click().run()
+    assert_ok(current)
+    assert any("cierres anteriores" in item.value for item in current.warning)
+    assert not any("Revisión manual" in item.value for item in current.info)
 
 
 @pytest.mark.parametrize("route", ["Inicio", "Invertir", "Resultados"])
@@ -315,7 +366,7 @@ def test_owner_switch_clears_new_workspace_state_and_reads_only_new_owners_repor
         assert key not in current.session_state
     assert current.session_state["qa_counts"] == {"prepare": 0, "enrich": 0, "load": 0}
     assert current.session_state["qa_reads"]["qa_b"] == {
-        "latest": int(route != "Resultados"), "bounded": int(route == "Invertir"), "snapshots": 0}
+        "latest": int(route != "Resultados"), "bounded": int(route in {"Inicio", "Invertir"}), "snapshots": 0}
     assert any("SAVED " + route + " qa_b" in str(item.value) for item in current.markdown)
     assert not any("SAVED " + route + " qa_a" in str(item.value) for item in current.markdown)
 

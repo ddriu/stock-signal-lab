@@ -9,7 +9,7 @@ import importlib
 import inspect
 import sys
 
-RUNTIME_COMPAT_VERSION = "compact-mobile-v3"
+RUNTIME_COMPAT_VERSION = "home-review-v4"
 
 
 ANALYSIS_MODULE_ORDER = (
@@ -23,6 +23,7 @@ _VERSIONS = {
     "src.analysis_data_quality": ("QUALITY_PRESENTATION_VERSION", "dated_quality_coverage_v2"),
     "src.daily_digest": ("DIGEST_PRESENTATION_VERSION", "compact-mobile-v3"),
     "src.analysis_snapshots": ("PRIMARY_PERSISTENCE_VERSION", "independent-primary-storage-v1"),
+    "src.alert_runner": ("ALERT_RUNNER_VERSION", "home-preview-v1"),
 }
 _SIGNATURES = {
     "src.analysis_policy": ("build_policy_snapshot", "enrich_analysis_rows"),

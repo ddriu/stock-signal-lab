@@ -57,6 +57,9 @@ from src.analysis_policy import (
     position_contexts_from_snapshot,
 )
 from src.alert_market_inputs import OwnerAlertMarketInputs
+from src.hourly_market_schedule import completed_daily_prices
+
+ALERT_RUNNER_VERSION = "home-preview-v1"
 
 
 @dataclass(frozen=True)
@@ -317,6 +320,7 @@ def run_daily_alerts(
     today: date | None = None,
     require_current_session: bool = False,
     virtual_tracker: Callable[[object, pd.DataFrame], object] | None = None,
+    review_receiver: Callable[[dict, pd.DataFrame], None] | None = None,
 ) -> AlertRunSummary:
     """Ejecuta el radar diario o una revisión manual de un solo propietario.
 
@@ -332,8 +336,16 @@ def run_daily_alerts(
     ``virtual_tracker`` es una acción opcional explícita, después de guardar las
     señales y antes de sellar el informe/SMTP. Nunca activa temporadas por sí
     mismo este runner; el resultado y sus incidencias forman parte del informe.
+
+    ``review_receiver`` entrega una revisión temporal de un propietario a la
+    pantalla. Sólo admite cierres completados y no persiste observaciones,
+    modifica el historial de avisos ni ejecuta el flujo de entrega.
     """
 
+    preview_only = review_receiver is not None
+    if preview_only and (owner is None or not callable(review_receiver) or virtual_tracker is not None):
+        raise ValueError("La revisión en pantalla requiere un propietario y no ejecuta el laboratorio.")
+    preview_clock = pd.Timestamp.now(tz="UTC") if preview_only else None
     resolved_today = today or datetime.now(ZoneInfo("Europe/Madrid")).date()
     manual_owner: str | None = None
     manual_journal: object | None = None
@@ -344,15 +356,18 @@ def run_daily_alerts(
         if not manual_owner or manual_owner == GROUP_PORTFOLIO_OWNER:
             raise ValueError("La revisión manual necesita un usuario privado propietario.")
         manual_journal = journal_factory(manual_owner)
-        if not hasattr(manual_journal, "get_alert_preferences"):
+        if preview_only and getattr(manual_journal, "owner", manual_owner) != manual_owner:
+            raise ValueError("El diario de revisión no corresponde al propietario.")
+        if not preview_only and not hasattr(manual_journal, "get_alert_preferences"):
             raise RuntimeError("No se pueden leer las preferencias del usuario.")
-        preference = manual_journal.get_alert_preferences()
+        read_preferences = getattr(manual_journal, "get_alert_preferences", None)
+        preference = read_preferences() if callable(read_preferences) else AlertPreferences(owner=manual_owner)
         if not isinstance(preference, AlertPreferences) or preference.owner != manual_owner:
             raise ValueError("Las preferencias no pertenecen al usuario solicitado.")
-        if preference.enabled is not True:
+        if not preview_only and preference.enabled is not True:
             raise ValueError("Activa los avisos por correo antes de solicitar una revisión manual.")
         recipient = preference.email
-        if (
+        if not preview_only and (
             not isinstance(recipient, str)
             or not recipient
             or recipient != recipient.strip()
@@ -482,9 +497,11 @@ def run_daily_alerts(
                 if not symbol:
                     return None
                 frame, _ = owner_inputs.select(symbol.strip().upper(), downloaded_reference_frame(symbol))
+                if preview_only and frame is not None and not frame.empty:
+                    frame = completed_daily_prices(symbol, frame, now=preview_clock)
                 return frame
 
-            previous = journal.list_alert_states()
+            previous = pd.DataFrame() if preview_only else journal.list_alert_states()
             previous_signatures = (
                 dict(zip(previous["ticker"], previous["signature"]))
                 if not previous.empty
@@ -551,8 +568,11 @@ def run_daily_alerts(
             evaluated: list[tuple[object, float, bool, str, DailyOverviewRow]] = []
             candidates: list[AlertCandidate] = []
             overview_rows: list[DailyOverviewRow] = []
+            preview_observations: list[dict] = []
             for ticker in sorted(scope):
                 frame, from_saved_cache = owner_inputs.select(ticker, frames.get(ticker))
+                if preview_only and frame is not None and not frame.empty:
+                    frame = completed_daily_prices(ticker, frame, now=preview_clock)
                 if from_saved_cache:
                     source_attrs = dict(frame.attrs)
                     frame = add_indicators(frame, config)
@@ -654,6 +674,12 @@ def run_daily_alerts(
                     )
                     broad_market = reference_frame(broad_name)
                     sector_market = reference_frame(sector_name)
+                    if preview_only:
+                        close_date = pd.Timestamp(signal.as_of).date()
+                        broad_market = (broad_market.loc[broad_market.index.date <= close_date]
+                                        if broad_market is not None else None)
+                        sector_market = (sector_market.loc[sector_market.index.date <= close_date]
+                                         if sector_market is not None else None)
                     for reference, label in ((broad_market, "general"), (sector_market, "sectorial")):
                         if reference is not None and not reference.empty:
                             reference_date = pd.Timestamp(reference.index[-1]).date()
@@ -936,12 +962,14 @@ def run_daily_alerts(
                     snapshot_key = (ticker, pd.Timestamp(signal.as_of).date())
                     policy_key = (*snapshot_key, str(policy["snapshot_id"]))
                     if (
-                        policy_key not in saved_policy_keys
-                        and (growth is not None or enhanced is not None)
-                        and hasattr(journal, "add_analysis_snapshot")
+                        preview_only or (
+                            policy_key not in saved_policy_keys
+                            and (growth is not None or enhanced is not None)
+                            and hasattr(journal, "add_analysis_snapshot")
+                        )
                     ):
                         try:
-                            journal.add_analysis_snapshot(
+                            observation = dict(
                                 ticker=ticker,
                                 analyzed_at=signal.as_of,
                                 price=price,
@@ -977,8 +1005,14 @@ def run_daily_alerts(
                                 explanation=str(getattr(enhanced, "explanation", "") or policy["primary"]["entry_reading"]),
                                 note=encode_policy_note("Actualización automática del radar diario", policy),
                             )
-                            saved_snapshot_keys.add(snapshot_key)
-                            saved_policy_keys.add(policy_key)
+                            if preview_only:
+                                preview_observations.append({**observation,
+                                    "created_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                                    "_preview_snapshot_id": str(policy["snapshot_id"])})
+                            else:
+                                journal.add_analysis_snapshot(**observation)
+                                saved_snapshot_keys.add(snapshot_key)
+                                saved_policy_keys.add(policy_key)
                         except Exception as exc:
                             errors.append(
                                 f"{owner} / {ticker}: no se pudo guardar el análisis "
@@ -1018,6 +1052,30 @@ def run_daily_alerts(
                             data_note="no se pudo completar el análisis",
                         )
                     )
+
+            if preview_only:
+                if not preview_observations:
+                    continue
+                combined = pd.concat([saved_snapshots, pd.DataFrame(preview_observations)], ignore_index=True)
+                report = build_daily_score_report(
+                    combined, tickers=scope, held_tickers=set(positions), company_names=names,
+                    as_of=max(pd.Timestamp(row["analyzed_at"]).date() for row in preview_observations),
+                )
+                new_keys = {(row["ticker"], row["_preview_snapshot_id"], row["created_at"])
+                            for row in preview_observations}
+                observed_count = sum(
+                    (row["ticker"], row.get("snapshot_id"), row.get("recorded_at")) in new_keys
+                    for row in report["rows"]
+                )
+                if observed_count:
+                    # No archive, notification state, SMTP or simulation writes.
+                    report = seal_daily_score_report({**report, "review_mode": "manual_preview",
+                        "review_observed_count": observed_count,
+                        "review_at": pd.Timestamp.now(tz="UTC").isoformat()})
+                    sessions = {row["session"] for row in report["rows"] if row.get("session")}
+                    dates = pd.to_datetime(combined["analyzed_at"], errors="coerce", utc=True, format="mixed")
+                    review_receiver(report, combined.loc[dates.dt.strftime("%Y-%m-%d").isin(sessions)].copy())
+                continue
 
             if manual_owner is not None and not evaluated:
                 errors.append(

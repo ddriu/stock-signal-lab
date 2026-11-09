@@ -12,7 +12,14 @@ from src.investment_workspace import build_investment_workspace
 
 
 HORIZON_LABELS = {"days": "Días", "weeks": "Semanas", "long_term": "Largo plazo"}
-WORKSPACE_UI_VERSION = "investment-workspace-ui-v2"
+HOME_READING_LABELS = {
+    "days": "Técnico",
+    "weeks": "Crecimiento",
+    "long_term": "Tesis",
+}
+WORKSPACE_UI_VERSION = "investment-workspace-ui-v3"
+
+
 def _load_workspace(journal, report, snapshots, holdings, reference_date):
     # A provided report (including {}) is authoritative: no additional reads.
     if report is None:
@@ -60,14 +67,24 @@ def _saved_growth_note(row):
 
 def _header(workspace):
     st.subheader("Hoy · cartera y posibles entradas")
-    st.write("Primero lo que ya tienes. Después, posibles entradas según el plazo.")
+    st.write("Primero lo que ya tienes. Después, lecturas independientes de posibles entradas.")
     st.caption(f"Cierre guardado: {workspace.get('as_of') or 'sin fecha'} · "
         f"Informe: {str(workspace.get('report_id') or 'N/D')[:12]}. "
         "Abrir esta página no descarga precios, envía correos ni ejecuta operaciones.")
     st.caption("Las notas son lecturas del modelo, no porcentajes de beneficio. Revisa precio, costes y riesgo antes de actuar.")
     coverage = workspace.get("coverage") or {}
     if workspace.get("status") == "unavailable":
-        st.warning("No hay una revisión utilizable. N/D significa sin información suficiente, no cero oportunidades.")
+        if workspace.get("report_id"):
+            st.warning(
+                "El informe no contiene notas recientes de crecimiento suficientes. "
+                "Las lecturas técnicas o de tesis enlazadas pueden seguir visibles; "
+                "N/D significa contexto pendiente, no cero oportunidades."
+            )
+        else:
+            st.warning(
+                "Falta un informe sellado y fechado para esta revisión. N/D significa "
+                "contexto pendiente, no cero oportunidades."
+            )
     elif workspace.get("status") == "partial":
         st.warning(f"Revisión parcial: {coverage.get('current_with_score', 0)}/{coverage.get('total', 0)} "
             "empresas con nota reciente. Las pendientes no son señales de venta.")
@@ -130,12 +147,74 @@ def _section(title, rows, on_action, key, *, empty):
             _one_more(rows[5:], on_action, key + "_more")
 
 
-def _actions(on_action, *, prefix):
+def _home_empty_context(horizon, view):
+    """Explain missing evidence without presenting it as a rejected entry."""
+    counts = view.get("counts") if isinstance(view, Mapping) else {}
+    counts = counts if isinstance(counts, Mapping) else {}
+    if horizon == "long_term" and view.get("research"):
+        return (
+            "Hay datos de calidad y valoración, pero falta una tesis documentada. "
+            "Se muestran como empresas para estudiar."
+        )
+    try:
+        observed = int(counts.get("observed") or 0)
+    except (TypeError, ValueError, OverflowError):
+        observed = 0
+    if observed == 0:
+        return {
+            "days": (
+                "Falta contexto técnico verificable para esta revisión. "
+                "Actualiza los datos antes de interpretar una configuración."
+            ),
+            "weeks": (
+                "Falta contexto de crecimiento y momentum verificable para esta "
+                "revisión. Las empresas permanecen pendientes, no descartadas."
+            ),
+            "long_term": (
+                "Falta contexto de tesis, calidad y valoración enlazado a esta "
+                "revisión. La ausencia de evidencia no confirma una decisión."
+            ),
+        }.get(horizon, "Falta contexto verificable para esta revisión.")
+    return {
+        "days": (
+            "La lectura técnica observada no confirma candidaturas en este plazo; "
+            "no se rebajan sus reglas para rellenar la lista."
+        ),
+        "weeks": (
+            "La lectura de crecimiento observada no confirma candidaturas en este "
+            "plazo; no se mezclan otras notas para rellenar la lista."
+        ),
+        "long_term": (
+            "La revisión de tesis no confirma candidaturas de largo plazo. Calidad, "
+            "valoración y tesis se mantienen separadas de una compra."
+        ),
+    }.get(horizon, "La lectura observada no confirma candidaturas en este plazo.")
+
+
+def _home_refresh_action(on_action):
+    """Visible explicit refresh; merely browsing the screen stays read-only."""
+    st.button(
+        "Actualizar revisión",
+        icon=":material/refresh:",
+        type="primary",
+        key="investment_home_refresh",
+        on_click=_navigate,
+        args=(on_action, "refresh", None),
+        width="stretch",
+        help=(
+            "Solicita una revisión nueva. Abrir la pantalla o cambiar de etiqueta "
+            "no consulta proveedores ni modifica posiciones."
+        ),
+    )
+
+
+def _actions(on_action, *, prefix, include_refresh=True):
     if not callable(on_action):
         return
-    for column, label, action in zip(st.columns(3),
-            ("Mi cartera", "Resultados", "Revisar datos"),
-            ("portfolio", "results", "refresh")):
+    actions = [("Mi cartera", "portfolio"), ("Resultados", "results")]
+    if include_refresh:
+        actions.append(("Revisar datos", "refresh"))
+    for column, (label, action) in zip(st.columns(len(actions)), actions, strict=True):
         column.button(label, key=f"{prefix}_{action}", on_click=_navigate,
             args=(on_action, action, None), width="stretch")
 
@@ -149,6 +228,15 @@ def render_investment_home(journal, *, report=None, on_action=None,
         st.error("No se pudo leer tu plan privado. No se han cambiado posiciones ni enviado correos.")
         return None
     _header(workspace)
+    _home_refresh_action(on_action)
+    horizon = st.radio("Lectura", list(HOME_READING_LABELS),
+        format_func=HOME_READING_LABELS.get, horizontal=True, index=1,
+        key="home_horizon_filter")
+    st.caption(
+        "Cambia la lectura de posibles entradas. No cambia el cierre ni recalcula "
+        "señales. Técnico, Crecimiento y Tesis conservan reglas y fuentes "
+        "independientes; no mezcla notas."
+    )
     portfolio = workspace.get("portfolio") or []
     st.markdown("### Qué revisar primero")
     if portfolio:
@@ -163,12 +251,14 @@ def render_investment_home(journal, *, report=None, on_action=None,
             _one_more(portfolio, on_action, "home_position_detail")
     else:
         st.info("No hay posiciones incluidas en este informe. Puedes revisar las posibles entradas por plazo.")
-    horizon = st.radio("Plazo", list(HORIZON_LABELS), format_func=HORIZON_LABELS.get,
-        horizontal=True, index=1, key="home_horizon_filter")
     view = workspace.get("horizons", {}).get(horizon, {})
     _section("Posibles entradas · máximo tres", (view.get("opportunities") or [])[:3],
-        on_action, "home_candidates", empty="No hay entradas verificadas para este plazo. No se rebajan los filtros para rellenar la lista.")
-    _actions(on_action, prefix="investment_home")
+        on_action, "home_candidates", empty=_home_empty_context(horizon, view))
+    research = view.get("research") or []
+    if horizon == "long_term" and research:
+        _section("Negocios para estudiar · no son compras confirmadas", research[:3],
+            on_action, "home_long_term_research", empty="")
+    _actions(on_action, prefix="investment_home", include_refresh=False)
     st.caption("Revisar cada día no obliga a operar cada día.")
     return workspace
 

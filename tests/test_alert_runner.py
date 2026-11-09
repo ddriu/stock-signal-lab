@@ -412,6 +412,60 @@ def _manual_test_frame(monkeypatch, *, as_of: str = "2026-10-14") -> pd.DataFram
     return frame
 
 
+@pytest.mark.parametrize("during_session", [False, True])
+def test_home_review_returns_linked_closed_observations_without_email_or_writes(monkeypatch, during_session):
+    from src.daily_digest import seal_daily_score_report
+    from src.hourly_market_schedule import completed_daily_prices
+    from src.investment_workspace import build_investment_workspace
+
+    preference = AlertPreferences(owner="ddriu", enabled=False, include_group=False)
+    user = FakeManualJournal(preference, tickers=("MINE",))
+    frame = _manual_test_frame(monkeypatch)
+    frame.loc[pd.Timestamp("2026-10-15")] = 105.
+    if during_session:
+        # Provider supplies a bar for the still-open session. It is not a close.
+        def at_open_session(ticker, frame, *, now):
+            assert now.tzinfo is not None
+            return completed_daily_prices(ticker, frame, now="2026-10-15T16:00:00Z")
+        monkeypatch.setattr("src.alert_runner.completed_daily_prices", at_open_session)
+    monkeypatch.setattr("src.alert_runner.evaluate_growth_momentum", lambda **kwargs: SimpleNamespace(
+        score=85, confidence_pct=90, label="Entrada fuerte", growth_score=80, momentum_score=90,
+        context_score=80, sector_key="technology", as_of=kwargs["frame"].index[-1],
+        positive_factors=(), risk_factors=(), manual_checks=()))
+    for method in ("list_alert_states", "add_analysis_snapshot", "save_daily_score_report",
+                   "claim_daily_digest", "finish_daily_digest", "upsert_alert_states"):
+        monkeypatch.setattr(user, method, lambda *a, **k: pytest.fail("Review must not touch delivery or write storage"))
+    received = []
+    result = run_daily_alerts(owner="ddriu", journal_factory=lambda owner: user,
+        downloader=lambda *a, **k: frame, fundamental_downloader=_verified_growth_info,
+        sender=lambda *a: pytest.fail("No SMTP"), today=date(2026, 10, 15),
+        review_receiver=lambda report, snapshots: received.append((report, snapshots)))
+    assert result.emails_sent == result.alerts_sent == 0
+    assert len(received) == 1, result.errors
+    report, snapshots = received[0]
+    assert report["as_of"] == ("2026-10-14" if during_session else "2026-10-15")
+    assert report["review_mode"] == "manual_preview" and report["review_observed_count"] == 1
+    assert seal_daily_score_report(report)["report_id"] == report["report_id"]
+    row = report["rows"][0]
+    assert row["score"] == 85
+    assert row["recorded_at"] == snapshots.iloc[0]["created_at"]
+    # Technical detail can be linked to the same observation, not the growth score.
+    workspace = build_investment_workspace(report, snapshots=snapshots,
+        reference_date=date(2026, 10, 15))
+    assert workspace["horizons"]["days"]["waiting"][0]["score"] == 50
+    assert user.snapshots == [] and user.reports == {}
+
+
+def test_home_review_rejects_unscoped_or_virtual_runs_before_any_collection():
+    with pytest.raises(ValueError, match="propietario"):
+        run_daily_alerts(review_receiver=lambda *a: None,
+            journal_factory=lambda *a: pytest.fail("No unscoped lookup"))
+    with pytest.raises(ValueError, match="laboratorio"):
+        run_daily_alerts(owner="ddriu", review_receiver=lambda *a: None,
+            virtual_tracker=lambda *a: None,
+            journal_factory=lambda *a: pytest.fail("No mixed review and simulation"))
+
+
 def test_daily_digest_claim_blocks_same_session_even_when_body_changes(monkeypatch):
     preference = normalize_alert_preferences(owner="ddriu", email="ddriu@example.com",
         enabled=True, include_group=False)

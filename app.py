@@ -21,7 +21,7 @@ import streamlit as st
 from config import BacktestConfig, StrategyConfig
 import src.investment_runtime as _investment_runtime_module
 
-if getattr(_investment_runtime_module, "INVESTMENT_RUNTIME_VERSION", "") != "compact-workspace-v2":
+if getattr(_investment_runtime_module, "INVESTMENT_RUNTIME_VERSION", "") != "home-review-v3":
     _investment_runtime_module = importlib.reload(_investment_runtime_module)
 prepare_investment_runtime = _investment_runtime_module.prepare_investment_runtime
 
@@ -33,7 +33,7 @@ from src.market_cache_ui import hydrate_saved_market, valuation_frames, poll_sav
 from src.portfolio_view_context import reconcile_home_views
 import src.runtime_compat as _analysis_runtime_module
 
-if getattr(_analysis_runtime_module, "RUNTIME_COMPAT_VERSION", "") != "compact-mobile-v3":
+if getattr(_analysis_runtime_module, "RUNTIME_COMPAT_VERSION", "") != "home-review-v4":
     _analysis_runtime_module = importlib.reload(_analysis_runtime_module)
 prepare_analysis_runtime = _analysis_runtime_module.prepare_analysis_runtime
 
@@ -523,7 +523,7 @@ SIDEBAR_ANALYSIS_SECTIONS = {
 def apply_visual_theme() -> None:
     """Aplica una capa visual responsive sin alterar los componentes financieros."""
 
-    st.markdown(f"<style>/* ssl-ui: compact-workspace-v2 */{APP_CSS}</style>", unsafe_allow_html=True)
+    st.markdown(f"<style>/* ssl-ui: home-review-v3 */{APP_CSS}</style>", unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=3_600, max_entries=350, show_spinner=False)
@@ -6713,6 +6713,8 @@ def _score_text(value: object) -> str:
 
 def _logout_current_user() -> None:
     st.session_state.pop("_authenticated_user", None)
+    st.session_state.pop("_investment_manual_review", None)
+    st.session_state.pop("_investment_review_requested", None)
 
 
 def render_app_header(user: AuthConfig) -> None:
@@ -9770,7 +9772,7 @@ def _investment_workspace_action(action: str, value: str | None = None) -> None:
     elif action == "results":
         _set_navigation("Resultados")
     elif action == "refresh":
-        _request_all_favorite_refresh("Crecimiento y momentum")
+        st.session_state["_investment_review_requested"] = True
     elif action == "model_details":
         _request_analysis_page("Validar")
         st.session_state["_requested_analysis_validation_navigation"] = "Resultados del modelo"
@@ -9779,10 +9781,34 @@ def _investment_workspace_action(action: str, value: str | None = None) -> None:
         st.session_state["private_journal_navigation"] = "Resultado real aproximado"
 
 
+def _refresh_investment_review(journal, group_journal):
+    """Collect a private, temporary review; never send or reserve an email."""
+    owner = str(journal.owner)
+    journals = {owner: journal, GROUP_PORTFOLIO_OWNER: group_journal}
+    result = {}
+
+    def receive(report, snapshots):
+        result.update(owner=owner, report=report, snapshots=snapshots)
+
+    run_daily_alerts(owner=owner, journal_factory=journals.__getitem__, review_receiver=receive)
+    return result
+
+
+def _open_current_investment_home() -> None:
+    st.query_params.pop("digest", None)
+    _set_navigation("Inicio")
+
+
 def _saved_investment_context(journal: object, *, with_snapshots: bool = False):
-    """One sealed report and, only in Invertir, its bounded exact observations."""
+    """Read the exact context for each method, without requesting market data."""
     reader = getattr(journal, "get_latest_daily_score_report", None)
     report = reader() if callable(reader) else None
+    preview = st.session_state.get("_investment_manual_review", {})
+    manual_report = preview.get("report") if preview.get("owner") == getattr(journal, "owner", None) else None
+    if isinstance(manual_report, dict) and (
+        not isinstance(report, dict) or str(manual_report.get("as_of") or "") >= str(report.get("as_of") or "")
+    ):
+        return manual_report, preview.get("snapshots") if with_snapshots else None
     if not isinstance(report, dict):
         return {}, None
     snapshots = None
@@ -15313,16 +15339,45 @@ def main() -> None:
     ):
         from src.daily_digest_ui import render_daily_score_page
 
+        if requested_digest:
+            st.button("Volver a Hoy", key="exit_archived_digest",
+                      on_click=_open_current_investment_home)
         render_daily_score_page(
             journal, report_id=str(requested_digest) if requested_digest else None,
         )
         return
     if selected_section in {"Inicio", "Invertir"}:
+        new_preview = None
+        if st.session_state.pop("_investment_review_requested", False):
+            with st.spinner("Consultando cierres y recalculando tu revisión. Puede tardar; no se envían correos…"):
+                try:
+                    preview = _refresh_investment_review(journal, group_journal)
+                except Exception:
+                    preview = {}
+            if preview:
+                st.session_state["_investment_manual_review"] = preview
+                new_preview = preview["report"]
+            else:
+                st.warning("No se pudo completar una revisión con cierres verificables. "
+                           "Se conserva la última lectura; no se ha enviado correo.")
         try:
-            report, snapshots = _saved_investment_context(journal, with_snapshots=selected_section == "Invertir")
+            report, snapshots = _saved_investment_context(journal, with_snapshots=True)
         except (JournalStorageError, ValueError, AttributeError):
             st.error("No se pudo consultar la revisión guardada. No se ejecutó ninguna operación ni envío.")
             return
+        if new_preview is not None and report.get("review_mode") != "manual_preview":
+            st.warning("La consulta sólo obtuvo cierres anteriores al informe guardado. "
+                       "Se conserva el informe más reciente.")
+        if report.get("review_mode") == "manual_preview":
+            reviewed = report.get("review_observed_count", 0)
+            total = len(report.get("rows", []))
+            checked_at = pd.to_datetime(report.get("review_at"), errors="coerce", utc=True)
+            when = (checked_at.tz_convert("Europe/Madrid").strftime("%d/%m a las %H:%M")
+                    if pd.notna(checked_at) else "")
+            st.info(f"Revisión manual{(' · ' + when) if when else ''} · "
+                    f"{reviewed}/{total} lecturas calculadas en esta consulta. "
+                    "Las restantes pueden ser lecturas guardadas o estar pendientes. "
+                    "Visible en esta sesión, sin correo ni cambio del informe archivado.")
         renderer = render_investment_home if selected_section == "Inicio" else render_investment_workspace
         renderer(journal, report=report, snapshots=snapshots, on_action=_investment_workspace_action)
         return

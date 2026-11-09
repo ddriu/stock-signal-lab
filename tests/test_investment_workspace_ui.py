@@ -8,7 +8,7 @@ from streamlit.testing.v1 import AppTest
 
 from src.daily_digest import seal_daily_score_report
 from src.analysis_policy import build_policy_snapshot, encode_policy_note
-from src.investment_workspace_ui import _note
+from src.investment_workspace_ui import WORKSPACE_UI_VERSION, _note
 
 
 DAY = date(2026, 11, 5)
@@ -26,6 +26,24 @@ def report(*, portfolio=1, favorites=1, waiting=0):
         rows=[row("HELD" + str(i), True) for i in range(portfolio)]
              + [row("NEW" + str(i)) for i in range(favorites)]
              + [row("WAIT" + str(i), candidate=False) for i in range(waiting)]))
+
+
+def research_report():
+    contents = report(portfolio=0)
+    row = contents["rows"][0]
+    policy = build_policy_snapshot({"Ticker": row["ticker"], "Fecha": row["session"],
+        "Fuente": "Fuente sintética", "Precio": 100, "Moneda": "USD",
+        "Calidad empresa": 72, "Valoración": 61, "Riesgo controlado": 70},
+        growth_result=SimpleNamespace(score=88, label="Entrada fuerte", growth_score=80,
+            momentum_score=90, context_score=80, confidence_pct=90, sector_key="technology",
+            as_of=row["session"], positive_factors=(), risk_factors=(), manual_checks=()),
+        position_context={"horizon": "No documentado", "strategy_id": "growth_momentum"}, held=False)
+    row["snapshot_id"] = policy["snapshot_id"]
+    contents = seal_daily_score_report(contents)
+    snapshots = [{"ticker": row["ticker"], "analyzed_at": row["session"],
+        "created_at": row["recorded_at"], "price": 100, "entry_score": 88,
+        "entry_label": "Entrada fuerte", "note": encode_policy_note("", policy)}]
+    return contents, snapshots
 
 
 def screen(contents, *, home=False, read=False, failure=False, snapshots=None):
@@ -116,6 +134,25 @@ def test_home_has_three_priorities_and_three_horizon_entrances_not_the_whole_wor
     assert page.session_state["actions"] == []
 
 
+def test_home_starts_with_explicit_refresh_and_independent_reading_labels():
+    assert WORKSPACE_UI_VERSION == "investment-workspace-ui-v3"
+    page = screen(report(), home=True)
+    assert not page.exception and not page.error
+    assert page.button[0].label == "Actualizar revisión"
+    assert [button.label for button in page.button].count("Actualizar revisión") == 1
+    assert not any(button.label == "Revisar datos" for button in page.button)
+    selector = page.radio(key="home_horizon_filter")
+    assert selector.label == "Lectura"
+    captions = " ".join(item.value for item in page.caption)
+    assert "Técnico, Crecimiento y Tesis" in captions
+    assert "No cambia el cierre ni recalcula señales" in captions
+    assert "no mezcla notas" in captions
+
+    page.button(key="investment_home_refresh").click().run()
+    assert not page.exception
+    assert page.session_state["actions"] == [("refresh", None)]
+
+
 def test_expanded_large_groups_render_only_one_selected_extra_company():
     page = screen(report(portfolio=20, favorites=20, waiting=150))
     assert not page.exception and not page.error
@@ -156,20 +193,7 @@ def test_home_can_request_all_unverified_plans_without_saving_anything():
 
 
 def test_long_term_research_is_separate_from_buy_candidates_and_has_no_combined_score():
-    contents = report(portfolio=0)
-    row = contents["rows"][0]
-    policy = build_policy_snapshot({"Ticker": row["ticker"], "Fecha": row["session"],
-        "Fuente": "Fuente sintética", "Precio": 100, "Moneda": "USD",
-        "Calidad empresa": 72, "Valoración": 61, "Riesgo controlado": 70},
-        growth_result=SimpleNamespace(score=88, label="Entrada fuerte", growth_score=80,
-            momentum_score=90, context_score=80, confidence_pct=90, sector_key="technology",
-            as_of=row["session"], positive_factors=(), risk_factors=(), manual_checks=()),
-        position_context={"horizon": "No documentado", "strategy_id": "growth_momentum"}, held=False)
-    row["snapshot_id"] = policy["snapshot_id"]
-    contents = seal_daily_score_report(contents)
-    snapshots = [{"ticker": row["ticker"], "analyzed_at": row["session"],
-        "created_at": row["recorded_at"], "price": 100, "entry_score": 88,
-        "entry_label": "Entrada fuerte", "note": encode_policy_note("", policy)}]
+    contents, snapshots = research_report()
     page = screen(contents, snapshots=snapshots)
     page.radio(key="investment_horizon").set_value("long_term").run()
     assert not page.exception and not page.error
@@ -183,6 +207,21 @@ def test_long_term_research_is_separate_from_buy_candidates_and_has_no_combined_
     assert len(page.text) == 1  # Not repeated again inside the pending section.
 
 
+def test_home_shows_available_long_term_research_when_thesis_label_is_selected():
+    contents, snapshots = research_report()
+    page = screen(contents, home=True, snapshots=snapshots)
+    page.radio(key="home_horizon_filter").set_value("long_term").run()
+    assert not page.exception and not page.error
+    assert any("Negocios para estudiar · no son compras confirmadas" in item.value
+               for item in page.markdown)
+    assert any(item.value == "Estudiar empresa" for item in page.markdown)
+    captions = " ".join(item.value for item in page.caption)
+    assert "Hay datos de calidad y valoración, pero falta una tesis documentada" in captions
+    assert "Sin nota conjunta" in captions
+    assert "Calidad 72/100" in captions and "Valoración 61/100" in captions
+    assert "Riesgo controlado 70/100" in captions
+
+
 def test_reader_fetches_only_the_latest_archived_report_once():
     page = screen(report(), read=True, home=True)
     assert not page.exception and not page.error
@@ -194,7 +233,22 @@ def test_missing_report_is_unavailable_instead_of_zero_opportunities():
     assert not page.exception and not page.error
     assert any("N/D" in warning.value and "no cero" in warning.value for warning in page.warning)
     assert not page.dataframe
-    assert any("No hay entradas verificadas" in caption.value for caption in page.caption)
+    captions = " ".join(caption.value for caption in page.caption)
+    assert "Falta contexto de crecimiento y momentum verificable" in captions
+    assert "No hay entradas verificadas" not in captions
+
+
+def test_missing_growth_note_does_not_hide_linked_technical_context():
+    contents, snapshots = research_report()
+    contents["rows"][0]["score"] = None
+    contents = seal_daily_score_report(contents)
+    page = screen(contents, home=True, snapshots=snapshots)
+    page.radio(key="home_horizon_filter").set_value("days").run()
+    assert not page.exception and not page.error
+    warnings = " ".join(item.value for item in page.warning)
+    assert "no contiene notas recientes de crecimiento suficientes" in warnings
+    assert "No hay una revisión utilizable" not in warnings
+    assert any(item.value == "Estudiar configuración" for item in page.markdown)
 
 
 def test_failed_saved_read_does_not_show_credentials_or_reconstruct_another_report():
