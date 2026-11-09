@@ -56,12 +56,12 @@ def frame(dates=("2026-10-29", "2026-10-30"), *, currency="USD", offset=0):
 
 
 def save_prices(journal, ticker="HALO", *, data=None, observed=OBSERVED,
-                auto_adjust=True, quote=None):
+                auto_adjust=True, quote=None, completed_price_date=None):
     data = frame() if data is None else data
     metadata = {"auto_adjust": auto_adjust, "interval": "1d",
         "history_start": data.index[0].isoformat(),
         "history_end": data.index[-1].isoformat(), "rows": len(data),
-        "completed_price_date": data.index[-1].date().isoformat(),
+        "completed_price_date": completed_price_date or data.index[-1].date().isoformat(),
         "quote": quote or {"price": float(data.close.iloc[-1]),
             "price_date": data.index[-1].date().isoformat(),
             "currency": data.attrs.get("display_currency") or data.attrs["quote_currency"],
@@ -142,6 +142,22 @@ def test_partial_daily_bar_excluded_from_engine_but_quote_available_for_valuatio
     assert valued["HALO"].close.iloc[-1] == 106.
     assert valued["HALO"].attrs["indicative_valuation_only"] is True
     pd.testing.assert_frame_equal(state["market_data"]["HALO"], before)
+
+
+def test_saved_intraday_bar_is_not_promoted_when_read_after_close(journal):
+    save_prices(journal, observed=pd.Timestamp("2026-10-30T16:00:00Z"))
+    state = {}
+    ui.hydrate_saved_market(journal, state, tickers=["HALO"], history=True, now=NOW)
+
+    assert state["market_data"]["HALO"].index.tolist() == [pd.Timestamp("2026-10-29")]
+
+
+def test_hydration_obeys_collector_declared_completed_date(journal):
+    save_prices(journal, completed_price_date="2026-10-29")
+    state = {}
+    ui.hydrate_saved_market(journal, state, tickers=["HALO"], history=True, now=NOW)
+
+    assert state["market_data"]["HALO"].index.tolist() == [pd.Timestamp("2026-10-29")]
 
 
 def test_non_adjusted_history_does_not_mix_with_adjusted_engine(journal):
@@ -261,6 +277,73 @@ def test_newer_manual_refresh_wins_over_older_saved_history_and_quote(journal):
     assert state["_market_view_revision"] == 7
     valued = ui.valuation_frames(state["market_data"], state["_cached_market_quotes"], now=NOW)
     pd.testing.assert_frame_equal(valued["HALO"], manual)
+
+
+def test_earlier_radar_batch_keeps_newer_prices_and_fundamentals(journal):
+    save_prices(journal)
+    save_fundamentals(journal)
+    manual = frame(offset=30)
+    manual.attrs["fetched_at_utc"] = "2026-10-31T22:30:00Z"
+    manual_fundamental = {"symbol": "HALO", "sector": "Healthcare", "marketCap": 99,
+                          "_ui_observed_at_utc": "2026-10-31T22:30:01Z"}
+    state = {
+        "market_data": {"HALO": manual},
+        "fundamental_data": {"HALO": manual_fundamental},
+        "_market_view_revision": 7,
+        # The latest completed batch no longer includes HALO.
+        "_last_price_refresh": {"succeeded": ["AAPL"], "requested_at_utc": "2026-10-31T22:50:00Z"},
+    }
+    ui.hydrate_saved_market(journal, state, tickers=["HALO"], history=True, now=NOW)
+
+    pd.testing.assert_frame_equal(state["market_data"]["HALO"], manual)
+    assert state["fundamental_data"]["HALO"] == manual_fundamental
+    assert state["_market_view_revision"] == 7
+
+
+def test_later_cache_retrieval_does_not_regress_completed_dates(journal):
+    old = frame(dates=("2026-10-28", "2026-10-29"), offset=-50)
+    save_prices(journal, data=old, observed=NEWER)
+    save_prices(journal, "SPY", data=old, observed=NEWER)
+    manual = frame(offset=30)
+    state = {"market_data": {"HALO": manual}, "reference_data": {"SPY": manual}}
+    ui.hydrate_saved_market(journal, state, tickers=["HALO"], history=True, now=NOW)
+
+    pd.testing.assert_frame_equal(state["market_data"]["HALO"], manual)
+    pd.testing.assert_frame_equal(state["reference_data"]["SPY"], manual)
+
+
+def test_newer_cache_can_replace_manual_even_when_payload_is_unchanged(journal):
+    save_prices(journal)
+    save_fundamentals(journal)
+    state = {}
+    ui.hydrate_saved_market(journal, state, tickers=["HALO"], history=True, now=NOW)
+    manual = frame(offset=30)
+    manual.attrs["fetched_at_utc"] = "2026-10-31T16:00:00Z"
+    state["market_data"]["HALO"] = manual
+    state["fundamental_data"]["HALO"] = {
+        "symbol": "HALO", "marketCap": 99, "_ui_observed_at_utc": "2026-10-31T16:00:00Z",
+    }
+    # Same cached data as before the manual run, but a new verified retrieval.
+    save_prices(journal, observed=NEWER)
+    save_fundamentals(journal, observed=NEWER)
+    force_manifest_refresh(state)
+    ui.hydrate_saved_market(journal, state, tickers=["HALO"], history=True, now=NOW)
+
+    assert state["market_data"]["HALO"].close.iloc[-1] == 106.
+    assert "_ui_observed_at_utc" not in state["fundamental_data"]["HALO"]
+    assert "marketCap" not in state["fundamental_data"]["HALO"]
+
+
+def test_newer_manual_history_is_still_cropped_to_requested_window(journal):
+    save_prices(journal)
+    manual = frame(offset=30)
+    manual.attrs["fetched_at_utc"] = "2026-10-31T22:30:00Z"
+    state = {"market_data": {"HALO": manual}}
+    ui.hydrate_saved_market(journal, state, tickers=["HALO"], history=True, now=NOW,
+                           start=date(2026, 10, 30), end=date(2026, 10, 30))
+
+    assert state["market_data"]["HALO"].close.tolist() == [136.]
+    assert state["market_data"]["HALO"].index.tolist() == [pd.Timestamp("2026-10-30")]
 
 
 def test_future_observation_does_not_replace_current_session(journal):

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 import pandas as pd
 
+from src.analysis_policy import decode_policy_note
 from src.data_loader import resolve_analysis_ticker
+
+
+VERIFIED_RADAR_READING = "Revisado y guardado"
 
 
 def _ticker(value: object) -> str:
@@ -106,6 +110,8 @@ def build_opportunity_catalog(
     favorite_tickers: Iterable[object],
     snapshots: pd.DataFrame,
     live_summary: Iterable[dict[str, object]],
+    *,
+    verified_review: Mapping[str, tuple[str, str]] | None = None,
 ) -> list[dict[str, object]]:
     """Incluye toda favorita y prioriza los datos recalculados en esta sesión.
 
@@ -134,6 +140,21 @@ def build_opportunity_catalog(
             live_order.append(ticker)
 
     latest = _latest_snapshots(snapshots)
+    confirmed: dict[str, dict[str, object]] = {}
+    if verified_review and {"ticker", "analyzed_at", "note"}.issubset(snapshots.columns):
+        candidates = snapshots.loc[snapshots["ticker"].isin(verified_review)]
+        for snapshot in candidates.to_dict("records"):
+            ticker = str(snapshot["ticker"])
+            price_date, identity = verified_review[ticker]
+            if ticker in confirmed or _date_text(snapshot["analyzed_at"]) != price_date:
+                continue
+            policy = decode_policy_note(snapshot["note"])
+            if policy and policy.get("snapshot_id") == identity:
+                confirmed[ticker] = {
+                    **_saved_row(ticker, snapshot),
+                    "Comprobación": VERIFIED_RADAR_READING,
+                    "Origen": "Revisión guardada del Radar",
+                }
     ordered_tickers = [*favorites]
     ordered_tickers.extend(
         ticker for ticker in live_order if ticker not in ordered_tickers
@@ -141,7 +162,12 @@ def build_opportunity_catalog(
 
     catalog: list[dict[str, object]] = []
     for ticker in ordered_tickers:
-        if ticker in live_by_ticker:
+        if ticker in confirmed and (
+            ticker not in live_by_ticker
+            or str(live_by_ticker[ticker].get("Fecha") or "")[:10] <= confirmed[ticker]["Fecha"]
+        ):
+            catalog.append(confirmed[ticker])
+        elif ticker in live_by_ticker:
             catalog.append(live_by_ticker[ticker])
         elif ticker in latest:
             catalog.append(_saved_row(ticker, latest[ticker]))

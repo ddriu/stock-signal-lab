@@ -32,6 +32,16 @@ class Journal:
         self.calls["get_daily_score_report"] += 1
         return {"report_id": report_id}
 
+    def get_radar_review_checkpoint(self):
+        self.calls["get_radar_review_checkpoint"] += 1
+        if self.fail_reads:
+            raise RuntimeError("checkpoint read failed")
+        return {"revision": self.calls["get_radar_review_checkpoint"]}
+
+    def save_radar_review_checkpoint(self, checkpoint, *, expected_revision):
+        self.calls["save_radar_review_checkpoint"] += 1
+        return True
+
     def list_enabled_alert_preferences(self):
         self.calls["list_enabled_alert_preferences"] += 1
         return []
@@ -59,6 +69,25 @@ def test_reuses_reads_across_proxy_bindings_in_one_session():
     assert journal.calls["list_operations"] == 1
     assert session_journal(journal, state).owner == "alice"
     assert session_journal(journal, state).backend_name == "Synthetic"
+
+
+def test_radar_checkpoint_reads_are_uncached_without_invalidating_other_reads():
+    journal, state = Journal(), {}
+    proxy = session_journal(journal, state)
+    proxy.list_operations()
+    assert proxy.get_radar_review_checkpoint() == {"revision": 1}
+    assert proxy.get_radar_review_checkpoint() == {"revision": 2}
+    journal.fail_reads = True
+    with pytest.raises(RuntimeError, match="checkpoint read failed"):
+        proxy.get_radar_review_checkpoint()
+    assert proxy.list_operations().iloc[0]["ticker"] == "TEST"
+    assert journal.calls["list_operations"] == 1
+    assert "_view_data_revision" not in state
+    journal.fail_reads = False
+    assert proxy.save_radar_review_checkpoint({"revision": 3}, expected_revision=2)
+    proxy.list_operations()
+    assert journal.calls["list_operations"] == 2
+    assert state["_view_data_revision"] == 1
 
 
 def test_private_and_group_owners_coexist_but_never_share_reads():

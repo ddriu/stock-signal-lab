@@ -3,8 +3,9 @@
 Wrap the process-cached backend, never cache this proxy with ``cache_resource``.
 The caller owns authentication and purges session state on an account change;
 private and group journals can coexist in the same session without sharing reads.
-Only the exact read methods below are cached. Writes are never deferred and
-invalidate both journal reads and derived views, including ambiguous failures.
+Only the exact cacheable read methods below are cached. Writes are never
+deferred and invalidate journal reads and derived views, including ambiguous
+failures. Checkpoint reads must observe other sessions immediately.
 """
 from __future__ import annotations
 
@@ -34,6 +35,7 @@ _READ_METHODS = frozenset({
     "get_alert_preferences", "list_alert_states", "list_paper_simulations",
     "list_paper_daily_runs",
 })
+_UNCACHED_READ_METHODS = frozenset({"get_radar_review_checkpoint"})
 
 
 def _owner(journal: object) -> str:
@@ -139,6 +141,16 @@ class SessionJournal:
         attribute = getattr(self._journal, name)
         if not callable(attribute) or name.startswith("_"):
             return attribute
+
+        if name in _UNCACHED_READ_METHODS:
+            @wraps(attribute)
+            def read_latest(*args, **kwargs):
+                self._check_owner()
+                result = attribute(*args, **kwargs)
+                self._check_owner()
+                return copy_view_value(result)
+
+            return read_latest
 
         if name in _READ_METHODS:
             @wraps(attribute)

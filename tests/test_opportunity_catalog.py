@@ -1,6 +1,8 @@
 import pandas as pd
 
+from src.analysis_policy import build_policy_snapshot, encode_policy_note
 from src.opportunity_catalog import build_opportunity_catalog
+from src.opportunity_status import opportunity_coverage
 
 
 def test_all_favorites_appear_without_downloading_again() -> None:
@@ -81,3 +83,26 @@ def test_broker_alias_and_market_ticker_share_one_radar_row() -> None:
     assert len(rows) == 1
     assert rows[0]["Ticker"] == "CEBS.DE"
     assert rows[0]["Comprobación"] == "Actualizado en esta sesión"
+
+
+def test_reconnected_radar_only_reuses_exact_saved_observation():
+    date = "2026-11-06"
+    policy = build_policy_snapshot({"Ticker": "NVDA", "Fecha": date})
+    other = build_policy_snapshot({"Ticker": "NVDA", "Fecha": date}, held=True)
+    snapshots = pd.DataFrame([
+        {"ticker": "NVDA", "analyzed_at": date, "entry_score": 78, "entry_label": "Esperar",
+         "note": encode_policy_note("Otro análisis", other)},
+        {"ticker": "NVDA", "analyzed_at": date, "entry_score": 81, "entry_label": "Entrada fuerte",
+         "note": encode_policy_note("Análisis verificado", policy)},
+    ])
+    rows = build_opportunity_catalog(["NVDA"], snapshots, [],
+                                    verified_review={"NVDA": (date, policy["snapshot_id"])})
+    assert rows[0]["Momento entrada"] == 81
+    assert rows[0]["Comprobación"] == "Revisado y guardado"
+    assert opportunity_coverage(rows, reference_date="2026-11-09")["strong"] == 1
+    assert opportunity_coverage(rows, reference_date="2026-11-20")["available"] == 0
+
+    wrong = build_opportunity_catalog(["NVDA"], snapshots, [],
+                                     verified_review={"NVDA": (date, "a" * 64)})
+    assert wrong[0]["Comprobación"] == "Pendiente de actualizar"
+    assert opportunity_coverage(wrong, reference_date="2026-11-09")["available"] == 0

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+import re
 import sqlite3
 import os
 import sys
@@ -68,6 +69,63 @@ def _bounded_position_comments(comments: str) -> str:
         ):
             raise ValueError("El plan necesita estrategia, horizonte y tesis.")
     return raw
+
+
+RADAR_CHECKPOINT_MAX_REVISION = 2_147_483_647
+RADAR_CHECKPOINT_MAX_BYTES = 262_144
+_RADAR_CHECKPOINT_OWNER = re.compile(r"[A-Za-z0-9_@.+:\-]{1,128}\Z")
+
+
+def validate_radar_checkpoint_owner(owner: str) -> str:
+    """Do not interpolate an unvalidated owner into a remote filter."""
+    if not isinstance(owner, str) or not _RADAR_CHECKPOINT_OWNER.fullmatch(owner):
+        raise ValueError("El propietario de la revisión de Radar no es válido.")
+    return owner
+
+
+def validate_radar_checkpoint_revision(revision: object) -> int:
+    if type(revision) is not int or not 1 <= revision <= RADAR_CHECKPOINT_MAX_REVISION:
+        raise ValueError("La revisión del punto de guardado de Radar no es válida.")
+    return revision
+
+
+def radar_checkpoint_json(checkpoint: dict[str, object]) -> str:
+    """Serialize ordinary bounded JSON; owner/revision belong to storage."""
+    if type(checkpoint) is not dict or "owner" in checkpoint:
+        raise ValueError("El punto de guardado de Radar debe ser un objeto sin propietario.")
+    payload = {key: value for key, value in checkpoint.items() if key != "revision"}
+
+    def check(value: object, depth: int = 0) -> None:
+        if depth > 32:
+            raise ValueError("El punto de guardado de Radar está demasiado anidado.")
+        if value is None or type(value) in (bool, int):
+            return
+        if type(value) is float and math.isfinite(value):
+            return
+        if type(value) is str and "\x00" not in value:
+            return
+        if type(value) is list:
+            for child in value:
+                check(child, depth + 1)
+            return
+        if type(value) is dict:
+            for key, child in value.items():
+                if type(key) is not str or "\x00" in key:
+                    break
+                check(child, depth + 1)
+            else:
+                return
+        raise ValueError("El punto de guardado de Radar contiene valores no válidos.")
+
+    check(payload)
+    try:
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        size = len(encoded.encode("utf-8"))
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError("El punto de guardado de Radar no es JSON válido.") from exc
+    if size > RADAR_CHECKPOINT_MAX_BYTES:
+        raise ValueError("El punto de guardado de Radar supera el límite permitido.")
+    return encoded
 
 
 OPERATION_COLUMNS = [
@@ -726,6 +784,23 @@ def normalize_analysis_sessions(sessions: Sequence[str]) -> tuple[str, ...]:
         if len(normalized) > 5:
             raise ValueError("La consulta admite como máximo cinco sesiones distintas.")
     return tuple(sorted(normalized, reverse=True))
+
+
+_ANALYSIS_LOOKUP_TICKER = re.compile(r"[A-Z0-9_^.=:/-]{1,64}\Z")
+
+
+def normalize_analysis_lookup_tickers(tickers: Sequence[str] | None) -> tuple[str, ...] | None:
+    """An optional exact, bounded batch filter shared by both journals."""
+    if tickers is None:
+        return None
+    if isinstance(tickers, (str, bytes)) or not isinstance(tickers, Sequence) or len(tickers) > 25:
+        raise ValueError("La consulta admite una lista de hasta 25 símbolos.")
+    normalized: set[str] = set()
+    for raw in tickers:
+        if not isinstance(raw, str) or not _ANALYSIS_LOOKUP_TICKER.fullmatch(raw.strip().upper()):
+            raise ValueError("La consulta contiene un símbolo no válido.")
+        normalized.add(raw.strip().upper())
+    return tuple(sorted(normalized))
 
 
 def normalize_analysis_snapshot(
@@ -1398,6 +1473,11 @@ class TradingJournal:
     def _initialize(self) -> None:
         self._migrate_primary_snapshot_storage()
         with self._connect() as connection:
+            connection.execute("""CREATE TABLE IF NOT EXISTS radar_review_checkpoints (
+                owner TEXT PRIMARY KEY NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision BETWEEN 1 AND 2147483647),
+                checkpoint TEXT NOT NULL CHECK (length(CAST(checkpoint AS BLOB)) <= 262144)
+            )""")
             connection.execute("""CREATE TABLE IF NOT EXISTS daily_score_reports (
                 owner TEXT NOT NULL, report_id TEXT NOT NULL,
                 market_date TEXT NOT NULL, report_json TEXT NOT NULL,
@@ -2451,22 +2531,31 @@ class TradingJournal:
         with self._connect() as connection:
             return pd.read_sql_query(query, connection, params=parameters)
 
-    def list_analysis_snapshots_for_sessions(self, sessions: Sequence[str]) -> pd.DataFrame:
+    def list_analysis_snapshots_for_sessions(
+        self, sessions: Sequence[str], *, tickers: Sequence[str] | None = None,
+    ) -> pd.DataFrame:
         """Read at most 1,000 existing observations from up to five UTC dates.
 
         Legacy SQLite analysis is isolated by database file, not an owner column.
         This never rebuilds observations or substitutes adjacent sessions.
         """
         days = normalize_analysis_sessions(sessions)
+        wanted = normalize_analysis_lookup_tickers(tickers)
         frame = pd.DataFrame(columns=ANALYSIS_SNAPSHOT_COLUMNS)
-        if days:
+        if days and wanted != ():
             placeholders = ",".join("?" for _ in days)
+            ticker_clause = ""
+            params = days
+            if wanted is not None:
+                ticker_clause = "AND ticker IN (" + ",".join("?" for _ in wanted) + ") "
+                params += wanted
             with self._connect() as connection:
                 frame = pd.read_sql_query(
                     f"SELECT {','.join(ANALYSIS_SNAPSHOT_COLUMNS)} FROM analysis_snapshots "
                     f"WHERE date(analyzed_at) IN ({placeholders}) "
+                    f"{ticker_clause}"
                     "ORDER BY analyzed_at DESC,id DESC LIMIT 1000",
-                    connection, params=days,
+                    connection, params=params,
                 )
         frame.attrs.update(requested_sessions=list(days), bounded_limit=1000,
                            possibly_truncated=len(frame) >= 1000)
@@ -2478,6 +2567,44 @@ class TradingJournal:
                 "DELETE FROM analysis_snapshots WHERE id = ?",
                 (int(snapshot_id),),
             )
+
+    def get_radar_review_checkpoint(self) -> dict[str, object] | None:
+        """Return the latest owner-scoped revision; never use session cache."""
+        owner = validate_radar_checkpoint_owner(self.owner)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT revision,checkpoint FROM radar_review_checkpoints WHERE owner=?",
+                (owner,),
+            ).fetchone()
+        if row is None:
+            return None
+        revision = validate_radar_checkpoint_revision(row["revision"])
+        checkpoint = json.loads(row["checkpoint"])
+        return {**json.loads(radar_checkpoint_json(checkpoint)), "revision": revision}
+
+    def save_radar_review_checkpoint(
+        self, checkpoint: dict[str, object], *, expected_revision: int | None,
+    ) -> bool:
+        """Atomically initialize or update only the expected owner revision."""
+        owner = validate_radar_checkpoint_owner(self.owner)
+        payload = radar_checkpoint_json(checkpoint)
+        with self._connect() as connection:
+            if expected_revision is None:
+                changed = connection.execute(
+                    "INSERT INTO radar_review_checkpoints(owner,revision,checkpoint) VALUES(?,1,?) "
+                    "ON CONFLICT(owner) DO NOTHING",
+                    (owner, payload),
+                )
+            else:
+                revision = validate_radar_checkpoint_revision(expected_revision)
+                if revision == RADAR_CHECKPOINT_MAX_REVISION:
+                    raise ValueError("Se ha agotado la revisión del punto de guardado de Radar.")
+                changed = connection.execute(
+                    "UPDATE radar_review_checkpoints SET revision=revision+1, checkpoint=? "
+                    "WHERE owner=? AND revision=?",
+                    (payload, owner, revision),
+                )
+            return changed.rowcount == 1
 
     def save_daily_score_report(self, report: dict[str, object]) -> str:
         """Append an immutable, owner-scoped report before any SMTP attempt."""

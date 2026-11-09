@@ -7,10 +7,12 @@ Versión de estabilización auditada: 2026-10-03.
 from __future__ import annotations
 
 from dataclasses import asdict, fields, replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from uuid import uuid4
 import html
 from hashlib import sha256
 import importlib
+import logging
 import inspect
 import json
 from math import isfinite
@@ -72,6 +74,7 @@ if getattr(_data_loader_module, "FUNDAMENTAL_SNAPSHOT_VERSION", "") != "dated_st
 
 from src.alert_runner import run_daily_alerts
 from src.analysis_snapshots import persist_analysis_batch_snapshots
+from src.radar_review import BATCH_SIZE as RADAR_BATCH_SIZE, RadarOutcome, RadarReview
 from src.approximate_returns import build_approximate_return_report
 from src.auth import (
     AuthConfig,
@@ -204,7 +207,6 @@ from src.navigation import (
     market_data_freshness_rows,
     merge_analysis_ticker_sources,
     next_daily_refresh_batch,
-    next_daily_review_batch,
     sanitize_favorite_selection,
 )
 from src.opportunity_catalog import build_opportunity_catalog
@@ -523,7 +525,7 @@ SIDEBAR_ANALYSIS_SECTIONS = {
 def apply_visual_theme() -> None:
     """Aplica una capa visual responsive sin alterar los componentes financieros."""
 
-    st.markdown(f"<style>/* ssl-ui: home-review-v3 */{APP_CSS}</style>", unsafe_allow_html=True)
+    st.markdown(f"<style>/* ssl-ui: home-review-v3 */ /* ssl-ui: radar-checkpoint-v1 */{APP_CSS}</style>", unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=3_600, max_entries=350, show_spinner=False)
@@ -1097,6 +1099,9 @@ def load_market_data(
     merge_existing: bool = False,
     refresh_fundamentals: bool = False,
     price_refresh_token: str = "",
+    review_reference_attempts: set[str] | None = None,
+    review_reference_data: dict[str, pd.DataFrame] | None = None,
+    review_clock: pd.Timestamp | None = None,
 ) -> set[str]:
     if not tickers:
         st.sidebar.error("Elige al menos una favorita o registra una posición.")
@@ -1107,6 +1112,48 @@ def load_market_data(
             "Reduce temporalmente la selección de favoritos."
         )
         return set()
+    # Radar uses a single aware clock throughout the job. Other screens keep
+    # their existing behaviour, except that empty results aren't successes.
+    if review_reference_data is not None and review_clock is None:
+        raise ValueError("Las referencias de la revisión necesitan una hora con zona horaria.")
+    if review_clock is not None:
+        import numpy as np
+
+        from src.data_loader import REQUIRED_COLUMNS
+        from src.hourly_market_schedule import completed_daily_prices
+
+        review_clock = pd.Timestamp(review_clock)
+        if pd.isna(review_clock) or review_clock.tzinfo is None:
+            raise ValueError("La revisión necesita una hora con zona horaria.")
+        review_clock = review_clock.tz_convert("UTC")
+
+    def checked_frame(symbol: str, frame: pd.DataFrame) -> pd.DataFrame:
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            raise DataDownloadError(f"{symbol}: la fuente no devolvió precios utilizables.")
+        if review_clock is None:
+            return frame
+        frame = completed_daily_prices(symbol, frame, now=review_clock)
+        if frame.empty:
+            raise DataDownloadError(f"{symbol}: no hay cierres de sesión verificables.")
+        if (not isinstance(frame.index, pd.DatetimeIndex) or frame.index.hasnans
+                or not frame.index.is_unique or not frame.index.is_monotonic_increasing
+                or not frame.columns.is_unique or not set(REQUIRED_COLUMNS).issubset(frame.columns)):
+            raise DataDownloadError(f"{symbol}: el histórico diario tiene un formato no válido.")
+        try:
+            opened, high, low, close, volume = frame.loc[:, list(REQUIRED_COLUMNS)].to_numpy(dtype=float).T
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise DataDownloadError(f"{symbol}: el histórico contiene precios no numéricos.") from exc
+        if (not np.isfinite([opened, high, low, close, volume]).all()
+                or (np.minimum(low, close) <= 0).any() or (volume < 0).any()
+                or (high < np.maximum(opened, close)).any()
+                or (low > np.minimum(opened, close)).any()):
+            raise DataDownloadError(f"{symbol}: el histórico contiene precios no válidos.")
+        return frame
+
+    def has_latest_review_close(frame: pd.DataFrame) -> bool:
+        expected = frame.attrs["hourly_market_schedule"]["latest_completed_session"]
+        return frame.index[-1].date().isoformat() == expected
+
     deep_tickers = set(tickers if fundamental_tickers is None else fundamental_tickers)
     if len(deep_tickers) > 25:
         deep_tickers = set(
@@ -1129,6 +1176,7 @@ def load_market_data(
     )
     errors: list[str] = []
     refreshed_tickers: set[str] = set()
+    stale_tickers: set[str] = set()
     refresh_token = (
         str(pd.Timestamp.utcnow().value) if refresh_fundamentals else ""
     )
@@ -1140,28 +1188,40 @@ def load_market_data(
             else max(start, end - timedelta(days=420))
         )
         try:
-            downloaded[ticker] = cached_download(
+            frame = checked_frame(ticker, cached_download(
                 ticker,
                 ticker_start,
                 end,
                 auto_adjust,
                 price_refresh_token,
-            )
+            ))
+            if review_clock is not None and not has_latest_review_close(frame):
+                latest = frame.index[-1].date()
+                stale_tickers.add(ticker)
+                raise DataDownloadError(
+                    f"{ticker}: la fuente solo devolvió un cierre anterior ({latest:%d/%m/%Y})."
+                )
+            downloaded[ticker] = frame
             refreshed_tickers.add(ticker)
         except (DataDownloadError, ValueError) as exc:
             errors.append(str(exc))
         if ticker in deep_tickers:
             try:
-                fundamentals[ticker] = cached_fundamentals(
+                info = cached_fundamentals(
                     ticker, refresh_token, source_version=FUNDAMENTAL_SNAPSHOT_VERSION,
                 )
+                if review_clock is not None and refresh_fundamentals and not info.get("_fundamental_error"):
+                    info = {**info, "_ui_observed_at_utc": pd.Timestamp.now(tz="UTC").isoformat()}
+                fundamentals[ticker] = info
             except (DataDownloadError, ValueError) as exc:
                 fundamentals[ticker] = {
                     "symbol": ticker,
                     "_fundamental_error": str(exc),
                 }
                 errors.append(str(exc))
-            if alpha_vantage_key and ticker in downloaded:
+            if alpha_vantage_key and ticker in (
+                refreshed_tickers if review_clock is not None else downloaded
+            ):
                 try:
                     verification = cached_price_verification(ticker, alpha_vantage_key)
                     verifications[ticker] = compare_verified_price(
@@ -1183,9 +1243,13 @@ def load_market_data(
     reference_symbols: set[str] = set()
     # La vista de ventaja relativa compara todas las cotizaciones con la misma
     # referencia. Se descarga una sola vez y se comparte con todo el universo.
-    if downloaded:
+    reference_scope = (
+        refreshed_tickers if review_clock is not None or review_reference_attempts is not None
+        else downloaded
+    )
+    if reference_scope:
         reference_symbols.add("SPY")
-    for ticker in downloaded:
+    for ticker in reference_scope:
         reference_symbols.add(benchmark_for_ticker(ticker))
         sector_reference = sector_benchmark(
             str(fundamentals.get(ticker, {}).get("sector") or ""),
@@ -1196,17 +1260,37 @@ def load_market_data(
     references: dict[str, pd.DataFrame] = (
         dict(st.session_state.get("reference_data", {})) if merge_existing else {}
     )
-    reference_candidates = reference_symbols.difference(downloaded)
-    references_to_download = (
-        reference_candidates
-        if price_refresh_token
-        else reference_candidates.difference(references)
-    )
+    attempts = review_reference_attempts
+    if attempts is None and review_reference_data is not None:
+        attempts = set(review_reference_data)
+    if attempts is not None:
+        # A successful asset download can itself supply the shared reference.
+        # A failed reference request is not repeated in every subsequent batch.
+        for symbol in reference_symbols.intersection(refreshed_tickers):
+            references[symbol] = downloaded[symbol]
+            if review_reference_data is not None:
+                review_reference_data[symbol] = downloaded[symbol]
+            attempts.add(symbol)
+        references_to_download = reference_symbols.difference(attempts)
+    else:
+        reference_candidates = reference_symbols.difference(downloaded)
+        references_to_download = (
+            reference_candidates
+            if price_refresh_token
+            else reference_candidates.difference(references)
+        )
     for symbol in sorted(references_to_download):
+        if attempts is not None:
+            attempts.add(symbol)
         try:
-            references[symbol] = cached_download(
+            frame = checked_frame(symbol, cached_download(
                 symbol, start, end, auto_adjust, price_refresh_token
-            )
+            ))
+            if review_clock is not None and not has_latest_review_close(frame):
+                raise DataDownloadError(f"{symbol}: falta el último cierre de la referencia.")
+            references[symbol] = frame
+            if review_reference_data is not None:
+                review_reference_data[symbol] = frame
         except (DataDownloadError, ValueError) as exc:
             errors.append(f"No se pudo calcular la comparación con {symbol}: {exc}")
     try:
@@ -1239,6 +1323,7 @@ def load_market_data(
         "failed": sorted(set(tickers).difference(refreshed_tickers)),
         "requested_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
         "forced": bool(price_refresh_token),
+        **({"stale": sorted(stale_tickers)} if review_clock is not None else {}),
     }
     refreshed_statuses = {
         ticker: growth_fundamental_status(fundamentals.get(ticker))
@@ -1267,6 +1352,8 @@ def prepare_data(
     raw_fundamentals: dict[str, dict[str, object]],
     reference_data: dict[str, pd.DataFrame],
     config: StrategyConfig,
+    *,
+    align_reference_dates: bool = False,
 ) -> tuple[
     dict[str, pd.DataFrame],
     list[dict[str, object]],
@@ -1303,9 +1390,11 @@ def prepare_data(
         relative = evaluate_relative_strength(
             ticker,
             frame,
-            reference_data.get(broad_name),
+            _reference_through(reference_data.get(broad_name), signal.as_of)
+            if align_reference_dates else reference_data.get(broad_name),
             broad_name=broad_name,
-            sector=reference_data.get(sector_name) if sector_name else None,
+            sector=(_reference_through(reference_data.get(sector_name), signal.as_of)
+                    if align_reference_dates else reference_data.get(sector_name)) if sector_name else None,
             sector_name=sector_name,
         )
         relative_results[ticker] = relative
@@ -1369,6 +1458,12 @@ def prepare_data(
         risk_results,
         opportunity_results,
     )
+
+
+def _reference_through(frame: pd.DataFrame | None, signal_date) -> pd.DataFrame | None:
+    if frame is None:
+        return None
+    return frame.loc[frame.index.date <= pd.Timestamp(signal_date).date()]
 
 
 def _report_price(report: InstrumentReport, value: float | None) -> str:
@@ -6947,6 +7042,7 @@ def _enrich_current_analysis_policy(
     strategy: StrategyConfig | None = None,
     position_snapshot: pd.DataFrame | None = None,
     held_tickers: list[str] | tuple[str, ...] = (),
+    align_reference_dates: bool = False,
 ) -> list[dict[str, object]]:
     """Enriquece copias; los fallos dejan cobertura pendiente, no una compra."""
 
@@ -6955,15 +7051,19 @@ def _enrich_current_analysis_policy(
     growth_failures: dict[str, str] = {}
     comparative_failures: dict[str, str] = {}
     growth_config = GrowthMomentumConfig()
+    signal_dates = {row.get("Ticker"): row.get("Fecha") for row in summary}
     for ticker, frame in prepared.items():
         try:
+            benchmark = reference_data.get(benchmark_for_ticker(ticker))
+            if align_reference_dates:
+                benchmark = _reference_through(benchmark, signal_dates.get(ticker))
             growth_results[ticker] = evaluate_growth_momentum(
                 ticker=ticker,
                 frame=frame,
                 info=raw_fundamentals.get(ticker, {}),
                 relative=relative_results.get(ticker),
                 risk=risk_results.get(ticker),
-                broad_market=reference_data.get(benchmark_for_ticker(ticker)),
+                broad_market=benchmark,
                 config=growth_config,
             )
         except (ValueError, KeyError, TypeError) as exc:
@@ -7002,7 +7102,9 @@ def _enrich_current_analysis_policy(
     )
 
 
-def _analysis_view_context(raw_data, raw_fundamentals, reference_data, strategy, journal):
+def _analysis_view_context(
+    raw_data, raw_fundamentals, reference_data, strategy, journal, *, align_reference_dates=False,
+):
     """Reuse pure analysis on navigation; fresh data/configuration invalidate it.
 
     The owner-scoped journal reads below are small and cached separately. The
@@ -7025,16 +7127,19 @@ def _analysis_view_context(raw_data, raw_fundamentals, reference_data, strategy,
         "source_objects": [id(raw_data), id(raw_fundamentals), id(reference_data)],
         "valuation_day": date.today().isoformat(),
         "strategy": asdict(strategy), "positions": position_hash, "held": sorted(held),
+        "align_reference_dates": align_reference_dates,
     }
 
     def build():
         prepared, summary, fundamentals, valuations, relatives, risks, opportunities = prepare_data(
             raw_data, raw_fundamentals, reference_data, strategy,
+            **({"align_reference_dates": True} if align_reference_dates else {}),
         )
         if summary:
             summary = _enrich_current_analysis_policy(
                 summary, prepared, raw_fundamentals, reference_data, relatives, risks,
                 strategy=strategy, position_snapshot=positions, held_tickers=held,
+                **({"align_reference_dates": True} if align_reference_dates else {}),
             )
         return prepared, summary, fundamentals, valuations, relatives, risks, opportunities
 
@@ -7051,7 +7156,7 @@ def _bind_navigation_owner(owner: str) -> None:
     if previous is not None and previous != owner:
         invalidate_view_cache(st.session_state)
         for key in list(st.session_state):
-            if str(key).startswith(("investment_", "_investment_", "_requested_plan_")):
+            if str(key).startswith(("investment_", "_investment_", "_requested_plan_", "_radar_review_")):
                 st.session_state.pop(key, None)
         for key in st.session_state.get("_navigation_sidebar_values", {}):
             st.session_state.pop(key, None)
@@ -7089,70 +7194,226 @@ def _remember_analysis_controls(*, restore=False) -> None:
         st.session_state["_navigation_sidebar_values"] = saved
 
 
-def render_automatic_review_status(username: str) -> None:
-    """Muestra el avance compartido por las vistas que recorren el universo."""
-
-    suffix = username.strip().lower() or "usuario"
-    total = int(st.session_state.get(f"_automatic_review_total_{suffix}", 0) or 0)
-    attempted = st.session_state.get(f"_automatic_review_attempted_{suffix}", [])
-    reviewed = len({str(ticker).strip().upper() for ticker in attempted if ticker})
-    failed_values = st.session_state.get(f"_automatic_review_failed_{suffix}", [])
-    failed = sorted(
-        {str(ticker).strip().upper() for ticker in failed_values if ticker}
-    )
-    fundamentals = dict(st.session_state.get("fundamental_data", {}) or {})
-    fundamental_statuses = [
-        growth_fundamental_status(fundamentals.get(ticker))
-        for ticker in {
-            str(value).strip().upper() for value in attempted if str(value).strip()
-        }
-    ]
-    fundamental_complete = sum(
-        status == "complete" for status in fundamental_statuses
-    )
-    fundamental_partial = sum(
-        status == "partial" for status in fundamental_statuses
-    )
-    fundamental_error = sum(status == "error" for status in fundamental_statuses)
-    fundamental_pending = sum(
-        status == "pending" for status in fundamental_statuses
-    )
-    price_complete = max(reviewed - len(failed), 0)
-    if total <= 0:
+def render_automatic_review_status(
+    review: RadarReview | None, *, compatible: bool, now: datetime, working: bool = False,
+) -> None:
+    """Estado del trabajo guardado; consultar esta vista no descarga mercado."""
+    if review is None:
         return
-    if reviewed >= total:
-        summary = (
-            f"Revisión terminada: precios {price_complete}/{total} · "
-            f"análisis empresarial completo {fundamental_complete}/{total}"
+    statuses = {
+        "complete": "Actualizadas",
+        "partial": "Lectura guardada, cobertura parcial",
+        "no_data": "Sin datos utilizables",
+        "stale": "Cierre antiguo",
+        "not_saved": "No se pudo guardar",
+    }
+    total, pending = len(review.tickers), len(review.pending)
+    done = total - pending
+    complete = sum(result.status == "complete" for result in review.outcomes.values())
+    started = pd.Timestamp(review.started_at).tz_convert("Europe/Madrid").strftime("%d/%m · %H:%M")
+    busy = review.busy(now)
+    title = (
+        "Revisión en curso" if working or busy
+        else "Revisión pausada" if pending
+        else "Revisión terminada con incidencias" if complete < total
+        else "Revisión terminada"
+    )
+    st.caption(
+        f"{title} · iniciada {started} (Madrid) · {done}/{total} con resultado registrado."
+    )
+    st.write(f"**Actualizadas: {complete} · Pendientes: {pending} · Con incidencias: {done - complete}**")
+    if done < total and (working or busy):
+        st.progress(done / total, text="Avance guardado")
+    if done > complete:
+        with st.expander("Ver qué ha faltado"):
+            for status, label in statuses.items():
+                tickers = [ticker for ticker, result in review.outcomes.items() if result.status == status]
+                if status != "complete" and tickers:
+                    st.write(f"**{label} ({len(tickers)}):** {', '.join(tickers)}")
+    if compatible and not (working or busy) and (pending or review.retryable):
+        st.button(
+            "Reanudar pendientes" if pending else "Reintentar solo las incidencias",
+            icon=":material/refresh:",
+            key="radar_resume_review",
+            on_click=lambda: st.session_state.update(_radar_review_resume=True),
         )
-        details = (
-            f"Parciales: {fundamental_partial} · con error: {fundamental_error} · "
-            f"pendientes: {fundamental_pending}."
+    elif busy and not working:
+        st.button("Comprobar avance", key="radar_check_review")
+    elif not compatible:
+        st.caption("Es una revisión anterior o con otros ajustes. Puedes iniciar una nueva.")
+
+
+def _save_radar_checkpoint(journal, review: RadarReview) -> None:
+    if not journal.save_radar_review_checkpoint(
+        review.checkpoint(), expected_revision=review.revision - 1 or None,
+    ):
+        raise JournalStorageError("La revisión se ha actualizado desde otra pestaña.")
+
+
+def _run_radar_batch(
+    journal, review: RadarReview, worker: str, *, history_days: int,
+    auto_adjust: bool, strategy: StrategyConfig, alpha_vantage_key: str = "",
+) -> RadarReview:
+    """Download, calculate and save just the claimed batch before yielding."""
+    claimed = review.claim(worker, datetime.now(timezone.utc))
+    _save_radar_checkpoint(journal, claimed)
+    batch = claimed.pending[:RADAR_BATCH_SIZE]
+    try:
+        clock = pd.Timestamp(claimed.started_at)
+        end = clock.tz_convert("Europe/Madrid").date()
+        run_references = st.session_state.get("_radar_review_references")
+        if not isinstance(run_references, dict) or run_references.get("run_id") != claimed.run_id:
+            run_references = {"run_id": claimed.run_id, "symbols": set(), "frames": {}, "token": worker}
+            st.session_state["_radar_review_references"] = run_references
+        references = run_references.setdefault("frames", {})
+        refreshed = load_market_data(
+            list(batch), end - timedelta(days=history_days), end, auto_adjust, alpha_vantage_key,
+            fundamental_tickers=set(batch), merge_existing=True, refresh_fundamentals=True,
+            price_refresh_token=run_references["token"], review_clock=clock,
+            review_reference_attempts=run_references["symbols"],
+            review_reference_data=references,
         )
-        if failed or fundamental_complete < total:
-            missing_prices = (
-                f" Sin precio: {', '.join(failed)}." if failed else ""
-            )
-            st.warning(
-                summary
-                + ". "
-                + details
-                + missing_prices
-                + " Puedes reintentar con «Actualizar ahora todas mis favoritas»."
-            )
-        else:
-            st.caption(
-                "✓ "
-                + summary
-                + ". Mi radar, Entradas hoy y Crecimiento comparten estos datos."
-            )
-    else:
-        st.caption(
-            f"Revisión en curso: {reviewed}/{total} empresas consultadas · "
-            f"precios {price_complete}/{reviewed} · análisis empresarial completo "
-            f"{fundamental_complete}/{reviewed}. La aplicación continúa en bloques "
-            "internos de 25."
+        stale = set(st.session_state.get("_last_price_refresh", {}).get("stale", []))
+        raw_prices = st.session_state.get("market_data", {})
+        raw_fundamentals = st.session_state.get("fundamental_data", {})
+        prices = {ticker: raw_prices[ticker] for ticker in batch if ticker in refreshed}
+        fundamentals = {ticker: raw_fundamentals.get(ticker, {}) for ticker in prices}
+        prepared, summary, fundamental_results, valuations, relatives, risks, opportunities = (
+            _analysis_view_context(prices, fundamentals, references, strategy, journal,
+                                   align_reference_dates=True)
         )
+        policies = {
+            str(row["Ticker"]): row["Política de análisis"]
+            for row in summary
+            if row.get("Ticker") and isinstance(row.get("Política de análisis"), dict)
+        }
+        dates = {}
+        for row in summary:
+            ticker = str(row.get("Ticker") or "")
+            if ticker not in prices or ticker not in prepared or row.get("Fecha") is None:
+                continue
+            observed = pd.Timestamp(row["Fecha"]).date()
+            if observed == pd.Timestamp(prices[ticker].index[-1]).date():
+                dates[ticker] = observed.isoformat()
+        # Renew before touching snapshots. If another worker took over an
+        # expired claim, the compare-and-swap stops this worker before writes.
+        renewed = claimed.claim(worker, datetime.now(timezone.utc))
+        _save_radar_checkpoint(journal, renewed)
+        claimed = renewed
+        saved: set[str] = set()
+        if dates:
+            sessions = sorted(set(dates.values()))
+            pages = [
+                journal.list_analysis_snapshots_for_sessions(sessions[offset:offset + 5], tickers=tuple(dates))
+                for offset in range(0, len(sessions), 5)
+            ]
+            if any(page.attrs.get("possibly_truncated") for page in pages):
+                raise JournalStorageError("El historial acotado no se pudo verificar completo.")
+            observations = pd.concat(pages, ignore_index=True)
+            result = persist_analysis_batch_snapshots(
+                journal, dates, prepared, fundamental_results, valuations, relatives, risks,
+                opportunities, strategy, policy_snapshots=policies,
+                existing_snapshots=observations,
+            )
+            saved = set(result.saved_tickers) | set(result.existing_tickers)
+        outcomes = {}
+        for ticker in batch:
+            if ticker not in dates:
+                outcomes[ticker] = RadarOutcome("stale" if ticker in stale else "no_data")
+            elif ticker not in saved:
+                outcomes[ticker] = RadarOutcome("not_saved", price_date=dates[ticker])
+            else:
+                status = growth_fundamental_status(fundamentals.get(ticker))
+                policy = policies.get(ticker, {})
+                complete = status == "complete" and benchmark_for_ticker(ticker) in references and all(
+                    policy.get(method, {}).get("data_status") == "complete"
+                    for method in ("primary", "comparative")
+                )
+                outcomes[ticker] = RadarOutcome(
+                    "complete" if complete else "partial",
+                    status, dates[ticker], policy.get("snapshot_id") or None,
+                )
+        checkpoint = claimed.release(outcomes)
+        _save_radar_checkpoint(journal, checkpoint)
+        return checkpoint
+    except Exception:
+        # Do not mark an interrupted batch as checked. Successful earlier
+        # checkpoints survive, and analysis snapshots are idempotent on retry.
+        try:
+            _save_radar_checkpoint(journal, claimed.release())
+        except (JournalStorageError, ValueError, AttributeError):
+            pass
+        raise
+
+
+def _radar_review_step(
+    journal, universe: list[str], *, strategy: StrategyConfig, history_days: int, auto_adjust: bool,
+    alpha_vantage_key: str = "",
+) -> tuple[RadarReview | None, bool]:
+    """Read progress on navigation; work only after explicit start/resume."""
+    now = datetime.now(timezone.utc)
+    context = sha256(json.dumps(
+        [sorted(universe), asdict(strategy), history_days, auto_adjust],
+        sort_keys=True, default=str,
+    ).encode()).hexdigest()
+    start_requested = bool(st.session_state.pop("_force_all_favorite_refresh", False))
+    resume_requested = bool(st.session_state.pop("_radar_review_resume", False))
+    running = st.session_state.get("_radar_review_active")
+    review = None
+    try:
+        review = RadarReview.from_checkpoint(journal.get_radar_review_checkpoint())
+        compatible = bool(review and review.compatible(context, now))
+        if start_requested or resume_requested:
+            if review and review.busy(now):
+                st.info("Ya hay una revisión en curso. El avance queda guardado por bloques.")
+                return review, compatible
+            if not universe:
+                st.info("No hay favoritas ni posiciones que revisar.")
+                return review, compatible
+            if resume_requested and not compatible:
+                st.info("Inicia una revisión nueva: la lista, los ajustes o la fecha han cambiado.")
+                return review, compatible
+            if not compatible or (start_requested and not review.pending):
+                candidate = RadarReview.start(
+                    universe, context, now, revision=review.revision + 1 if review else 1,
+                )
+                _save_radar_checkpoint(journal, candidate)
+                review = candidate
+                compatible = True
+            elif resume_requested and not review.pending and review.retryable:
+                candidate = review.retry(now)
+                _save_radar_checkpoint(journal, candidate)
+                review = candidate
+                st.session_state.pop("_radar_review_references", None)
+            running = (review.run_id, uuid4().hex)
+            st.session_state["_radar_review_active"] = running
+        if not (compatible and review.pending and running and running[0] == review.run_id):
+            st.session_state.pop("_radar_review_active", None)
+            return review, compatible
+        if review.busy(now, running[1]):
+            st.session_state.pop("_radar_review_active", None)
+            return review, compatible
+        progress = st.empty()
+        with progress.container():
+            render_automatic_review_status(review, compatible=True, now=now, working=True)
+        review = _run_radar_batch(
+            journal, review, running[1], history_days=history_days,
+            auto_adjust=auto_adjust, strategy=strategy, alpha_vantage_key=alpha_vantage_key,
+        )
+        progress.empty()
+        if review.pending:
+            st.rerun()
+        st.session_state.pop("_radar_review_active", None)
+        return review, True
+    except Exception as exc:
+        st.session_state.pop("_radar_review_active", None)
+        if start_requested or resume_requested or running:
+            logging.getLogger(__name__).warning("Revisión de Radar pausada: %s", type(exc).__name__)
+            st.warning("Revisión pausada. Lo ya guardado se conserva. "
+                       "Si el bloque estaba reservado, espera unos minutos antes de reanudar.")
+        elif hasattr(journal, "get_radar_review_checkpoint"):
+            st.caption("No se pudo consultar el progreso guardado del Radar.")
+        return review, bool(review and review.compatible(context, now))
 
 
 def render_market_data_status(
@@ -7229,7 +7490,7 @@ def render_market_data_status(
                 width="stretch",
                 key="force_all_favorite_refresh",
                 on_click=_request_all_favorite_refresh,
-                help="Vuelve a consultar precios y recorre la lista en bloques de 25.",
+                help="Consulta los últimos cierres y guarda el avance después de cada bloque.",
             )
 
 
@@ -10921,6 +11182,7 @@ def render_opportunities_page(
     journal: object,
     favorite_tickers: list[str],
     include_company_detail: bool = True,
+    radar_review: RadarReview | None = None,
 ) -> None:
     render_page_intro(
         "RADAR COMPARATIVO",
@@ -10941,10 +11203,15 @@ def render_opportunities_page(
     except JournalStorageError as exc:
         saved_snapshots = pd.DataFrame()
         st.warning(f"No se pudo leer el último análisis guardado: {exc}")
+    verified_review = radar_review.saved_readings if radar_review else {}
+    if radar_review:
+        pending_or_failed = set(radar_review.tickers).difference(
+            ticker for ticker, result in radar_review.outcomes.items()
+            if result.status in {"complete", "partial"}
+        )
+        summary = [row for row in summary if row.get("Ticker") not in pending_or_failed]
     catalog_summary = build_opportunity_catalog(
-        favorite_tickers,
-        saved_snapshots,
-        summary,
+        favorite_tickers, saved_snapshots, summary, verified_review=verified_review,
     )
     if not catalog_summary:
         st.info(
@@ -15314,6 +15581,10 @@ def main() -> None:
         )
 
     layout_analysis_section = analysis_detail or analysis_section
+    radar_route = (selected_section, analysis_section, analysis_detail)
+    if st.session_state.get("_radar_review_route") != radar_route:
+        st.session_state.pop("_radar_review_active", None)
+        st.session_state["_radar_review_route"] = radar_route
     apply_section_layout(str(selected_section), layout_analysis_section)
     # These screens do not consume market analysis. Returning before the shared
     # sidebar/load/prepare path also leaves pending explicit work for its page.
@@ -15544,39 +15815,15 @@ def main() -> None:
         )
     )
     review_suffix = authenticated_user.username.strip().lower() or "usuario"
-    review_date_key = f"_automatic_review_date_{review_suffix}"
-    review_attempted_key = f"_automatic_review_attempted_{review_suffix}"
-    review_failed_key = f"_automatic_review_failed_{review_suffix}"
-    review_total_key = f"_automatic_review_total_{review_suffix}"
-    review_continue_key = f"_automatic_review_continue_{review_suffix}"
     today_key = date.today().isoformat()
-    force_all_favorite_refresh = bool(
-        st.session_state.pop("_force_all_favorite_refresh", False)
-    )
-    continue_all_favorite_refresh = bool(
-        st.session_state.pop(review_continue_key, False)
-    )
-    review_cycle_active = bool(
-        force_all_favorite_refresh or continue_all_favorite_refresh
-    )
-    automatic_review_batch: list[str] = []
-    if automatic_review_page and review_cycle_active:
-        if force_all_favorite_refresh:
-            st.session_state[review_date_key] = today_key
-            st.session_state[review_attempted_key] = []
-            st.session_state[review_failed_key] = []
-        st.session_state[review_total_key] = len(review_universe)
-        attempted_review = list(st.session_state.get(review_attempted_key, []))
-        automatic_review_batch = next_daily_review_batch(
-            review_universe,
-            attempted_review,
-            limit=25,
+    radar_review, radar_compatible = None, False
+    if automatic_review_page and not favorite_storage_error:
+        radar_review, radar_compatible = _radar_review_step(
+            journal, review_universe, strategy=strategy,
+            history_days=max(1, (end - start).days), auto_adjust=auto_adjust,
+            alpha_vantage_key=alpha_vantage_key,
         )
-    growth_scan_tickers = (
-        requested_growth_scan_tickers
-        if requested_growth_scan_tickers
-        else automatic_review_batch
-    )
+    growth_scan_tickers = requested_growth_scan_tickers
     if requested_pending_ticker and requested_pending_ticker != pending_analysis_ticker:
         st.info(
             f"{requested_pending_ticker} es el símbolo mostrado por el bróker; "
@@ -15704,7 +15951,6 @@ def main() -> None:
                 load_clicked
                 or pending_analysis_ticker
                 or portfolio_refresh_requested
-                or review_cycle_active
             )
             price_refresh_token = (
                 str(pd.Timestamp.now(tz="UTC").value)
@@ -15759,24 +16005,6 @@ def main() -> None:
                     "proveedor. Se reintentará sólo lo pendiente en el próximo rerun."
                 )
         if growth_scan_tickers:
-            attempted_review = list(
-                st.session_state.get(review_attempted_key, [])
-            )
-            attempted_review = merge_analysis_ticker_sources(
-                attempted_review,
-                [ticker for ticker in growth_scan_tickers if ticker in review_universe],
-            )
-            st.session_state[review_attempted_key] = attempted_review
-            failed_review = list(st.session_state.get(review_failed_key, []))
-            failed_review = merge_analysis_ticker_sources(
-                failed_review,
-                [
-                    ticker
-                    for ticker in growth_scan_tickers
-                    if ticker not in refreshed_tickers and ticker in review_universe
-                ],
-            )
-            st.session_state[review_failed_key] = failed_review
             refresh_summary = dict(
                 st.session_state.get("_last_fundamental_refresh", {}) or {}
             )
@@ -15785,27 +16013,9 @@ def main() -> None:
             refresh_summary.setdefault("requested", len(growth_scan_tickers))
             st.session_state["_growth_scan_completed"] = refresh_summary
         st.session_state.pop("_pending_analysis_ticker", None)
-        if automatic_review_page and growth_scan_tickers:
-            attempted_review = list(
-                st.session_state.get(review_attempted_key, [])
-            )
-            remaining_review = next_daily_review_batch(
-                review_universe,
-                attempted_review,
-                limit=25,
-            )
-            if remaining_review:
-                # Cada rerun constituye una petición pequeña e independiente. Así
-                # se recorren todas las favoritas sin un proceso único demasiado
-                # pesado para Streamlit Community Cloud.
-                st.session_state[review_continue_key] = True
-                st.rerun()
-    attempted_after_refresh = {
-        str(ticker).strip().upper()
-        for ticker in st.session_state.get(review_attempted_key, [])
-        if str(ticker).strip()
-    }
-    favorites_reviewed = set(review_universe).issubset(attempted_after_refresh)
+    favorites_reviewed = not review_universe or bool(
+        radar_review and radar_compatible and not radar_review.pending
+    )
     if (
         automatic_review_page
         and st.session_state.get("_pending_speculative_discovery")
@@ -15902,11 +16112,7 @@ def main() -> None:
         for row in summary
         if row.get("Ticker") and isinstance(row.get("Política de análisis"), dict)
     }
-    snapshot_batch_tickers = (
-        review_universe
-        if automatic_review_page and favorites_reviewed and growth_scan_tickers
-        else growth_scan_tickers
-    )
+    snapshot_batch_tickers = growth_scan_tickers
     if snapshot_batch_tickers and prepared:
         try:
             batch_snapshot_result = persist_analysis_batch_snapshots(
@@ -15965,7 +16171,9 @@ def main() -> None:
     elif selected_section == "Analizar":
         render_market_data_status(raw_data, favorite_tickers)
         if automatic_review_page:
-            render_automatic_review_status(authenticated_user.username)
+            render_automatic_review_status(
+                radar_review, compatible=radar_compatible, now=datetime.now(timezone.utc),
+            )
         if analysis_section == "Radar":
             render_opportunities_page(
                 raw_data,
@@ -15983,6 +16191,7 @@ def main() -> None:
                 journal,
                 favorite_tickers,
                 include_company_detail=False,
+                radar_review=radar_review if radar_compatible else None,
             )
         elif analysis_section == "Oportunidades":
             render_entry_opportunities_page(

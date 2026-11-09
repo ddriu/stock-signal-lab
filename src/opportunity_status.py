@@ -6,6 +6,7 @@ from math import isfinite
 import pandas as pd
 
 from src.market_data_quality import quote_freshness
+from src.opportunity_catalog import VERIFIED_RADAR_READING
 
 
 def measured_count_label(count: int, *, available: int, total: int) -> str:
@@ -26,7 +27,7 @@ def opportunity_coverage(rows, *, reference_date=None):
     rows = list(rows)
     available = []
     for row in rows:
-        if row.get("Comprobación") != "Actualizado en esta sesión":
+        if row.get("Comprobación") not in {"Actualizado en esta sesión", VERIFIED_RADAR_READING}:
             continue
         score = row.get("Momento entrada")
         try:

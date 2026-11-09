@@ -139,6 +139,7 @@ def persist_analysis_batch_snapshots(
     *,
     note: str = DEFAULT_BATCH_SNAPSHOT_NOTE,
     policy_snapshots: Mapping[str, Mapping[str, object]] | None = None,
+    existing_snapshots: pd.DataFrame | None = None,
 ) -> BatchAnalysisSnapshotResult:
     """Guarda una fotografía observada por ticker, sesión y versión.
 
@@ -169,7 +170,9 @@ def persist_analysis_batch_snapshots(
     risks_by_ticker = _results_by_ticker(risk_results)
     opportunities_by_ticker = _results_by_ticker(opportunity_results)
 
-    stored_snapshots = journal.list_analysis_snapshots()
+    stored_snapshots = (
+        journal.list_analysis_snapshots() if existing_snapshots is None else existing_snapshots
+    )
     existing_keys = _existing_snapshot_keys(stored_snapshots)
     policies = _results_by_ticker(policy_snapshots or {})
     versioned_keys: set[tuple[str, date, str]] = set()

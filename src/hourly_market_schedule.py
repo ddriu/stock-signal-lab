@@ -182,6 +182,7 @@ def completed_daily_prices(ticker: str, frame: pd.DataFrame, *,
             diagnosis.update(
                 status=("unverified_daily_session_labels" if unverified_labels
                         else "completed_sessions_only"),
+                latest_completed_session=(completed[-1].date().isoformat() if len(completed) else None),
                 excluded_rows=len(frame) - len(result),
                 invalid_date_labels=invalid_labels,
                 unverified_session_labels=unverified_labels,

@@ -37,8 +37,10 @@ from src.journal import (
     PRIVATE_INVESTMENT_STATUSES,
     PORTFOLIO_ACCOUNT_COLUMNS,
     PORTFOLIO_SNAPSHOT_COLUMNS,
+    RADAR_CHECKPOINT_MAX_REVISION,
     calculate_open_positions,
     historical_closure_operations,
+    normalize_analysis_lookup_tickers,
     normalize_analysis_snapshot,
     normalize_analysis_sessions,
     normalize_favorite,
@@ -48,7 +50,10 @@ from src.journal import (
     normalize_private_investment,
     normalize_portfolio_account,
     normalize_portfolio_snapshot_position,
+    radar_checkpoint_json,
     serialize_stable_json,
+    validate_radar_checkpoint_owner,
+    validate_radar_checkpoint_revision,
 )
 
 
@@ -1217,11 +1222,15 @@ class SupabaseTradingJournal:
                 frame[column] = None
         return frame.loc[:, ANALYSIS_SNAPSHOT_COLUMNS]
 
-    def list_analysis_snapshots_for_sessions(self, sessions: Sequence[str]) -> pd.DataFrame:
+    def list_analysis_snapshots_for_sessions(
+        self, sessions: Sequence[str], *, tickers: Sequence[str] | None = None,
+    ) -> pd.DataFrame:
         """One bounded owner-filtered query; no pagination of the full history."""
         days = normalize_analysis_sessions(sessions)
+        wanted = normalize_analysis_lookup_tickers(tickers)
         frame = pd.DataFrame(columns=ANALYSIS_SNAPSHOT_COLUMNS)
-        if days:
+        truncated = False
+        if days and wanted != ():
             try:
                 ranges = [
                     f"and(analyzed_at.gte.{day}T00:00:00Z,"
@@ -1236,17 +1245,31 @@ class SupabaseTradingJournal:
                 "or": "(" + ",".join(ranges) + ")",
                 "order": "analyzed_at.desc,id.desc", "limit": "1000",
             }
+            request_options = {}
+            if wanted is not None:
+                params["ticker"] = "in.(" + ",".join(f'"{ticker}"' for ticker in wanted) + ")"
+                request_options["headers"] = {**self.headers, "Prefer": "count=exact"}
             try:
-                rows = self._request("GET", endpoint=self.analysis_endpoint, params=params).json()
+                response = self._request(
+                    "GET", endpoint=self.analysis_endpoint, params=params, **request_options,
+                )
             except JournalStorageError as exc:
                 if not self._is_missing_columns_error(exc, {"confidence_pct"}):
                     raise
                 params["select"] = "owner," + ",".join(LEGACY_ANALYSIS_SNAPSHOT_COLUMNS)
-                rows = self._request("GET", endpoint=self.analysis_endpoint, params=params).json()
+                response = self._request(
+                    "GET", endpoint=self.analysis_endpoint, params=params, **request_options,
+                )
+            rows = response.json()
             if (not isinstance(rows, list) or len(rows) > 1000
                     or any(not isinstance(row, dict) or row.get("owner") != self.owner
                            for row in rows)):
                 raise JournalStorageError("El contexto de análisis guardado no tiene un propietario o formato válido.")
+            if wanted is not None:
+                if any(not isinstance(row.get("ticker"), str) or row["ticker"] not in wanted for row in rows):
+                    raise JournalStorageError("El contexto guardado contiene símbolos no solicitados.")
+                total = str(getattr(response, "headers", {}).get("Content-Range", "")).rsplit("/", 1)[-1]
+                truncated = total.isdigit() and int(total) > len(rows)
             if rows:
                 frame = pd.DataFrame(rows)
                 if ("analyzed_at" not in frame
@@ -1261,7 +1284,7 @@ class SupabaseTradingJournal:
                         frame[column] = None
                 frame = frame.loc[:, ANALYSIS_SNAPSHOT_COLUMNS]
         frame.attrs.update(requested_sessions=list(days), bounded_limit=1000,
-                           possibly_truncated=len(frame) >= 1000)
+                           possibly_truncated=truncated or len(frame) >= 1000)
         return frame
 
     def delete_analysis_snapshot(self, snapshot_id: int) -> None:
@@ -1273,6 +1296,49 @@ class SupabaseTradingJournal:
                 "owner": f"eq.{self.owner}",
             },
         )
+
+    def get_radar_review_checkpoint(self) -> dict[str, object] | None:
+        """Read only this owner's current revision, with no process cache."""
+        owner = validate_radar_checkpoint_owner(self.owner)
+        response = self._request(
+            "GET", endpoint=f"{self.url}/rest/v1/radar_review_checkpoints",
+            params={"owner": f"eq.{owner}", "select": "owner,revision,checkpoint", "limit": "2"},
+        )
+        try:
+            rows = response.json()
+            if type(rows) is not list or len(rows) > 1:
+                raise ValueError("Invalid checkpoint response")
+            if not rows:
+                return None
+            row = rows[0]
+            if type(row) is not dict or row.get("owner") != owner:
+                raise ValueError("Checkpoint owner did not match")
+            revision = validate_radar_checkpoint_revision(row.get("revision"))
+            payload = json.loads(radar_checkpoint_json(row.get("checkpoint")))
+        except (TypeError, ValueError) as exc:
+            raise JournalStorageError("No se pudo verificar el punto de guardado de Radar.") from exc
+        return {**payload, "revision": revision}
+
+    def save_radar_review_checkpoint(
+        self, checkpoint: dict[str, object], *, expected_revision: int | None,
+    ) -> bool:
+        owner = validate_radar_checkpoint_owner(self.owner)
+        if expected_revision is not None:
+            validate_radar_checkpoint_revision(expected_revision)
+            if expected_revision == RADAR_CHECKPOINT_MAX_REVISION:
+                raise ValueError("Se ha agotado la revisión del punto de guardado de Radar.")
+        payload = json.loads(radar_checkpoint_json(checkpoint))
+        response = self._request(
+            "POST", endpoint=f"{self.url}/rest/v1/rpc/save_radar_review_checkpoint",
+            json={"p_owner": owner, "p_expected_revision": expected_revision, "p_checkpoint": payload},
+        )
+        try:
+            accepted = response.json()
+        except (TypeError, ValueError) as exc:
+            raise JournalStorageError("No se pudo confirmar el guardado de la revisión de Radar.") from exc
+        if type(accepted) is not bool:
+            raise JournalStorageError("No se pudo confirmar el guardado de la revisión de Radar.")
+        return accepted
 
     def save_daily_score_report(self, report: dict[str, object]) -> str:
         identifier, market_date, payload = normalized_digest_report(report)

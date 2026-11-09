@@ -22,6 +22,32 @@ from src.price_units import resolve_quote_unit
 from src.view_cache import invalidate_view_cache
 
 
+def _observed_at(value, *, now):
+    """Ignore unknown, naive or implausibly future in-session provenance."""
+    if value is None:
+        return None
+    try:
+        stamp = pd.Timestamp(value)
+        if (pd.isna(stamp) or stamp.tzinfo is None
+                or stamp > now + pd.Timedelta(minutes=5)):
+            return None
+        return stamp
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _price_window(frame, start_day, end_day):
+    if start_day is not None:
+        frame = frame.loc[frame.index.date >= start_day]
+    if end_day is not None:
+        frame = frame.loc[frame.index.date <= end_day]
+    return frame
+
+
+_PRICE_UNIT_ATTRS = ("quote_currency", "display_currency", "source_currency",
+                     "price_scale", "quote_units_normalized")
+
+
 def poll_saved_market_revision(journal, state, *, monotonic_now=None):
     """Hourly header-only check for an open UI; initial/warm calls do no I/O."""
     clock = time.monotonic() if monotonic_now is None else float(monotonic_now)
@@ -115,16 +141,23 @@ def hydrate_saved_market(journal, state, *, tickers, history=False, now=None, au
         changed = False
         fingerprints = dict(bucket["fingerprints"])
         if history and auto_adjust:
+            start_day = pd.Timestamp(start).date() if start is not None else None
+            end_day = pd.Timestamp(end).date() if end is not None else None
             fundamentals = dict(state.get("fundamental_data", {}))
             prices = dict(state.get("market_data", {}))
             references = dict(state.get("reference_data", {}))
             reference_symbols = {"SPY"}
             for ticker in targets:
                 row = bucket["rows"].get(("fundamentals", ticker))
+                previous_observation = _observed_at(
+                    fundamentals.get(ticker, {}).get("_ui_observed_at_utc"), now=now
+                )
                 if (row and row["metadata"].get("source_version") == FUNDAMENTAL_SNAPSHOT_VERSION
-                        and row["payload"].get("_snapshot_version", FUNDAMENTAL_SNAPSHOT_VERSION) == FUNDAMENTAL_SNAPSHOT_VERSION):
+                        and row["payload"].get("_snapshot_version", FUNDAMENTAL_SNAPSHOT_VERSION) == FUNDAMENTAL_SNAPSHOT_VERSION
+                        and (previous_observation is None or pd.Timestamp(row["observed_at"]) >= previous_observation)):
                     fingerprint = sha256(json.dumps(row["payload"], sort_keys=True).encode()).hexdigest()
-                    if fingerprints.get(("fundamentals", ticker)) != fingerprint or ticker not in fundamentals:
+                    if (fingerprints.get(("fundamentals", ticker)) != fingerprint
+                            or ticker not in fundamentals or previous_observation is not None):
                         fundamentals[ticker] = row["payload"]
                         fingerprints["fundamentals", ticker] = fingerprint
                         changed = True
@@ -143,27 +176,57 @@ def hydrate_saved_market(journal, state, *, tickers, history=False, now=None, au
                 row = bucket["rows"].get(("prices", ticker))
                 if not row or row["metadata"].get("auto_adjust") is not True:
                     continue
-                manual = state.get("_last_price_refresh", {})
-                if ticker in manual.get("succeeded", []) and manual.get("requested_at_utc"):
-                    if pd.Timestamp(manual["requested_at_utc"]) > pd.Timestamp(row["observed_at"]):
-                        continue
-                frame = completed_daily_prices(ticker, decode_prices(row["payload"]), now=now)
-                if start is not None:
-                    frame = frame.loc[frame.index.date >= pd.Timestamp(start).date()]
-                if end is not None:
-                    frame = frame.loc[frame.index.date <= pd.Timestamp(end).date()]
+                row_observed = pd.Timestamp(row["observed_at"])
+                # A saved intraday candle does not become a final close
+                # merely because the UI reads it after the session ends.
+                frame = completed_daily_prices(
+                    ticker, decode_prices(row["payload"]), now=min(now, row_observed)
+                )
+                if "completed_price_date" in row["metadata"]:
+                    try:
+                        declared_close = date.fromisoformat(row["metadata"]["completed_price_date"])
+                    except (TypeError, ValueError):
+                        frame = frame.iloc[:0]
+                    else:
+                        frame = _price_window(frame, None, declared_close)
+                frame = _price_window(frame, start_day, end_day)
                 destination = prices if ticker in targets else references
+                previous = destination.get(ticker)
+                if (isinstance(previous, pd.DataFrame) and not previous.empty
+                        and isinstance(previous.index, pd.DatetimeIndex)):
+                    # Per-frame retrieval time survives all later manual
+                    # batches. The last-batch marker is a legacy fallback.
+                    manual_observed = _observed_at(previous.attrs.get("fetched_at_utc"), now=now)
+                    if manual_observed is None:
+                        manual = state.get("_last_price_refresh", {})
+                        if ticker in manual.get("succeeded", ()):
+                            manual_observed = _observed_at(manual.get("requested_at_utc"), now=now)
+                    older_observation = (manual_observed is not None and row_observed < manual_observed)
+                    previous_window = _price_window(previous, start_day, end_day)
+                    if not previous_window.empty and (older_observation or frame.empty
+                            or previous_window.index[-1].date() > frame.index[-1].date()):
+                        verified = completed_daily_prices(ticker, previous_window, now=now)
+                        if not verified.empty and (older_observation or frame.empty
+                                or verified.index[-1].date() > frame.index[-1].date()):
+                            # Respect a newly selected date window rather than
+                            # keeping rows outside it solely for provenance.
+                            if not previous.index.equals(verified.index):
+                                destination[ticker] = verified
+                                fingerprints.pop(("prices", ticker), None)
+                                changed = True
+                            continue
                 if frame.empty:
                     if ticker in destination:
                         del destination[ticker]
                         fingerprints.pop(("prices", ticker), None)
                         changed = True
                     continue
-                units = {key: frame.attrs.get(key) for key in (
-                    "quote_currency", "display_currency", "source_currency", "price_scale", "quote_units_normalized")}
+                units = {key: frame.attrs.get(key) for key in _PRICE_UNIT_ATTRS}
                 fingerprint = sha256((frame.to_json(date_format="iso") + json.dumps(units, sort_keys=True)).encode()).hexdigest()
-                if fingerprints.get(("prices", ticker)) != fingerprint or ticker not in destination:
-                    (prices if ticker in targets else references)[ticker] = frame
+                if (fingerprints.get(("prices", ticker)) != fingerprint
+                        or not isinstance(previous, pd.DataFrame) or not previous.equals(frame)
+                        or any(previous.attrs.get(key) != value for key, value in units.items())):
+                    destination[ticker] = frame
                     fingerprints["prices", ticker] = fingerprint
                     changed = True
             if changed:

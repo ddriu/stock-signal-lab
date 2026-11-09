@@ -67,3 +67,6 @@ jobs:
 
       - name: Validar guardado principal independiente y conservación del historial
         run: node scripts/validate_primary_snapshot_migration.mjs "$GITHUB_WORKSPACE"
+
+      - name: Validar reanudación privada y protección de escrituras de Radar
+        run: node scripts/validate_radar_review_migration.mjs "$GITHUB_WORKSPACE"
