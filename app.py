@@ -14937,9 +14937,8 @@ def _render_manual_email_review(journal: object, preferences: object, *, mail_co
     st.markdown("#### Revisar ahora y recibir el resumen")
     st.write(f"Destino guardado: {preferences.email or 'sin configurar'}.")
     st.caption(
-        "Frecuencia: este botón inicia una revisión manual; la programación sigue "
-        "de lunes a viernes a las 07:15 UTC (08:15/09:15 en Madrid). "
-        "No cambia tus preferencias ni tus posiciones, operaciones o planes."
+        "Este botón inicia una revisión manual. No cambia tus preferencias ni "
+        "tus posiciones, operaciones o planes."
     )
     source = "Origen: tus favoritas guardadas y tus posiciones abiertas"
     source += (
@@ -14974,6 +14973,7 @@ def _render_manual_email_review(journal: object, preferences: object, *, mail_co
             )
         else:
             accepted = attempt["accepted"]
+            already_reserved = not accepted and not attempt["issues"] and attempt.get("skipped", 0) > 0
             metrics = st.columns(4)
             metrics[0].metric("Empresas solicitadas", attempt["requested"])
             metrics[1].metric("Con precios", attempt["with_prices"])
@@ -14984,6 +14984,11 @@ def _render_manual_email_review(journal: object, preferences: object, *, mail_co
                     f"SMTP aceptó {accepted} correo(s) para {attempt['email']}. "
                     "Esto no confirma su llegada a la bandeja de entrada; revisa también "
                     "spam. No se repetirá el envío desde esta sesión."
+                )
+            elif already_reserved:
+                st.info(
+                    "Ya hay un envío registrado o reservado para ese cierre. "
+                    "No se envió otra copia."
                 )
             else:
                 st.warning(
@@ -15008,7 +15013,7 @@ def _render_manual_email_review(journal: object, preferences: object, *, mail_co
                     "un mensaje. Se bloquea el reintento en esta sesión para evitar "
                     "duplicados."
                 )
-            elif not accepted:
+            elif not accepted and not already_reserved:
                 confirmed = st.checkbox(
                     "Confirmo que quiero reintentar esta revisión sin aceptación SMTP registrada",
                     key=f"manual_email_review_retry_confirm_{owner_key}_{attempt['number']}",
@@ -15037,6 +15042,7 @@ def _render_manual_email_review(journal: object, preferences: object, *, mail_co
                 "with_prices": summary.tickers_with_prices,
                 "fresh_prices": summary.tickers_with_fresh_prices,
                 "issues": len(summary.errors),
+                "skipped": getattr(summary, "emails_skipped", 0),
             }
         except Exception:
             # No exponer errores de proveedores/credenciales ni suponer que una
@@ -15164,15 +15170,17 @@ def render_email_alert_settings(journal: object) -> None:
 
     mail_configured = load_email_config().configured
     if mail_configured:
-        st.success(
-            "El canal de correo está conectado. La revisión automática se ejecuta "
-            "por la mañana, de lunes a viernes."
-        )
+        st.success("El canal de correo está conectado.")
     else:
         st.warning(
             "Las preferencias pueden guardarse, pero el administrador todavía debe "
             "conectar la cuenta Gmail del proyecto."
         )
+    st.caption(
+        "Resumen automático: de lunes a viernes a las 23:00 (Madrid). "
+        "El intento de recuperación de la 01:17 corresponde al mismo cierre y "
+        "no duplica un resumen ya enviado. Las ejecuciones pueden empezar con retraso."
+    )
     test_disabled = not bool(preferences.email) or not mail_configured
     if st.button(
         "Enviarme un correo de prueba",
@@ -15180,11 +15188,14 @@ def render_email_alert_settings(journal: object) -> None:
         width="stretch",
     ):
         try:
-            send_test_email(preferences.email)
-            st.success(
-                "SMTP aceptó el correo de prueba; no confirma su llegada a la bandeja "
-                "de entrada. Revisa también spam."
-            )
+            receipt = send_test_email(preferences.email)
+            if receipt is not None and receipt.status == "smtp_accepted":
+                st.success(
+                    "SMTP aceptó el correo de prueba; no confirma su llegada a la bandeja "
+                    "de entrada. Revisa también spam."
+                )
+            else:
+                st.warning("No consta confirmación SMTP del correo de prueba.")
         except (EmailConfigurationError, EmailDeliveryError) as exc:
             st.error(str(exc))
 

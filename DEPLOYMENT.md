@@ -140,13 +140,17 @@ allí la disponibilidad de la RPC y las columnas nuevas antes de desplegar el c�
 4. En GitHub abre **Settings > Secrets and variables > Actions** y crea:
    `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `EMAIL_SMTP_USERNAME` y
    `EMAIL_SMTP_PASSWORD`.
-5. Abre **Actions > Enviar alertas diarias > Run workflow** para la primera prueba.
-6. Cada usuario entra en **Más > Alertas por correo**, guarda su dirección y activa
-   los tipos de aviso que quiera recibir.
+5. Cada usuario entra en **Más > Alertas por correo**, guarda su dirección y activa
+   los tipos de aviso que quiera recibir. El botón **Enviarme un correo de prueba**
+   comprueba solo el canal; **Revisar mis favoritas y enviarme el resumen** limita
+   el análisis y el destinatario a la cuenta que inició sesión.
+6. **Actions > Enviar alertas diarias > Run workflow** ejecuta el lote general.
+   No lo uses para probar un único destinatario.
 
-El workflow programado se lanza a las 07:15 UTC de lunes a viernes. GitHub puede
-retrasar algunos minutos las tareas gratuitas. Es un resumen con el último cierre
-diario disponible, no una alerta intradía.
+El resumen se programa a las 23:00 de Madrid de lunes a viernes. La recuperación
+de la 01:17 corresponde al cierre anterior y no duplica un resumen ya enviado.
+GitHub puede retrasar el arranque; las ejecuciones programadas fuera de la ventana
+23:00–06:00 se omiten. Es un informe de cierres, no una alerta intradía.
 
 ## Seguridad
 

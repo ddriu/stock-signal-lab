@@ -90,8 +90,11 @@ def _operation_counts(store, headers, when):
     """Counts are per simulated strategy account, never broker operations."""
     proposals, fills, incidents, pending = set(), set(), set(), set()
     operation_events = {}
+    paused_backlog = False
     for header in headers:
         season = header["season_id"]
+        manifest = header["manifest"]
+        is_signal_feed = manifest.get("mode") == "theoretical" and manifest.get("strategy_key") == "A"
         events = store.list_events(season)
         executed = {event["payload"].get("intention_id") for event in events
                     if event["event_type"] == "order_filled"}
@@ -102,6 +105,8 @@ def _operation_counts(store, headers, when):
                 operation_events[key] = (header["manifest"], event)
             elif event["event_type"] == "incident":
                 incidents.add(key)
+                if is_signal_feed and event["payload"].get("code") == "collector_backlog_requires_new_season":
+                    paused_backlog = True
             elif event["event_type"] == "order_proposed":
                 proposals.add(key)
                 operation_events[key] = (header["manifest"], event)
@@ -109,7 +114,7 @@ def _operation_counts(store, headers, when):
                 if opening and event["event_id"] not in executed and _utc(opening) > when:
                     pending.add(key)
     return dict(proposals=proposals, fills=fills, incidents=incidents, pending=pending,
-                operation_events=operation_events)
+                operation_events=operation_events, paused_backlog=paused_backlog)
 
 
 def _operation_preview(manifest, event):
@@ -157,8 +162,6 @@ def collect_owner_models(journal, snapshots=None, *, now=None, experiment_id=Non
         if row["manifest"].get("engine_version") == TRACKING_VERSION
         and row["manifest"].get("experiment_id")
         and (experiment_id is None or row["manifest"]["experiment_id"] == experiment_id)}
-    if snapshots is None and experiments:
-        snapshots = journal.list_analysis_snapshots()
     statuses = []
     unknown_counts = False
     for experiment, manifest in experiments.items():
@@ -180,14 +183,22 @@ def collect_owner_models(journal, snapshots=None, *, now=None, experiment_id=Non
         before = None
         try:
             before = _operation_counts(store, headers, when)
-            # In live runs the tracker takes its clock AFTER downloading. Do not
-            # backdate newly fetched evidence to collection start. Explicit now
-            # is only the caller's reproducible point-in-time test boundary.
-            result = advance_one(journal, store, seasons, snapshots, experiment, manifest, now=now)
-            item.update(status=result.get("status", "updated"), runs=result.get("runs", 0),
-                new_inputs=result.get("new_inputs", 0))
-            summary["runs"] += item["runs"]
-            statuses.append(item["status"])
+            if before["paused_backlog"]:
+                # The immutable incident already records the failure. Keep
+                # the pause visible without downloading, writing or repeatedly
+                # failing a scheduled job for this known closed path.
+                item.update(status="collector_backlog", backlog_preexisting=True,
+                            requires_new_experiment=True)
+            else:
+                if snapshots is None:
+                    snapshots = journal.list_analysis_snapshots()
+                # In live runs the tracker takes its clock AFTER downloading.
+                # Explicit now is only the reproducible point-in-time boundary.
+                result = advance_one(journal, store, seasons, snapshots, experiment, manifest, now=now)
+                item.update(status=result.get("status", "updated"), runs=result.get("runs", 0),
+                    new_inputs=result.get("new_inputs", 0))
+                summary["runs"] += item["runs"]
+                statuses.append(item["status"])
         except ModelTrackingBacklog:
             item["status"] = "collector_backlog"
             summary["issues"] += 1
@@ -196,7 +207,7 @@ def collect_owner_models(journal, snapshots=None, *, now=None, experiment_id=Non
             item.update(status="error", error_type=type(error).__name__)
             summary["issues"] += 1
         try:
-            after = _operation_counts(store, headers, _utc(now))
+            after = before if item.get("backlog_preexisting") else _operation_counts(store, headers, _utc(now))
             summary["cumulative_proposals"] += len(after["proposals"])
             summary["cumulative_fills"] += len(after["fills"])
             summary["pending_proposals"] += len(after["pending"])
@@ -231,7 +242,7 @@ def collect_owner_models(journal, snapshots=None, *, now=None, experiment_id=Non
         summary["status"] = "waiting_for_signals"
     elif statuses:
         summary["status"] = "unchanged"
-    elif summary["preserved_experiments"]:
+    elif summary["preserved_experiments"] or any(item.get("backlog_preexisting") for item in summary["experiments"]):
         summary["status"] = "needs_new_activation"
     summary["available_at"] = _utc(now).isoformat()
     return summary
@@ -268,7 +279,7 @@ def main() -> int:
         return 1
     owners = sorted({row["owner"] for row in records
                     if not requested_owner or row.get("owner") == requested_owner})
-    count, failures, waiting, unchanged, backlogs = 0, 0, 0, 0, 0
+    count, failures, waiting, unchanged, backlogs, paused = 0, 0, 0, 0, 0, 0
     if not owners:
         if requested_experiment:
             print("::error::No se encontró una activación del propietario seleccionado. "
@@ -293,7 +304,9 @@ def main() -> int:
             failures += result["issues"]
             waiting += sum(item.get("status") == "waiting_for_signals" for item in result["experiments"])
             unchanged += sum(item.get("status") == "unchanged" for item in result["experiments"])
-            backlogs += sum(item.get("status") == "collector_backlog" for item in result["experiments"])
+            backlogs += sum(item.get("status") == "collector_backlog" and not item.get("backlog_preexisting")
+                            for item in result["experiments"])
+            paused += sum(bool(item.get("backlog_preexisting")) for item in result["experiments"])
             if result["preserved_experiments"]:
                 print("::warning::Se conservan experimentos históricos incompatibles sin modificarlos; "
                       "sólo se actualizan activaciones compatibles con su versión congelada.")
@@ -306,10 +319,13 @@ def main() -> int:
             failures += 1
     print(f"Seguimiento virtual: {count} resultados nuevos, {failures} incidencias de proceso, "
           f"{waiting} esperando señales, {unchanged} sin cambios y {backlogs} con recogidas atrasadas. No se enviaron correos.")
+    if paused:
+        print(f"::warning::{paused} temporada(s) ya pausada(s) por sesiones no recogidas: "
+              "no se actualizaron ni se descargaron precios para ellas. El histórico sigue intacto. "
+              "Para retomar el seguimiento, activa una temporada nueva desde la fecha real "
+              "y selecciónala en el programador. Este proceso no envía correos.")
     if backlogs:
-        # A persisted backlog is a deliberate stop, not a transient SMTP error.
-        # Explain recovery without exposing private experiment IDs or changing
-        # the collector's counts, immutable ledger or failure exit status.
+        # A newly detected backlog still fails the job visibly once.
         print("::error::Laboratorio pausado por sesiones no recogidas. "
               "Revisa la última recogida en el panel privado y autoriza una nueva activación independiente "
               "con fecha actual para retomar el seguimiento. El histórico se conserva: no se borran registros "

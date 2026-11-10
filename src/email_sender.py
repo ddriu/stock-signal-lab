@@ -181,8 +181,8 @@ def send_email(
     return receipt
 
 
-def send_test_email(recipient: str, *, config: EmailConfig | None = None) -> None:
-    send_email(
+def send_test_email(recipient: str, *, config: EmailConfig | None = None) -> EmailDeliveryReceipt | None:
+    return send_email(
         recipient,
         "Stock Signal Lab · correo de prueba",
         (

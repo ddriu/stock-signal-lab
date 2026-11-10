@@ -83,7 +83,9 @@ def test_opening_and_rerunning_settings_never_sends_or_writes(monkeypatch):
     forbidden.assert_not_called()
     assert not _send(page).disabled
     assert "alice@example.test" in _text(page)
-    assert "07:15 UTC" in _text(page)
+    assert "23:00 (Madrid)" in _text(page)
+    assert "01:17" in _text(page) and "no duplica un resumen ya enviado" in _text(page)
+    assert "07:15 UTC" not in _text(page)
     assert "la cartera del grupo no está incluida" in _text(page)
     assert "no se mezclan las notas ni se exige consenso" in _text(page)
 

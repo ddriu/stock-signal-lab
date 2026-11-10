@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import pandas as pd
 
 from scripts import run_model_tracking as runner
-from src.model_results_tracking import TRACKING_VERSION
+from src.model_results_tracking import ModelTrackingBacklog, TRACKING_VERSION
 
 
 def test_disabled_scheduler_has_no_storage_or_mail_side_effects(monkeypatch):
@@ -229,6 +229,60 @@ def test_scheduler_explains_backlog_recovery_without_hiding_failure_or_private_i
     assert "no se borran registros" in output.err and "ni se inventan compras atrasadas" in output.err
     assert "No es un fallo de envío SMTP" in output.err
     assert "private-" not in output.out + output.err
+
+
+def test_first_backlog_fails_and_known_pause_skips_future_collections(monkeypatch, capsys):
+    monkeypatch.setenv("MODEL_RESULTS_ENABLED", "true")
+    monkeypatch.setenv("MODEL_RESULTS_OWNER", "private-user")
+    monkeypatch.setenv("MODEL_RESULTS_EXPERIMENT", "private-season")
+    headers = _headers("private-season")
+    events = {header["season_id"]: [] for header in headers}
+    feed = "private-season-theoretical-A"
+    backend = SimpleNamespace(url="https://example.invalid", _list_rows=Mock(return_value=[
+        {"owner": "private-user", "season_id": feed}]))
+    journal = SimpleNamespace(list_analysis_snapshots=Mock(return_value=pd.DataFrame()))
+    store = SimpleNamespace(list_seasons=lambda: headers, list_events=lambda season: list(events[season]))
+    monkeypatch.setattr(runner, "create_journal", lambda owner:
+        backend if owner == runner.GROUP_PORTFOLIO_OWNER else journal)
+    monkeypatch.setattr(runner, "create_model_results_store", lambda value: store)
+    monkeypatch.setattr(runner, "experiment_readiness", lambda rows: dict(ready=True))
+    def new_backlog(*args, **kwargs):
+        events[feed].append(dict(event_id="persisted", event_type="incident",
+            payload=dict(code="collector_backlog_requires_new_season")))
+        raise ModelTrackingBacklog("several sessions")
+    advance = Mock(side_effect=new_backlog)
+    monkeypatch.setattr(runner, "advance_one", advance)
+
+    assert runner.main() == 1
+    assert "::error::Laboratorio pausado por sesiones no recogidas" in capsys.readouterr().err
+    assert runner.main() == 0
+    output = capsys.readouterr()
+    assert "::warning::1 temporada(s) ya pausada(s)" in output.out
+    assert "0 resultados nuevos" in output.out
+    assert "private-" not in output.out + output.err and "::error::" not in output.err
+    advance.assert_called_once()
+    journal.list_analysis_snapshots.assert_called_once()
+    assert len(events[feed]) == 1
+
+
+def test_known_pause_does_not_skip_another_experiment_or_hide_its_error(monkeypatch):
+    headers = _headers("paused") + _headers("active")
+    events = {"paused-theoretical-A": [dict(event_id="persisted", event_type="incident",
+        payload=dict(code="collector_backlog_requires_new_season"))]}
+    store = SimpleNamespace(list_seasons=lambda: headers, list_events=lambda season: events.get(season, []))
+    monkeypatch.setattr(runner, "create_model_results_store", lambda value: store)
+    monkeypatch.setattr(runner, "experiment_readiness", lambda rows: dict(ready=True))
+    advance = Mock(side_effect=RuntimeError("new provider error"))
+    monkeypatch.setattr(runner, "advance_one", advance)
+    result = runner.collect_owner_models(object(), pd.DataFrame(), now="2026-11-10T05:00:00Z")
+    assert result["status"] == "error" and result["issues"] == 1
+    assert result["ledger_incidents"] == 1
+    paused, active = result["experiments"]
+    assert paused["status"] == "collector_backlog" and paused["backlog_preexisting"]
+    assert paused["new_fills"] == paused["new_proposals"] == 0
+    assert active["status"] == "error" and active["error_type"] == "RuntimeError"
+    advance.assert_called_once()
+    assert advance.call_args.args[4] == "active"
 
 
 def test_scheduler_does_not_prescribe_new_activation_for_an_unrelated_error(monkeypatch, capsys):
