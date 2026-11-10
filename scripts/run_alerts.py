@@ -68,6 +68,14 @@ def main() -> int:
         # structured result private and never publish those strings in CI logs.
         print(f"AVISO: {len(result.errors)} incidencias de actualización o envío. "
               "Los detalles privados no se muestran en este registro.", file=sys.stderr)
+    if event_name in {"schedule", "workflow_dispatch"}:
+        from scripts.send_arena_digest import send_arena_digest
+        try:
+            send_arena_digest(expected_session=session)
+        except Exception:
+            # CI is public. Do not log recipient addresses, credentials or API bodies.
+            print("::warning::Correo de la Arena pendiente o sin confirmación.", file=sys.stderr)
+            return 1
     # Un fallo total debe ser visible en Actions. No se vuelve a enviar ningún
     # correo aquí: los destinatarios ya entregados no se duplican.
     if result.tickers_checked and result.tickers_with_fresh_prices == 0:
