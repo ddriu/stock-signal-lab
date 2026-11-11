@@ -26,6 +26,12 @@ def render_digest(digest):
         f"Clasificación de la liga (comisión simulada: {digest['fee_percent']:g} % por orden).",
         "",
     ]
+    entries = digest["standings"]
+    if all(entry.get("invested_total") is not None for entry in entries):
+        invested = sum(entry["invested_total"] for entry in entries)
+        value = sum(entry["market_value"] for entry in entries)
+        lines.extend([f"Total invertido en posiciones abiertas: {invested:.2f} USD (incluye comisiones).",
+                      f"Valor conjunto al último cierre: {value:.2f} USD.", ""])
     for rank, entry in enumerate(digest["standings"], 1):
         lines.append(
             f"{rank}. {entry['name']} · mercado acumulado {entry['market_pnl']:+.2f} USD"
@@ -38,6 +44,25 @@ def render_digest(digest):
             )
         else:
             lines.append("   Sin una jornada de liga liquidada para la fecha del informe.")
+        if entry.get("invested_total") is not None:
+            lines.append(f"   Invertido en posiciones abiertas: {entry['invested_total']:.2f} USD"
+                         f" · valor al cierre {entry['market_value']:.2f} USD")
+        if "positions" in entry:
+            if not entry["positions"]:
+                lines.append("   Posiciones abiertas: ninguna.")
+            for position in entry["positions"]:
+                units = position.get("units")
+                quantity = f"{units:.8f} acciones" if units is not None else "cantidad sin dato"
+                cost = position.get("cost_basis")
+                cost_text = f"{cost:.2f} USD" if cost is not None else "sin dato"
+                price = position.get("entry_price")
+                price_text = f"{price:.8f} USD" if price is not None else "sin dato"
+                lines.append(
+                    f"   {position['ticker']} · {quantity} · compra media {price_text}"
+                    f" · invertido {cost_text} · valor al cierre {position['value']:.2f} USD"
+                    f" ({position['valuation_date']})"
+                )
+        lines.append("   Decisiones para la próxima sesión:")
         orders = entry["plan"]["orders"]
         if not orders:
             lines.append("   Mantener la cartera.")
