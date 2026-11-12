@@ -1,0 +1,44 @@
+name: Analistas externos (opt-in privado)
+
+on:
+  schedule:
+    # Hourly observations; runtime guard sends once at 09:30 Madrid in CET/CEST.
+    - cron: '30 * * * 1-5'
+  workflow_dispatch:
+
+concurrency:
+  group: external-analysts-private
+  cancel-in-progress: false
+
+jobs:
+  external-analysts:
+    if: vars.EXTERNAL_ANALYSTS_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      PYTHONPATH: .
+      EXTERNAL_ANALYSTS_ENABLED: ${{ vars.EXTERNAL_ANALYSTS_ENABLED }}
+      EXTERNAL_ANALYSTS_MAILBOX_OWNER: ${{ vars.EXTERNAL_ANALYSTS_MAILBOX_OWNER }}
+      EXTERNAL_ANALYSTS_IMAP_ENABLED: ${{ vars.EXTERNAL_ANALYSTS_IMAP_ENABLED }}
+      EXTERNAL_ANALYSTS_IMAP_FOLDER: ${{ vars.EXTERNAL_ANALYSTS_IMAP_FOLDER }}
+      EXTERNAL_ANALYSTS_SEND_ENABLED: ${{ vars.EXTERNAL_ANALYSTS_SEND_ENABLED }}
+      PERITO_ALLOWED_SENDERS: ${{ vars.PERITO_ALLOWED_SENDERS }}
+      EMAIL_SMTP_HOST: smtp.gmail.com
+      EMAIL_SMTP_PORT: '465'
+      EMAIL_SMTP_USERNAME: ${{ secrets.EMAIL_SMTP_USERNAME }}
+      EMAIL_SMTP_PASSWORD: ${{ secrets.EMAIL_SMTP_PASSWORD }}
+      EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Recibir, registrar y seguir carteras virtuales
+        run: python -m scripts.run_external_analysts --receive --advance --send --scheduled

@@ -42,6 +42,7 @@ ROUTES = {
         analysis("entradas", "Entradas hoy", "radar", "Oportunidades"),
         analysis("empresa", "Empresa", "radar", "Empresa", "Análisis individual"),
         analysis("comparar", "Comparar", "radar", "Empresa", "Comparar empresas"),
+        Route("analistas", "Analistas externos", "radar", "Analistas externos"),
         Route("favoritas-anadir", "Añadir empresa", "favoritas", "Favoritos", (("favorite_view", "Añadir empresa"),)),
         Route("cartera-grupo", "Grupo", "cartera", "Carteras", (("portfolio_navigation", "Grupo"),)),
         Route("cartera-plan", "Plan por posición", "cartera", "Carteras", (("portfolio_navigation", "Plan por posición"),)),
@@ -67,11 +68,11 @@ ROUTES = {
 LOCAL_ROUTES = {
     "hoy": ("hoy", "invertir", "cinco-sesiones"),
     "cartera": ("cartera", "cartera-plan", "cartera-grupo", "cartera-capital"),
-    "radar": ("radar", "entradas", "empresa", "comparar"),
+    "radar": ("radar", "entradas", "empresa", "comparar", "analistas"),
     "favoritas": ("favoritas", "favoritas-anadir"),
 }
 TOOLS_GROUPS = (
-    ("Seguimiento", ("resultados", "laboratorio", "alertas")),
+    ("Seguimiento", ("resultados", "laboratorio", "analistas", "alertas")),
     ("Métodos de análisis", ("crecimiento", "fundamentales", "ventaja-relativa", "especulativas")),
     ("Validar el método", ("modelo", "evolucion", "resultado-posterior", "backtest", "auditoria")),
 )
