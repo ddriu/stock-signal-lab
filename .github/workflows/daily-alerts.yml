@@ -37,7 +37,8 @@ jobs:
       - name: Instalar dependencias
         run: python -m pip install -r requirements.txt
 
-      - name: Analizar, actualizar laboratorio activado y enviar resúmenes
+      - name: Stock Signal Lab · analizar y enviar resúmenes
+        id: stock
         env:
           # Owner explicitly enabled this virtual deployment. A configured
           # false/0 remains a kill switch; unrelated owners are never tracked.
@@ -53,3 +54,20 @@ jobs:
           EMAIL_SENDER: ${{ secrets.EMAIL_SMTP_USERNAME }}
           EMAIL_SENDER_NAME: Stock Signal Lab
         run: python -m scripts.run_alerts
+
+      - name: Arena · preparar y enviar sus decisiones
+        if: steps.stock.outputs.status != 'omitted_outside_window'
+        env:
+          # Keep the first stage's market session even if analysis crosses
+          # midnight or finishes after the scheduler's startup window.
+          ARENA_EXPECTED_SESSION: ${{ steps.stock.outputs.market_session }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          EMAIL_SMTP_HOST: smtp.gmail.com
+          EMAIL_SMTP_PORT: "465"
+          EMAIL_SMTP_USE_SSL: "true"
+          EMAIL_SMTP_USERNAME: ${{ secrets.EMAIL_SMTP_USERNAME }}
+          EMAIL_SMTP_PASSWORD: ${{ secrets.EMAIL_SMTP_PASSWORD }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SMTP_USERNAME }}
+          EMAIL_SENDER_NAME: Stock Signal Lab
+        run: python -m scripts.send_arena_digest

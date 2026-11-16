@@ -9,6 +9,14 @@ from src.alert_runner import run_daily_alerts
 from src.digest_schedule import daily_digest_session_date
 
 
+def _stage_output(**values):
+    path = os.getenv("GITHUB_OUTPUT")
+    if path:
+        with open(path, "a", encoding="utf-8") as output:
+            for key, value in values.items():
+                output.write(f"{key}={value}\n")
+
+
 def configured_virtual_tracker():
     """Only advance the explicitly scoped deployment owner, never activate.
 
@@ -44,7 +52,10 @@ def main() -> int:
                   file=sys.stderr)
             print("Estado: omitido_fuera_de_horario. "
                   "Sin revisión ni intento de envío; no se amplía la ventana de seguridad.")
+            _stage_output(status="omitted_outside_window")
             return 0
+
+    _stage_output(market_session=session.isoformat() if session is not None else "")
 
     kwargs = {}
     # Model collection belongs to model-results.yml. Never put simulations or
@@ -68,14 +79,8 @@ def main() -> int:
         # structured result private and never publish those strings in CI logs.
         print(f"AVISO: {len(result.errors)} incidencias de actualización o envío. "
               "Los detalles privados no se muestran en este registro.", file=sys.stderr)
-    if event_name in {"schedule", "workflow_dispatch"}:
-        from scripts.send_arena_digest import send_arena_digest
-        try:
-            send_arena_digest(expected_session=session)
-        except Exception:
-            # CI is public. Do not log recipient addresses, credentials or API bodies.
-            print("::warning::Correo de la Arena pendiente o sin confirmación.", file=sys.stderr)
-            return 1
+    # Arena is a separate workflow step with its own safe diagnostics. Never
+    # rerun successful Stock Signal Lab mail to recover a downstream failure.
     # Un fallo total debe ser visible en Actions. No se vuelve a enviar ningún
     # correo aquí: los destinatarios ya entregados no se duplican.
     if result.tickers_checked and result.tickers_with_fresh_prices == 0:
