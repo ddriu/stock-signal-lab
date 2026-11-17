@@ -1,0 +1,85 @@
+name: Envío puntual autorizado · usuario y Arena
+
+on:
+  push:
+    branches: [codex/send-owner-mail-20261117]
+
+concurrency:
+  group: stock-signal-lab-daily-alerts
+  cancel-in-progress: false
+
+jobs:
+  send-owner:
+    if: github.event.created && github.repository == 'ddriu/stock-signal-lab'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+      EMAIL_SMTP_HOST: smtp.gmail.com
+      EMAIL_SMTP_PORT: '465'
+      EMAIL_SMTP_USE_SSL: 'true'
+      EMAIL_SMTP_USERNAME: ${{ secrets.EMAIL_SMTP_USERNAME }}
+      EMAIL_SMTP_PASSWORD: ${{ secrets.EMAIL_SMTP_PASSWORD }}
+      EMAIL_SENDER: ${{ secrets.EMAIL_SMTP_USERNAME }}
+      EMAIL_SENDER_NAME: Stock Signal Lab
+    steps:
+      - name: Usar exclusivamente el código aprobado y fusionado
+        uses: actions/checkout@v4
+        with:
+          ref: 46e5957aa7eca5d9744c7e0873a51b425d088a99
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Instalar dependencias existentes
+        run: python -m pip install -r requirements.txt
+      - name: Stock Signal Lab · solo el propietario
+        id: stock
+        shell: bash
+        run: |
+          python - <<'PY'
+          from contextlib import redirect_stderr, redirect_stdout
+          from datetime import datetime
+          from io import StringIO
+          import os
+          from zoneinfo import ZoneInfo
+          from src.alert_runner import run_daily_alerts
+          from src.digest_schedule import daily_digest_session_date
+
+          def output(value):
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as target:
+                  target.write(value + "\n")
+
+          now = datetime.now(ZoneInfo("Europe/Madrid"))
+          session = daily_digest_session_date(now=now)
+          if now.date().isoformat() != "2026-11-17" or session is None:
+              print("Envío puntual omitido: autorización fechada o ventana de cierre no vigente.")
+              raise SystemExit(0)
+          try:
+              # Provider output can contain private symbols or backend text.
+              # Emit only delivery counts; do not save the captured buffers.
+              with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                  result = run_daily_alerts(
+                      owner=os.environ["GITHUB_REPOSITORY_OWNER"],
+                      today=session, require_current_session=True,
+                  )
+          except Exception as error:
+              print("::error::No se confirmó el envío del propietario (" + type(error).__name__ + "). Sin detalles privados ni reintento SMTP.")
+              raise SystemExit(1) from None
+          print("Sesión:", session.isoformat(), "usuarios:", result.users_checked,
+                "correos aceptados:", result.emails_sent, "omitidos:", result.emails_skipped,
+                "incidencias:", len(result.errors))
+          if result.tickers_checked and result.tickers_with_fresh_prices == 0:
+              raise SystemExit("::error::No hay precios utilizables para el resumen.")
+          if result.emails_sent == 0 and result.emails_skipped == 0:
+              raise SystemExit("::error::No hay un envío confirmado ni una reserva existente.")
+          output("market_session=" + session.isoformat())
+          PY
+      - name: Arena · envío independiente con su reserva existente
+        if: steps.stock.outputs.market_session != ''
+        env:
+          ARENA_EXPECTED_SESSION: ${{ steps.stock.outputs.market_session }}
+        run: python -m scripts.send_arena_digest
