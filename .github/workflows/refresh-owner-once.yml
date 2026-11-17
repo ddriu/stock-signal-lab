@@ -1,0 +1,140 @@
+name: Revisión puntual autorizada · todas las favoritas
+
+on:
+  push:
+    branches: [codex/refresh-owner-favorites-20261117]
+
+concurrency:
+  group: stock-signal-lab-daily-alerts
+  cancel-in-progress: false
+
+jobs:
+  review-owner:
+    if: github.event.created && github.repository == 'ddriu/stock-signal-lab'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+    steps:
+      - name: Código publicado, sin cambios de reglas ni SMTP
+        uses: actions/checkout@v4
+        with:
+          ref: 46e5957aa7eca5d9744c7e0873a51b425d088a99
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Revisar y guardar todas las favoritas por bloques
+        shell: bash
+        run: |
+          python - <<'PY'
+          from collections import Counter
+          from contextlib import redirect_stderr, redirect_stdout
+          from dataclasses import asdict
+          from datetime import datetime, timezone
+          from hashlib import sha256
+          from io import StringIO
+          import json
+          import logging
+          import os
+          from uuid import uuid4
+          from zoneinfo import ZoneInfo
+
+          now = datetime.now(timezone.utc)
+          if now.astimezone(ZoneInfo("Europe/Madrid")).date().isoformat() != "2026-11-17":
+              print("Omitido: autorización puntual fechada, no es una tarea periódica.")
+              raise SystemExit(0)
+
+          def quiet(fn, *args, **kwargs):
+              previous = logging.root.manager.disable
+              try:
+                  logging.disable(logging.CRITICAL)
+                  with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                      return fn(*args, **kwargs)
+              finally:
+                  logging.disable(previous)
+
+          def setup():
+              import app
+              import streamlit as st
+              from config import StrategyConfig
+              from src.navigation import merge_analysis_ticker_sources
+              from src.radar_review import RadarReview
+              from src.storage import create_journal
+              st.session_state = {}
+              journal = create_journal(os.environ["GITHUB_REPOSITORY_OWNER"])
+              favorites = journal.list_favorites()["ticker"].dropna().tolist()
+              universe = merge_analysis_ticker_sources(favorites, app._portfolio_tracking_tickers(journal))
+              if not 1 <= len(universe) <= 200:
+                  raise ValueError("Universo vacío o fuera del límite seguro")
+              strategy, days = StrategyConfig(), 365 * 5
+              context = sha256(json.dumps([sorted(universe), asdict(strategy), days, True],
+                  sort_keys=True, default=str).encode()).hexdigest()
+              old = RadarReview.from_checkpoint(journal.get_radar_review_checkpoint())
+              if old and old.busy(now):
+                  raise ValueError("Hay otra revisión en curso; no se toma su reserva")
+              if old and old.compatible(context, now) and old.pending:
+                  review = old
+              else:
+                  review = RadarReview.start(universe, context, now, revision=old.revision+1 if old else 1)
+                  app._save_radar_checkpoint(journal, review)
+              return app, st, journal, strategy, days, review, len(favorites)
+
+          try:
+              app, st, journal, strategy, days, review, favorite_count = quiet(setup)
+              print("Favoritas:", favorite_count, "universo:", len(review.tickers),
+                    "pendientes iniciales:", len(review.pending))
+              worker, batches = uuid4().hex, 0
+              while review.pending:
+                  if batches >= 40:
+                      raise RuntimeError("Límite seguro de bloques")
+                  review = quiet(app._run_radar_batch, journal, review, worker,
+                                 history_days=days, auto_adjust=True, strategy=strategy)
+                  batches += 1
+                  print("Bloque confirmado:", batches, "resultados:", len(review.outcomes),
+                        "pendientes:", len(review.pending), flush=True)
+
+              def persist_transport():
+                  from src.data_loader import FUNDAMENTAL_SNAPSHOT_VERSION
+                  from src.market_cache import MarketCacheStore
+                  from src.hourly_market_refresh import _json_value, refresh_market_cache
+                  store = MarketCacheStore(journal)
+                  infos = st.session_state.get("fundamental_data", {})
+                  count = 0
+                  for ticker, info in infos.items():
+                      if ticker not in review.tickers or not isinstance(info, dict) or not info or info.get("_fundamental_error"):
+                          continue
+                      if store.put("fundamentals", ticker, _json_value(info),
+                          {"source_version": FUNDAMENTAL_SNAPSHOT_VERSION,
+                           "currency": info.get("currency"), "sector": info.get("sector")},
+                          observed_at=datetime.now(timezone.utc)):
+                          count += 1
+                  frames = dict(st.session_state.get("market_data", {}))
+                  frames.update(st.session_state.get("_radar_review_references", {}).get("frames", {}))
+                  def price_loader(ticker, *args, **kwargs):
+                      if ticker not in frames:
+                          raise ValueError("No hay una observación nueva validada")
+                      return frames[ticker].copy(deep=True)
+                  def fundamental_loader(ticker):
+                      raise ValueError("No se solicitan ni fabrican fundamentales adicionales")
+                  result = refresh_market_cache(journal, bootstrap=True, fundamental_limit=0,
+                      price_loader=price_loader, fundamental_loader=fundamental_loader)
+                  return count, result
+
+              try:
+                  fund_count, cache = quiet(persist_transport)
+                  print("Caché: fundamentales", fund_count, "históricos", cache.prices_saved,
+                        "divisas", cache.fx_saved, "incidencias", len(cache.errors))
+              except Exception as error:
+                  print("::warning::Análisis conservados; caché adicional no confirmada (" + type(error).__name__ + ").")
+              print("Resultados Radar:", json.dumps(dict(Counter(v.status for v in review.outcomes.values())), sort_keys=True))
+              print("Pendientes finales:", len(review.pending),
+                    "Sin SMTP, sin operaciones, sin cambiar decisiones ni informe fuente de Arena.")
+          except Exception as error:
+              print("::error::Revisión interrumpida (" + type(error).__name__ + "). Se conservan los bloques confirmados; sin detalles privados.")
+              raise SystemExit(1) from None
+          PY
