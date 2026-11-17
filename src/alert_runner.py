@@ -294,6 +294,7 @@ def _download_alert_frames(
     *,
     today: date,
     downloader: Callable[..., pd.DataFrame],
+    require_current_session: bool = False,
 ) -> tuple[dict[str, pd.DataFrame], list[str]]:
     frames: dict[str, pd.DataFrame] = {}
     errors: list[str] = []
@@ -303,8 +304,50 @@ def _download_alert_frames(
         try:
             raw = downloader(ticker, start, today, auto_adjust=True)
             frames[ticker] = add_indicators(raw, config)
+            frames[ticker].attrs.update(dict(raw.attrs))
         except (DataDownloadError, ValueError, KeyError) as exc:
             errors.append(f"{ticker}: {exc}")
+    if require_current_session:
+        # "Usable within two business days" is not the same as the latest
+        # completed exchange session. One bounded retry can recover a provider
+        # lag without redating yesterday's signal or rerunning SMTP.
+        from src.hourly_market_schedule import _calendar, DAILY_CLOSE_PUBLICATION_MARGIN
+        clock = pd.Timestamp.now(tz="UTC")
+        retries = 0
+        for ticker, frame in list(frames.items()):
+            try:
+                calendar = _calendar(ticker)
+                if calendar is None:
+                    continue
+                session = calendar.date_to_session(pd.Timestamp(today), direction="previous")
+                if calendar.session_close(session) + DAILY_CLOSE_PUBLICATION_MARGIN > clock:
+                    continue
+                expected = session.date()
+                original_date = frame.index[-1].date()
+                if original_date >= expected:
+                    continue
+                if retries >= 180:
+                    errors.append(f"{ticker}: pendiente por límite de reintentos del cierre.")
+                    continue
+                retries += 1
+                retry = downloader(ticker, start, today, auto_adjust=True)
+                if retry.empty or retry.index[-1].date() <= original_date:
+                    continue
+                original_currency = str(frame.attrs.get("quote_currency") or "").strip()
+                retry_currency = str(retry.attrs.get("quote_currency") or "").strip()
+                if original_currency and retry_currency and original_currency != retry_currency:
+                    errors.append(f"{ticker}: reintento descartado por distinta unidad de cotización.")
+                    continue
+                # Preserve the target cutoff and a whole observed series.
+                # No forward-fill, date shifting, source splicing or prices
+                # from a later session may make this report look complete.
+                retry = retry.loc[[stamp.date() <= expected for stamp in retry.index]].copy(deep=True)
+                if not retry.empty and retry.index[-1].date() > original_date:
+                    frames[ticker] = add_indicators(retry, config)
+                    frames[ticker].attrs.update(dict(retry.attrs))
+                    frames[ticker].attrs["alert_current_session_retry"] = True
+            except (DataDownloadError, ValueError, KeyError, IndexError, TypeError) as exc:
+                errors.append(f"{ticker}: reintento del cierre no confirmado ({type(exc).__name__}).")
     return frames, errors
 
 
@@ -451,6 +494,7 @@ def run_daily_alerts(
         all_tickers,
         today=resolved_today,
         downloader=downloader,
+        require_current_session=require_current_session,
     )
     errors.extend(download_errors)
     reference_frames: dict[str, pd.DataFrame | None] = dict(frames)

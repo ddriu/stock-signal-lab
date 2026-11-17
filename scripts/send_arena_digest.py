@@ -15,6 +15,42 @@ from src.storage import create_journal
 ARENA = "https://ddriu-arena-ia.gabledtapir.chatgpt.site"
 
 
+class ArenaDigestError(RuntimeError):
+    """Safe stage/code only: no recipient, credentials or provider body in CI."""
+
+    def __init__(self, phase, code, http_status=None):
+        self.phase, self.code, self.http_status = phase, code, http_status
+        super().__init__(f"Arena {phase}: {code}" + (f" (HTTP {http_status})" if http_status else ""))
+
+
+def _failure_code(response):
+    try:
+        body = response.json()
+        message = body.get("error", "") if isinstance(body, dict) else ""
+    except (ValueError, TypeError):
+        message = ""
+    if not isinstance(message, str):
+        return "http_error"
+    if "error de OpenRouter (402)" in message:
+        return "model_provider_payment_required"
+    if "error de OpenRouter (429)" in message:
+        return "model_rate_limited"
+    for text, code in (
+        ("Hay una ronda pendiente con otro informe.", "report_conflict"),
+        ("Las decisiones guardadas no corresponden al informe actualizado.", "report_conflict"),
+        ("La Arena está procesando otra ronda.", "lease_busy"),
+        ("La sesión de ejecución caducó.", "lease_expired"),
+        ("El informe carece de señales válidas o tiene duplicados.", "report_no_signals"),
+        ("No se pudieron obtener cotizaciones", "quotes_unavailable"),
+        ("Falta cotización", "quotes_unavailable"),
+        ("La ronda requiere un informe renovado y una sesión futura.", "report_or_session_not_ready"),
+        ("Todavía no está disponible el informe de Streamlit", "report_not_ready"),
+    ):
+        if text in message:
+            return code
+    return "http_error"
+
+
 def render_digest(digest):
     opening = datetime.fromisoformat(digest["open_at"]).astimezone(
         ZoneInfo("Europe/Madrid")
@@ -97,27 +133,48 @@ def send_arena_digest(expected_session=None):
 
     config = load_email_config()
     if not config.configured or not config.sender_email:
-        raise RuntimeError("El correo de la Arena necesita SMTP.")
-    response = requests.post(
-        f"{journal.url}/rest/v1/rpc/arena_mail_credentials",
-        headers=journal.headers, json={}, timeout=12, allow_redirects=False,
-    )
+        raise ArenaDigestError("config", "smtp_not_configured")
+    try:
+        response = requests.post(
+            f"{journal.url}/rest/v1/rpc/arena_mail_credentials",
+            headers=journal.headers, json={}, timeout=12, allow_redirects=False,
+        )
+    except requests.Timeout:
+        raise ArenaDigestError("credentials", "transport_timeout") from None
+    except requests.RequestException:
+        raise ArenaDigestError("credentials", "transport_error") from None
     if not response.ok:
-        raise RuntimeError("No se pudo autorizar el correo de la Arena.")
-    settings = response.json()
-    if not isinstance(settings, dict) or not is_valid_email(settings.get("recipient", "")):
-        raise RuntimeError("Falta el destinatario del correo de la Arena.")
+        raise ArenaDigestError("credentials", "http_error", response.status_code)
+    try:
+        settings = response.json()
+    except ValueError:
+        raise ArenaDigestError("credentials", "invalid_response") from None
+    if (not isinstance(settings, dict) or not is_valid_email(settings.get("recipient", ""))
+            or not all(isinstance(settings.get(key), str) and settings[key] for key in ("site_token", "job_token"))):
+        raise ArenaDigestError("credentials", "invalid_credentials")
     headers = {
         "OAI-Sites-Authorization": "Bearer " + settings["site_token"],
         "X-Arena-Mail-Token": settings["job_token"],
     }
 
     def arena(payload):
-        res = requests.post(ARENA + "/api/arena/daily-mail", headers=headers, json=payload,
-                            timeout=145, allow_redirects=False)
+        phase = payload["action"]
+        try:
+            res = requests.post(ARENA + "/api/arena/daily-mail", headers=headers, json=payload,
+                                timeout=145, allow_redirects=False)
+        except requests.Timeout:
+            raise ArenaDigestError(phase, "transport_timeout") from None
+        except requests.RequestException:
+            raise ArenaDigestError(phase, "transport_error") from None
         if not res.ok:
-            raise RuntimeError(f"La Arena no pudo preparar el correo (HTTP {res.status_code}).")
-        return res.json()
+            raise ArenaDigestError(phase, _failure_code(res), res.status_code)
+        try:
+            data = res.json()
+        except ValueError:
+            raise ArenaDigestError(phase, "invalid_response") from None
+        if not isinstance(data, dict) or not isinstance(data.get("status"), str):
+            raise ArenaDigestError(phase, "invalid_response")
+        return data
 
     data = arena({
         "action": "prepare", "report_day": report_day.isoformat(), "report_id": report["report_id"],
@@ -126,15 +183,51 @@ def send_arena_digest(expected_session=None):
     if data["status"] == "accepted":
         return
     if data["status"] != "ready":
-        raise RuntimeError("El correo de la Arena tiene un intento pendiente de confirmación.")
+        raise ArenaDigestError("prepare", "reservation_uncertain")
+    if not isinstance(data.get("digest"), dict) or not isinstance(data.get("delivery_id"), str):
+        raise ArenaDigestError("prepare", "invalid_response")
     subject, plain, html = render_digest(data["digest"])
     try:
         receipt = send_email(settings["recipient"], subject, plain, html, config=config)
     except Exception as error:
         receipt = getattr(error, "smtp_receipt", None)
         if receipt is None:
-            raise
-    if receipt is None:
-        raise RuntimeError("Gmail no confirmó la aceptación del correo.")
-    arena({"action": "confirm", "session": session.date().isoformat(), "delivery_id": data["delivery_id"]})
+            raise ArenaDigestError("send", "smtp_unconfirmed") from None
+    if getattr(receipt, "status", None) != "smtp_accepted":
+        raise ArenaDigestError("send", "smtp_unconfirmed")
+    confirmation = arena({"action": "confirm", "session": session.date().isoformat(), "delivery_id": data["delivery_id"]})
+    if confirmation["status"] != "accepted":
+        raise ArenaDigestError("confirm", "reservation_uncertain")
     print("Correo de la Arena aceptado por Gmail.")
+
+
+def main():
+    """Separate scheduled stage: a failed Arena must not masquerade as SMTP."""
+    import sys
+    from src.digest_schedule import daily_digest_session_date
+    session = None
+    anchored = os.getenv("ARENA_EXPECTED_SESSION", "").strip()
+    if anchored:
+        try:
+            session = date.fromisoformat(anchored)
+        except ValueError:
+            print("::error::Arena: sesión de origen inválida; no se intenta correo.", file=sys.stderr)
+            return 1
+    elif os.getenv("GITHUB_EVENT_NAME") == "schedule":
+        session = daily_digest_session_date()
+        if session is None:
+            print("Arena omitida fuera de la ventana de entrega; no se intenta correo.")
+            return 0
+    try:
+        send_arena_digest(expected_session=session)
+    except ArenaDigestError as error:
+        print(f"::error::Correo Arena pendiente: fase={error.phase}; código={error.code}; HTTP={error.http_status or 'N/D'}. No se reenvían resúmenes de Stock Signal Lab.", file=sys.stderr)
+        return 1
+    except Exception:
+        print("::error::Correo Arena pendiente: fallo no clasificado; no se publican detalles privados ni se reenvían otros correos.", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
