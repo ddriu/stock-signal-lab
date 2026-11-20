@@ -1,0 +1,47 @@
+name: Recuperación autorizada de Arena del 20 noviembre
+
+on:
+  push:
+    branches: [codex/recover-arena-once-20261120]
+
+concurrency:
+  group: stock-signal-lab-daily-alerts
+  cancel-in-progress: false
+
+jobs:
+  recover-owner-arena:
+    if: github.event.created && github.repository == 'ddriu/stock-signal-lab'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 84ac9e5af5ddda544192c16e9c8457c479fbb9de
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Verificar autorización limitada al día 20, sin envíos históricos
+        run: |
+          python - <<'PY'
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          if datetime.now(ZoneInfo("Europe/Madrid")).date().isoformat() != "2026-11-20":
+              raise SystemExit("Autorización puntual caducada; no se intenta correo.")
+          PY
+      - name: Enviar solo Arena pendiente, respetando apertura y reserva persistente
+        env:
+          ARENA_EXPECTED_SESSION: "2026-11-19"
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          EMAIL_SMTP_HOST: smtp.gmail.com
+          EMAIL_SMTP_PORT: "465"
+          EMAIL_SMTP_USE_SSL: "true"
+          EMAIL_SMTP_USERNAME: ${{ secrets.EMAIL_SMTP_USERNAME }}
+          EMAIL_SMTP_PASSWORD: ${{ secrets.EMAIL_SMTP_PASSWORD }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SMTP_USERNAME }}
+          EMAIL_SENDER_NAME: Stock Signal Lab
+        run: python -m scripts.send_arena_digest
