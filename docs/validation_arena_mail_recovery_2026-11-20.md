@@ -1,13 +1,8 @@
 # Recuperación del correo de Arena — 20/11/2026
 
-## Incidente observado (producción, solo lectura)
+## Reproducción sintética
 
-- Código publicado: `46e5957aa7eca5d9744c7e0873a51b425d088a99`.
-- Run `44663483806`: Stock Signal Lab terminó; Arena respondió HTTP 409 al preparar.
-- El registro privado confirmó el resumen de la sesión 19/11 como enviado.
-- Tres modelos guardaron decisiones a las 02:56 UTC; el cuarto a las 08:42 UTC.
-- Run `44695196094`: análisis omitido por inicio tardío; Arena se saltó por la condición del workflow. No fue una recuperación exitosa.
-- No hay evidencia suficiente para atribuir el fallo original del cuarto modelo a créditos o a una validación concreta. Los registros antiguos solo conservan un código genérico.
+La revisión nocturna puede quedar omitida por un inicio tardío aunque todavía exista una ventana válida para enviar las decisiones de la siguiente sesión. La recuperación de Arena debe comprobar el calendario bursátil por separado, sin recalcular el resumen ni duplicar SMTP.
 
 ## Cambio
 
@@ -21,5 +16,6 @@
 
 - Dos regresiones fallaron sobre el código anterior: recuperación después de las 06:00 y bloqueo del workflow por Stock omitido.
 - 114 pruebas dirigidas pasaron con servicios sintéticos, sin red ni SMTP real: Arena, CLI de alertas y horarios.
+- Batería completa local: 2.206 pruebas pasan. Sintaxis Python, YAML y diff sin errores.
 - Casos añadidos: preparación parcial, reintento limitado, cruce de apertura, reserva tras timeout, correo ya aceptado, prioridades de errores y exclusión de fallos no recuperables.
-- Las verificaciones reales de publicación y entrega se documentan en el PR y sus ejecuciones de Actions. Un resultado verde por omisión no se considera una entrega.
+- Un resultado verde por omisión no se considera una entrega. Los diagnósticos y registros de entrega privados no se publican en el repositorio.
