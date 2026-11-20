@@ -4,6 +4,8 @@ from datetime import date, datetime, timezone
 from html import escape
 from zoneinfo import ZoneInfo
 import os
+import re
+from time import sleep
 
 import exchange_calendars
 import requests
@@ -13,6 +15,11 @@ from src.email_sender import load_email_config, send_email
 from src.storage import create_journal
 
 ARENA = "https://ddriu-arena-ia.gabledtapir.chatgpt.site"
+RECOVERABLE_PREPARE_CODES = frozenset({
+    "model_plan_incomplete", "model_rate_limited", "model_provider_unavailable",
+    "lease_busy", "lease_expired", "quotes_unavailable",
+    "transport_timeout", "transport_error",
+})
 
 
 class ArenaDigestError(RuntimeError):
@@ -35,6 +42,8 @@ def _failure_code(response):
         return "model_provider_payment_required"
     if "error de OpenRouter (429)" in message:
         return "model_rate_limited"
+    if re.search(r"error de OpenRouter \(5\d{2}\)", message):
+        return "model_provider_unavailable"
     for text, code in (
         ("Hay una ronda pendiente con otro informe.", "report_conflict"),
         ("Las decisiones guardadas no corresponden al informe actualizado.", "report_conflict"),
@@ -45,9 +54,13 @@ def _failure_code(response):
         ("Falta cotización", "quotes_unavailable"),
         ("La ronda requiere un informe renovado y una sesión futura.", "report_or_session_not_ready"),
         ("Todavía no está disponible el informe de Streamlit", "report_not_ready"),
+        ("La bolsa ya abrió.", "execution_window_closed"),
+        ("La temporada está cerrada.", "season_closed"),
     ):
         if text in message:
             return code
+    if "Las respuestas válidas quedan guardadas. Puedes reintentar." in message:
+        return "model_plan_incomplete"
     return "http_error"
 
 
@@ -114,22 +127,22 @@ def render_digest(digest):
 
 def send_arena_digest(expected_session=None):
     if os.getenv("GITHUB_REPOSITORY_OWNER") != "ddriu" or not os.getenv("GITHUB_ACTIONS"):
-        return
+        return "omitted_not_deployment"
     journal = create_journal("ddriu")
     report = journal.get_latest_daily_score_report()
     if not report:
-        return
+        return "omitted_no_report"
     report_day = date.fromisoformat(report["as_of"])
     if expected_session is not None and report_day != expected_session:
-        return
+        return "omitted_session_mismatch"
     calendar = exchange_calendars.get_calendar("XNYS")
     if not calendar.is_session(report_day):
-        return
+        return "omitted_nontrading_report"
     session = calendar.next_session(report_day)
     opening, closing = calendar.session_open(session), calendar.session_close(session)
     now = datetime.now(timezone.utc)
     if now < calendar.session_close(report_day) or now >= opening:
-        return
+        return "omitted_outside_execution_window"
 
     config = load_email_config()
     if not config.configured or not config.sender_email:
@@ -181,7 +194,7 @@ def send_arena_digest(expected_session=None):
         "session": session.date().isoformat(), "open_at": opening.isoformat(), "close_at": closing.isoformat(),
     })
     if data["status"] == "accepted":
-        return
+        return "already_accepted"
     if data["status"] != "ready":
         raise ArenaDigestError("prepare", "reservation_uncertain")
     if not isinstance(data.get("digest"), dict) or not isinstance(data.get("delivery_id"), str):
@@ -199,6 +212,20 @@ def send_arena_digest(expected_session=None):
     if confirmation["status"] != "accepted":
         raise ArenaDigestError("confirm", "reservation_uncertain")
     print("Correo de la Arena aceptado por Gmail.")
+    return "sent"
+
+
+def _record_status(status):
+    """Distinguish an omission from delivery, including in Actions summaries."""
+    print(f"Arena: estado={status}.")
+    output = os.getenv("GITHUB_OUTPUT")
+    if output:
+        with open(output, "a", encoding="utf-8") as stream:
+            stream.write(f"status={status}\n")
+    summary = os.getenv("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as stream:
+            stream.write(f"\nArena · estado: `{status}`. No se reenvían resúmenes de Stock Signal Lab.\n")
 
 
 def main():
@@ -215,18 +242,27 @@ def main():
             return 1
     elif os.getenv("GITHUB_EVENT_NAME") == "schedule":
         session = daily_digest_session_date()
-        if session is None:
-            print("Arena omitida fuera de la ventana de entrega; no se intenta correo.")
+        # A late recovery may read an already saved report. Unlike the Stock
+        # analysis window, its limit is the actual next exchange opening.
+        # send_arena_digest enforces report close < now < next session open.
+    for attempt in range(2):
+        try:
+            status = send_arena_digest(expected_session=session)
+            _record_status(status or "completed")
             return 0
-    try:
-        send_arena_digest(expected_session=session)
-    except ArenaDigestError as error:
-        print(f"::error::Correo Arena pendiente: fase={error.phase}; código={error.code}; HTTP={error.http_status or 'N/D'}. No se reenvían resúmenes de Stock Signal Lab.", file=sys.stderr)
-        return 1
-    except Exception:
-        print("::error::Correo Arena pendiente: fallo no clasificado; no se publican detalles privados ni se reenvían otros correos.", file=sys.stderr)
-        return 1
-    return 0
+        except ArenaDigestError as error:
+            if (attempt == 0 and error.phase == "prepare"
+                    and error.code in RECOVERABLE_PREPARE_CODES):
+                print(f"::warning::Arena pendiente: código={error.code}; un único reintento de preparación. Se conservan las decisiones válidas.", file=sys.stderr)
+                sleep(3)
+                continue
+            _record_status("pending")
+            print(f"::error::Correo Arena pendiente: fase={error.phase}; código={error.code}; HTTP={error.http_status or 'N/D'}. No se reenvían resúmenes de Stock Signal Lab.", file=sys.stderr)
+            return 1
+        except Exception:
+            _record_status("pending")
+            print("::error::Correo Arena pendiente: fallo no clasificado; no se publican detalles privados ni se reenvían otros correos.", file=sys.stderr)
+            return 1
 
 
 if __name__ == "__main__":

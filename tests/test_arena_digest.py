@@ -340,13 +340,14 @@ def test_arena_cli_hides_unclassified_private_exception(monkeypatch, capsys):
     assert "no clasificado" in captured.err
 
 
-def test_arena_cli_skips_unsafe_schedule_before_reading_accounts(monkeypatch, capsys):
+def test_arena_cli_skips_after_exchange_open_without_attempting_mail(monkeypatch, capsys, mail_case):
     monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+    monkeypatch.delenv("ARENA_EXPECTED_SESSION", raising=False)
     monkeypatch.setattr("src.digest_schedule.daily_digest_session_date", lambda: None)
-    monkeypatch.setattr(arena_mail, "send_arena_digest",
-        lambda **kwargs: pytest.fail("No account read or mail outside the safe window"))
+    mail_case.now = datetime(2026, 11, 13, 14, 30, tzinfo=timezone.utc)
     assert arena_mail.main() == 0
-    assert "omitida fuera de la ventana" in capsys.readouterr().out
+    assert mail_case.posts == mail_case.messages == []
+    assert "estado=omitted_outside_execution_window" in capsys.readouterr().out
 
 
 def test_arena_cli_uses_same_target_session_as_daily_report(monkeypatch):
@@ -374,3 +375,152 @@ def test_arena_cli_invalid_upstream_session_never_reads_or_sends(monkeypatch):
     monkeypatch.setattr(arena_mail, "send_arena_digest",
                         lambda **kwargs: pytest.fail("Invalid anchor cannot send"))
     assert arena_mail.main() == 1
+
+
+def test_arena_cli_recovers_after_stock_window_before_next_open(monkeypatch, mail_case):
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+    monkeypatch.delenv("ARENA_EXPECTED_SESSION", raising=False)
+    monkeypatch.setattr("src.digest_schedule.daily_digest_session_date", lambda: None)
+    mail_case.now = datetime(2026, 11, 13, 8, 28, tzinfo=timezone.utc)
+    assert arena_mail.main() == 0
+    assert len(mail_case.messages) == 1
+    assert mail_case.posts[-1][1]["json"]["action"] == "confirm"
+
+
+def test_daily_workflow_does_not_block_arena_when_stock_window_is_closed():
+    from pathlib import Path
+    workflow = (Path(__file__).parents[1] / ".github/workflows/daily-alerts.yml").read_text()
+    assert "if: steps.stock.outputs.status != 'omitted_outside_window'" not in workflow
+
+
+@pytest.mark.parametrize(("message", "code"), [
+    ("Atlas: formato inválido. Las respuestas válidas quedan guardadas. Puedes reintentar.", "model_plan_incomplete"),
+    ("Atlas recibió un error de OpenRouter (503). Las respuestas válidas quedan guardadas. Puedes reintentar.", "model_provider_unavailable"),
+    ("Atlas recibió un error de OpenRouter (402). Las respuestas válidas quedan guardadas. Puedes reintentar.", "model_provider_payment_required"),
+    ("La bolsa ya abrió. La ronda quedó incompleta.", "execution_window_closed"),
+    ("La temporada está cerrada.", "season_closed"),
+])
+def test_additional_prepare_diagnostics_are_safe_and_keep_payment_priority(message, code):
+    assert arena_mail._failure_code(response({"error": message + PRIVATE_MARKER}, 409)) == code
+
+
+def test_cli_partial_models_retry_preparation_once_then_send_once(monkeypatch, mail_case, capsys):
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.delenv("ARENA_EXPECTED_SESSION", raising=False)
+    original_post = arena_mail.requests.post
+    prepares = []
+
+    def partial_then_ready(url, **kwargs):
+        if kwargs["json"].get("action") == "prepare":
+            prepares.append(deepcopy(kwargs["json"]))
+            if len(prepares) == 1:
+                mail_case.posts.append((url, deepcopy(kwargs)))
+                return response({"error": "Atlas inválido. Las respuestas válidas quedan guardadas. Puedes reintentar."}, 409)
+        return original_post(url, **kwargs)
+
+    waits = []
+    monkeypatch.setattr(arena_mail.requests, "post", partial_then_ready)
+    monkeypatch.setattr(arena_mail, "sleep", waits.append)
+    assert arena_mail.main() == 0
+    assert len(prepares) == 2 and prepares[0] == prepares[1]
+    assert waits == [3]
+    assert len(mail_case.messages) == 1
+    assert mail_case.posts[-1][1]["json"]["action"] == "confirm"
+    assert "estado=sent" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(("phase", "code"), [
+    ("prepare", "model_provider_payment_required"),
+    ("prepare", "report_conflict"), ("prepare", "report_no_signals"),
+    ("prepare", "reservation_uncertain"), ("prepare", "http_error"),
+    ("prepare", "season_closed"), ("prepare", "execution_window_closed"),
+    ("send", "smtp_unconfirmed"), ("confirm", "transport_timeout"),
+])
+def test_cli_does_not_retry_unsafe_or_nonrecoverable_stages(monkeypatch, phase, code):
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.delenv("ARENA_EXPECTED_SESSION", raising=False)
+    calls = []
+
+    def fail(**kwargs):
+        calls.append(kwargs)
+        raise arena_mail.ArenaDigestError(phase, code, 409)
+
+    monkeypatch.setattr(arena_mail, "send_arena_digest", fail)
+    monkeypatch.setattr(arena_mail, "sleep", lambda _: pytest.fail("Must not retry"))
+    assert arena_mail.main() == 1
+    assert len(calls) == 1
+
+
+def test_cli_recovery_is_bounded_to_two_attempts(monkeypatch, capsys):
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    calls = []
+    monkeypatch.setattr(arena_mail, "sleep", lambda _: None)
+
+    def fail(**kwargs):
+        calls.append(kwargs)
+        raise arena_mail.ArenaDigestError("prepare", "model_plan_incomplete", 409)
+
+    monkeypatch.setattr(arena_mail, "send_arena_digest", fail)
+    assert arena_mail.main() == 1
+    assert len(calls) == 2
+    assert "estado=pending" in capsys.readouterr().out
+
+
+def test_prepare_timeout_then_reservation_never_sends_smtp(monkeypatch, mail_case):
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setattr(arena_mail, "sleep", lambda _: None)
+    original_post = arena_mail.requests.post
+    attempts = []
+
+    def reserved_after_timeout(url, **kwargs):
+        if kwargs["json"].get("action") == "prepare":
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise arena_mail.requests.Timeout(PRIVATE_MARKER)
+            return response({"status": "reserved"})
+        return original_post(url, **kwargs)
+
+    monkeypatch.setattr(arena_mail.requests, "post", reserved_after_timeout)
+    assert arena_mail.main() == 1
+    assert len(attempts) == 2 and mail_case.messages == []
+
+
+def test_recovery_rechecks_opening_before_retry(monkeypatch, mail_case, capsys):
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    mail_case.prepare = response({"error": "La Arena está procesando otra ronda."}, 409)
+
+    def cross_opening(_):
+        mail_case.now = datetime(2026, 11, 13, 14, 30, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(arena_mail, "sleep", cross_opening)
+    assert arena_mail.main() == 0
+    assert mail_case.messages == []
+    assert len(mail_case.posts) == 2
+    assert "estado=omitted_outside_execution_window" in capsys.readouterr().out
+
+
+def test_recovery_of_already_accepted_mail_is_not_a_second_send(monkeypatch, mail_case, tmp_path):
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+    monkeypatch.delenv("ARENA_EXPECTED_SESSION", raising=False)
+    monkeypatch.setattr("src.digest_schedule.daily_digest_session_date", lambda: None)
+    mail_case.now = datetime(2026, 11, 13, 10, 35, tzinfo=timezone.utc)
+    mail_case.prepare = response({"status": "accepted"})
+    output, summary = tmp_path / "output", tmp_path / "summary"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    assert arena_mail.main() == 0
+    assert mail_case.messages == []
+    assert output.read_text() == "status=already_accepted\n"
+    assert "already_accepted" in summary.read_text()
+
+
+def test_recovery_workflow_is_arena_only_and_shares_delivery_lock():
+    from pathlib import Path
+    workflow = (Path(__file__).parents[1] / ".github/workflows/arena-mail-recovery.yml").read_text()
+    assert 'cron: "35 7 * * 1-5"' in workflow
+    assert 'cron: "35 10 * * 1-5"' in workflow
+    assert "group: stock-signal-lab-daily-alerts" in workflow
+    assert "cancel-in-progress: false" in workflow
+    assert "python -m scripts.send_arena_digest" in workflow
+    assert "scripts.run_alerts" not in workflow
+    assert "MODEL_RESULTS_ENABLED" not in workflow

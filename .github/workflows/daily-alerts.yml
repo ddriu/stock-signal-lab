@@ -56,7 +56,9 @@ jobs:
         run: python -m scripts.run_alerts
 
       - name: Arena · preparar y enviar sus decisiones
-        if: steps.stock.outputs.status != 'omitted_outside_window'
+        # A delayed Stock step may be omitted while Arena's saved report is
+        # still usable before the next opening. The script checks that window.
+        if: ${{ !cancelled() && steps.stock.conclusion == 'success' }}
         env:
           # Keep the first stage's market session even if analysis crosses
           # midnight or finishes after the scheduler's startup window.
