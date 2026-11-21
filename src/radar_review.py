@@ -23,6 +23,12 @@ _TOKEN = re.compile(r"[a-f0-9]{32}\Z")
 _HASH = re.compile(r"[a-f0-9]{64}\Z")
 OUTCOMES = frozenset({"complete", "partial", "no_data", "stale", "not_saved"})
 FUNDAMENTALS = frozenset({"complete", "partial", "error", "pending"})
+DIAGNOSTICS = frozenset({
+    "stale_close", "invalid_ohlc", "currency_mismatch", "unverified_session_labels",
+    "unsupported_market", "missing_completed_close", "provider_unavailable",
+    "analysis_unavailable", "fundamentals_incomplete", "reference_unavailable",
+    "analysis_partial", "storage_failed", "adjustment_unverified", "currency_unverified", "invalid_date_labels", "instrument_mismatch", "no_data",
+})
 BATCH_SIZE = 6
 
 
@@ -39,10 +45,17 @@ class RadarOutcome:
     fundamentals: str = "pending"
     price_date: str | None = None
     snapshot_id: str | None = None
+    diagnostic_code: str | None = None
+    price_verified: bool = False
 
     def __post_init__(self) -> None:
         if self.status not in OUTCOMES or self.fundamentals not in FUNDAMENTALS:
             raise ValueError("Resultado de revisión no válido.")
+        if self.diagnostic_code is not None and self.diagnostic_code not in DIAGNOSTICS:
+            raise ValueError("Diagnóstico de revisión no válido.")
+        if (type(self.price_verified) is not bool
+                or (self.price_verified and (not self.price_date or self.status == "stale"))):
+            raise ValueError("Comprobación de precio no válida.")
         if self.price_date is not None:
             if date.fromisoformat(self.price_date).isoformat() != self.price_date:
                 raise ValueError("Fecha de precio no válida.")

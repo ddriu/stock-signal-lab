@@ -412,6 +412,61 @@ def _manual_test_frame(monkeypatch, *, as_of: str = "2026-10-14") -> pd.DataFram
     return frame
 
 
+@pytest.mark.parametrize("reverse_preferences", [False, True])
+def test_arena_manifest_keeps_each_personal_universe_without_removing_group_from_email(
+    monkeypatch, reverse_preferences,
+):
+    """The last collected account must never supply another owner's manifest."""
+    monkeypatch.setenv("MODEL_RESULTS_ENABLED", "false")
+    preferences = [
+        normalize_alert_preferences(owner="owner-a", email="a@example.invalid",
+            enabled=True, include_group=True),
+        normalize_alert_preferences(owner="owner-b", email="b@example.invalid",
+            enabled=True, include_group=False),
+    ]
+    if reverse_preferences:
+        preferences.reverse()
+
+    class MultiOwnerGroup(FakeGroupJournal):
+        def list_enabled_alert_preferences(self):
+            return preferences
+
+    group = MultiOwnerGroup(tickers=("GROUP",))
+    owners = {"owner-a": FakeJournal(tickers=("AAA",)),
+        "owner-b": FakeJournal(tickers=("BBB",))}
+    frame = _manual_test_frame(monkeypatch)
+    frame["open"], frame["high"], frame["low"], frame["atr_14"] = 99., 101., 98., 2.
+    monkeypatch.setattr("src.alert_runner.evaluate_growth_momentum", lambda **kwargs: SimpleNamespace(
+        score=85, confidence_pct=90, label="Entrada fuerte", growth_score=80, momentum_score=90,
+        context_score=80, sector_key="technology", as_of=kwargs["frame"].index[-1],
+        positive_factors=(), risk_factors=(), manual_checks=()))
+    monkeypatch.setattr("src.alert_runner.evaluate_entry_opportunity", lambda **kwargs: SimpleNamespace(
+        opportunity_score=50, confidence_pct=20, status_code=STATUS_WAIT_PRICE,
+        status_label="Esperar", explanation="Análisis sintético de aislamiento"))
+    sent = []
+
+    def journal_factory(owner):
+        return group if owner == GROUP_PORTFOLIO_OWNER else owners[owner]
+
+    result = run_daily_alerts(journal_factory=journal_factory,
+        downloader=lambda *args, **kwargs: frame.copy(),
+        fundamental_downloader=_verified_growth_info,
+        sender=lambda *args: sent.append(args), today=date(2026, 10, 15))
+
+    assert result.users_checked == result.emails_sent == len(sent) == 2
+    assert {message[0] for message in sent} == {"a@example.invalid", "b@example.invalid"}
+    first = next(iter(owners["owner-a"].reports.values()))
+    second = next(iter(owners["owner-b"].reports.values()))
+    assert first["arena_quality"]["favorite_tickers"] == ["AAA"]
+    assert second["arena_quality"]["favorite_tickers"] == ["BBB"]
+    assert first["arena_quality"]["eligible_tickers"] == ["AAA"]
+    assert second["arena_quality"]["eligible_tickers"] == ["BBB"]
+    # Group-following still belongs to A's daily information, not its Arena
+    # universe. B must not inherit A's private favorites or the shared group.
+    assert {row["ticker"] for row in first["rows"]} == {"AAA", "GROUP"}
+    assert {row["ticker"] for row in second["rows"]} == {"BBB"}
+
+
 @pytest.mark.parametrize("during_session", [False, True])
 def test_home_review_returns_linked_closed_observations_without_email_or_writes(monkeypatch, during_session):
     from src.daily_digest import seal_daily_score_report

@@ -56,7 +56,7 @@ from src.analysis_policy import (
     encode_policy_note,
     position_contexts_from_snapshot,
 )
-from src.alert_market_inputs import OwnerAlertMarketInputs
+from src.alert_market_inputs import OwnerAlertMarketInputs, download_verified_alert_prices
 from src.hourly_market_schedule import completed_daily_prices
 
 ALERT_RUNNER_VERSION = "home-preview-v1"
@@ -355,7 +355,7 @@ def run_daily_alerts(
     *,
     owner: str | None = None,
     journal_factory: Callable[[str], object] = create_journal,
-    downloader: Callable[..., pd.DataFrame] = download_prices,
+    downloader: Callable[..., pd.DataFrame] = download_verified_alert_prices,
     fundamental_downloader: Callable[[str], dict[str, object]] = (
         download_fundamental_snapshot
     ),
@@ -456,6 +456,7 @@ def run_daily_alerts(
         ],
     ] = {}
     all_tickers: set[str] = set()
+    personal_favorites_by_owner: dict[str, set[str]] = {}
     for preference in preferences:
         try:
             user_journal = (
@@ -463,6 +464,9 @@ def run_daily_alerts(
             )
             names = _favorite_names(user_journal)
             favorites = set(names)
+            # Arena coverage is personal, not the email's optional group scope.
+            # Capture it before merging group favorites and keep it owner-bound.
+            personal_favorites_by_owner[preference.owner] = set(favorites)
             positions = _position_costs(user_journal)
             snapshot_positions = _snapshot_positions(user_journal)
             contexts = _position_contexts(user_journal, errors=errors, owner=preference.owner)
@@ -1103,6 +1107,7 @@ def run_daily_alerts(
                 combined = pd.concat([saved_snapshots, pd.DataFrame(preview_observations)], ignore_index=True)
                 report = build_daily_score_report(
                     combined, tickers=scope, held_tickers=set(positions), company_names=names,
+                    favorite_tickers=personal_favorites_by_owner.get(owner, set()),
                     as_of=max(pd.Timestamp(row["analyzed_at"]).date() for row in preview_observations),
                 )
                 new_keys = {(row["ticker"], row["_preview_snapshot_id"], row["created_at"])
@@ -1175,6 +1180,7 @@ def run_daily_alerts(
                     report = build_daily_score_report(
                         stored, tickers=scope, held_tickers=set(positions),
                         company_names=names, as_of=report_date,
+                        favorite_tickers=personal_favorites_by_owner.get(owner, set()),
                     )
                     report_date = str(report.get("as_of") or "")
                     current_sessions = {(str(row.get("ticker") or ""), str(row.get("session") or ""))

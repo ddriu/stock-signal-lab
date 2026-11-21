@@ -43,3 +43,45 @@ def test_price_format_uses_human_currency() -> None:
     assert format_quote_price(17.66, "GBP") == "£17.66"
     assert format_quote_price(17.66, "GBp") == "£17.66"
 
+
+def test_conflicting_quote_currency_is_not_silently_overridden():
+    raw = _frame()
+    raw.attrs["quote_currency"] = "USD"
+    with pytest.raises(ValueError, match="moneda") as failed:
+        normalize_price_frame_units(raw, "GBp")
+    assert failed.value.code == "currency_mismatch"
+    assert raw.close.iloc[-1] == 1792.
+
+
+def test_source_pence_are_not_mistaken_for_a_display_pound_hint():
+    raw = _frame()
+    raw.attrs["quote_currency"] = "GBp"
+    result = normalize_price_frame_units(raw, "GBP")
+    assert result.close.iloc[-1] == pytest.approx(17.92)
+    assert result.attrs["source_currency"] == "GBp"
+
+
+def test_unknown_currency_is_not_certified_or_scaled():
+    result = normalize_price_frame_units(_frame(), None)
+    assert result.close.iloc[-1] == 1792.
+    assert result.attrs["quote_units_normalized"] is False
+    assert result.attrs["display_currency"] == ""
+    assert result.attrs["price_scale"] is None
+    with pytest.raises(ValueError) as failed:
+        normalize_price_frame_units(_frame(), None, require_verified=True)
+    assert failed.value.code == "currency_unverified"
+
+
+def test_normalized_history_cannot_be_relabelled_in_another_currency():
+    normalized = normalize_price_frame_units(_frame(), "GBP")
+    with pytest.raises(ValueError):
+        normalize_price_frame_units(normalized, "USD")
+
+
+def test_old_normalized_marker_without_currency_is_not_proof():
+    raw = _frame()
+    raw.attrs["quote_units_normalized"] = True
+    with pytest.raises(ValueError) as failed:
+        normalize_price_frame_units(raw, None, require_verified=True)
+    assert failed.value.code == "currency_unverified"
+

@@ -30,6 +30,7 @@ def mail_case(monkeypatch):
         now=datetime(2026, 11, 13, 2, 27, tzinfo=timezone.utc),
         report={"as_of": REPORT_DAY.isoformat(), "report_id": "a" * 64},
         posts=[], messages=[], journal_owners=[],
+        report_verified=True,
         config=EmailConfig(host="smtp.example.invalid", port=465, username="synthetic",
             password="private-password", sender_email="sender@example.invalid"),
         receipt=EmailDeliveryReceipt(status="smtp_accepted", smtp_code=250,
@@ -53,6 +54,8 @@ def mail_case(monkeypatch):
 
     monkeypatch.setattr(arena_mail, "create_journal", journal_factory)
     monkeypatch.setattr(arena_mail, "load_email_config", lambda: state.config)
+    monkeypatch.setattr(arena_mail, "arena_report_authorized",
+                        lambda report, **kwargs: state.report_verified)
     state.credentials = response({"recipient": "recipient@example.invalid",
         "site_token": "private-site-token", "job_token": "private-job-token"})
     state.digest = {"report_day": REPORT_DAY.isoformat(),
@@ -524,3 +527,23 @@ def test_recovery_workflow_is_arena_only_and_shares_delivery_lock():
     assert "python -m scripts.send_arena_digest" in workflow
     assert "scripts.run_alerts" not in workflow
     assert "MODEL_RESULTS_ENABLED" not in workflow
+
+
+def test_unverified_report_never_reads_mail_credentials_or_calls_arena(mail_case):
+    mail_case.report_verified = False
+    assert arena_mail.send_arena_digest(expected_session=REPORT_DAY) == "omitted_unverified_report"
+    assert mail_case.posts == mail_case.messages == []
+
+
+def test_paused_arena_never_sends_smtp_or_confirms(mail_case):
+    mail_case.prepare = response({"status": "paused", "message": "Calidad de datos pendiente."})
+    assert arena_mail.send_arena_digest(expected_session=REPORT_DAY) == "paused_data_quality"
+    assert mail_case.messages == []
+    assert [request["json"].get("action") for _, request in mail_case.posts] == [None, "prepare"]
+
+
+def test_legacy_unsealed_report_cannot_feed_real_quality_gate(monkeypatch, mail_case):
+    from src.arena_data_quality import arena_report_authorized
+    monkeypatch.setattr(arena_mail, "arena_report_authorized", arena_report_authorized)
+    assert arena_mail.send_arena_digest(expected_session=REPORT_DAY) == "omitted_unverified_report"
+    assert mail_case.posts == mail_case.messages == []

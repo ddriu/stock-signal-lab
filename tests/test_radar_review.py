@@ -84,6 +84,7 @@ def test_review_saves_each_batch_survives_reconnect_and_retries_only_missing(tmp
     browser = _browser(monkeypatch, {"_force_all_favorite_refresh": True})
     failed = {missing}
     frames = pd.DataFrame({"close": [30.0]}, index=pd.DatetimeIndex(["2026-11-06"]))
+    frames.attrs.update(quote_units_normalized=True, display_currency="USD")
     interrupted = False
 
     def load(tickers, *_args, **kwargs):

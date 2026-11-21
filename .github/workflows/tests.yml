@@ -73,3 +73,6 @@ jobs:
 
       - name: Validar reanudación privada y protección de escrituras de Radar
         run: node scripts/validate_radar_review_migration.mjs "$GITHUB_WORKSPACE"
+
+      - name: Validar pausa de Arena y conservación íntegra del historial
+        run: node scripts/validate_arena_pause.mjs "$GITHUB_WORKSPACE"
