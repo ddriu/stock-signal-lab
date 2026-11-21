@@ -18,6 +18,7 @@ import re
 
 import exchange_calendars as calendars
 from exchange_calendars.errors import CalendarError
+import numpy as np
 import pandas as pd
 
 
@@ -47,6 +48,14 @@ _UNSUPPORTED_PAIR = re.compile(r"-(?:USD|USDT|USDC|BTC|ETH|EUR|GBP|JPY)$")
 _ISIN = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$")
 _BARE_US_SYMBOL = re.compile(r"^[A-Z][A-Z0-9]{0,9}(?:-[A-Z0-9]{1,2})?$")
 _FOREIGN_SYMBOL = re.compile(r"^[A-Z0-9][A-Z0-9-]*$")
+
+
+class DailyPriceValidationError(ValueError):
+    """Stable, non-provider diagnostic for an unusable completed price series."""
+
+    def __init__(self, message: str, *, code: str):
+        self.code = code
+        super().__init__(message)
 
 
 def _calendar_name(ticker: object) -> str | None:
@@ -196,3 +205,54 @@ def completed_daily_prices(ticker: str, frame: pd.DataFrame, *,
             diagnosis.update(status="calendar_unavailable", excluded_rows=len(frame))
     result.attrs["hourly_market_schedule"] = diagnosis
     return result
+
+
+def validated_completed_daily_prices(ticker: str, frame: pd.DataFrame, *, now: object,
+                                     require_currency: bool = False,
+                                     currency: object = None) -> pd.DataFrame:
+    """Validate the provider candidate before accepting it for a current review.
+
+    A failed candidate may be replaced by a different complete provider series,
+    never by splicing bars, changing units or filling absent prices. This helper
+    is also suitable as ``download_prices``' optional validator callback.
+    """
+    def reject(code: str, detail: str):
+        raise DailyPriceValidationError(f"{ticker}: {detail}", code=code)
+
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        reject("missing_completed_close", "la fuente no devolvió precios utilizables.")
+    if frame.attrs.get("adjustment_status") == "unverified":
+        reject("adjustment_unverified", "la fuente no acredita los ajustes del histórico.")
+    checked = completed_daily_prices(ticker, frame, now=now)
+    diagnosis = checked.attrs["hourly_market_schedule"]
+    if diagnosis.get("status") == "unsupported_market":
+        reject("unsupported_market", "no se puede verificar el calendario del mercado.")
+    if diagnosis.get("unverified_session_labels"):
+        reject("unverified_session_labels", "no se han podido verificar las fechas diarias de la fuente.")
+    if checked.empty:
+        reject("missing_completed_close", "no hay cierres de sesión verificables.")
+    required = ("open", "high", "low", "close", "volume")
+    if (not isinstance(checked.index, pd.DatetimeIndex) or checked.index.hasnans
+            or not checked.index.is_unique or not checked.index.is_monotonic_increasing
+            or not checked.columns.is_unique or not set(required).issubset(checked.columns)):
+        reject("invalid_ohlc", "el histórico diario tiene un formato no válido.")
+    try:
+        opened, high, low, close, volume = checked.loc[:, list(required)].to_numpy(dtype=float).T
+    except (TypeError, ValueError, OverflowError):
+        reject("invalid_ohlc", "el histórico contiene valores no numéricos.")
+    if (not np.isfinite([opened, high, low, close, volume]).all()
+            or (np.minimum.reduce([opened, high, low, close]) <= 0).any()
+            or (volume < 0).any() or (high < np.maximum(opened, close)).any()
+            or (low > np.minimum(opened, close)).any() or (high < low).any()):
+        reject("invalid_ohlc", "el histórico contiene precios no válidos.")
+    expected = diagnosis.get("latest_completed_session")
+    if checked.index[-1].date().isoformat() != expected:
+        reject("stale_close", "la fuente solo devolvió un cierre anterior al último cierre confirmado.")
+    if require_currency:
+        # Callers may supply an explicit listing-currency observation; neither
+        # an empty hint nor the ticker's country is a licence to guess a unit.
+        # Reusing this in the provider callback allows a quote missing its
+        # currency to fall back to a source that actually declares one.
+        from src.price_units import normalize_price_frame_units
+        checked = normalize_price_frame_units(checked, currency, require_verified=True)
+    return checked

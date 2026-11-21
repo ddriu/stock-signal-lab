@@ -11,6 +11,7 @@ import exchange_calendars
 import requests
 
 from src.alerts import is_valid_email
+from src.arena_data_quality import arena_report_authorized
 from src.email_sender import load_email_config, send_email
 from src.storage import create_journal
 
@@ -143,6 +144,10 @@ def send_arena_digest(expected_session=None):
     now = datetime.now(timezone.utc)
     if now < calendar.session_close(report_day) or now >= opening:
         return "omitted_outside_execution_window"
+    # Calendar, coverage, currency and persisted price identities must be
+    # verified before even requesting credentials or asking models to plan.
+    if not arena_report_authorized(report, expected_session=report_day.isoformat()):
+        return "omitted_unverified_report"
 
     config = load_email_config()
     if not config.configured or not config.sender_email:
@@ -195,6 +200,8 @@ def send_arena_digest(expected_session=None):
     })
     if data["status"] == "accepted":
         return "already_accepted"
+    if data["status"] == "paused":
+        return "paused_data_quality"
     if data["status"] != "ready":
         raise ArenaDigestError("prepare", "reservation_uncertain")
     if not isinstance(data.get("digest"), dict) or not isinstance(data.get("delivery_id"), str):

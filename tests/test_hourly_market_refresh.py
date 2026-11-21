@@ -258,6 +258,32 @@ def test_known_currency_subunits_are_normalized_in_quote_not_twice_in_transport(
     assert decode_prices(row["payload"]).close.tolist() == [102.0, 103.0]
 
 
+def test_cache_does_not_certify_requested_adjustment_without_provider_evidence(journal):
+    journal.add_favorite("HALO")
+    Providers().run(journal)
+    row = MarketCacheStore(journal).read("prices", "HALO")
+    assert row["metadata"]["auto_adjust"] is None
+    assert row["metadata"]["adjustment_status"] == "unverified"
+
+
+def test_unverified_fallback_or_conflicting_currency_cannot_replace_good_cache(journal):
+    journal.add_favorite("HALO")
+    good = frame()
+    good.attrs.update(auto_adjust=True, adjustment_status="provider_confirmed")
+    Providers(prices=good).run(journal)
+    before = MarketCacheStore(journal).read("prices", "HALO")
+    bad = good.copy()
+    bad.attrs.update(provider="Stooq", auto_adjust=None, adjustment_status="unverified")
+    result = Providers(prices=bad).run(journal, now=OPEN + pd.Timedelta(hours=1))
+    assert result.prices_saved == 0
+    assert MarketCacheStore(journal).read("prices", "HALO") == before
+    bad = good.copy()
+    bad.attrs["quote_currency"] = "GBP"
+    result = Providers(prices=bad).run(journal, now=OPEN + pd.Timedelta(hours=1))
+    assert result.prices_saved == 0
+    assert MarketCacheStore(journal).read("prices", "HALO") == before
+
+
 def test_sector_and_broad_references_are_deduplicated_and_cached(journal):
     journal.add_favorite("HALO")
     journal.add_favorite("SPY")

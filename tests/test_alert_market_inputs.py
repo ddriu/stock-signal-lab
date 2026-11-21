@@ -75,6 +75,43 @@ def test_equal_session_prefers_download_not_different_cached_prices():
     assert chosen.close.iloc[-1] == downloaded.close.iloc[-1]
 
 
+def test_cache_without_price_currency_cannot_certify_an_alert_observation():
+    cached = prices()
+    cached.attrs.pop("quote_currency")
+    chosen, saved = choose(cached=row(cached))
+    assert not saved
+    assert chosen.index[-1].date() == date(2026, 11, 2)
+
+
+def test_cache_with_unverified_adjustment_does_not_feed_alerts():
+    cached = prices()
+    cached.attrs["adjustment_status"] = "unverified"
+    chosen, saved = choose(cached=row(cached))
+    assert not saved
+    assert chosen.index[-1].date() == date(2026, 11, 2)
+
+
+def test_production_alert_downloader_uses_metadata_first_and_strict_units(monkeypatch):
+    from src.alert_market_inputs import download_verified_alert_prices
+    import src.data_loader as loader
+    calls = []
+    monkeypatch.setattr("src.alert_market_inputs._clock", lambda *a: pd.Timestamp(CLOCK))
+    def fake_download(ticker, start, end, **kwargs):
+        calls.append(kwargs)
+        candidate = prices(ticker=ticker)
+        result = kwargs["validator"](ticker, candidate)
+        assert result.attrs["display_currency"] == "USD"
+        candidate.attrs.pop("quote_currency")
+        with pytest.raises(ValueError):
+            kwargs["validator"](ticker, candidate)
+        return result
+    monkeypatch.setattr(loader, "download_prices", fake_download)
+    result = download_verified_alert_prices("ANET", TARGET - pd.Timedelta(days=550), TARGET)
+    assert calls[0]["prefer_metadata"] is True
+    assert calls[0]["auto_adjust"] is True
+    assert result.index[-1].date() == TARGET
+
+
 def test_later_read_does_not_certify_intraday_payload_and_future_rows_do_not_leak():
     # A Nov4 bar was saved during its session. It may supply the confirmed
     # Nov3 close for the requested report, never the Nov4 partial quote.

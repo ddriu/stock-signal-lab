@@ -246,7 +246,14 @@ def test_incomplete_primary_does_not_replace_original_scores_or_sell_position() 
     assert enriched["Política de análisis"]["position"]["strategy_id"] == "previous_thesis"
 
 
-def test_central_policy_calculates_primary_with_explicit_engine_config() -> None:
+@pytest.mark.parametrize(("price_metadata", "expected_source", "expected_currency"), [
+    ({}, "Fuente de precio sin verificar", None),
+    ({"provider": "Fuente de prueba · cierre diario", "display_currency": "EUR",
+      "quote_units_normalized": True}, "Fuente de prueba · cierre diario", "EUR"),
+])
+def test_central_policy_calculates_primary_with_explicit_engine_config(
+    price_metadata, expected_source, expected_currency,
+) -> None:
     def growth_with_required_config(*, config, **kwargs):
         config.validate()
         return _growth()
@@ -254,16 +261,20 @@ def test_central_policy_calculates_primary_with_explicit_engine_config() -> None
     row = {"Ticker": "TEST", "Fecha": "2026-10-13", "Cierre": 100,
            "Moneda": "EUR", "Calidad empresa": 77, "Valoración": 48,
            "Riesgo controlado": 59, "Oportunidad": 60}
+    price_frame = pd.DataFrame()
+    price_frame.attrs = dict(price_metadata)
     with patch.object(application, "evaluate_growth_momentum", side_effect=growth_with_required_config):
         enriched = application._enrich_current_analysis_policy(
-            [row], {"TEST": pd.DataFrame()}, {}, {}, {}, {},
+            [row], {"TEST": price_frame}, {}, {}, {}, {},
         )[0]
 
     assert enriched["Nota principal"] == 83
     assert enriched["Oportunidad"] == 60
     assert enriched["Política de análisis"]["config"]["growth"]["candidate_score"] == 75
     assert "technical" in enriched["Política de análisis"]["config"]
-    assert enriched["Política de análisis"]["source"] == "Yahoo Finance / yfinance · cierre diario"
+    # A blank frame cannot certify Yahoo or infer its currency from a row label.
+    assert enriched["Política de análisis"]["source"] == expected_source
+    assert enriched["Política de análisis"]["currency"] == expected_currency
 
 
 def test_snapshot_note_keeps_explicit_method_and_human_note() -> None:

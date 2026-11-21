@@ -72,12 +72,25 @@ from src.alerts import normalize_alert_preferences
 # provenance-version export. Refresh before binding it or importing consumers.
 import src.data_loader as _data_loader_module
 
-if getattr(_data_loader_module, "FUNDAMENTAL_SNAPSHOT_VERSION", "") != "dated_statement_fallback_v2":
+if (getattr(_data_loader_module, "FUNDAMENTAL_SNAPSHOT_VERSION", "") != "dated_statement_fallback_v2"
+        or not {"validator", "prefer_metadata"}.issubset(
+            inspect.signature(_data_loader_module.download_prices).parameters)):
     _data_loader_module = importlib.reload(_data_loader_module)
+
+import src.hourly_market_schedule as _daily_price_runtime_module
+_daily_price_validator = getattr(_daily_price_runtime_module, "validated_completed_daily_prices", None)
+if (not callable(_daily_price_validator)
+        or "require_currency" not in inspect.signature(_daily_price_validator).parameters):
+    _daily_price_runtime_module = importlib.reload(_daily_price_runtime_module)
+import src.radar_review as _radar_review_runtime_module
+if not {"diagnostic_code", "price_verified"}.issubset(
+        getattr(_radar_review_runtime_module.RadarOutcome, "__dataclass_fields__", {})):
+    _radar_review_runtime_module = importlib.reload(_radar_review_runtime_module)
 
 from src.alert_runner import run_daily_alerts
 from src.analysis_snapshots import persist_analysis_batch_snapshots
 from src.radar_review import BATCH_SIZE as RADAR_BATCH_SIZE, RadarOutcome, RadarReview
+from src.entry_data_gate import ENTRY_DATA_REASONS, normalized_quote_currency_verified, verified_entry_prices
 from src.approximate_returns import build_approximate_return_report
 from src.auth import (
     AuthConfig,
@@ -527,9 +540,17 @@ def cached_download(
     end: date,
     auto_adjust: bool,
     refresh_token: str = "",
+    *, review_clock: str = "",
 ) -> pd.DataFrame:
     """Caché de red con una clave que permite forzar una consulta nueva."""
 
+    if review_clock:
+        from src.hourly_market_schedule import validated_completed_daily_prices
+        return download_prices(
+            ticker, start, end, auto_adjust=auto_adjust, prefer_metadata=True,
+            validator=lambda symbol, frame: validated_completed_daily_prices(
+                symbol, frame, now=review_clock, require_currency=True),
+        )
     return download_prices(ticker, start, end, auto_adjust=auto_adjust)
 
 
@@ -1100,6 +1121,7 @@ def load_market_data(
     review_reference_attempts: set[str] | None = None,
     review_reference_data: dict[str, pd.DataFrame] | None = None,
     review_clock: pd.Timestamp | None = None,
+    show_progress: bool = True,
 ) -> set[str]:
     if not tickers:
         st.error("Elige al menos una favorita o registra una posición.")
@@ -1173,12 +1195,13 @@ def load_market_data(
         else {}
     )
     errors: list[str] = []
+    diagnostics: dict[str, str] = {}
     refreshed_tickers: set[str] = set()
     stale_tickers: set[str] = set()
     refresh_token = (
         str(pd.Timestamp.utcnow().value) if refresh_fundamentals else ""
     )
-    progress = st.progress(0, text="Descargando precios…")
+    progress = st.progress(0, text="Consultando cierres…") if show_progress else None
     for position, ticker in enumerate(tickers, start=1):
         ticker_start = (
             start
@@ -1192,6 +1215,7 @@ def load_market_data(
                 end,
                 auto_adjust,
                 price_refresh_token,
+                **({"review_clock": review_clock.isoformat()} if review_clock is not None else {}),
             ))
             if review_clock is not None and not has_latest_review_close(frame):
                 latest = frame.index[-1].date()
@@ -1203,6 +1227,14 @@ def load_market_data(
             refreshed_tickers.add(ticker)
         except (DataDownloadError, ValueError) as exc:
             errors.append(str(exc))
+            code = getattr(exc, "code", "")
+            diagnostics[ticker] = code if code in {
+                "stale_close", "invalid_ohlc", "currency_mismatch", "unverified_session_labels",
+                "unsupported_market", "missing_completed_close", "provider_unavailable",
+                "adjustment_unverified", "currency_unverified", "invalid_date_labels", "instrument_mismatch", "no_data",
+            } else "provider_unavailable"
+            if code == "stale_close":
+                stale_tickers.add(ticker)
         if ticker in deep_tickers:
             try:
                 info = cached_fundamentals(
@@ -1233,11 +1265,9 @@ def load_market_data(
             # empresarial completo que ya existe en esta sesión.
             if ticker not in fundamentals:
                 fundamentals[ticker] = {"symbol": ticker, "_quick_mode": True}
-        mode = "análisis completo" if ticker in deep_tickers else "actualización rápida"
-        progress.progress(
-            position / len(tickers),
-            text=f"{ticker}: {mode}",
-        )
+        if progress is not None:
+            mode = "cierre recibido" if ticker in refreshed_tickers else "cierre no confirmado"
+            progress.progress(position / len(tickers), text=f"{ticker}: {mode}")
     reference_symbols: set[str] = set()
     # La vista de ventaja relativa compara todas las cotizaciones con la misma
     # referencia. Se descarga una sola vez y se comparte con todo el universo.
@@ -1282,7 +1312,8 @@ def load_market_data(
             attempts.add(symbol)
         try:
             frame = checked_frame(symbol, cached_download(
-                symbol, start, end, auto_adjust, price_refresh_token
+                symbol, start, end, auto_adjust, price_refresh_token,
+                **({"review_clock": review_clock.isoformat()} if review_clock is not None else {}),
             ))
             if review_clock is not None and not has_latest_review_close(frame):
                 raise DataDownloadError(f"{symbol}: falta el último cierre de la referencia.")
@@ -1296,7 +1327,8 @@ def load_market_data(
     except (ExternalDataError, ValueError) as exc:
         fx_snapshot = FxSnapshot(as_of=None, rates_per_eur={"EUR": 1.0})
         errors.append(str(exc))
-    progress.empty()
+    if progress is not None:
+        progress.empty()
     st.session_state["market_data"] = downloaded
     st.session_state["fundamental_data"] = fundamentals
     st.session_state["reference_data"] = references
@@ -1321,6 +1353,7 @@ def load_market_data(
         "failed": sorted(set(tickers).difference(refreshed_tickers)),
         "requested_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
         "forced": bool(price_refresh_token),
+        "diagnostics": diagnostics,
         **({"stale": sorted(stale_tickers)} if review_clock is not None else {}),
     }
     refreshed_statuses = {
@@ -7084,7 +7117,9 @@ def _enrich_current_analysis_policy(
         [
             {
                 **row,
-                "Fuente": row.get("Fuente") or "Yahoo Finance / yfinance · cierre diario",
+                "Fuente": (prepared.get(str(row.get("Ticker") or ""), pd.DataFrame()).attrs.get("provider")
+                           or row.get("Fuente") or "Fuente de precio sin verificar"),
+                "Moneda": prepared.get(str(row.get("Ticker") or ""), pd.DataFrame()).attrs.get("display_currency"),
                 "Incidencia principal": growth_failures.get(str(row.get("Ticker") or "")),
                 "Incidencia comparativa": comparative_failures.get(str(row.get("Ticker") or "")),
             }
@@ -7212,6 +7247,8 @@ def render_automatic_review_status(
     total, pending = len(review.tickers), len(review.pending)
     done = total - pending
     complete = sum(result.status == "complete" for result in review.outcomes.values())
+    price_verified = sum(result.price_verified is True for result in review.outcomes.values())
+    partial = sum(result.status == "partial" for result in review.outcomes.values())
     started = pd.Timestamp(review.started_at).tz_convert("Europe/Madrid").strftime("%d/%m · %H:%M")
     busy = review.busy(now)
     title = (
@@ -7223,7 +7260,10 @@ def render_automatic_review_status(
     st.caption(
         f"{title} · iniciada {started} (Madrid) · {done}/{total} con resultado registrado."
     )
-    st.write(f"**Actualizadas: {complete} · Pendientes: {pending} · Con incidencias: {done - complete}**")
+    st.write(f"**Precios validados (fecha/unidades): {price_verified} · Análisis completos: {complete} · Análisis parciales: {partial}**")
+    st.caption(f"Pendientes: {pending} · Sin análisis completo: {done - complete}. "
+               "Una incidencia puede ser de fundamentales o referencias, no necesariamente del precio.")
+    st.caption("Son controles internos de fecha, histórico y unidades; no equivalen a un contraste independiente con otra fuente.")
     if done < total and (working or busy):
         st.progress(done / total, text="Avance guardado")
     if done > complete:
@@ -7232,6 +7272,17 @@ def render_automatic_review_status(
                 tickers = [ticker for ticker, result in review.outcomes.items() if result.status == status]
                 if status != "complete" and tickers:
                     st.write(f"**{label} ({len(tickers)}):** {', '.join(tickers)}")
+            for ticker, result in review.outcomes.items():
+                if result.diagnostic_code:
+                    reason = {
+                        **ENTRY_DATA_REASONS,
+                        "provider_unavailable": "El proveedor no entregó un histórico verificable",
+                        "analysis_unavailable": "Cierre verificado, pero no se pudo calcular el análisis",
+                        "fundamentals_incomplete": "Faltan fundamentales con cobertura suficiente",
+                        "reference_unavailable": "Falta el cierre verificable del índice de referencia",
+                        "storage_failed": "No se pudo confirmar el guardado",
+                    }.get(result.diagnostic_code, "Análisis incompleto")
+                    st.caption(f"{ticker}: {reason}.")
     if compatible and not (working or busy) and (pending or review.retryable):
         st.button(
             "Reanudar pendientes" if pending else "Reintentar solo las incidencias",
@@ -7275,8 +7326,10 @@ def _run_radar_batch(
             price_refresh_token=run_references["token"], review_clock=clock,
             review_reference_attempts=run_references["symbols"],
             review_reference_data=references,
+            show_progress=False,
         )
         stale = set(st.session_state.get("_last_price_refresh", {}).get("stale", []))
+        diagnostics = st.session_state.get("_last_price_refresh", {}).get("diagnostics", {})
         raw_prices = st.session_state.get("market_data", {})
         raw_fundamentals = st.session_state.get("fundamental_data", {})
         prices = {ticker: raw_prices[ticker] for ticker in batch if ticker in refreshed}
@@ -7321,20 +7374,37 @@ def _run_radar_batch(
             saved = set(result.saved_tickers) | set(result.existing_tickers)
         outcomes = {}
         for ticker in batch:
+            price_confirmed = bool(ticker in refreshed and ticker in prepared
+                                   and normalized_quote_currency_verified(prepared[ticker]))
             if ticker not in dates:
-                outcomes[ticker] = RadarOutcome("stale" if ticker in stale else "no_data")
+                verified_date = (pd.Timestamp(raw_prices[ticker].index[-1]).date().isoformat()
+                                 if ticker in refreshed and ticker in raw_prices else None)
+                outcomes[ticker] = RadarOutcome(
+                    "stale" if ticker in stale else "no_data", price_date=verified_date,
+                    diagnostic_code=("stale_close" if ticker in stale else
+                                     "analysis_unavailable" if verified_date else
+                                     diagnostics.get(ticker, "provider_unavailable")),
+                    price_verified=bool(price_confirmed and verified_date),
+                )
             elif ticker not in saved:
-                outcomes[ticker] = RadarOutcome("not_saved", price_date=dates[ticker])
+                outcomes[ticker] = RadarOutcome("not_saved", price_date=dates[ticker],
+                                               diagnostic_code="storage_failed", price_verified=price_confirmed)
             else:
                 status = growth_fundamental_status(fundamentals.get(ticker))
                 policy = policies.get(ticker, {})
-                complete = status == "complete" and benchmark_for_ticker(ticker) in references and all(
+                complete = price_confirmed and status == "complete" and benchmark_for_ticker(ticker) in references and all(
                     policy.get(method, {}).get("data_status") == "complete"
                     for method in ("primary", "comparative")
                 )
                 outcomes[ticker] = RadarOutcome(
                     "complete" if complete else "partial",
                     status, dates[ticker], policy.get("snapshot_id") or None,
+                    diagnostic_code=(None if complete else
+                                     "currency_unverified" if not price_confirmed else
+                                     "fundamentals_incomplete" if status != "complete" else
+                                     "reference_unavailable" if benchmark_for_ticker(ticker) not in references else
+                                     "analysis_partial"),
+                    price_verified=price_confirmed,
                 )
         checkpoint = claimed.release(outcomes)
         _save_radar_checkpoint(journal, checkpoint)
@@ -7400,6 +7470,8 @@ def _radar_review_step(
         while review.pending:
             with progress.container():
                 render_automatic_review_status(review, compatible=True, now=now, working=True)
+                st.caption("Actualización en curso. Los resultados anteriores que aún se vean atenuados "
+                           "no pertenecen a esta revisión y no deben usarse como entradas actuales.")
             review = _run_radar_batch(
                 journal, review, worker, history_days=history_days,
                 auto_adjust=auto_adjust, strategy=strategy, alpha_vantage_key=alpha_vantage_key,
@@ -11933,6 +12005,10 @@ def render_entry_opportunities_page(
     journal: object,
     favorite_tickers: list[str],
     favorite_labels: dict[str, str],
+    *,
+    radar_review: RadarReview | None = None,
+    policy_snapshots: dict[str, dict[str, object]] | None = None,
+    reference_time: object | None = None,
 ) -> None:
     """Nueva capa: distingue una buena señal de un buen precio de entrada."""
 
@@ -11956,6 +12032,33 @@ def render_entry_opportunities_page(
         )
         return
 
+    clock = pd.Timestamp(reference_time) if reference_time is not None else pd.Timestamp.now(tz="UTC")
+    review_total = len(radar_review.tickers) if radar_review is not None else len(prepared)
+    gate = verified_entry_prices(prepared, review=radar_review, policies=policy_snapshots, now=clock)
+    if gate.excluded:
+        st.warning(
+            f"Revisión parcial: {len(gate.prices)}/{review_total} precios y análisis confirmados para entradas. "
+            "Los históricos, pendientes y valores con incidencias no cuentan como compras ni como cero oportunidades."
+        )
+        with st.expander(f"Tabla de decisión histórica · {len(gate.excluded)} lecturas no operativas"):
+            st.markdown("### Tabla de decisión histórica · no operativa")
+            historical_rows = []
+            for ticker, code in gate.excluded.items():
+                frame = prepared.get(ticker)
+                has_frame = isinstance(frame, pd.DataFrame) and not frame.empty
+                historical_rows.append({
+                    "Empresa": favorite_labels.get(ticker, ticker),
+                    "Fecha del cierre guardado": str(pd.Timestamp(frame.index[-1]).date()) if has_frame else "Sin dato",
+                    "Cierre guardado": float(frame["close"].iloc[-1]) if has_frame and "close" in frame else None,
+                    "Estado": ENTRY_DATA_REASONS.get(code, "Sin verificación suficiente"),
+                })
+            st.dataframe(pd.DataFrame(historical_rows), hide_index=True, width="stretch")
+    if not gate.prices:
+        st.warning("Revisión no disponible para confirmar nuevas entradas. Completa Radar o revisa sus incidencias. "
+                   "No se presentan lecturas antiguas como si fueran actuales y esto no genera ventas.")
+        return
+    prepared = gate.prices
+
     results, errors = _build_entry_opportunities(
         prepared,
         fundamental_results,
@@ -11975,13 +12078,14 @@ def render_entry_opportunities_page(
         return
 
     counts = opportunity_status_counts(results)
+    count_label = lambda count: measured_count_label(count, available=len(results), total=review_total)
     status_metrics = st.columns(4)
-    status_metrics[0].metric("Comprables ahora", counts[STATUS_BUYABLE])
-    status_metrics[1].metric("Esperar precio", counts[STATUS_WAIT_PRICE])
-    status_metrics[2].metric("Demasiado extendidas", counts[STATUS_EXTENDED])
-    status_metrics[3].metric("Evento próximo", counts[STATUS_EVENT])
+    status_metrics[0].metric("Comprables ahora", count_label(counts[STATUS_BUYABLE]))
+    status_metrics[1].metric("Esperar precio", count_label(counts[STATUS_WAIT_PRICE]))
+    status_metrics[2].metric("Demasiado extendidas", count_label(counts[STATUS_EXTENDED]))
+    status_metrics[3].metric("Evento próximo", count_label(counts[STATUS_EVENT]))
     st.caption(
-        f"{len(results)} empresas con lectura actual. Sólo las verdes pasan a la vez "
+        f"{len(results)} empresas con controles de cierre, unidades y análisis completos para esta revisión. Sólo las verdes pasan a la vez "
         "los filtros de tendencia, timing, score conjunto y beneficio/riesgo."
     )
 
@@ -16376,6 +16480,8 @@ def main(*, route: Route | None = None, pages=None) -> None:
                 journal,
                 favorite_tickers,
                 favorite_labels,
+                radar_review=radar_review if radar_compatible else None,
+                policy_snapshots=policy_snapshots,
             )
         elif (
             analysis_section == "Estrategias"

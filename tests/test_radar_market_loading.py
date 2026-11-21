@@ -38,15 +38,19 @@ def fake_loader(frames, *, existing=None):
     calls = Counter()
     state = dict(existing or {})
 
-    def download(ticker, *_):
+    def download(ticker, *_, **_kwargs):
         calls[ticker] += 1
         data = frames[ticker]
         if isinstance(data, Exception):
             raise data
         return data.copy(deep=True)
 
-    progress = SimpleNamespace(progress=lambda *a, **k: None, empty=lambda: None)
-    fake_st = SimpleNamespace(session_state=state, progress=lambda *a, **k: progress)
+    state["_test_progress_labels"] = []
+    def made_progress(*args, **kwargs):
+        state["_test_progress_labels"].append(kwargs.get("text"))
+        return progress
+    progress = SimpleNamespace(progress=lambda *a, **k: state["_test_progress_labels"].append(k.get("text")), empty=lambda: None)
+    fake_st = SimpleNamespace(session_state=state, progress=made_progress)
     node = next(
         node
         for node in ast.parse(APP.read_text(encoding="utf-8")).body
@@ -215,3 +219,18 @@ def test_review_requires_an_aware_clock_before_downloading():
     with pytest.raises(ValueError, match="zona horaria"):
         load(["AAPL"], START, END, True, review_clock=OPEN_US.tz_localize(None))
     assert not calls
+
+
+def test_radar_batch_can_suppress_its_inner_progress_bar():
+    frame = prices("2026-11-06")
+    load, state, _ = fake_loader({ticker: frame for ticker in ("AAPL", "SPY", "XLK")})
+    assert load(["AAPL"], START, END, True, review_clock=OPEN_US,
+                review_reference_attempts=set(), show_progress=False) == {"AAPL"}
+    assert state["_test_progress_labels"] == []
+
+
+def test_failed_quote_progress_does_not_claim_analysis_complete():
+    load, state, _ = fake_loader({"AAPL": DataDownloadError("no quote")})
+    load(["AAPL"], START, END, True, review_clock=OPEN_US)
+    assert any("no confirmado" in label for label in state["_test_progress_labels"])
+    assert not any("análisis completo" in label for label in state["_test_progress_labels"])

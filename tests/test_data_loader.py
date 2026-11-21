@@ -68,6 +68,7 @@ def test_download_prices_uses_direct_yahoo_chart_before_stooq(monkeypatch) -> No
             "result": [
                 {
                     "timestamp": [1735776000, 1735862400],
+                    "meta": {"symbol": "7974.T", "exchangeTimezoneName": "Asia/Tokyo", "dataGranularity": "1d"},
                     "indicators": {
                         "quote": [
                             {

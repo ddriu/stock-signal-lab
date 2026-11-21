@@ -18,6 +18,7 @@ import pandas as pd
 from src.analysis_policy import PRIMARY_STRATEGY_ID, decode_policy_note
 from src.analysis_data_quality import GROWTH_METRICS
 from src.instruments import resolve_analysis_ticker, resolve_company_name
+from src.arena_data_quality import build_arena_quality_manifest
 
 DIGEST_VERSION = "daily-score-report-v2"
 DIGEST_PRESENTATION_VERSION = "compact-mobile-v3"
@@ -316,6 +317,8 @@ def build_daily_score_report(
     snapshots: pd.DataFrame, *, tickers: Iterable[str] | None = None,
     held_tickers: Iterable[str] = (), company_names: Mapping[str, object] | None = None,
     as_of: date | str | None = None, reference_time: object | None = None,
+    favorite_tickers: Iterable[str] | None = None,
+    arena_exclusions: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     """Dated, deterministic observed history; never backfill missing scores."""
     held = {_symbol(value) for value in held_tickers if _symbol(value)}
@@ -354,7 +357,8 @@ def build_daily_score_report(
             policy = None
         created = timestamp.isoformat() if pd.notna(timestamp) else ""
         seen.setdefault((ticker, day), []).append({"policy": policy, "created": created,
-            "id": _text(row.get("id")), "snapshot_id": _text((policy or {}).get("snapshot_id"))})
+            "id": _text(row.get("id")), "snapshot_id": _text((policy or {}).get("snapshot_id")),
+            "price": row.get("price")})
     rows, calendar_status = [], "complete"
     for ticker in sorted(universe):
         dates, calendar = calendars.get(ticker, ([], _calendar_name(ticker)))
@@ -374,6 +378,19 @@ def build_daily_score_report(
                 "recorded_at": (observation["created"] or None) if observation else None, "revised": revised})
             policies.append(policy)
         current = policies[0] if policies else None
+        current_observations = seen.get((ticker, dates[0]), []) if dates else []
+        selected_observation = next((item for item in reversed(current_observations)
+            if current and item.get("snapshot_id") == current.get("snapshot_id")), None)
+        raw_price = selected_observation.get("price") if selected_observation else None
+        try:
+            price = None if isinstance(raw_price, bool) else float(raw_price)
+            price = price if price is not None and math.isfinite(price) and price > 0 else None
+        except (TypeError, ValueError, OverflowError):
+            price = None
+        policy_price = (current or {}).get("price")
+        price_bound = (price is not None and isinstance(policy_price, (int, float))
+            and not isinstance(policy_price, bool) and math.isfinite(policy_price)
+            and math.isclose(price, policy_price, rel_tol=1e-9, abs_tol=1e-9))
         primary, quality = current["primary"] if current else {}, _quality(current)
         score = _score(primary.get("score"))
         label = _text(primary.get("status")) or "Sin dato de esta sesión"
@@ -401,11 +418,20 @@ def build_daily_score_report(
             "momentum_score": _score(primary.get("momentum_score")), "growth_score": _score(primary.get("growth_score")),
             "context_score": _score(primary.get("context_score")), "session": dates[0] if dates else None,
             "calendar": calendar, "recorded_at": history[0]["recorded_at"] if history else None,
+            "primary_data_status": primary.get("data_status"),
+            "price": price, "price_session": dates[0] if price is not None and dates else None,
+            "price_currency": (current or {}).get("currency"),
+            "price_source": "analysis_snapshot" if selected_observation else None,
+            "price_identity_verified": price_bound,
             "revision_count": revisions, "source": _text((current or {}).get("source")),
             "policy_version": _text((current or {}).get("policy_version")), "snapshot_id": (current or {}).get("snapshot_id")})
     rows.sort(key=daily_score_sort_key)
+    arena_quality = build_arena_quality_manifest(rows, favorite_tickers=favorite_tickers,
+        expected_session=_day(as_of) if as_of is not None else None,
+        exclusions=arena_exclusions, reference_time=clock.isoformat())
     return seal_daily_score_report({"version": DIGEST_VERSION, "as_of": anchor,
         "session_dates": reference_dates, "calendar_status": calendar_status,
+        "arena_quality": arena_quality,
         "rows": rows, "limitations": ["Las notas son salidas observadas del modelo, no probabilidades de beneficio.",
             "No se rellenan sesiones sin análisis ni se mezclan estrategias.",
             "La comparación entre empresas no incorpora comisiones, divisa ni valoración de una operación concreta."]})

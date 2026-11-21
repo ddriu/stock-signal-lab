@@ -2,7 +2,8 @@
 
 A new short-window provider request can lag the longer hourly transport cache.
 Compare complete series, never append prices from different units/providers.
-This module reads existing cache rows only; it creates no database or quotes.
+The selector reads existing cache rows only and creates no database or quotes.
+The separate production downloader applies the same provider contract as Radar.
 """
 from __future__ import annotations
 
@@ -12,6 +13,21 @@ import pandas as pd
 
 from src.hourly_market_schedule import completed_daily_prices
 from src.market_cache import MarketCacheStore, decode_prices
+
+
+def download_verified_alert_prices(ticker, start, end, *, auto_adjust=True):
+    """Production alert downloader with the same strict contract as Radar.
+
+    No storage or SMTP occurs here. A metadata-bearing daily source is preferred
+    and every fallback must prove its completed session and explicit price unit.
+    """
+    from src.data_loader import download_prices
+    from src.hourly_market_schedule import validated_completed_daily_prices
+    now = _clock()
+    return download_prices(ticker, start, end, auto_adjust=auto_adjust,
+        prefer_metadata=True,
+        validator=lambda symbol, frame: validated_completed_daily_prices(
+            symbol, frame, now=now, require_currency=True))
 
 
 def _clock(value=None):
@@ -73,6 +89,8 @@ def prefer_alert_prices(downloaded, cached_row, *, owner, ticker, target_date, n
         cached = cached.loc[[stamp.date() <= declared_closed.date() for stamp in cached.index]].copy(deep=True)
         if cached.empty:
             return original, False
+        from src.hourly_market_schedule import validated_completed_daily_prices
+        cached = validated_completed_daily_prices(ticker, cached, now=observed, require_currency=True)
         previous_currency, cached_currency = _currency(original), _currency(raw)
         if previous_currency and cached_currency and previous_currency != cached_currency:
             return original, False

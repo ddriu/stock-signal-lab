@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from io import StringIO
 import math
+from typing import Callable
 from urllib.parse import quote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 import requests
@@ -42,6 +44,11 @@ STOOQ_INDEX_SYMBOLS = {
 
 class DataDownloadError(RuntimeError):
     """Error recuperable al obtener o validar precios."""
+
+    def __init__(self, message: str, *, code: str = "download_unavailable", attempts=()):
+        self.code = code
+        self.attempts = tuple(attempts)
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -384,7 +391,38 @@ def _download_stooq_prices(
 
     frame = frame.set_index("Date")
     frame.attrs["provider"] = "Stooq"
+    # This CSV does not attest currency or the requested split/dividend policy.
+    # It can remain indicative, never certified as an adjusted engine series.
+    frame.attrs.update(auto_adjust=None, adjustment_status="unverified",
+                       daily_session_contract="provider_date_labels")
     return frame
+
+
+def _yahoo_daily_session_index(symbol: str, timestamps, metadata: dict) -> pd.DatetimeIndex:
+    """Map verified Yahoo daily epochs to local exchange session dates."""
+    from src.hourly_market_schedule import _calendar
+
+    if metadata.get("dataGranularity") != "1d":
+        raise DataDownloadError("Unverified daily granularity", code="unverified_session_labels")
+    if str(metadata.get("symbol") or "").upper() != symbol:
+        raise DataDownloadError("Unverified instrument", code="instrument_mismatch")
+    try:
+        zone = ZoneInfo(str(metadata.get("exchangeTimezoneName") or ""))
+    except (ZoneInfoNotFoundError, ValueError):
+        raise DataDownloadError("Unverified exchange timezone", code="unverified_session_labels") from None
+    calendar = _calendar(symbol)
+    if calendar is None:
+        raise DataDownloadError("Unverified exchange", code="unsupported_market")
+    instants = pd.to_datetime(timestamps, unit="s", utc=True)
+    local = instants.tz_convert(zone)
+    expected_zone = instants.tz_convert(calendar.tz)
+    if any(a.utcoffset() != b.utcoffset() or a.date() != b.date()
+           for a, b in zip(local, expected_zone)):
+        raise DataDownloadError("Conflicting exchange timezone", code="unverified_session_labels")
+    # The API contract is daily, not intraday. Its epoch may be the opening
+    # instant (Sydney often lies on the previous UTC date); preserve its LOCAL
+    # exchange date as a label, then apply the separate completed-session gate.
+    return local.normalize().tz_localize(None)
 
 
 def _download_yahoo_chart_prices(
@@ -434,7 +472,7 @@ def _download_yahoo_chart_prices(
         quote_values = quotes[0]
         frame = pd.DataFrame(
             {
-                "Date": pd.to_datetime(timestamps, unit="s", utc=True).tz_localize(None),
+                "Date": _yahoo_daily_session_index(symbol, timestamps, metadata),
                 "Open": quote_values.get("open"),
                 "High": quote_values.get("high"),
                 "Low": quote_values.get("low"),
@@ -445,16 +483,22 @@ def _download_yahoo_chart_prices(
 
         adjusted = indicators.get("adjclose") or []
         adjusted_values = adjusted[0].get("adjclose") if adjusted else None
-        if auto_adjust and adjusted_values is not None:
+        if auto_adjust:
+            if adjusted_values is None or len(adjusted_values) != len(frame):
+                raise DataDownloadError("Missing adjusted daily closes", code="adjustment_unverified")
             adjusted_close = pd.Series(adjusted_values, index=frame.index, dtype=float)
-            ratio = adjusted_close.div(frame["Close"]).replace([float("inf"), float("-inf")], pd.NA)
-            ratio = ratio.fillna(1.0)
+            ratio = adjusted_close.div(frame["Close"])
+            if not ratio.map(lambda value: math.isfinite(value) and value > 0).all():
+                raise DataDownloadError("Invalid adjustment factors", code="adjustment_unverified")
             for column in ("Open", "High", "Low", "Close"):
                 frame[column] = pd.to_numeric(frame[column], errors="coerce") * ratio
         frame.attrs["provider"] = "Yahoo Finance (conexión directa)"
         frame.attrs["quote_currency"] = str(metadata.get("currency") or "").strip()
+        frame.attrs.update(auto_adjust=bool(auto_adjust), adjustment_status="provider_confirmed",
+                           daily_session_contract="yahoo_daily_exchange_timezone_v1",
+                           exchange_timezone=str(metadata["exchangeTimezoneName"]))
         return frame
-    except (requests.RequestException, AttributeError, KeyError, TypeError, ValueError) as exc:
+    except (requests.RequestException, AttributeError, KeyError, TypeError, ValueError, ZoneInfoNotFoundError) as exc:
         # No se expone la URL completa ni la respuesta interna del proveedor en
         # la interfaz móvil. El detalle técnico sigue encadenado en la excepción.
         raise DataDownloadError(
@@ -468,6 +512,8 @@ def download_prices(
     end: date | str,
     *,
     auto_adjust: bool = True,
+    validator: Callable[[str, pd.DataFrame], pd.DataFrame] | None = None,
+    prefer_metadata: bool = False,
 ) -> pd.DataFrame:
     """Descarga OHLCV diario y devuelve un índice temporal ordenado.
 
@@ -481,7 +527,7 @@ def download_prices(
     if start_ts >= end_ts:
         raise ValueError("La fecha inicial debe ser anterior a la final.")
 
-    try:
+    def primary():
         frame = yf.download(
             symbol,
             start=start_ts.date().isoformat(),
@@ -491,55 +537,74 @@ def download_prices(
             actions=False,
             threads=False,
         )
-    except Exception:  # yfinance puede lanzar errores de red heterogéneos
-        frame = pd.DataFrame()
+        if isinstance(frame, pd.DataFrame):
+            frame.attrs.update(provider="Yahoo Finance", auto_adjust=bool(auto_adjust),
+                               adjustment_status="provider_confirmed",
+                               daily_session_contract="provider_date_labels")
+        return frame
 
-    if frame.empty:
+    attempts = []
+    sources = (
+        ("Yahoo Finance", primary),
+        ("Yahoo Finance (conexión directa)", lambda: _download_yahoo_chart_prices(
+            symbol, start_ts, end_ts, auto_adjust=auto_adjust)),
+        ("Stooq", lambda: _download_stooq_prices(symbol, start_ts, end_ts)),
+    )
+    if prefer_metadata:
+        # Strict review consumers need currency and timezone as well as OHLC.
+        # The chart response carries all three, avoiding a predictable extra
+        # request when yfinance's DataFrame omits the price's unit metadata.
+        sources = (sources[1], sources[0], sources[2])
+    for provider, fetch in sources:
         try:
-            frame = _download_yahoo_chart_prices(
-                symbol,
-                start_ts,
-                end_ts,
-                auto_adjust=auto_adjust,
-            )
-        except DataDownloadError:
-            # Se intenta Stooq a continuación; el detalle del proveedor no es
-            # útil para quien usa la aplicación desde el móvil.
-            pass
-
-    if frame.empty:
-        try:
-            frame = _download_stooq_prices(symbol, start_ts, end_ts)
-        except DataDownloadError as exc:
-            raise DataDownloadError(
-                f"No encontramos precios para {symbol} en ese periodo. "
-                "Busca la empresa por nombre o comprueba el ticker y su mercado."
-            ) from exc
-
-    if isinstance(frame.columns, pd.MultiIndex):
-        # yfinance reciente devuelve (campo, ticker) incluso para un símbolo.
-        frame.columns = frame.columns.get_level_values(0)
-
-    frame = frame.rename(columns=lambda column: str(column).strip().lower())
-    missing = [column for column in REQUIRED_COLUMNS if column not in frame.columns]
-    if missing:
-        raise DataDownloadError(f"Faltan columnas para {symbol}: {', '.join(missing)}")
-
-    result = frame.loc[:, list(REQUIRED_COLUMNS)].copy()
-    result.index = pd.to_datetime(result.index).tz_localize(None)
-    result = result[~result.index.duplicated(keep="last")].sort_index()
-    result = result.apply(pd.to_numeric, errors="coerce")
-    result = result.dropna(subset=["open", "high", "low", "close"])
-    result["volume"] = result["volume"].fillna(0.0)
-    result.attrs["ticker"] = symbol
-    result.attrs["provider"] = frame.attrs.get("provider", "Yahoo Finance")
-    # Se conserva el instante real de la consulta dentro del propio DataFrame.
-    # Así la interfaz puede distinguir una descarga nueva de un objeto devuelto
-    # por la caché de Streamlit.
-    result.attrs["fetched_at_utc"] = pd.Timestamp.now(tz="UTC").isoformat()
-    if frame.attrs.get("quote_currency"):
-        result.attrs["quote_currency"] = frame.attrs["quote_currency"]
-    return result
+            frame = fetch()
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                raise DataDownloadError("No daily observations", code="no_data")
+            if isinstance(frame.columns, pd.MultiIndex):
+                frame.columns = frame.columns.get_level_values(0)
+            frame = frame.rename(columns=lambda column: str(column).strip().lower())
+            if not frame.columns.is_unique or not set(REQUIRED_COLUMNS).issubset(frame.columns):
+                raise DataDownloadError("Invalid daily columns", code="invalid_ohlc")
+            result = frame.loc[:, list(REQUIRED_COLUMNS)].copy()
+            result.index = pd.to_datetime(result.index).tz_localize(None)
+            if result.index.hasnans or not result.index.is_unique:
+                raise DataDownloadError("Invalid daily dates", code="invalid_date_labels")
+            result = result.sort_index().apply(pd.to_numeric, errors="coerce")
+            opened, high, low, close, volume = result.to_numpy(dtype=float).T
+            if (not all(math.isfinite(value) for value in result.to_numpy(dtype=float).flat)
+                    or (result.loc[:, ["open", "high", "low", "close"]] <= 0).any().any()
+                    or (volume < 0).any() or (high < low).any()
+                    or (high < pd.concat([result.open, result.close], axis=1).max(axis=1)).any()
+                    or (low > pd.concat([result.open, result.close], axis=1).min(axis=1)).any()):
+                raise DataDownloadError("Invalid daily price range", code="invalid_ohlc")
+            result.attrs = dict(frame.attrs)
+            result.attrs.update(ticker=symbol, provider=provider,
+                requested_auto_adjust=bool(auto_adjust),
+                fetched_at_utc=pd.Timestamp.now(tz="UTC").isoformat())
+            if validator is not None:
+                result = validator(symbol, result)
+                if not isinstance(result, pd.DataFrame) or result.empty:
+                    raise DataDownloadError("No validated daily observations", code="no_data")
+            result.attrs["provider_attempts"] = list(attempts)
+            return result
+        except Exception as exc:
+            # Provider exception strings can contain URLs, tokens or bodies.
+            # Persist only our stable stage/code, never the private response.
+            code = getattr(exc, "code", None)
+            if not isinstance(code, str) or not code.replace("_", "").isalpha():
+                code = "provider_unavailable"
+            attempts.append({"provider": provider, "code": code})
+    codes = {item["code"] for item in attempts}
+    code = next((value for value in (
+        "currency_mismatch", "instrument_mismatch", "invalid_ohlc", "invalid_date_labels",
+        "stale_close", "adjustment_unverified", "unverified_session_labels", "unsupported_market",
+        "missing_completed_close", "no_data",
+    ) if value in codes), "download_unavailable")
+    raise DataDownloadError(
+        f"No encontramos precios validados para {symbol} en ese periodo. "
+        "Busca la empresa por nombre o comprueba el ticker y su mercado.",
+        code=code, attempts=attempts,
+    )
 
 
 def _statement_series(

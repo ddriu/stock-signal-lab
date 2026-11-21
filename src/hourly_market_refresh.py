@@ -165,6 +165,8 @@ def refresh_market_cache(journal, *, now=None, bootstrap=False, max_symbols=200,
             calendar = _calendar(ticker)
             if calendar is None or frame.empty:
                 raise ValueError("Unverified market/empty history")
+            if frame.attrs.get("adjustment_status") == "unverified":
+                raise ValueError("Unverified price adjustment policy")
             # A session label can be tomorrow in UTC (Australia), but its
             # official opening must already be in the past. Never save a
             # genuinely future bar over the last valid cached observation.
@@ -173,10 +175,19 @@ def refresh_market_cache(journal, *, now=None, bootstrap=False, max_symbols=200,
                 raise ValueError("Future or unverified price session")
             payload = encode_prices(frame)
             currency = infos.get(ticker, {}).get("currency") or frame.attrs.get("quote_currency")
-            normalized = normalize_price_frame_units(frame, currency)
+            normalized = normalize_price_frame_units(frame, currency, require_verified=True)
+            previous_currency = ((head or {}).get("metadata", {}).get("quote", {}).get("currency"))
+            if previous_currency and previous_currency != normalized.attrs.get("display_currency"):
+                from src.price_units import PriceUnitError
+                raise PriceUnitError("La moneda nueva no coincide con la última cotización guardada.",
+                                     code="currency_mismatch")
             closed = completed_daily_prices(ticker, frame, now=now)
             metadata = {
-                "auto_adjust": True, "interval": "1d", "history_start": frame.index[0].isoformat(),
+                # A requested option is not evidence that a fallback applied it.
+                "auto_adjust": (frame.attrs.get("auto_adjust")
+                                if type(frame.attrs.get("auto_adjust")) is bool else None),
+                "adjustment_status": frame.attrs.get("adjustment_status", "unverified"),
+                "interval": "1d", "history_start": frame.index[0].isoformat(),
                 "history_end": frame.index[-1].isoformat(), "rows": len(frame),
                 "quote": {"price": float(normalized.close.iloc[-1]),
                     "currency": normalized.attrs.get("display_currency", ""),
