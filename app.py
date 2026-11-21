@@ -15610,6 +15610,12 @@ def main(*, route: Route | None = None, pages=None) -> None:
         elif route.key != "mas":
             st.caption(f"Más / {route.label}")
         selected_section = route.section
+        if route.key == "analistas":
+            # Private read-only route: no quote download, analysis sidebar,
+            # model recalculation, automatic import or SMTP on navigation.
+            from src.external_analyst_ui import render_external_analysts
+            render_external_analysts(journal, held=_portfolio_tracking_tickers(journal))
+            return
     else:
         selected_section = st.segmented_control(
             "Navegación principal",

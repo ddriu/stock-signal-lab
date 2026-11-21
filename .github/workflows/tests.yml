@@ -73,3 +73,6 @@ jobs:
 
       - name: Validar reanudación privada y protección de escrituras de Radar
         run: node scripts/validate_radar_review_migration.mjs "$GITHUB_WORKSPACE"
+
+      - name: Validar analistas externos privados y registros inmutables
+        run: node scripts/validate_external_analysts_migration.mjs "$GITHUB_WORKSPACE"
