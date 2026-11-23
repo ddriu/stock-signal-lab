@@ -54,6 +54,7 @@ for name in (
     "src.journal", "src.supabase_journal", "src.storage", "src.session_journal",
     "src.hourly_market_schedule", "src.market_cache_ui", "src.analysis_snapshots",
     "src.opportunity_catalog", "src.opportunity_status", "src.runtime_compat",
+    "src.indicators",
 ):
     previous_module(name)
 
@@ -67,6 +68,12 @@ assert old_consumer.JournalStorageError is old_error
 
 empty = pd.DataFrame()
 strategy = StrategyConfig()
+prices_with_evidence = pd.DataFrame({
+    "open": [100.] * 80, "high": [101.] * 80, "low": [99.] * 80,
+    "close": [100.] * 80, "volume": [1000] * 80,
+}, index=pd.date_range("2026-01-01", periods=80))
+prices_with_evidence.attrs = {"quote_units_normalized": True, "display_currency": "USD"}
+assert not old.add_indicators(prices_with_evidence, strategy).attrs
 missing_keyword(
     lambda: old.build_opportunity_catalog(["NVDA"], empty, [], verified_review={}),
     "verified_review",
@@ -116,10 +123,12 @@ with (
         "src.runtime_compat", "src.journal", "src.supabase_journal", "src.storage",
         "src.session_journal", "src.hourly_market_schedule", "src.market_cache_ui",
         "src.analysis_snapshots", "src.opportunity_catalog", "src.opportunity_status",
+        "src.indicators",
     }
     assert set(reloaded) == expected and len(reloaded) == len(expected), reloaded
     assert current.JournalStorageError is old_consumer.JournalStorageError is old_error
     assert current.st.session_state["qa_radar_keep"] == {"owner": "qa_local", "favorite": "NVDA"}
+    assert current.add_indicators(prices_with_evidence, strategy).attrs == prices_with_evidence.attrs
 
     with patch.object(storage, "load_supabase_config", return_value=None):
         local = current.cached_journal("qa_local")

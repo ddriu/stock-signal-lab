@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import numpy as np
 import pandas as pd
 
 from config import StrategyConfig
 from src.stop_engine import AtrMethod, calculate_atr
+
+PRICE_METADATA_VERSION = "preserved-price-metadata-v1"
 
 
 def calculate_rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -133,4 +137,8 @@ def add_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
     data["atr_14"] = calculate_atr(data, period=14, method=AtrMethod.SMA)
     adx = calculate_adx(data, period=14)
     data = data.join(adx)
+    # Joining the derived ADX frame drops attrs when its empty metadata differs
+    # from the price frame's. Indicators do not change prices or their units:
+    # retain the exact source evidence, including unknown/unverified markers.
+    data.attrs = deepcopy(frame.attrs)
     return data
