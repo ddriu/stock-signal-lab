@@ -104,4 +104,3 @@ app._radar_review_step(journal, ["SYNTH"], strategy=StrategyConfig(),
     text = " ".join(w.value for w in page.warning)
     assert "Consultando fundamentales: SYNTH" in text
     assert "PRIVATE_PROVIDER_BODY" not in text
-
