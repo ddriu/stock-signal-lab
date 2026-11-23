@@ -6,6 +6,7 @@ Versión de estabilización auditada: 2026-10-03.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, fields, replace
 from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
@@ -86,6 +87,10 @@ import src.radar_review as _radar_review_runtime_module
 if not {"diagnostic_code", "price_verified"}.issubset(
         getattr(_radar_review_runtime_module.RadarOutcome, "__dataclass_fields__", {})):
     _radar_review_runtime_module = importlib.reload(_radar_review_runtime_module)
+
+import src.indicators as _indicator_runtime_module
+if getattr(_indicator_runtime_module, "PRICE_METADATA_VERSION", "") != "preserved-price-metadata-v1":
+    _indicator_runtime_module = importlib.reload(_indicator_runtime_module)
 
 from src.alert_runner import run_daily_alerts
 from src.analysis_snapshots import persist_analysis_batch_snapshots
@@ -1122,6 +1127,7 @@ def load_market_data(
     review_reference_data: dict[str, pd.DataFrame] | None = None,
     review_clock: pd.Timestamp | None = None,
     show_progress: bool = True,
+    progress_callback=None,
 ) -> set[str]:
     if not tickers:
         st.error("Elige al menos una favorita o registra una posición.")
@@ -1209,6 +1215,8 @@ def load_market_data(
             else max(start, end - timedelta(days=420))
         )
         try:
+            if progress_callback is not None:
+                progress_callback(ticker, "Consultando precio")
             frame = checked_frame(ticker, cached_download(
                 ticker,
                 ticker_start,
@@ -1237,6 +1245,8 @@ def load_market_data(
                 stale_tickers.add(ticker)
         if ticker in deep_tickers:
             try:
+                if progress_callback is not None:
+                    progress_callback(ticker, "Consultando fundamentales")
                 info = cached_fundamentals(
                     ticker, refresh_token, source_version=FUNDAMENTAL_SNAPSHOT_VERSION,
                 )
@@ -1311,6 +1321,8 @@ def load_market_data(
         if attempts is not None:
             attempts.add(symbol)
         try:
+            if progress_callback is not None:
+                progress_callback(symbol, "Consultando referencia")
             frame = checked_frame(symbol, cached_download(
                 symbol, start, end, auto_adjust, price_refresh_token,
                 **({"review_clock": review_clock.isoformat()} if review_clock is not None else {}),
@@ -1323,6 +1335,8 @@ def load_market_data(
         except (DataDownloadError, ValueError) as exc:
             errors.append(f"No se pudo calcular la comparación con {symbol}: {exc}")
     try:
+        if progress_callback is not None:
+            progress_callback("", "Comprobando divisas")
         fx_snapshot = cached_fx_rates()
     except (ExternalDataError, ValueError) as exc:
         fx_snapshot = FxSnapshot(as_of=None, rates_per_eur={"EUR": 1.0})
@@ -7191,7 +7205,7 @@ def _bind_navigation_owner(owner: str) -> None:
     if previous is not None and previous != owner:
         invalidate_view_cache(st.session_state)
         for key in list(st.session_state):
-            if str(key).startswith(("investment_", "_investment_", "_requested_plan_", "_radar_review_",
+            if str(key).startswith(("investment_", "_investment_", "_requested_plan_", "_radar_review_", "_radar_fragment_",
                                     "analysis_picker_", "favorite_search_", "favorite_list_search_")):
                 st.session_state.pop(key, None)
         for key in st.session_state.get("_navigation_sidebar_values", {}):
@@ -7233,6 +7247,7 @@ def _remember_analysis_controls(*, restore=False) -> None:
 
 def render_automatic_review_status(
     review: RadarReview | None, *, compatible: bool, now: datetime, working: bool = False,
+    activity: str = "",
 ) -> None:
     """Estado del trabajo guardado; consultar esta vista no descarga mercado."""
     if review is None:
@@ -7265,8 +7280,8 @@ def render_automatic_review_status(
                "Una incidencia puede ser de fundamentales o referencias, no necesariamente del precio.")
     st.caption("Son controles internos de fecha, histórico y unidades; no equivalen a un contraste independiente con otra fuente.")
     if done < total and (working or busy):
-        st.progress(done / total, text="Avance guardado")
-    if done > complete:
+        st.progress(done / total, text=(f"Guardadas {done}/{total} · {activity}" if activity else "Avance guardado"))
+    if done > complete and not working:
         with st.expander("Ver qué ha faltado"):
             for status, label in statuses.items():
                 tickers = [ticker for ticker, result in review.outcomes.items() if result.status == status]
@@ -7306,6 +7321,7 @@ def _save_radar_checkpoint(journal, review: RadarReview) -> None:
 def _run_radar_batch(
     journal, review: RadarReview, worker: str, *, history_days: int,
     auto_adjust: bool, strategy: StrategyConfig, alpha_vantage_key: str = "",
+    progress_callback=None,
 ) -> RadarReview:
     """Download, calculate and save just the claimed batch before yielding."""
     claimed = review.claim(worker, datetime.now(timezone.utc))
@@ -7313,6 +7329,18 @@ def _run_radar_batch(
     batch = claimed.pending[:RADAR_BATCH_SIZE]
     committed = False
     try:
+        def report_progress(symbol: str, stage: str) -> None:
+            nonlocal claimed
+            # Fence a worker that lost its lease before more IO or snapshots.
+            # Renew at phase boundaries, not by widening the recovery timeout.
+            observed = datetime.now(timezone.utc)
+            if claimed.lease_until is not None and observed >= claimed.lease_until - timedelta(minutes=2):
+                renewed = claimed.claim(worker, observed)
+                _save_radar_checkpoint(journal, renewed)
+                claimed = renewed
+            if progress_callback is not None:
+                progress_callback(symbol, stage)
+
         clock = pd.Timestamp(claimed.started_at)
         end = clock.tz_convert("Europe/Madrid").date()
         run_references = st.session_state.get("_radar_review_references")
@@ -7327,6 +7355,7 @@ def _run_radar_batch(
             review_reference_attempts=run_references["symbols"],
             review_reference_data=references,
             show_progress=False,
+            progress_callback=report_progress,
         )
         stale = set(st.session_state.get("_last_price_refresh", {}).get("stale", []))
         diagnostics = st.session_state.get("_last_price_refresh", {}).get("diagnostics", {})
@@ -7334,6 +7363,7 @@ def _run_radar_batch(
         raw_fundamentals = st.session_state.get("fundamental_data", {})
         prices = {ticker: raw_prices[ticker] for ticker in batch if ticker in refreshed}
         fundamentals = {ticker: raw_fundamentals.get(ticker, {}) for ticker in prices}
+        report_progress("", "Calculando análisis del bloque")
         prepared, summary, fundamental_results, valuations, relatives, risks, opportunities = (
             _analysis_view_context(prices, fundamentals, references, strategy, journal,
                                    align_reference_dates=True)
@@ -7358,6 +7388,7 @@ def _run_radar_batch(
         claimed = renewed
         saved: set[str] = set()
         if dates:
+            report_progress("", "Guardando resultados del bloque")
             sessions = sorted(set(dates.values()))
             pages = [
                 journal.list_analysis_snapshots_for_sessions(sessions[offset:offset + 5], tickers=tuple(dates))
@@ -7424,20 +7455,27 @@ def _run_radar_batch(
 def _radar_review_step(
     journal, universe: list[str], *, strategy: StrategyConfig, history_days: int, auto_adjust: bool,
     alpha_vantage_key: str = "",
+    allow_work: bool = True,
+    max_batches: int | None = None,
+    continue_review: bool = False,
+    progress_slot=None,
 ) -> tuple[RadarReview | None, bool]:
     """Read progress on navigation; work only after explicit start/resume."""
     now = datetime.now(timezone.utc)
     context = sha256(json.dumps(
-        [sorted(universe), asdict(strategy), history_days, auto_adjust],
+        [sorted(universe), asdict(strategy), history_days, auto_adjust,
+         "radar-price-metadata-v2"],
         sort_keys=True, default=str,
     ).encode()).hexdigest()
-    start_requested = bool(st.session_state.pop("_force_all_favorite_refresh", False))
-    resume_requested = bool(st.session_state.pop("_radar_review_resume", False))
+    start_requested = allow_work and bool(st.session_state.pop("_force_all_favorite_refresh", False))
+    resume_requested = allow_work and (
+        bool(st.session_state.pop("_radar_review_resume", False)) or continue_review)
     review = None
     try:
         review = RadarReview.from_checkpoint(journal.get_radar_review_checkpoint())
         compatible = bool(review and review.compatible(context, now))
         if start_requested or resume_requested:
+            st.session_state.pop("_radar_review_notice", None)
             if review and review.busy(now):
                 st.info("Ya hay una revisión en curso. El avance queda guardado por bloques.")
                 return review, compatible
@@ -7454,38 +7492,118 @@ def _radar_review_step(
                 _save_radar_checkpoint(journal, candidate)
                 review = candidate
                 compatible = True
-            elif resume_requested and not review.pending and review.retryable:
+            elif resume_requested and not continue_review and not review.pending and review.retryable:
                 candidate = review.retry(now)
                 _save_radar_checkpoint(journal, candidate)
                 review = candidate
                 st.session_state.pop("_radar_review_references", None)
         if not (start_requested or resume_requested) or not compatible or not review.pending:
             return review, compatible
+        if max_batches == 0:
+            return review, compatible
         worker = uuid4().hex
-        progress = st.empty()
-        # Emit progress between durable batches instead of requesting a full
-        # rerun, which can compete with a navigation event for a different page.
-        # Streamlit can interrupt this run at the progress or data yield points;
-        # a new page/session cannot keep it running without explicit resume.
+        progress = progress_slot if progress_slot is not None else st.empty()
+        processed = 0
+        # The web worker uses one batch per fragment tick. Direct/offline callers
+        # can still drain the explicitly requested queue in a single call.
         while review.pending:
-            with progress.container():
-                render_automatic_review_status(review, compatible=True, now=now, working=True)
-                st.caption("Actualización en curso. Los resultados anteriores que aún se vean atenuados "
-                           "no pertenecen a esta revisión y no deben usarse como entradas actuales.")
+            def show_progress(symbol: str = "", stage: str = "Preparando siguiente bloque") -> None:
+                progress.empty()
+                activity = f"{stage}: {symbol}" if symbol else stage
+                st.session_state["_radar_review_last_activity"] = activity
+                with progress.container():
+                    render_automatic_review_status(review, compatible=True,
+                        now=datetime.now(timezone.utc), working=True, activity=activity)
+            show_progress()
             review = _run_radar_batch(
                 journal, review, worker, history_days=history_days,
                 auto_adjust=auto_adjust, strategy=strategy, alpha_vantage_key=alpha_vantage_key,
+                progress_callback=show_progress,
             )
-        progress.empty()
+            processed += 1
+            if max_batches is not None and processed >= max_batches:
+                break
+        if progress_slot is None:
+            progress.empty()
         return review, True
     except Exception as exc:
         if start_requested or resume_requested:
             logging.getLogger(__name__).warning("Revisión de Radar pausada: %s", type(exc).__name__)
-            st.warning("Revisión pausada. Lo ya guardado se conserva. "
-                       "Si el bloque estaba reservado, espera unos minutos antes de reanudar.")
+            activity = st.session_state.get("_radar_review_last_activity", "Preparando la revisión")
+            reason = "Conflicto de guardado" if isinstance(exc, JournalStorageError) else "No se pudo completar el bloque"
+            notice = (f"Revisión pausada: {reason.lower()}. Última etapa: {activity}. "
+                      "Los bloques confirmados se conservan; puedes reanudar lo pendiente.")
+            st.session_state["_radar_review_notice"] = notice
+            st.warning(notice)
         elif hasattr(journal, "get_radar_review_checkpoint"):
             st.caption("No se pudo consultar el progreso guardado del Radar.")
         return review, bool(review and review.compatible(context, now))
+
+
+@contextmanager
+def _analysis_result_surface(enabled: bool):
+    """One replaceable surface for saved results and live review progress.
+
+    Clear the previous surface before blocking provider IO. Merely creating a
+    new progress placeholder leaves the prior page visible as stale DOM.
+    """
+    if not enabled:
+        yield
+        return
+    surface = st.empty()
+    surface.empty()
+    with surface.container():
+        yield
+
+
+@st.fragment(run_every=1.0)
+def _radar_review_fragment(
+    journal, universe, *, strategy, history_days, auto_adjust, alpha_vantage_key="",
+) -> None:
+    """Only an explicitly armed, visible Radar processes one durable batch.
+
+    The full page renders a progress-only state and finishes before the first
+    provider call. Native fragment cleanup then owns subsequent updates; saved
+    result cards are never kept on a long-running full-page script.
+    """
+    execution = st.session_state.get("_radar_review_execution")
+    if not execution or execution.get("owner") != journal.owner:
+        return
+    review, compatible = _radar_review_step(
+        journal, universe, strategy=strategy, history_days=history_days,
+        auto_adjust=auto_adjust, alpha_vantage_key=alpha_vantage_key, allow_work=False,
+    )
+    if (not review or not compatible or execution.get("run_id") != review.run_id
+            or not review.pending or review.busy(datetime.now(timezone.utc))):
+        st.session_state.pop("_radar_review_execution", None)
+        st.rerun()
+    slot = st.empty()
+    if st.session_state.pop("_radar_fragment_defer", False):
+        with slot.container():
+            render_automatic_review_status(review, compatible=True,
+                now=datetime.now(timezone.utc), working=True, activity="Preparando primer bloque")
+        return
+    revision = review.revision
+    review, compatible = _radar_review_step(
+        journal, universe, strategy=strategy, history_days=history_days,
+        auto_adjust=auto_adjust, alpha_vantage_key=alpha_vantage_key,
+        continue_review=True, max_batches=1, progress_slot=slot,
+    )
+    if (not review or not compatible or not review.pending
+            or st.session_state.get("_radar_review_notice") or review.revision == revision):
+        st.session_state.pop("_radar_review_execution", None)
+        st.rerun()
+    with slot.container():
+        render_automatic_review_status(review, compatible=True,
+            now=datetime.now(timezone.utc), working=True, activity="Bloque guardado; preparando el siguiente")
+
+
+def _bind_radar_execution_view(view: str) -> None:
+    """Leaving the explicit work view never arms downloads in another view."""
+    execution = st.session_state.get("_radar_review_execution")
+    if execution and execution.get("view") != view:
+        st.session_state.pop("_radar_review_execution", None)
+        st.session_state.pop("_radar_fragment_defer", None)
 
 
 def render_market_data_status(
@@ -16047,6 +16165,8 @@ def main(*, route: Route | None = None, pages=None) -> None:
         )
     )
     review_position_tickers: list[str] = []
+    review_view_key = route.key if route is not None else f"{selected_section}/{analysis_section}/{analysis_detail}"
+    _bind_radar_execution_view(review_view_key)
     if automatic_review_page:
         try:
             review_position_tickers = [
@@ -16081,6 +16201,7 @@ def main(*, route: Route | None = None, pages=None) -> None:
             journal, review_universe, strategy=strategy,
             history_days=max(1, (end - start).days), auto_adjust=auto_adjust,
             alpha_vantage_key=alpha_vantage_key,
+            allow_work=False,
         )
     growth_scan_tickers = requested_growth_scan_tickers
     if requested_pending_ticker and requested_pending_ticker != pending_analysis_ticker:
@@ -16327,8 +16448,9 @@ def main(*, route: Route | None = None, pages=None) -> None:
             "Especulativas"
         )
         st.rerun()
-    for error in st.session_state.get("download_errors", []):
-        st.warning(error)
+    if not automatic_review_page:
+        for error in st.session_state.get("download_errors", []):
+            st.warning(error)
 
     passive_catalog = route is not None and route.key == "radar" and not should_load_market
     if not should_load_market and not passive_catalog:
@@ -16435,214 +16557,259 @@ def main(*, route: Route | None = None, pages=None) -> None:
         )
 
     elif selected_section == "Analizar":
-        if route is not None and analysis_section == "Radar":
-            st.button(
-                "Actualizar ahora todas mis favoritas", key="radar_primary_refresh",
-                icon=":material/refresh:", type="primary", disabled=not favorite_tickers,
-                on_click=_request_all_favorite_refresh,
-            )
-            st.caption("Consulta los cierres y guarda el avance por bloques. Abrir Radar muestra lo guardado sin descargar.")
-        elif analysis_section in {"Radar", "Oportunidades", "Estrategias"}:
-            render_market_data_status(raw_data, favorite_tickers, show_refresh=analysis_section == "Radar")
-        if automatic_review_page:
-            render_automatic_review_status(
-                radar_review, compatible=radar_compatible, now=datetime.now(timezone.utc),
-            )
-        if analysis_section == "Radar":
-            render_opportunities_page(
-                raw_data,
-                prepared,
-                summary,
-                strategy,
-                backtest,
-                fundamental_results,
-                valuation_results,
-                relative_results,
-                risk_results,
-                opportunity_results,
-                raw_fundamentals,
-                price_verifications,
-                journal,
-                favorite_tickers,
-                include_company_detail=False,
-                radar_review=radar_review if radar_compatible else None,
-                show_entries_shortcut=route is None,
-            )
-        elif analysis_section == "Oportunidades":
-            render_entry_opportunities_page(
-                prepared,
-                strategy,
-                fundamental_results,
-                valuation_results,
-                relative_results,
-                risk_results,
-                raw_fundamentals,
-                journal,
-                favorite_tickers,
-                favorite_labels,
-                radar_review=radar_review if radar_compatible else None,
-                policy_snapshots=policy_snapshots,
-            )
-        elif (
-            analysis_section == "Estrategias"
-            and analysis_detail == "Ventaja relativa"
-        ):
-            render_benchmark_outperformance_page(
-                prepared,
-                strategy,
-                raw_fundamentals,
-                reference_data,
-                valuation_results,
-                relative_results,
-                risk_results,
-                opportunity_results,
-                journal,
-                favorite_tickers,
-                favorite_labels,
-                private_favorites,
-            )
-        elif (
-            analysis_section == "Empresa"
-            and analysis_detail == "Análisis individual"
-        ):
-            render_page_intro(
-                "ANÁLISIS DE EMPRESA",
-                "Entender una empresa",
-                "Busca una sola vez y revisa qué apoya la inversión, qué puede fallar "
-                "y si el precio ofrece una entrada razonable.",
-            )
-            render_analysis_company_picker(
-                favorite_tickers,
-                favorite_labels,
-                journal,
-                raw_fundamentals,
-            )
-            render_company_analysis_page(
-                prepared,
-                strategy,
-                backtest,
-                fundamental_results,
-                valuation_results,
-                relative_results,
-                risk_results,
-                opportunity_results,
-                raw_fundamentals,
-                price_verifications,
-                journal,
-                policy_snapshots=policy_snapshots,
-                summary_rows=summary,
-            )
-        elif (
-            analysis_section == "Empresa"
-            and analysis_detail == "Comparar empresas"
-        ):
-            render_page_intro(
-                "COMPARAR",
-                "Comparar empresas",
-                "Compara negocios semejantes; el precio nominal de una acción no indica "
-                "si está más barata o es mejor que otra.",
-            )
-            render_sector_comparison(
-                prepared,
-                fundamental_results,
-                valuation_results,
-                risk_results,
-                private_favorites,
-                group_favorites,
-            )
-        elif (
-            analysis_section == "Estrategias"
-            and analysis_detail == "Crecimiento y momentum"
-        ):
-            render_growth_momentum_page(
-                prepared,
-                raw_fundamentals,
-                reference_data,
-                relative_results,
-                risk_results,
-                fx_snapshot,
-                journal,
-                private_favorites,
-                group_favorites,
-                authenticated_user.username,
-                comparative_summary=summary,
-            )
-        elif (
-            analysis_section == "Estrategias"
-            and analysis_detail == "Calidad fundamental"
-        ):
-            render_fundamental_filter_page(
-                prepared,
-                raw_fundamentals,
-                strategy,
-                private_favorites,
-                group_favorites,
-                favorite_labels,
-            )
-        elif analysis_section == "Estrategias" and analysis_detail == "Especulativas":
-            render_speculative_opportunities_page(
-                prepared,
-                strategy,
-                fundamental_results,
-                valuation_results,
-                relative_results,
-                risk_results,
-                raw_fundamentals,
-                favorite_labels,
-                list(st.session_state.get("_speculative_candidates", []) or []),
-            )
-        elif analysis_section == "Validar" and analysis_detail == "Resultado posterior":
-            render_long_horizon_calibration(
-                prepared,
-                summary,
-                backtest,
-                fundamental_results,
-            )
-        elif analysis_section == "Validar" and analysis_detail == "Evolución del análisis":
-            render_page_intro(
-                "VALIDAR MÉTODO",
-                "Evolución del análisis",
-                "Consulta cómo cambiaron el precio y las notas entre revisiones; no es "
-                "un registro de compras y ventas.",
-            )
-            render_saved_analysis_history(journal, prepared)
-        elif (
-            analysis_section == "Validar"
-            and analysis_detail == "Backtest técnico"
-            and not prepared
-        ):
-            st.info("Actualiza empresas antes de ejecutar una prueba histórica.")
-        elif analysis_section == "Validar" and analysis_detail == "Backtest técnico":
-            render_page_intro(
-                "VALIDAR MÉTODO",
-                "Backtest técnico",
-                "Simula las reglas sobre datos históricos. Sirve para detectar una "
-                "estrategia frágil; no predice la próxima subida.",
-            )
-            preferred_backtest = str(
-                st.session_state.get("analysis_ticker", "") or ""
-            )
-            if preferred_backtest not in prepared:
-                preferred_backtest = next(iter(prepared))
-            if st.session_state.get("backtest_select") not in prepared:
-                st.session_state["backtest_select"] = preferred_backtest
-            selected_backtest = st.selectbox(
-                "Empresa para la prueba histórica",
-                list(prepared),
-                key="backtest_select",
-                on_change=_sync_analysis_ticker,
-                args=("backtest_select",),
-            )
-            st.info(
-                "El cálculo se ejecuta automáticamente con el historial ya descargado. "
-                "Cambiar de pestaña no vuelve a consultar el mercado."
-            )
-            render_backtest(
-                selected_backtest,
-                prepared[selected_backtest],
-                strategy,
-                backtest,
-            )
+        with _analysis_result_surface(automatic_review_page):
+            if route is not None and analysis_section == "Radar":
+                st.button(
+                    "Actualizar ahora todas mis favoritas", key="radar_primary_refresh",
+                    icon=":material/refresh:", type="primary",
+                    disabled=(not favorite_tickers
+                        or bool(st.session_state.get("_force_all_favorite_refresh")
+                                or st.session_state.get("_radar_review_resume")
+                                or st.session_state.get("_radar_review_execution"))
+                        or bool(radar_review and radar_review.busy(datetime.now(timezone.utc)))),
+                    on_click=_request_all_favorite_refresh,
+                )
+                st.caption("Consulta los cierres y guarda el avance por bloques. Abrir Radar muestra lo guardado sin descargar.")
+            elif analysis_section in {"Radar", "Oportunidades", "Estrategias"}:
+                render_market_data_status(raw_data, favorite_tickers, show_refresh=analysis_section == "Radar")
+            if automatic_review_page:
+                requested_review = bool(st.session_state.get("_force_all_favorite_refresh")
+                                        or st.session_state.get("_radar_review_resume"))
+                if not favorite_storage_error:
+                    radar_review, radar_compatible = _radar_review_step(
+                        journal, review_universe, strategy=strategy,
+                        history_days=max(1, (end - start).days), auto_adjust=auto_adjust,
+                        alpha_vantage_key=alpha_vantage_key,
+                        max_batches=0,
+                    )
+                if requested_review and not favorite_storage_error:
+                    if (radar_review and radar_compatible and radar_review.pending
+                            and not radar_review.busy(datetime.now(timezone.utc))):
+                        st.session_state["_radar_review_execution"] = {
+                            "owner": journal.owner, "run_id": radar_review.run_id, "view": review_view_key,
+                        }
+                execution = st.session_state.get("_radar_review_execution")
+                if execution and not favorite_storage_error:
+                    if (radar_review and radar_compatible and radar_review.pending
+                            and execution.get("owner") == journal.owner
+                            and execution.get("run_id") == radar_review.run_id):
+                        # The initial fragment renders only. The page must finish
+                        # and remove stale results before any provider IO begins.
+                        st.session_state["_radar_fragment_defer"] = True
+                        _radar_review_fragment(
+                            journal, review_universe, strategy=strategy,
+                            history_days=max(1, (end - start).days), auto_adjust=auto_adjust,
+                            alpha_vantage_key=alpha_vantage_key,
+                        )
+                        st.caption("Puedes cambiar de página; los bloques confirmados quedan guardados. "
+                                   "Para continuar al volver, pulsa «Reanudar pendientes».")
+                        return
+                    st.session_state.pop("_radar_review_execution", None)
+                notice = st.session_state.pop("_radar_review_notice", None)
+                if notice:
+                    st.warning(notice)
+                render_automatic_review_status(
+                    radar_review, compatible=radar_compatible, now=datetime.now(timezone.utc),
+                )
+                if st.session_state.get("download_errors"):
+                    with st.expander("Detalles guardados de la última consulta"):
+                        for error in st.session_state["download_errors"]:
+                            st.warning(error)
+            if analysis_section == "Radar":
+                render_opportunities_page(
+                    raw_data,
+                    prepared,
+                    summary,
+                    strategy,
+                    backtest,
+                    fundamental_results,
+                    valuation_results,
+                    relative_results,
+                    risk_results,
+                    opportunity_results,
+                    raw_fundamentals,
+                    price_verifications,
+                    journal,
+                    favorite_tickers,
+                    include_company_detail=False,
+                    radar_review=radar_review if radar_compatible else None,
+                    show_entries_shortcut=route is None,
+                )
+            elif analysis_section == "Oportunidades":
+                render_entry_opportunities_page(
+                    prepared,
+                    strategy,
+                    fundamental_results,
+                    valuation_results,
+                    relative_results,
+                    risk_results,
+                    raw_fundamentals,
+                    journal,
+                    favorite_tickers,
+                    favorite_labels,
+                    radar_review=radar_review if radar_compatible else None,
+                    policy_snapshots=policy_snapshots,
+                )
+            elif (
+                analysis_section == "Estrategias"
+                and analysis_detail == "Ventaja relativa"
+            ):
+                render_benchmark_outperformance_page(
+                    prepared,
+                    strategy,
+                    raw_fundamentals,
+                    reference_data,
+                    valuation_results,
+                    relative_results,
+                    risk_results,
+                    opportunity_results,
+                    journal,
+                    favorite_tickers,
+                    favorite_labels,
+                    private_favorites,
+                )
+            elif (
+                analysis_section == "Empresa"
+                and analysis_detail == "Análisis individual"
+            ):
+                render_page_intro(
+                    "ANÁLISIS DE EMPRESA",
+                    "Entender una empresa",
+                    "Busca una sola vez y revisa qué apoya la inversión, qué puede fallar "
+                    "y si el precio ofrece una entrada razonable.",
+                )
+                render_analysis_company_picker(
+                    favorite_tickers,
+                    favorite_labels,
+                    journal,
+                    raw_fundamentals,
+                )
+                render_company_analysis_page(
+                    prepared,
+                    strategy,
+                    backtest,
+                    fundamental_results,
+                    valuation_results,
+                    relative_results,
+                    risk_results,
+                    opportunity_results,
+                    raw_fundamentals,
+                    price_verifications,
+                    journal,
+                    policy_snapshots=policy_snapshots,
+                    summary_rows=summary,
+                )
+            elif (
+                analysis_section == "Empresa"
+                and analysis_detail == "Comparar empresas"
+            ):
+                render_page_intro(
+                    "COMPARAR",
+                    "Comparar empresas",
+                    "Compara negocios semejantes; el precio nominal de una acción no indica "
+                    "si está más barata o es mejor que otra.",
+                )
+                render_sector_comparison(
+                    prepared,
+                    fundamental_results,
+                    valuation_results,
+                    risk_results,
+                    private_favorites,
+                    group_favorites,
+                )
+            elif (
+                analysis_section == "Estrategias"
+                and analysis_detail == "Crecimiento y momentum"
+            ):
+                render_growth_momentum_page(
+                    prepared,
+                    raw_fundamentals,
+                    reference_data,
+                    relative_results,
+                    risk_results,
+                    fx_snapshot,
+                    journal,
+                    private_favorites,
+                    group_favorites,
+                    authenticated_user.username,
+                    comparative_summary=summary,
+                )
+            elif (
+                analysis_section == "Estrategias"
+                and analysis_detail == "Calidad fundamental"
+            ):
+                render_fundamental_filter_page(
+                    prepared,
+                    raw_fundamentals,
+                    strategy,
+                    private_favorites,
+                    group_favorites,
+                    favorite_labels,
+                )
+            elif analysis_section == "Estrategias" and analysis_detail == "Especulativas":
+                render_speculative_opportunities_page(
+                    prepared,
+                    strategy,
+                    fundamental_results,
+                    valuation_results,
+                    relative_results,
+                    risk_results,
+                    raw_fundamentals,
+                    favorite_labels,
+                    list(st.session_state.get("_speculative_candidates", []) or []),
+                )
+            elif analysis_section == "Validar" and analysis_detail == "Resultado posterior":
+                render_long_horizon_calibration(
+                    prepared,
+                    summary,
+                    backtest,
+                    fundamental_results,
+                )
+            elif analysis_section == "Validar" and analysis_detail == "Evolución del análisis":
+                render_page_intro(
+                    "VALIDAR MÉTODO",
+                    "Evolución del análisis",
+                    "Consulta cómo cambiaron el precio y las notas entre revisiones; no es "
+                    "un registro de compras y ventas.",
+                )
+                render_saved_analysis_history(journal, prepared)
+            elif (
+                analysis_section == "Validar"
+                and analysis_detail == "Backtest técnico"
+                and not prepared
+            ):
+                st.info("Actualiza empresas antes de ejecutar una prueba histórica.")
+            elif analysis_section == "Validar" and analysis_detail == "Backtest técnico":
+                render_page_intro(
+                    "VALIDAR MÉTODO",
+                    "Backtest técnico",
+                    "Simula las reglas sobre datos históricos. Sirve para detectar una "
+                    "estrategia frágil; no predice la próxima subida.",
+                )
+                preferred_backtest = str(
+                    st.session_state.get("analysis_ticker", "") or ""
+                )
+                if preferred_backtest not in prepared:
+                    preferred_backtest = next(iter(prepared))
+                if st.session_state.get("backtest_select") not in prepared:
+                    st.session_state["backtest_select"] = preferred_backtest
+                selected_backtest = st.selectbox(
+                    "Empresa para la prueba histórica",
+                    list(prepared),
+                    key="backtest_select",
+                    on_change=_sync_analysis_ticker,
+                    args=("backtest_select",),
+                )
+                st.info(
+                    "El cálculo se ejecuta automáticamente con el historial ya descargado. "
+                    "Cambiar de pestaña no vuelve a consultar el mercado."
+                )
+                render_backtest(
+                    selected_backtest,
+                    prepared[selected_backtest],
+                    strategy,
+                    backtest,
+                )
 
     elif selected_section == "Favoritos":
         if not persistent_journal_enabled():
