@@ -34,7 +34,7 @@ from src.view_cache import get_or_build_view, invalidate_view_cache
 from src.portfolio_view_context import reconcile_home_views
 import src.runtime_compat as _analysis_runtime_module
 
-if getattr(_analysis_runtime_module, "RUNTIME_COMPAT_VERSION", "") != "arena-report-runtime-v1":
+if getattr(_analysis_runtime_module, "RUNTIME_COMPAT_VERSION", "") != "arena-report-runtime-v2":
     _analysis_runtime_module = importlib.reload(_analysis_runtime_module)
 prepare_analysis_runtime = _analysis_runtime_module.prepare_analysis_runtime
 
@@ -74,6 +74,7 @@ from src.alerts import normalize_alert_preferences
 import src.data_loader as _data_loader_module
 
 if (getattr(_data_loader_module, "FUNDAMENTAL_SNAPSHOT_VERSION", "") != "dated_statement_fallback_v2"
+        or getattr(_data_loader_module, "PRICE_VALIDATION_VERSION", "") != "completed-session-ohlc-order-v1"
         or not {"validator", "prefer_metadata"}.issubset(
             inspect.signature(_data_loader_module.download_prices).parameters)):
     _data_loader_module = importlib.reload(_data_loader_module)

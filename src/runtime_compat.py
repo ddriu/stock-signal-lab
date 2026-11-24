@@ -10,7 +10,7 @@ import inspect
 import sys
 from threading import RLock
 
-RUNTIME_COMPAT_VERSION = "arena-report-runtime-v1"
+RUNTIME_COMPAT_VERSION = "arena-report-runtime-v2"
 JOURNAL_RESOURCE_VERSION = "radar-checkpoints-v1"
 
 # Keep one lock for concurrent app reruns, including when this module itself
@@ -36,6 +36,7 @@ _VERSIONS = {
     "src.saved_close_report": ("SAVED_CLOSE_REPORT_VERSION", "saved-close-report-v1"),
 }
 _SCOPE_VERSIONS = {
+    "src.data_loader": ("PRICE_VALIDATION_VERSION", "completed-session-ohlc-order-v1"),
     "src.instruments": ("INSTRUMENT_SCOPE_VERSION", "isin-market-scope-v1"),
     "src.arena_data_quality": ("ARENA_SCOPE_VERSION", "isin-market-scope-v1"),
     "src.daily_digest": ("DIGEST_SCOPE_VERSION", "isin-market-scope-v1"),
