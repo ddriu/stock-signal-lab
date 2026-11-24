@@ -24,6 +24,7 @@ from src.instruments import ANALYSIS_TICKER_ALIASES, resolve_analysis_ticker
 
 REQUIRED_COLUMNS = ("open", "high", "low", "close", "volume")
 FUNDAMENTAL_SNAPSHOT_VERSION = "dated_statement_fallback_v2"
+PRICE_VALIDATION_VERSION = "completed-session-ohlc-order-v1"
 STOOQ_DAILY_URL = "https://stooq.com/q/d/l/"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 STOOQ_SUFFIXES = {
@@ -570,13 +571,6 @@ def download_prices(
             if result.index.hasnans or not result.index.is_unique:
                 raise DataDownloadError("Invalid daily dates", code="invalid_date_labels")
             result = result.sort_index().apply(pd.to_numeric, errors="coerce")
-            opened, high, low, close, volume = result.to_numpy(dtype=float).T
-            if (not all(math.isfinite(value) for value in result.to_numpy(dtype=float).flat)
-                    or (result.loc[:, ["open", "high", "low", "close"]] <= 0).any().any()
-                    or (volume < 0).any() or (high < low).any()
-                    or (high < pd.concat([result.open, result.close], axis=1).max(axis=1)).any()
-                    or (low > pd.concat([result.open, result.close], axis=1).min(axis=1)).any()):
-                raise DataDownloadError("Invalid daily price range", code="invalid_ohlc")
             result.attrs = dict(frame.attrs)
             result.attrs.update(ticker=symbol, provider=provider,
                 requested_auto_adjust=bool(auto_adjust),
@@ -585,6 +579,17 @@ def download_prices(
                 result = validator(symbol, result)
                 if not isinstance(result, pd.DataFrame) or result.empty:
                     raise DataDownloadError("No validated daily observations", code="no_data")
+            # A completed-session validator must remove the still-open daily
+            # bar before its provisional OHLC can reject an otherwise valid
+            # history. Every accepted row retains the same exhaustive checks;
+            # without a validator, the entire provider series is still checked.
+            opened, high, low, close, volume = result.to_numpy(dtype=float).T
+            if (not all(math.isfinite(value) for value in result.to_numpy(dtype=float).flat)
+                    or (result.loc[:, ["open", "high", "low", "close"]] <= 0).any().any()
+                    or (volume < 0).any() or (high < low).any()
+                    or (high < pd.concat([result.open, result.close], axis=1).max(axis=1)).any()
+                    or (low > pd.concat([result.open, result.close], axis=1).min(axis=1)).any()):
+                raise DataDownloadError("Invalid daily price range", code="invalid_ohlc")
             result.attrs["provider_attempts"] = list(attempts)
             return result
         except Exception as exc:
