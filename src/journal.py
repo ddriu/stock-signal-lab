@@ -28,6 +28,10 @@ from src.daily_digest_storage import (
     digest_identifier, digest_market_date, digest_terminal_state,
     normalized_digest_report,
 )
+from src.arena_universe_policy import (
+    normalize_arena_universe_policy, prepare_arena_universe_policy_change,
+    validate_arena_policy_owner,
+)
 from src.analysis_policy import (
     POSITION_PLAN_MARKER,
     POLICY_NOTE_MARKER,
@@ -1319,6 +1323,7 @@ class TradingJournal:
         owner: str = "",
     ) -> None:
         self.database_path = Path(database_path)
+        self._arena_policy_owner = owner.lower()
         self.owner = owner.strip().lower() or self.database_path.stem
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
@@ -1473,6 +1478,16 @@ class TradingJournal:
     def _initialize(self) -> None:
         self._migrate_primary_snapshot_storage()
         with self._connect() as connection:
+            connection.execute("""CREATE TABLE IF NOT EXISTS arena_universe_policies (
+                owner TEXT PRIMARY KEY NOT NULL CHECK (length(owner) BETWEEN 1 AND 128
+                    AND owner=trim(owner) AND lower(owner) NOT IN
+                    ('anon','anonymous','public','group','grupo_compartido')),
+                mode TEXT NOT NULL CHECK (mode IN ('strict','verified_only')),
+                approved_at TEXT,
+                version TEXT NOT NULL CHECK (version='arena-universe-policy-v1'),
+                policy_id TEXT NOT NULL CHECK (length(policy_id)=64 AND policy_id NOT GLOB '*[^0-9a-f]*'),
+                CHECK (mode='strict' OR approved_at IS NOT NULL)
+            )""")
             connection.execute("""CREATE TABLE IF NOT EXISTS radar_review_checkpoints (
                 owner TEXT PRIMARY KEY NOT NULL,
                 revision INTEGER NOT NULL CHECK (revision BETWEEN 1 AND 2147483647),
@@ -2581,6 +2596,48 @@ class TradingJournal:
         revision = validate_radar_checkpoint_revision(row["revision"])
         checkpoint = json.loads(row["checkpoint"])
         return {**json.loads(radar_checkpoint_json(checkpoint)), "revision": revision}
+
+    def _arena_policy_scope(self) -> str:
+        owner = validate_arena_policy_owner(getattr(self, "_arena_policy_owner", self.owner))
+        if owner != self.owner:
+            raise ValueError("El propietario de la política de Arena ha cambiado.")
+        return owner
+
+    def get_arena_universe_policy(self) -> dict[str, object]:
+        """Read current owner consent; absence defaults to strict without writes."""
+        owner = self._arena_policy_scope()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT owner,mode,approved_at,version,policy_id FROM arena_universe_policies WHERE owner=?",
+                (owner,),
+            ).fetchone()
+        return normalize_arena_universe_policy(dict(row) if row is not None else None, owner=owner)
+
+    def set_arena_universe_policy(
+        self, mode: str, *, owner_consent: bool = False, approved_at: object | None = None,
+    ) -> dict[str, object]:
+        """Persist consent only; never change favorites, investments or mail."""
+        owner = self._arena_policy_scope()
+        candidate = prepare_arena_universe_policy_change(owner, mode,
+            owner_consent=owner_consent, approved_at=approved_at)
+        previous = self.get_arena_universe_policy()
+        if previous["mode"] == mode and previous["approved_at"] is not None:
+            return previous
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO arena_universe_policies(owner,mode,approved_at,version,policy_id) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(owner) DO UPDATE SET mode=excluded.mode, "
+                "approved_at=excluded.approved_at,version=excluded.version,policy_id=excluded.policy_id",
+                tuple(candidate[key] for key in ("owner", "mode", "approved_at", "version", "policy_id")),
+            )
+            row = connection.execute(
+                "SELECT owner,mode,approved_at,version,policy_id FROM arena_universe_policies WHERE owner=?",
+                (owner,),
+            ).fetchone()
+            saved = normalize_arena_universe_policy(dict(row) if row is not None else None, owner=owner)
+            if saved != candidate:
+                raise ValueError("No se pudo confirmar la política exacta del universo de Arena.")
+        return saved
 
     def save_radar_review_checkpoint(
         self, checkpoint: dict[str, object], *, expected_revision: int | None,

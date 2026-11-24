@@ -82,7 +82,7 @@ with (
     import src.daily_digest as digest
     import src.saved_close_report as bridge
 
-    assert compat.RUNTIME_COMPAT_VERSION == 'arena-report-runtime-v2'
+    assert compat.RUNTIME_COMPAT_VERSION == 'arena-universe-runtime-v3'
     assert reloaded[0] == 'src.runtime_compat',reloaded
     assert reloaded.index('src.instruments') < reloaded.index('src.arena_data_quality') < reloaded.index('src.daily_digest')
     assert instruments is old_instruments and digest is old_digest

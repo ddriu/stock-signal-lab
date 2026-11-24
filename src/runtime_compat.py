@@ -10,8 +10,8 @@ import inspect
 import sys
 from threading import RLock
 
-RUNTIME_COMPAT_VERSION = "arena-report-runtime-v2"
-JOURNAL_RESOURCE_VERSION = "radar-checkpoints-v1"
+RUNTIME_COMPAT_VERSION = "arena-universe-runtime-v3"
+JOURNAL_RESOURCE_VERSION = "arena-universe-policy-v1"
 
 # Keep one lock for concurrent app reruns, including when this module itself
 # was reloaded during a deployment.
@@ -22,7 +22,7 @@ if "_RADAR_RUNTIME_LOCK" not in globals():
 ANALYSIS_MODULE_ORDER = (
     "src.instruments", "src.data_sources", "src.data_loader", "src.analysis_data_quality",
     "src.analysis_policy", "src.growth_candidates", "src.portfolio_rotation", "src.arena_data_quality",
-    "src.daily_digest", "src.saved_close_report",
+    "src.arena_universe_policy", "src.arena_universe", "src.daily_digest", "src.saved_close_report",
     "src.daily_digest_ui", "src.analysis_snapshots", "src.alert_runner",
 )
 _VERSIONS = {
@@ -34,6 +34,8 @@ _VERSIONS = {
     "src.analysis_snapshots": ("PRIMARY_PERSISTENCE_VERSION", "independent-primary-storage-v1"),
     "src.alert_runner": ("ALERT_RUNNER_VERSION", "home-preview-v1"),
     "src.saved_close_report": ("SAVED_CLOSE_REPORT_VERSION", "saved-close-report-v1"),
+    "src.arena_universe_policy": ("ARENA_UNIVERSE_POLICY_VERSION", "arena-universe-policy-v1"),
+    "src.arena_universe": ("ARENA_UNIVERSE_SELECTOR_VERSION", "verified-only-universe-v1"),
 }
 _SCOPE_VERSIONS = {
     "src.data_loader": ("PRICE_VALIDATION_VERSION", "completed-session-ohlc-order-v1"),
@@ -45,10 +47,17 @@ _SIGNATURES = {
     "src.analysis_policy": ("build_policy_snapshot", "enrich_analysis_rows"),
     "src.growth_candidates": ("build_growth_candidate_rows",),
 }
+_KEYWORD_CONTRACTS = (
+    ("src.arena_data_quality", "arena_report_authorized", "universe_policy"),
+    ("src.daily_digest", "build_daily_score_report", "arena_universe_policy"),
+    ("src.alert_runner", "run_daily_alerts", "analysis_only"),
+)
 _FUNCTIONS = {
     "src.instruments": ("resolve_company_name", "is_isin_identifier"),
     "src.arena_data_quality": ("build_arena_quality_manifest", "arena_report_authorized"),
     "src.saved_close_report": ("archive_saved_close_report",),
+    "src.arena_universe_policy": ("normalize_arena_universe_policy",),
+    "src.arena_universe": ("resolve_arena_universe", "read_arena_universe_policy"),
     "src.daily_digest": ("daily_score_reading", "daily_score_coverage", "daily_score_sort_key", "daily_score_overview"),
     "src.daily_digest_ui": ("daily_score_reading", "daily_score_coverage", "daily_score_sort_key", "daily_score_overview"),
 }
@@ -56,9 +65,14 @@ _BINDINGS = (
     ("src.arena_data_quality", "is_isin_identifier", "src.instruments"),
     ("src.daily_digest", "is_isin_identifier", "src.instruments"),
     ("src.daily_digest", "build_arena_quality_manifest", "src.arena_data_quality"),
+    ("src.arena_universe", "build_arena_quality_manifest", "src.arena_data_quality"),
+    ("src.arena_universe", "normalize_arena_universe_policy", "src.arena_universe_policy"),
+    ("src.daily_digest", "resolve_arena_universe", "src.arena_universe"),
+    ("src.daily_digest", "normalize_arena_universe_policy", "src.arena_universe_policy"),
     ("src.portfolio_rotation", "resolve_company_name", "src.instruments"),
     ("src.saved_close_report", "build_daily_score_report", "src.daily_digest"),
     ("src.saved_close_report", "seal_daily_score_report", "src.daily_digest"),
+    ("src.saved_close_report", "read_arena_universe_policy", "src.arena_universe"),
     ("src.data_loader", "download_sec_fundamental_snapshot", "src.data_sources"),
     ("src.analysis_policy", "assess_analysis_data_quality", "src.analysis_data_quality"),
     ("src.growth_candidates", "assess_analysis_data_quality", "src.analysis_data_quality"),
@@ -67,6 +81,7 @@ _BINDINGS = (
     ("src.alert_runner", "download_fundamental_snapshot", "src.data_loader"),
     ("src.alert_runner", "build_daily_score_report", "src.daily_digest"),
     ("src.alert_runner", "render_daily_score_email", "src.daily_digest"),
+    ("src.alert_runner", "read_arena_universe_policy", "src.arena_universe"),
 )
 
 
@@ -88,6 +103,10 @@ def _incompatible_loaded_module() -> bool:
     for name, functions in _FUNCTIONS.items():
         module = sys.modules.get(name)
         if module is not None and any(not callable(getattr(module, key, None)) for key in functions):
+            return True
+    for name, symbol, keyword in _KEYWORD_CONTRACTS:
+        module = sys.modules.get(name)
+        if module is not None and not _takes_keyword(getattr(module, symbol, None), keyword):
             return True
     for consumer_name, symbol, source_name in _BINDINGS:
         consumer, source = sys.modules.get(consumer_name), sys.modules.get(source_name)
@@ -128,6 +147,8 @@ def _takes_keyword(function, name: str) -> bool:
 def _radar_journal_contract(cls) -> bool:
     return (
         callable(getattr(cls, "get_radar_review_checkpoint", None))
+        and callable(getattr(cls, "get_arena_universe_policy", None))
+        and _takes_keyword(getattr(cls, "set_arena_universe_policy", None), "owner_consent")
         and _takes_keyword(getattr(cls, "save_radar_review_checkpoint", None), "expected_revision")
         and _takes_keyword(getattr(cls, "list_analysis_snapshots_for_sessions", None), "tickers")
     )
@@ -165,6 +186,7 @@ def prepare_radar_runtime() -> tuple[str, ...]:
         ))
         repair("src.session_journal", lambda m: (
             "get_radar_review_checkpoint" not in getattr(m, "_UNCACHED_READ_METHODS", ())
+            or "get_arena_universe_policy" not in getattr(m, "_UNCACHED_READ_METHODS", ())
         ))
         repair("src.hourly_market_schedule", lambda m: (
             getattr(m, "RADAR_CLOSE_CONTRACT_VERSION", "") != "radar-close-v1"

@@ -58,3 +58,56 @@ report must remain blocked; this does not validate live quotes.
 
 Publishing must not be described as making Arena operational. Its data gate,
 current inputs, explicit pause and execution-window checks remain authoritative.
+
+## Follow-up: persistent verified-only universe
+
+The optional owner-approved policy is stored separately from the league and
+from favorites. Missing policy means the original strict behavior, including
+unchanged legacy report identifiers. Enabling `verified_only` requires explicit
+consent; it is never inferred from an incomplete review.
+
+Every report writer recomputes the same universe from that close's evidence.
+Pending instruments retain their favorite, observations and scores, but cannot
+be selected for new entries. Recovered instruments rejoin automatically. The
+audit records the policy identity, pending reasons and counts. Duplicates,
+observed evidence contradictions and global integrity errors remain blocking;
+an empty eligible universe is not an authorized round. Existing virtual
+holdings still require valid quotes, whether or not eligible for a new entry.
+
+The existing morning recovery workflow now prepares owner-scoped analyses and
+an immutable saved-close report before its existing Arena-mail stage. Preparation
+does not need an enabled email recipient, never includes the shared group, and
+preserves the owner's analysis parameters. It has no SMTP/model credentials,
+notification claims or simulation calls. Both before and after collection it
+requires a completed US session whose next opening is still in the future.
+Preparation being ready is not proof of mail delivery or a completed round.
+
+The policy migration creates no approvals. The follow-up guard validates the
+current approval on report insertion and signal export; old writers cannot
+silently replace the current report with a different policy. The wrapper keeps
+the existing lock, pause and exact-universe checks. An expired unverifiable
+pending plan must be preserved separately as **not executed** before resuming;
+it must not be settled retrospectively or removed from the audit trail.
+
+Recovery reuses an already authorized report for the exact close, favorites and
+current policy; it does not regenerate its identifier and strand a partial model
+plan. An explicit return to strict gets a sealed policy context and a new report
+identity, avoiding reuse of the original pre-consent strict archive. Replaying
+either state remains idempotent. Policy changes govern new plans; they do not
+retroactively cancel an already accepted valid plan. The separate pause remains
+the immediate stop control for the league.
+
+| Isolated environment | Additional regression evidence |
+|---|---|
+| Python, synthetic rows | `tests/test_arena_universe.py`: strict equivalence, changing coverage, recovery, ownership, tampering, revocation, global failures |
+| SQLite / fake HTTP | `tests/test_arena_universe_policy_storage.py`: explicit consent, persistence, idempotence, uncached policy reads, failed-read behavior |
+| Python, simulated providers | `tests/test_alert_runner.py`: saved owner settings, snapshots and archive, no notification state, claims, mail or laboratory |
+| Python + real SQLite path | `tests/test_arena_data_cli.py`: preparation through report verification, closed-session window, no delivery or operations |
+| Actual prior source, subprocess | `tests/test_arena_universe_runtime.py`: warm deployment rebinds modules and backend instances without deleting favorites or session state |
+| Streamlit AppTest, synthetic report | `tests/test_daily_digest_ui.py`: pending/verified display does not claim execution or modify data |
+| PostgreSQL WASM | `scripts/validate_arena_universe_policy.mjs`: backend-only permissions, no seeded approval, unrelated data preserved |
+
+These cases do not verify a live provider, authenticated production navigation,
+future mail delivery or the result of the next market session. The browser CLI
+could not load its required workflow because the OS denied process inspection;
+AppTest is not presented as a replacement for a real-browser production check.

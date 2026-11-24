@@ -66,6 +66,74 @@ class Journal:
         raise AttributeError(name)
 
 
+def test_saved_archive_uses_current_owner_policy_and_readmits_recovered_favorite():
+    from src.arena_universe_policy import build_arena_universe_policy
+    from src.arena_data_quality import arena_report_authorized
+
+    clock = "2026-11-24T16:15:00Z"
+    journal = Journal(favorites=("SYNTH", "MISSING"))
+    policy = build_arena_universe_policy(journal.owner, "verified_only",
+        approved_at="2026-11-24T15:00:00Z", reference_time=clock)
+    journal.get_arena_universe_policy = lambda: policy
+    favorites_before = journal.favorites.copy(deep=True)
+    first = archive_saved_close_report(journal, reference_time=clock)
+    initial = deepcopy(journal.archived[first.report_id])
+    assert first.authorized is True and initial["arena_universe"]["pending_count"] == 1
+    assert initial["arena_universe"]["policy"] == policy
+    assert arena_report_authorized(initial, owner=journal.owner) is True
+
+    journal.observations = pd.DataFrame([observation(), observation("MISSING")])
+    second = archive_saved_close_report(journal, reference_time=clock)
+    recovered = journal.archived[second.report_id]
+    assert second.authorized is True and recovered["arena_universe"]["pending_count"] == 0
+    assert recovered["arena_quality"]["eligible_tickers"] == ["MISSING", "SYNTH"]
+    assert recovered["arena_quality"]["explicit_exclusions"] == []
+    assert journal.archived[first.report_id] == initial
+    pd.testing.assert_frame_equal(journal.favorites, favorites_before)
+
+
+def test_saved_archive_never_converts_failed_policy_read_into_a_strict_report():
+    journal = Journal()
+    def fail():
+        raise RuntimeError("policy storage unavailable")
+    journal.get_arena_universe_policy = fail
+    with pytest.raises(RuntimeError, match="storage unavailable"):
+        archive_saved_close_report(journal, reference_time="2026-11-24T16:15:00Z")
+    assert journal.archived == {}
+
+
+def test_saved_archive_policy_cycle_appends_a_new_current_strict_report_then_replays():
+    from src.arena_universe_policy import build_arena_universe_policy
+    from src.arena_data_quality import arena_report_authorized
+
+    clock = "2026-11-24T16:15:00Z"
+    journal = Journal()
+    policy = build_arena_universe_policy(journal.owner, reference_time=clock)
+    journal.get_arena_universe_policy = lambda: policy
+    initial = archive_saved_close_report(journal, reference_time=clock)
+    assert initial.authorized is True
+    policy = build_arena_universe_policy(journal.owner, "verified_only",
+        approved_at="2026-11-24T15:00:00Z", reference_time=clock)
+    verified = archive_saved_close_report(journal, reference_time=clock)
+    assert verified.report_id != initial.report_id
+    assert arena_report_authorized(next(reversed(journal.archived.values())),
+        owner=journal.owner, universe_policy=policy) is True
+
+    policy = build_arena_universe_policy(journal.owner, "strict",
+        approved_at="2026-11-24T15:30:00Z", reference_time=clock)
+    restored = archive_saved_close_report(journal, reference_time=clock)
+    assert restored.report_id not in (initial.report_id, verified.report_id)
+    assert restored.unchanged is False and len(journal.archived) == 3
+    latest = next(reversed(journal.archived.values()))
+    assert latest["report_id"] == restored.report_id
+    assert latest["arena_policy_context"] == policy
+    assert "arena_universe" not in latest
+    assert arena_report_authorized(latest, owner=journal.owner, universe_policy=policy) is True
+    replay = archive_saved_close_report(journal, reference_time=clock)
+    assert replay.report_id == restored.report_id and replay.unchanged is True
+    assert len(journal.archived) == 3
+
+
 @pytest.mark.parametrize(("clock", "expected"), [
     # The two actual delayed starts on 24 November must recover the 23rd.
     ("2026-11-24T05:44:22Z", "2026-11-23"),

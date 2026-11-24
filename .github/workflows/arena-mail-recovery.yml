@@ -15,7 +15,7 @@ concurrency:
 jobs:
   recover-arena:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -25,8 +25,17 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -r requirements.txt
-      - name: Recuperar solo Arena, sin recalcular señales ni reenviar Stock Signal Lab
+      - name: Preparar datos e informe privados, sin correo ni modelos
+        id: arena_data
         env:
+          ARENA_DATA_OWNER: ${{ github.repository_owner }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+        run: python -m scripts.run_arena_data
+      - name: Recuperar solo Arena con el informe verificado, sin reenviar Stock Signal Lab
+        if: ${{ !cancelled() && steps.arena_data.conclusion == 'success' && steps.arena_data.outputs.status == 'ready' }}
+        env:
+          ARENA_EXPECTED_SESSION: ${{ steps.arena_data.outputs.report_session }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           EMAIL_SMTP_HOST: smtp.gmail.com

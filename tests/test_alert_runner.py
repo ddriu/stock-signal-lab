@@ -412,6 +412,126 @@ def _manual_test_frame(monkeypatch, *, as_of: str = "2026-10-14") -> pd.DataFram
     return frame
 
 
+@pytest.mark.parametrize("preview", [False, True])
+def test_both_report_routes_share_the_same_durable_owner_universe_policy(monkeypatch, preview):
+    from src.arena_universe_policy import build_arena_universe_policy
+
+    owner = "synthetic-policy-owner"
+    preference = normalize_alert_preferences(owner=owner, email="test@example.invalid",
+        enabled=True, include_group=False)
+    user = FakeManualJournal(preference, tickers=("MINE", "MISSING"))
+    user.owner = owner
+    policy = build_arena_universe_policy(owner, "verified_only", approved_at="2026-10-14T23:00:00Z")
+    reads = []
+    user.get_arena_universe_policy = lambda: (reads.append(owner) or policy)
+    frame = _manual_test_frame(monkeypatch)
+    frame["open"], frame["high"], frame["low"], frame["atr_14"] = 99., 101., 98., 2.
+    monkeypatch.setenv("MODEL_RESULTS_ENABLED", "false")
+    monkeypatch.setattr("src.alert_runner.evaluate_growth_momentum", lambda **kwargs: SimpleNamespace(
+        score=85, confidence_pct=90, label="Entrada fuerte", growth_score=80, momentum_score=90,
+        context_score=80, sector_key="technology", as_of=kwargs["frame"].index[-1],
+        positive_factors=(), risk_factors=(), manual_checks=()))
+    from src.data_loader import DataDownloadError
+    def download(ticker, *args, **kwargs):
+        if ticker == "MISSING":
+            raise DataDownloadError("Synthetic missing observations")
+        return frame.copy(deep=True)
+    received, sent = [], []
+    result = run_daily_alerts(owner=owner, journal_factory=lambda actual: user,
+        downloader=download, fundamental_downloader=lambda ticker: {**_verified_growth_info(ticker), "currency": "USD"},
+        sender=lambda *args: sent.append(args), today=date(2026, 10, 15),
+        review_receiver=(lambda report, snapshots: received.append(report)) if preview else None)
+    actual = received[0] if preview else next(iter(user.reports.values()))
+    assert actual["arena_universe"]["policy"] == policy
+    assert actual["arena_universe"]["mode"] == "verified_only"
+    assert actual["arena_quality"]["favorite_tickers"] == ["MINE", "MISSING"]
+    assert "MISSING" in {row["ticker"] for row in actual["arena_universe"]["pending"]}
+    assert reads == [owner]
+    if preview:
+        assert sent == [] and user.reports == {} and result.emails_sent == 0
+    else:
+        assert result.emails_sent == len(sent) == 1
+
+
+@pytest.mark.parametrize("preview", [False, True])
+def test_report_routes_do_not_send_or_archive_after_a_policy_read_failure(monkeypatch, preview):
+    owner = "synthetic-policy-owner"
+    preference = normalize_alert_preferences(owner=owner, email="test@example.invalid",
+        enabled=True, include_group=False)
+    user = FakeManualJournal(preference, tickers=("MINE",))
+    user.owner = owner
+    def failed_policy():
+        raise RuntimeError("policy storage unavailable")
+    user.get_arena_universe_policy = failed_policy
+    frame = _manual_test_frame(monkeypatch)
+    result = run_daily_alerts(owner=owner, journal_factory=lambda actual: user,
+        downloader=lambda *args, **kwargs: frame.copy(), fundamental_downloader=_verified_growth_info,
+        sender=lambda *args: pytest.fail("No SMTP after failed policy lookup"), today=date(2026, 10, 15),
+        review_receiver=(lambda *args: pytest.fail("No preview after failed policy lookup")) if preview else None)
+    assert result.emails_sent == 0 and user.reports == {} and user.snapshots == []
+    assert any("policy storage unavailable" in item for item in result.errors)
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_analysis_only_preserves_configuration_without_delivery_state_or_recipient_gating(monkeypatch, available):
+    owner = "synthetic-data-owner"
+    preference = AlertPreferences(owner=owner, email="not a recipient", enabled=False, include_group=True,
+        minimum_buy_score=91, alert_buy=False, alert_reduce=False, only_changes=False)
+    user = FakeManualJournal(preference, tickers=("MINE",))
+    user.owner = owner
+    forbidden = ("list_enabled_alert_preferences", "list_alert_states",
+                 "claim_daily_digest", "finish_daily_digest", "upsert_alert_states")
+    for method in forbidden:
+        monkeypatch.setattr(user, method,
+            lambda *args, **kwargs: pytest.fail("Data preparation must not read or mutate delivery state"))
+    frame = _manual_test_frame(monkeypatch, as_of="2026-11-23")
+    frame["open"], frame["high"], frame["low"], frame["atr_14"] = 99., 101., 98., 2.
+    monkeypatch.setattr("src.alert_runner.evaluate_growth_momentum", lambda **kwargs: SimpleNamespace(
+        score=85, confidence_pct=90, label="Entrada fuerte", growth_score=80, momentum_score=90,
+        context_score=80, sector_key="technology", as_of=kwargs["frame"].index[-1],
+        positive_factors=(), risk_factors=(), manual_checks=()))
+    archived = []
+    monkeypatch.setattr("src.saved_close_report.archive_saved_close_report",
+        lambda journal, **kwargs: archived.append((journal.owner, len(journal.snapshots))))
+    import src.alert_runner as runner
+    candidate_builder, observed_preferences = runner.build_alert_candidate, []
+    def configured_candidate(*args, **kwargs):
+        observed_preferences.append(kwargs["preferences"])
+        return candidate_builder(*args, **kwargs)
+    monkeypatch.setattr(runner, "build_alert_candidate", configured_candidate)
+    def journal_factory(actual):
+        assert actual == owner, "No shared group or other account may be opened"
+        return user
+    result = run_daily_alerts(owner=owner, journal_factory=journal_factory, analysis_only=True,
+        downloader=lambda *args, **kwargs: frame.copy() if available else pd.DataFrame(),
+        fundamental_downloader=lambda ticker: {**_verified_growth_info(ticker), "currency": "USD"},
+        sender=lambda *args: pytest.fail("No SMTP in data preparation"),
+        today=date(2026, 11, 23), require_current_session=True)
+    assert result.users_checked == 1
+    assert result.emails_sent == result.alerts_sent == 0
+    assert archived == [(owner, 1 if available else 0)]
+    assert user.preference is preference and preference.enabled is False and preference.include_group is True
+    assert user.preference_reads == 1 and user.state_writes == 0
+    assert user.delivery_claims == {} and user.delivery_finishes == []
+    assert observed_preferences == ([replace(preference, include_group=False)] if available else [])
+
+
+@pytest.mark.parametrize("kwargs", [
+    {}, {"owner": "anonymous"}, {"owner": "synthetic", "review_receiver": lambda *args: None},
+    {"owner": "synthetic", "virtual_tracker": lambda *args: None},
+])
+def test_analysis_only_requires_explicit_owner_and_rejects_other_execution_modes(kwargs):
+    with pytest.raises(ValueError):
+        run_daily_alerts(analysis_only=True, **kwargs,
+            journal_factory=lambda *args: pytest.fail("Rejected mode must not open a journal"))
+
+
+def test_analysis_only_rejects_a_journal_bound_to_another_owner():
+    with pytest.raises(ValueError, match="propietario"):
+        run_daily_alerts(owner="synthetic-a", analysis_only=True,
+            journal_factory=lambda actual: SimpleNamespace(owner="synthetic-b"))
+
+
 @pytest.mark.parametrize("reverse_preferences", [False, True])
 def test_arena_manifest_keeps_each_personal_universe_without_removing_group_from_email(
     monkeypatch, reverse_preferences,

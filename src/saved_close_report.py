@@ -16,6 +16,7 @@ from src.daily_digest import (
     build_daily_score_report, seal_daily_score_report,
 )
 from src.instruments import resolve_analysis_ticker
+from src.arena_universe import read_arena_universe_policy
 from src.journal import validate_radar_checkpoint_owner
 from src.portfolio_snapshot import latest_portfolio_snapshot
 from src.storage import GROUP_PORTFOLIO_OWNER
@@ -83,6 +84,8 @@ def build_saved_close_report(
     snapshots: pd.DataFrame, *, favorite_tickers: Iterable[str],
     held_tickers: Iterable[str] = (), company_names: Mapping[str, object] | None = None,
     reference_time=None,
+    arena_universe_policy: Mapping[str, object] | None = None,
+    arena_policy_owner: str | None = None,
 ) -> dict[str, object]:
     """Pure saved-input reconstruction: missing inputs stay N/D and blocked."""
     clock = _clock(reference_time)
@@ -94,6 +97,7 @@ def build_saved_close_report(
         snapshots, tickers=sorted(favorites | held), held_tickers=held,
         company_names=company_names, favorite_tickers=sorted(favorites),
         as_of=session, reference_time=clock,
+        arena_universe_policy=arena_universe_policy, arena_policy_owner=arena_policy_owner,
     )
     # This archive's target is explicitly the completed US close. Foreign and
     # unknown-only universes may have an older/no display anchor; keep every row
@@ -127,6 +131,7 @@ def archive_saved_close_report(journal, *, reference_time=None) -> SavedCloseRep
         raise ValueError("El archivo necesita un propietario privado explícito.")
     clock = _clock(reference_time)
     session = latest_completed_us_session(reference_time=clock)
+    arena_universe_policy = read_arena_universe_policy(journal, reference_time=clock)
     favorites_frame = _owner_frame(journal.list_favorites(), owner)
     if not favorites_frame.empty and ("ticker" not in favorites_frame
             or any(not isinstance(value, str) or not value.strip() for value in favorites_frame["ticker"])):
@@ -157,7 +162,8 @@ def archive_saved_close_report(journal, *, reference_time=None) -> SavedCloseRep
                 raise JournalStorageError("El archivo de cierre no pudo verificar todo el historial acotado.")
             pages.append(page)
     report = build_saved_close_report(pd.concat(pages, ignore_index=True),
-        favorite_tickers=favorites, held_tickers=held, company_names=names, reference_time=clock)
+        favorite_tickers=favorites, held_tickers=held, company_names=names, reference_time=clock,
+        arena_universe_policy=arena_universe_policy, arena_policy_owner=owner)
     identifier = report["report_id"]
     previous = journal.get_daily_score_report(identifier)
     if previous is not None and previous != report:
