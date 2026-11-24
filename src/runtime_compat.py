@@ -68,6 +68,7 @@ _BINDINGS = (
     ("src.arena_universe", "build_arena_quality_manifest", "src.arena_data_quality"),
     ("src.arena_universe", "normalize_arena_universe_policy", "src.arena_universe_policy"),
     ("src.daily_digest", "resolve_arena_universe", "src.arena_universe"),
+    ("src.daily_digest", "normalize_arena_universe_policy", "src.arena_universe_policy"),
     ("src.portfolio_rotation", "resolve_company_name", "src.instruments"),
     ("src.saved_close_report", "build_daily_score_report", "src.daily_digest"),
     ("src.saved_close_report", "seal_daily_score_report", "src.daily_digest"),

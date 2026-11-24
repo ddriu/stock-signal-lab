@@ -89,6 +89,14 @@ the existing lock, pause and exact-universe checks. An expired unverifiable
 pending plan must be preserved separately as **not executed** before resuming;
 it must not be settled retrospectively or removed from the audit trail.
 
+Recovery reuses an already authorized report for the exact close, favorites and
+current policy; it does not regenerate its identifier and strand a partial model
+plan. An explicit return to strict gets a sealed policy context and a new report
+identity, avoiding reuse of the original pre-consent strict archive. Replaying
+either state remains idempotent. Policy changes govern new plans; they do not
+retroactively cancel an already accepted valid plan. The separate pause remains
+the immediate stop control for the league.
+
 | Isolated environment | Additional regression evidence |
 |---|---|
 | Python, synthetic rows | `tests/test_arena_universe.py`: strict equivalence, changing coverage, recovery, ownership, tampering, revocation, global failures |

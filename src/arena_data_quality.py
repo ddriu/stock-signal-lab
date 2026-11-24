@@ -242,6 +242,18 @@ def arena_report_authorized(report: Mapping[str, object], *, expected_session=No
             expected_policy = normalize_arena_universe_policy(universe_policy, owner=owner)
             if (expected_policy["mode"] == "verified_only") != ("arena_universe" in report):
                 return False
+        if "arena_policy_context" in report:
+            from src.arena_universe_policy import normalize_arena_universe_policy
+
+            context = report["arena_policy_context"]
+            if not isinstance(context, Mapping) or "arena_universe" in report:
+                return False
+            policy = normalize_arena_universe_policy(context,
+                owner=owner if owner is not None else context.get("owner"))
+            if (policy["mode"] != "strict" or policy["approved_at"] is None
+                    or _canonical(dict(context)) != _canonical(policy)
+                    or expected_policy is not None and policy != expected_policy):
+                return False
         if "arena_universe" in report:
             from src.arena_universe import resolve_arena_universe
 

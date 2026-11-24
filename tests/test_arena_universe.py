@@ -212,6 +212,25 @@ def test_verifier_with_current_database_policy_rejects_revoked_or_replaced_conse
     assert arena_report_authorized(legacy, owner=OWNER, universe_policy=consent()) is False
 
 
+def test_explicit_strict_policy_context_is_sealed_owner_bound_and_current():
+    strict = build_arena_universe_policy(OWNER, "strict",
+        approved_at="2026-11-24T15:30:00Z", reference_time=CLOCK)
+    value = report(tickers=["GOOD"], favorite_tickers=["GOOD"],
+        arena_universe_policy=strict, arena_policy_owner=OWNER)
+    assert value["arena_policy_context"] == strict
+    assert arena_report_authorized(value, owner=OWNER, universe_policy=strict) is True
+    assert arena_report_authorized(value, owner="other-owner") is False
+    previous = build_arena_universe_policy(OWNER, reference_time=CLOCK)
+    assert arena_report_authorized(value, owner=OWNER, universe_policy=previous) is False
+    for context in (None, {}, consent(), {**strict, "policy_id": "f" * 64}, previous):
+        tampered = deepcopy(value)
+        tampered["arena_policy_context"] = context
+        assert arena_report_authorized(seal_daily_score_report(tampered), owner=OWNER) is False
+    mixed = report()
+    mixed["arena_policy_context"] = strict
+    assert arena_report_authorized(seal_daily_score_report(mixed), owner=OWNER) is False
+
+
 def test_policy_reader_is_owner_local_and_never_hides_storage_failures():
     assert read_arena_universe_policy(object(), reference_time=CLOCK) is None
     policy = consent()

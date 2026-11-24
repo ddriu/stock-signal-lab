@@ -20,6 +20,7 @@ from src.analysis_data_quality import GROWTH_METRICS
 from src.instruments import is_isin_identifier, resolve_analysis_ticker, resolve_company_name
 from src.arena_data_quality import build_arena_quality_manifest
 from src.arena_universe import resolve_arena_universe
+from src.arena_universe_policy import normalize_arena_universe_policy
 
 DIGEST_VERSION = "daily-score-report-v2"
 DIGEST_PRESENTATION_VERSION = "compact-mobile-v3"
@@ -436,10 +437,19 @@ def build_daily_score_report(
         expected_session=_day(as_of) if as_of is not None else None,
         exclusions=arena_exclusions, policy=arena_universe_policy, owner=arena_policy_owner,
         reference_time=clock.isoformat())
+    strict_context = None
+    if arena_universe_policy is not None:
+        policy = normalize_arena_universe_policy(arena_universe_policy,
+            owner=arena_policy_owner, reference_time=clock)
+        if policy["mode"] == "strict" and policy["approved_at"] is not None:
+            # An explicit return to strict must append a new immutable report,
+            # not reuse the pre-consent report ID and leave the old mode latest.
+            strict_context = policy
     return seal_daily_score_report({"version": DIGEST_VERSION, "as_of": anchor,
         "session_dates": reference_dates, "calendar_status": calendar_status,
         "arena_quality": arena_quality,
         **({"arena_universe": arena_universe} if arena_universe is not None else {}),
+        **({"arena_policy_context": strict_context} if strict_context is not None else {}),
         "rows": rows, "limitations": ["Las notas son salidas observadas del modelo, no probabilidades de beneficio.",
             "No se rellenan sesiones sin análisis ni se mezclan estrategias.",
             "La comparación entre empresas no incorpora comisiones, divisa ni valoración de una operación concreta."]})
