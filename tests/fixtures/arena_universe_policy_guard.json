@@ -1,0 +1,880 @@
+{
+  "all_pending": {
+    "arena_quality": {
+      "authorized": false,
+      "criteria": {
+        "all_calendar_verified": true,
+        "all_current_growth": true,
+        "all_current_prices": true,
+        "all_eligible_quality_unblocked": true,
+        "all_snapshot_evidence": true,
+        "expected_session_closed": true,
+        "favorite_universe_known": true,
+        "has_eligible_instruments": false,
+        "unique_rows": true
+      },
+      "eligible_count": 0,
+      "eligible_tickers": [],
+      "errors": [
+        {
+          "code": "no_eligible_instruments",
+          "ticker": null
+        }
+      ],
+      "evidence": [],
+      "excluded": [
+        {
+          "code": "owner_excluded",
+          "reason": "verified_only:missing_analysis",
+          "ticker": "GOOD"
+        },
+        {
+          "code": "owner_excluded",
+          "reason": "verified_only:missing_analysis",
+          "ticker": "PENDING"
+        }
+      ],
+      "expected_session": "2026-11-23",
+      "explicit_exclusions": [
+        {
+          "reason": "verified_only:missing_analysis",
+          "ticker": "GOOD"
+        },
+        {
+          "reason": "verified_only:missing_analysis",
+          "ticker": "PENDING"
+        }
+      ],
+      "favorite_tickers": [
+        "GOOD",
+        "PENDING"
+      ],
+      "manifest_id": "1c089486ae168be86f6ca2440efc6e71a4499829cad30ede9926781730cc12fa",
+      "price_ready": false,
+      "required_count": 0,
+      "session_close_at": "2026-11-23T21:00:00+00:00",
+      "status": "blocked",
+      "valid_count": 0,
+      "verification_scope": "persisted_snapshot_checks",
+      "version": "arena-data-quality-v1"
+    },
+    "arena_universe": {
+      "eligible_count": 0,
+      "global_errors": [
+        {
+          "code": "no_eligible_instruments",
+          "ticker": null
+        }
+      ],
+      "initial_eligible_count": 2,
+      "initial_valid_count": 0,
+      "mode": "verified_only",
+      "pending": [
+        {
+          "codes": [
+            "missing_analysis"
+          ],
+          "reason": "verified_only:missing_analysis",
+          "ticker": "GOOD"
+        },
+        {
+          "codes": [
+            "missing_analysis"
+          ],
+          "reason": "verified_only:missing_analysis",
+          "ticker": "PENDING"
+        }
+      ],
+      "pending_count": 2,
+      "policy": {
+        "approved_at": "2026-11-24T15:00:00.000000+00:00",
+        "mode": "verified_only",
+        "owner": "ddriu",
+        "policy_id": "cc2a875f7f6f32241665f0e99a3766f4f2f1084bdaff7311bbba1603a74946fc",
+        "version": "arena-universe-policy-v1"
+      },
+      "required_count": 2,
+      "strict_errors": [
+        {
+          "code": "missing_analysis",
+          "ticker": "GOOD"
+        },
+        {
+          "code": "missing_analysis",
+          "ticker": "PENDING"
+        }
+      ],
+      "target_session": "2026-11-23",
+      "valid_count": 0,
+      "version": "arena-universe-audit-v1"
+    },
+    "as_of": "2026-11-23",
+    "report_id": "4bf2ececd90a29b81cbb0fb9b30ef7631a25e388b1539acce3a255ae3941cb85",
+    "rows": []
+  },
+  "changed_policy": {
+    "approved_at": "2026-11-24T15:30:00.000000+00:00",
+    "mode": "verified_only",
+    "owner": "ddriu",
+    "policy_id": "fbdd17f36cd45cb3b59e07fd2848469095b1db91bde8032846af484e98baeae9",
+    "version": "arena-universe-policy-v1"
+  },
+  "complete": {
+    "arena_quality": {
+      "authorized": true,
+      "criteria": {
+        "all_calendar_verified": true,
+        "all_current_growth": true,
+        "all_current_prices": true,
+        "all_eligible_quality_unblocked": true,
+        "all_snapshot_evidence": true,
+        "expected_session_closed": true,
+        "favorite_universe_known": true,
+        "has_eligible_instruments": true,
+        "unique_rows": true
+      },
+      "eligible_count": 2,
+      "eligible_tickers": [
+        "GOOD",
+        "PENDING"
+      ],
+      "errors": [],
+      "evidence": [
+        {
+          "price": 100,
+          "price_currency": "USD",
+          "price_source": "analysis_snapshot",
+          "recorded_at": "2026-11-23T22:00:00+00:00",
+          "session": "2026-11-23",
+          "snapshot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ticker": "GOOD"
+        },
+        {
+          "price": 100,
+          "price_currency": "USD",
+          "price_source": "analysis_snapshot",
+          "recorded_at": "2026-11-23T22:00:00+00:00",
+          "session": "2026-11-23",
+          "snapshot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "ticker": "PENDING"
+        }
+      ],
+      "excluded": [],
+      "expected_session": "2026-11-23",
+      "explicit_exclusions": [],
+      "favorite_tickers": [
+        "GOOD",
+        "PENDING"
+      ],
+      "manifest_id": "97728a8710858b1bb47ff365850945d40f0ce957c133f46e60d2f04cdd60a19d",
+      "price_ready": true,
+      "required_count": 2,
+      "session_close_at": "2026-11-23T21:00:00+00:00",
+      "status": "verified",
+      "valid_count": 2,
+      "verification_scope": "persisted_snapshot_checks",
+      "version": "arena-data-quality-v1"
+    },
+    "arena_universe": {
+      "eligible_count": 2,
+      "global_errors": [],
+      "initial_eligible_count": 2,
+      "initial_valid_count": 2,
+      "mode": "verified_only",
+      "pending": [],
+      "pending_count": 0,
+      "policy": {
+        "approved_at": "2026-11-24T15:00:00.000000+00:00",
+        "mode": "verified_only",
+        "owner": "ddriu",
+        "policy_id": "cc2a875f7f6f32241665f0e99a3766f4f2f1084bdaff7311bbba1603a74946fc",
+        "version": "arena-universe-policy-v1"
+      },
+      "required_count": 2,
+      "strict_errors": [],
+      "target_session": "2026-11-23",
+      "valid_count": 2,
+      "version": "arena-universe-audit-v1"
+    },
+    "as_of": "2026-11-23",
+    "report_id": "9ced8ce5fb05b9f9486f2a5523655292e1fd9139f794cbbd527d5a37bc43dddc",
+    "rows": [
+      {
+        "calendar": "XNYS",
+        "context_score": 90,
+        "growth_score": 70,
+        "momentum_score": 80,
+        "price": 100.0,
+        "price_currency": "USD",
+        "price_identity_verified": true,
+        "price_session": "2026-11-23",
+        "price_source": "analysis_snapshot",
+        "primary_data_status": "complete",
+        "quality": {
+          "block_entry": false,
+          "status": "ok"
+        },
+        "recorded_at": "2026-11-23T22:00:00Z",
+        "score": 80,
+        "session": "2026-11-23",
+        "snapshot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "status": "entry_strong",
+        "ticker": "GOOD"
+      },
+      {
+        "calendar": "XNYS",
+        "context_score": 90,
+        "growth_score": 70,
+        "momentum_score": 80,
+        "price": 100.0,
+        "price_currency": "USD",
+        "price_identity_verified": true,
+        "price_session": "2026-11-23",
+        "price_source": "analysis_snapshot",
+        "primary_data_status": "complete",
+        "quality": {
+          "block_entry": false,
+          "status": "ok"
+        },
+        "recorded_at": "2026-11-23T22:00:00Z",
+        "score": 80,
+        "session": "2026-11-23",
+        "snapshot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "status": "entry_strong",
+        "ticker": "PENDING"
+      }
+    ]
+  },
+  "conflict": {
+    "arena_quality": {
+      "authorized": false,
+      "criteria": {
+        "all_calendar_verified": true,
+        "all_current_growth": true,
+        "all_current_prices": false,
+        "all_eligible_quality_unblocked": true,
+        "all_snapshot_evidence": true,
+        "expected_session_closed": true,
+        "favorite_universe_known": true,
+        "has_eligible_instruments": true,
+        "unique_rows": true
+      },
+      "eligible_count": 2,
+      "eligible_tickers": [
+        "GOOD",
+        "PENDING"
+      ],
+      "errors": [
+        {
+          "code": "price_identity_unverified",
+          "ticker": "PENDING"
+        }
+      ],
+      "evidence": [
+        {
+          "price": 100,
+          "price_currency": "USD",
+          "price_source": "analysis_snapshot",
+          "recorded_at": "2026-11-23T22:00:00+00:00",
+          "session": "2026-11-23",
+          "snapshot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ticker": "GOOD"
+        },
+        {
+          "price": 100,
+          "price_currency": "USD",
+          "price_source": "analysis_snapshot",
+          "recorded_at": "2026-11-23T22:00:00+00:00",
+          "session": "2026-11-23",
+          "snapshot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "ticker": "PENDING"
+        }
+      ],
+      "excluded": [],
+      "expected_session": "2026-11-23",
+      "explicit_exclusions": [],
+      "favorite_tickers": [
+        "GOOD",
+        "PENDING"
+      ],
+      "manifest_id": "1570baee214cc61c2284ac0bf78025aac88da947a727f144b0c9961b8fa19626",
+      "price_ready": false,
+      "required_count": 2,
+      "session_close_at": "2026-11-23T21:00:00+00:00",
+      "status": "blocked",
+      "valid_count": 1,
+      "verification_scope": "persisted_snapshot_checks",
+      "version": "arena-data-quality-v1"
+    },
+    "arena_universe": {
+      "eligible_count": 2,
+      "global_errors": [
+        {
+          "code": "price_identity_unverified",
+          "ticker": "PENDING"
+        }
+      ],
+      "initial_eligible_count": 2,
+      "initial_valid_count": 1,
+      "mode": "verified_only",
+      "pending": [],
+      "pending_count": 0,
+      "policy": {
+        "approved_at": "2026-11-24T15:00:00.000000+00:00",
+        "mode": "verified_only",
+        "owner": "ddriu",
+        "policy_id": "cc2a875f7f6f32241665f0e99a3766f4f2f1084bdaff7311bbba1603a74946fc",
+        "version": "arena-universe-policy-v1"
+      },
+      "required_count": 2,
+      "strict_errors": [
+        {
+          "code": "price_identity_unverified",
+          "ticker": "PENDING"
+        }
+      ],
+      "target_session": "2026-11-23",
+      "valid_count": 1,
+      "version": "arena-universe-audit-v1"
+    },
+    "as_of": "2026-11-23",
+    "report_id": "e77110344906340a1a2a76b20be6853b09636fcecc77a49b15c8ce9eefe2e24c",
+    "rows": [
+      {
+        "calendar": "XNYS",
+        "context_score": 90,
+        "growth_score": 70,
+        "momentum_score": 80,
+        "price": 100.0,
+        "price_currency": "USD",
+        "price_identity_verified": true,
+        "price_session": "2026-11-23",
+        "price_source": "analysis_snapshot",
+        "primary_data_status": "complete",
+        "quality": {
+          "block_entry": false,
+          "status": "ok"
+        },
+        "recorded_at": "2026-11-23T22:00:00Z",
+        "score": 80,
+        "session": "2026-11-23",
+        "snapshot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "status": "entry_strong",
+        "ticker": "GOOD"
+      },
+      {
+        "calendar": "XNYS",
+        "context_score": 90,
+        "growth_score": 70,
+        "momentum_score": 80,
+        "price": 100.0,
+        "price_currency": "USD",
+        "price_identity_verified": false,
+        "price_session": "2026-11-23",
+        "price_source": "analysis_snapshot",
+        "primary_data_status": "complete",
+        "quality": {
+          "block_entry": false,
+          "status": "ok"
+        },
+        "recorded_at": "2026-11-23T22:00:00Z",
+        "score": 80,
+        "session": "2026-11-23",
+        "snapshot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "status": "entry_strong",
+        "ticker": "PENDING"
+      }
+    ]
+  },
+  "growth_pending": {
+    "arena_quality": {
+      "authorized": true,
+      "criteria": {
+        "all_calendar_verified": true,
+        "all_current_growth": true,
+        "all_current_prices": true,
+        "all_eligible_quality_unblocked": true,
+        "all_snapshot_evidence": true,
+        "expected_session_closed": true,
+        "favorite_universe_known": true,
+        "has_eligible_instruments": true,
+        "unique_rows": true
+      },
+      "eligible_count": 1,
+      "eligible_tickers": [
+        "GOOD"
+      ],
+      "errors": [],
+      "evidence": [
+        {
+          "price": 100,
+          "price_currency": "USD",
+          "price_source": "analysis_snapshot",
+          "recorded_at": "2026-11-23T22:00:00+00:00",
+          "session": "2026-11-23",
+          "snapshot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ticker": "GOOD"
+        }
+      ],
+      "excluded": [
+        {
+          "code": "owner_excluded",
+          "reason": "verified_only:growth_incomplete",
+          "ticker": "PENDING"
+        }
+      ],
+      "expected_session": "2026-11-23",
+      "explicit_exclusions": [
+        {
+          "reason": "verified_only:growth_incomplete",
+          "ticker": "PENDING"
+        }
+      ],
+      "favorite_tickers": [
+        "GOOD",
+        "PENDING"
+      ],
+      "manifest_id": "a9663edbf6dcaddcc36884dadb315072d4636de91151e52e87bb090a9be43a5a",
+      "price_ready": true,
+      "required_count": 1,
+      "session_close_at": "2026-11-23T21:00:00+00:00",
+      "status": "verified",
+      "valid_count": 1,
+      "verification_scope": "persisted_snapshot_checks",
+      "version": "arena-data-quality-v1"
+    },
+    "arena_universe": {
+      "eligible_count": 1,
+      "global_errors": [],
+      "initial_eligible_count": 2,
+      "initial_valid_count": 1,
+      "mode": "verified_only",
+      "pending": [
+        {
+          "codes": [
+            "growth_incomplete"
+          ],
+          "reason": "verified_only:growth_incomplete",
+          "ticker": "PENDING"
+        }
+      ],
+      "pending_count": 1,
+      "policy": {
+        "approved_at": "2026-11-24T15:00:00.000000+00:00",
+        "mode": "verified_only",
+        "owner": "ddriu",
+        "policy_id": "cc2a875f7f6f32241665f0e99a3766f4f2f1084bdaff7311bbba1603a74946fc",
+        "version": "arena-universe-policy-v1"
+      },
+      "required_count": 2,
+      "strict_errors": [
+        {
+          "code": "growth_incomplete",
+          "ticker": "PENDING"
+        }
+      ],
+      "target_session": "2026-11-23",
+      "valid_count": 1,
+      "version": "arena-universe-audit-v1"
+    },
+    "as_of": "2026-11-23",
+    "report_id": "bafce395286cc03f633f1c95d1366e97c053a79c1ff87a1255d1208c06aef0ae",
+    "rows": [
+      {
+        "calendar": "XNYS",
+        "context_score": 90,
+        "growth_score": 70,
+        "momentum_score": 80,
+        "price": 100.0,
+        "price_currency": "USD",
+        "price_identity_verified": true,
+        "price_session": "2026-11-23",
+        "price_source": "analysis_snapshot",
+        "primary_data_status": "complete",
+        "quality": {
+          "block_entry": false,
+          "status": "ok"
+        },
+        "recorded_at": "2026-11-23T22:00:00Z",
+        "score": 80,
+        "session": "2026-11-23",
+        "snapshot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "status": "entry_strong",
+        "ticker": "GOOD"
+      },
+      {
+        "calendar": "XNYS",
+        "context_score": 90,
+        "growth_score": null,
+        "momentum_score": 80,
+        "price": 100.0,
+        "price_currency": "USD",
+        "price_identity_verified": true,
+        "price_session": "2026-11-23",
+        "price_source": "analysis_snapshot",
+        "primary_data_status": "complete",
+        "quality": {
+          "block_entry": false,
+          "status": "ok"
+        },
+        "recorded_at": "2026-11-23T22:00:00Z",
+        "score": 80,
+        "session": "2026-11-23",
+        "snapshot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "status": "entry_strong",
+        "ticker": "PENDING"
+      }
+    ]
+  },
+  "policy": {
+    "approved_at": "2026-11-24T15:00:00.000000+00:00",
+    "mode": "verified_only",
+    "owner": "ddriu",
+    "policy_id": "cc2a875f7f6f32241665f0e99a3766f4f2f1084bdaff7311bbba1603a74946fc",
+    "version": "arena-universe-policy-v1"
+  },
+  "quality_pending": {
+    "arena_quality": {
+      "authorized": true,
+      "criteria": {
+        "all_calendar_verified": true,
+        "all_current_growth": true,
+        "all_current_prices": true,
+        "all_eligible_quality_unblocked": true,
+        "all_snapshot_evidence": true,
+        "expected_session_closed": true,
+        "favorite_universe_known": true,
+        "has_eligible_instruments": true,
+        "unique_rows": true
+      },
+      "eligible_count": 1,
+      "eligible_tickers": [
+        "GOOD"
+      ],
+      "errors": [],
+      "evidence": [
+        {
+          "price": 100,
+          "price_currency": "USD",
+          "price_source": "analysis_snapshot",
+          "recorded_at": "2026-11-23T22:00:00+00:00",
+          "session": "2026-11-23",
+          "snapshot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ticker": "GOOD"
+        }
+      ],
+      "excluded": [
+        {
+          "code": "owner_excluded",
+          "reason": "verified_only:price_missing",
+          "ticker": "PENDING"
+        }
+      ],
+      "expected_session": "2026-11-23",
+      "explicit_exclusions": [
+        {
+          "reason": "verified_only:price_missing",
+          "ticker": "PENDING"
+        }
+      ],
+      "favorite_tickers": [
+        "GOOD",
+        "PENDING"
+      ],
+      "manifest_id": "205a96fafec275563e41043fda437ded1e54a8f4a6f5f3eb9a4f8e25386777cd",
+      "price_ready": true,
+      "required_count": 1,
+      "session_close_at": "2026-11-23T21:00:00+00:00",
+      "status": "verified",
+      "valid_count": 1,
+      "verification_scope": "persisted_snapshot_checks",
+      "version": "arena-data-quality-v1"
+    },
+    "arena_universe": {
+      "eligible_count": 1,
+      "global_errors": [],
+      "initial_eligible_count": 1,
+      "initial_valid_count": 1,
+      "mode": "verified_only",
+      "pending": [
+        {
+          "codes": [
+            "price_missing"
+          ],
+          "reason": "verified_only:price_missing",
+          "ticker": "PENDING"
+        }
+      ],
+      "pending_count": 1,
+      "policy": {
+        "approved_at": "2026-11-24T15:00:00.000000+00:00",
+        "mode": "verified_only",
+        "owner": "ddriu",
+        "policy_id": "cc2a875f7f6f32241665f0e99a3766f4f2f1084bdaff7311bbba1603a74946fc",
+        "version": "arena-universe-policy-v1"
+      },
+      "required_count": 2,
+      "strict_errors": [
+        {
+          "code": "price_missing",
+          "ticker": "PENDING"
+        }
+      ],
+      "target_session": "2026-11-23",
+      "valid_count": 1,
+      "version": "arena-universe-audit-v1"
+    },
+    "as_of": "2026-11-23",
+    "report_id": "82c2aaed6703bf48b3f6096b344203fbdc304494012a72c8111322af8aaba252",
+    "rows": [
+      {
+        "calendar": "XNYS",
+        "context_score": 90,
+        "growth_score": 70,
+        "momentum_score": 80,
+        "price": 100.0,
+        "price_currency": "USD",
+        "price_identity_verified": true,
+        "price_session": "2026-11-23",
+        "price_source": "analysis_snapshot",
+        "primary_data_status": "complete",
+        "quality": {
+          "block_entry": false,
+          "status": "ok"
+        },
+        "recorded_at": "2026-11-23T22:00:00Z",
+        "score": 80,
+        "session": "2026-11-23",
+        "snapshot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "status": "entry_strong",
+        "ticker": "GOOD"
+      },
+      {
+        "calendar": "XNYS",
+        "context_score": 90,
+        "growth_score": 70,
+        "momentum_score": 80,
+        "price": null,
+        "price_currency": "USD",
+        "price_identity_verified": true,
+        "price_session": "2026-11-23",
+        "price_source": "analysis_snapshot",
+        "primary_data_status": "complete",
+        "quality": {
+          "block_entry": true,
+          "status": "blocked"
+        },
+        "recorded_at": "2026-11-23T22:00:00Z",
+        "score": 80,
+        "session": "2026-11-23",
+        "snapshot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "status": "entry_strong",
+        "ticker": "PENDING"
+      }
+    ]
+  },
+  "strict": {
+    "arena_quality": {
+      "authorized": false,
+      "criteria": {
+        "all_calendar_verified": false,
+        "all_current_growth": false,
+        "all_current_prices": false,
+        "all_eligible_quality_unblocked": false,
+        "all_snapshot_evidence": false,
+        "expected_session_closed": true,
+        "favorite_universe_known": true,
+        "has_eligible_instruments": true,
+        "unique_rows": true
+      },
+      "eligible_count": 2,
+      "eligible_tickers": [
+        "GOOD",
+        "PENDING"
+      ],
+      "errors": [
+        {
+          "code": "missing_analysis",
+          "ticker": "PENDING"
+        }
+      ],
+      "evidence": [
+        {
+          "price": 100,
+          "price_currency": "USD",
+          "price_source": "analysis_snapshot",
+          "recorded_at": "2026-11-23T22:00:00+00:00",
+          "session": "2026-11-23",
+          "snapshot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ticker": "GOOD"
+        }
+      ],
+      "excluded": [],
+      "expected_session": "2026-11-23",
+      "explicit_exclusions": [],
+      "favorite_tickers": [
+        "GOOD",
+        "PENDING"
+      ],
+      "manifest_id": "7268805fb51a908f7cce89ea3a1218bd8678f5194a9c3d30a77712dc24acc8cb",
+      "price_ready": false,
+      "required_count": 2,
+      "session_close_at": "2026-11-23T21:00:00+00:00",
+      "status": "blocked",
+      "valid_count": 1,
+      "verification_scope": "persisted_snapshot_checks",
+      "version": "arena-data-quality-v1"
+    },
+    "as_of": "2026-11-23",
+    "report_id": "7f00d12dc32a8fb356f372e17953499f83e7c16a381c722ec4ce70b27a5b05de",
+    "rows": [
+      {
+        "calendar": "XNYS",
+        "context_score": 90,
+        "growth_score": 70,
+        "momentum_score": 80,
+        "price": 100.0,
+        "price_currency": "USD",
+        "price_identity_verified": true,
+        "price_session": "2026-11-23",
+        "price_source": "analysis_snapshot",
+        "primary_data_status": "complete",
+        "quality": {
+          "block_entry": false,
+          "status": "ok"
+        },
+        "recorded_at": "2026-11-23T22:00:00Z",
+        "score": 80,
+        "session": "2026-11-23",
+        "snapshot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "status": "entry_strong",
+        "ticker": "GOOD"
+      }
+    ]
+  },
+  "strict_policy": {
+    "approved_at": null,
+    "mode": "strict",
+    "owner": "ddriu",
+    "policy_id": "a1819700befc4327df3576ce264be74eeee22ff95aa7365733db86729e6d0804",
+    "version": "arena-universe-policy-v1"
+  },
+  "verified": {
+    "arena_quality": {
+      "authorized": true,
+      "criteria": {
+        "all_calendar_verified": true,
+        "all_current_growth": true,
+        "all_current_prices": true,
+        "all_eligible_quality_unblocked": true,
+        "all_snapshot_evidence": true,
+        "expected_session_closed": true,
+        "favorite_universe_known": true,
+        "has_eligible_instruments": true,
+        "unique_rows": true
+      },
+      "eligible_count": 1,
+      "eligible_tickers": [
+        "GOOD"
+      ],
+      "errors": [],
+      "evidence": [
+        {
+          "price": 100,
+          "price_currency": "USD",
+          "price_source": "analysis_snapshot",
+          "recorded_at": "2026-11-23T22:00:00+00:00",
+          "session": "2026-11-23",
+          "snapshot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ticker": "GOOD"
+        }
+      ],
+      "excluded": [
+        {
+          "code": "owner_excluded",
+          "reason": "verified_only:missing_analysis",
+          "ticker": "PENDING"
+        }
+      ],
+      "expected_session": "2026-11-23",
+      "explicit_exclusions": [
+        {
+          "reason": "verified_only:missing_analysis",
+          "ticker": "PENDING"
+        }
+      ],
+      "favorite_tickers": [
+        "GOOD",
+        "PENDING"
+      ],
+      "manifest_id": "3c9664fb60e8667a3fec42ffc50535a05dad768576910f5481d390e1082a1b40",
+      "price_ready": true,
+      "required_count": 1,
+      "session_close_at": "2026-11-23T21:00:00+00:00",
+      "status": "verified",
+      "valid_count": 1,
+      "verification_scope": "persisted_snapshot_checks",
+      "version": "arena-data-quality-v1"
+    },
+    "arena_universe": {
+      "eligible_count": 1,
+      "global_errors": [],
+      "initial_eligible_count": 2,
+      "initial_valid_count": 1,
+      "mode": "verified_only",
+      "pending": [
+        {
+          "codes": [
+            "missing_analysis"
+          ],
+          "reason": "verified_only:missing_analysis",
+          "ticker": "PENDING"
+        }
+      ],
+      "pending_count": 1,
+      "policy": {
+        "approved_at": "2026-11-24T15:00:00.000000+00:00",
+        "mode": "verified_only",
+        "owner": "ddriu",
+        "policy_id": "cc2a875f7f6f32241665f0e99a3766f4f2f1084bdaff7311bbba1603a74946fc",
+        "version": "arena-universe-policy-v1"
+      },
+      "required_count": 2,
+      "strict_errors": [
+        {
+          "code": "missing_analysis",
+          "ticker": "PENDING"
+        }
+      ],
+      "target_session": "2026-11-23",
+      "valid_count": 1,
+      "version": "arena-universe-audit-v1"
+    },
+    "as_of": "2026-11-23",
+    "report_id": "062892bee61b7946ba65727e05c77b3ec43ff4eb34f6f1f9829cdb8f841fceb4",
+    "rows": [
+      {
+        "calendar": "XNYS",
+        "context_score": 90,
+        "growth_score": 70,
+        "momentum_score": 80,
+        "price": 100.0,
+        "price_currency": "USD",
+        "price_identity_verified": true,
+        "price_session": "2026-11-23",
+        "price_source": "analysis_snapshot",
+        "primary_data_status": "complete",
+        "quality": {
+          "block_entry": false,
+          "status": "ok"
+        },
+        "recorded_at": "2026-11-23T22:00:00Z",
+        "score": 80,
+        "session": "2026-11-23",
+        "snapshot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "status": "entry_strong",
+        "ticker": "GOOD"
+      }
+    ]
+  }
+}

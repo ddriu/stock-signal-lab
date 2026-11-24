@@ -76,3 +76,9 @@ jobs:
 
       - name: Validar pausa de Arena y conservación íntegra del historial
         run: node scripts/validate_arena_pause.mjs "$GITHUB_WORKSPACE"
+
+      - name: Validar política privada y consentimiento del universo de Arena
+        run: node scripts/validate_arena_universe_policy.mjs "$GITHUB_WORKSPACE"
+
+      - name: Validar informes vigentes, exclusiones exactas y cuarentena de Arena
+        run: node scripts/validate_arena_universe_policy_guard.mjs "$GITHUB_WORKSPACE"

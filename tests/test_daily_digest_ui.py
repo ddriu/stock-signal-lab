@@ -59,6 +59,33 @@ render_daily_score_page(Journal(), report_id=report["report_id"])
     assert any("Arena: informe bloqueado" in item.value for item in page.warning)
 
 
+def test_verified_universe_shows_pending_without_claiming_execution_or_mutating():
+    script = '''
+import pandas as pd
+from src.daily_digest import build_daily_score_report, seal_daily_score_report
+from src.daily_digest_ui import render_daily_score_page
+from src.arena_universe_policy import build_arena_universe_policy
+report = build_daily_score_report(pd.DataFrame(), as_of="2026-11-23",
+    tickers=["SYNTH"], favorite_tickers=["SYNTH"], reference_time="2026-11-24T18:00:00Z",
+    arena_universe_policy=build_arena_universe_policy("synthetic-owner", "verified_only",
+        approved_at="2026-11-24T15:00:00Z"), arena_policy_owner="synthetic-owner")
+report = seal_daily_score_report({**report, "review_mode": "saved_close_archive"})
+class Journal:
+    def get_daily_score_report(self, identifier):
+        return report
+    def __getattr__(self, name):
+        raise AssertionError("Forbidden read or mutation: " + name)
+render_daily_score_page(Journal(), report_id=report["report_id"])
+'''
+    page = AppTest.from_string(script, default_timeout=30).run()
+    assert not page.exception and not page.error
+    assert any("sólo verificadas: 0 valores" in item.value for item in page.info)
+    assert any("1 pendientes" in item.value for item in page.info)
+    assert any("no confirma que Arena esté activa" in item.value for item in page.caption)
+    assert any("SYNTH" in str(item.value) for item in page.dataframe)
+    assert any("informe bloqueado" in item.value for item in page.warning)
+
+
 def test_archived_virtual_summary_is_displayed_without_advancing_or_reading_any_ledger():
     script = '''
 import pandas as pd

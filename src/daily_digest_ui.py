@@ -111,6 +111,20 @@ def render_daily_score_page(journal: object, *, report_id: str | None = None) ->
         st.warning("Este informe no existe o no está disponible para tu usuario. No se mostrará otra versión como si fuera la del correo.")
         return
     st.caption(f"Precios y señales guardados: {report.get('as_of') or 'sin sesión guardada'}. Consulta de solo lectura; no son cotizaciones en tiempo real.")
+    universe = report.get("arena_universe")
+    if isinstance(universe, Mapping) and universe.get("mode") == "verified_only":
+        st.info(f"Arena · sólo verificadas: {universe.get('valid_count', 0)} valores con evidencia "
+                f"y {universe.get('pending_count', 0)} pendientes para nuevas entradas. "
+                "Se revisan de nuevo en cada cierre; no se eliminan de tus favoritas.")
+        st.caption("Las posiciones virtuales ya abiertas siguen necesitando precios válidos para su seguimiento. "
+                   "Este informe no confirma que Arena esté activa ni que haya ejecutado una ronda.")
+        pending = universe.get("pending") or []
+        if pending:
+            with st.expander("Valores pendientes para Arena · motivos"):
+                st.dataframe(pd.DataFrame([
+                    {"Valor": item.get("ticker"), "Controles pendientes": ", ".join(item.get("codes") or [])}
+                    for item in pending if isinstance(item, Mapping)
+                ]), hide_index=True, width="stretch")
     if report.get("review_mode") == "saved_close_archive":
         st.info("Informe del cierre preparado con análisis guardados. No acredita el envío de un correo "
                 "ni una actualización de las operaciones de Arena o del laboratorio.")

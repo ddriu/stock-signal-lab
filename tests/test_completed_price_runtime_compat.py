@@ -79,7 +79,7 @@ with (
 
     current = real_reload(old)
     import src.runtime_compat as compat
-    assert compat.RUNTIME_COMPAT_VERSION == 'arena-report-runtime-v2'
+    assert compat.RUNTIME_COMPAT_VERSION == 'arena-universe-runtime-v3'
     assert loader.PRICE_VALIDATION_VERSION == 'completed-session-ohlc-order-v1'
     assert reloaded[0] == 'src.runtime_compat'
     assert 'src.data_loader' in reloaded

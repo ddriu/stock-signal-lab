@@ -35,6 +35,8 @@ from src.data_loader import (
 from src.data_sources import benchmark_for_ticker, sector_benchmark
 from src.email_sender import send_email
 from src.daily_digest import build_daily_score_report, render_daily_score_email, seal_daily_score_report
+from src.arena_universe import read_arena_universe_policy
+from src.arena_universe_policy import validate_arena_policy_owner
 from src.entry_opportunity import STATUS_BUYABLE, evaluate_entry_opportunity
 from src.fundamentals import evaluate_fundamentals
 from src.fundamental_filter import evaluate_fundamental_filter
@@ -364,6 +366,7 @@ def run_daily_alerts(
     require_current_session: bool = False,
     virtual_tracker: Callable[[object, pd.DataFrame], object] | None = None,
     review_receiver: Callable[[dict, pd.DataFrame], None] | None = None,
+    analysis_only: bool = False,
 ) -> AlertRunSummary:
     """Ejecuta el radar diario o una revisión manual de un solo propietario.
 
@@ -383,12 +386,21 @@ def run_daily_alerts(
     ``review_receiver`` entrega una revisión temporal de un propietario a la
     pantalla. Sólo admite cierres completados y no persiste observaciones,
     modifica el historial de avisos ni ejecuta el flujo de entrega.
+
+    ``analysis_only`` prepara los mismos análisis y archiva el cierre guardado
+    para un propietario explícito. Conserva su configuración sin depender de
+    habilitación o destinatario; no consulta estados de notificación, no incluye
+    el grupo y nunca envía o ejecuta el laboratorio.
     """
 
     preview_only = review_receiver is not None
+    if type(analysis_only) is not bool:
+        raise ValueError("El modo de preparación necesita un indicador booleano.")
+    if analysis_only and (owner is None or preview_only or virtual_tracker is not None):
+        raise ValueError("La preparación necesita un propietario y no admite correo, vista previa ni laboratorio.")
     if preview_only and (owner is None or not callable(review_receiver) or virtual_tracker is not None):
         raise ValueError("La revisión en pantalla requiere un propietario y no ejecuta el laboratorio.")
-    preview_clock = pd.Timestamp.now(tz="UTC") if preview_only else None
+    preview_clock = pd.Timestamp.now(tz="UTC") if preview_only or analysis_only else None
     resolved_today = today or datetime.now(ZoneInfo("Europe/Madrid")).date()
     manual_owner: str | None = None
     manual_journal: object | None = None
@@ -398,19 +410,25 @@ def run_daily_alerts(
         manual_owner = owner.strip().lower()
         if not manual_owner or manual_owner == GROUP_PORTFOLIO_OWNER:
             raise ValueError("La revisión manual necesita un usuario privado propietario.")
+        if analysis_only:
+            manual_owner = validate_arena_policy_owner(manual_owner)
         manual_journal = journal_factory(manual_owner)
+        if analysis_only and getattr(manual_journal, "owner", None) != manual_owner:
+            raise ValueError("El diario de preparación no corresponde al propietario.")
         if preview_only and getattr(manual_journal, "owner", manual_owner) != manual_owner:
             raise ValueError("El diario de revisión no corresponde al propietario.")
-        if not preview_only and not hasattr(manual_journal, "get_alert_preferences"):
+        if not preview_only and not analysis_only and not hasattr(manual_journal, "get_alert_preferences"):
             raise RuntimeError("No se pueden leer las preferencias del usuario.")
         read_preferences = getattr(manual_journal, "get_alert_preferences", None)
         preference = read_preferences() if callable(read_preferences) else AlertPreferences(owner=manual_owner)
         if not isinstance(preference, AlertPreferences) or preference.owner != manual_owner:
             raise ValueError("Las preferencias no pertenecen al usuario solicitado.")
-        if not preview_only and preference.enabled is not True:
+        if analysis_only:
+            preference = replace(preference, include_group=False)
+        if not preview_only and not analysis_only and preference.enabled is not True:
             raise ValueError("Activa los avisos por correo antes de solicitar una revisión manual.")
         recipient = preference.email
-        if not preview_only and (
+        if not preview_only and not analysis_only and (
             not isinstance(recipient, str)
             or not recipient
             or recipient != recipient.strip()
@@ -539,17 +557,18 @@ def run_daily_alerts(
 
     for owner, (preference, journal, scope, positions, names) in scopes.items():
         try:
+            arena_universe_policy = read_arena_universe_policy(journal, reference_time=preview_clock)
             owner_inputs = OwnerAlertMarketInputs(journal, scope, target_date=resolved_today)
 
             def reference_frame(symbol: str | None) -> pd.DataFrame | None:
                 if not symbol:
                     return None
                 frame, _ = owner_inputs.select(symbol.strip().upper(), downloaded_reference_frame(symbol))
-                if preview_only and frame is not None and not frame.empty:
+                if (preview_only or analysis_only) and frame is not None and not frame.empty:
                     frame = completed_daily_prices(symbol, frame, now=preview_clock)
                 return frame
 
-            previous = pd.DataFrame() if preview_only else journal.list_alert_states()
+            previous = pd.DataFrame() if preview_only or analysis_only else journal.list_alert_states()
             previous_signatures = (
                 dict(zip(previous["ticker"], previous["signature"]))
                 if not previous.empty
@@ -619,7 +638,7 @@ def run_daily_alerts(
             preview_observations: list[dict] = []
             for ticker in sorted(scope):
                 frame, from_saved_cache = owner_inputs.select(ticker, frames.get(ticker))
-                if preview_only and frame is not None and not frame.empty:
+                if (preview_only or analysis_only) and frame is not None and not frame.empty:
                     frame = completed_daily_prices(ticker, frame, now=preview_clock)
                 if from_saved_cache:
                     source_attrs = dict(frame.attrs)
@@ -1109,6 +1128,7 @@ def run_daily_alerts(
                     combined, tickers=scope, held_tickers=set(positions), company_names=names,
                     favorite_tickers=personal_favorites_by_owner.get(owner, set()),
                     as_of=max(pd.Timestamp(row["analyzed_at"]).date() for row in preview_observations),
+                    arena_universe_policy=arena_universe_policy, arena_policy_owner=owner,
                 )
                 new_keys = {(row["ticker"], row["_preview_snapshot_id"], row["created_at"])
                             for row in preview_observations}
@@ -1124,6 +1144,12 @@ def run_daily_alerts(
                     sessions = {row["session"] for row in report["rows"] if row.get("session")}
                     dates = pd.to_datetime(combined["analyzed_at"], errors="coerce", utc=True, format="mixed")
                     review_receiver(report, combined.loc[dates.dt.strftime("%Y-%m-%d").isin(sessions)].copy())
+                continue
+
+            if analysis_only:
+                from src.saved_close_report import archive_saved_close_report
+
+                archive_saved_close_report(journal, reference_time=pd.Timestamp.now(tz="UTC"))
                 continue
 
             if manual_owner is not None and not evaluated:
@@ -1181,6 +1207,7 @@ def run_daily_alerts(
                         stored, tickers=scope, held_tickers=set(positions),
                         company_names=names, as_of=report_date,
                         favorite_tickers=personal_favorites_by_owner.get(owner, set()),
+                        arena_universe_policy=arena_universe_policy, arena_policy_owner=owner,
                     )
                     report_date = str(report.get("as_of") or "")
                     current_sessions = {(str(row.get("ticker") or ""), str(row.get("session") or ""))

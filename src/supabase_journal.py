@@ -14,6 +14,10 @@ from src.daily_digest_storage import (
     digest_identifier, digest_market_date, digest_terminal_state,
     normalized_digest_report,
 )
+from src.arena_universe_policy import (
+    normalize_arena_universe_policy, prepare_arena_universe_policy_change,
+    validate_arena_policy_owner,
+)
 
 from src.alerts import (
     ALERT_PREFERENCE_COLUMNS,
@@ -184,6 +188,7 @@ class SupabaseTradingJournal:
             raise JournalStorageError("El nombre de tabla del diario paper no es válido.")
         self.url = normalized_url
         self.secret_key = secret_key.strip()
+        self._arena_policy_owner = owner
         self.owner = owner.strip()
         self.table = table
         self.favorites_table = favorites_table
@@ -1321,6 +1326,45 @@ class SupabaseTradingJournal:
         except (TypeError, ValueError) as exc:
             raise JournalStorageError("No se pudo verificar el punto de guardado de Radar.") from exc
         return {**payload, "revision": revision}
+
+    def _arena_policy_scope(self) -> str:
+        owner = validate_arena_policy_owner(getattr(self, "_arena_policy_owner", self.owner))
+        if owner != self.owner:
+            raise ValueError("El propietario de la política de Arena ha cambiado.")
+        return owner
+
+    def get_arena_universe_policy(self) -> dict[str, object]:
+        """Read a single backend-private owner; storage errors never mean strict."""
+        owner = self._arena_policy_scope()
+        response = self._request("GET", endpoint=f"{self.url}/rest/v1/arena_universe_policies",
+            params={"owner": f"eq.{owner}",
+                "select": "owner,mode,approved_at,version,policy_id", "limit": "2"})
+        try:
+            rows = response.json()
+            if type(rows) is not list or len(rows) > 1:
+                raise ValueError("Ambiguous policy response")
+            return normalize_arena_universe_policy(rows[0] if rows else None, owner=owner)
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise JournalStorageError("No se pudo verificar la política privada del universo de Arena.") from exc
+
+    def set_arena_universe_policy(
+        self, mode: str, *, owner_consent: bool = False, approved_at: object | None = None,
+    ) -> dict[str, object]:
+        """Persist only the explicitly approved owner policy, then verify it."""
+        owner = self._arena_policy_scope()
+        candidate = prepare_arena_universe_policy_change(owner, mode,
+            owner_consent=owner_consent, approved_at=approved_at)
+        previous = self.get_arena_universe_policy()
+        if previous["mode"] == mode and previous["approved_at"] is not None:
+            return previous
+        self._request("POST", endpoint=f"{self.url}/rest/v1/arena_universe_policies",
+            params={"on_conflict": "owner"},
+            headers={**self.headers, "Prefer": "resolution=merge-duplicates,return=representation"},
+            json=candidate)
+        saved = self.get_arena_universe_policy()
+        if saved != candidate:
+            raise JournalStorageError("No se pudo confirmar la política exacta del universo de Arena.")
+        return saved
 
     def save_radar_review_checkpoint(
         self, checkpoint: dict[str, object], *, expected_revision: int | None,

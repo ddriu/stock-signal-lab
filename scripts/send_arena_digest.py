@@ -12,6 +12,7 @@ import requests
 
 from src.alerts import is_valid_email
 from src.arena_data_quality import arena_report_authorized
+from src.arena_universe import read_arena_universe_policy
 from src.email_sender import load_email_config, send_email
 from src.storage import create_journal
 
@@ -146,7 +147,9 @@ def send_arena_digest(expected_session=None):
         return "omitted_outside_execution_window"
     # Calendar, coverage, currency and persisted price identities must be
     # verified before even requesting credentials or asking models to plan.
-    if not arena_report_authorized(report, expected_session=report_day.isoformat()):
+    policy = read_arena_universe_policy(journal, reference_time=now)
+    if not arena_report_authorized(report, expected_session=report_day.isoformat(),
+                                   owner="ddriu", universe_policy=policy):
         return "omitted_unverified_report"
 
     config = load_email_config()

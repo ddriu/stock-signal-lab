@@ -66,6 +66,42 @@ class Journal:
         raise AttributeError(name)
 
 
+def test_saved_archive_uses_current_owner_policy_and_readmits_recovered_favorite():
+    from src.arena_universe_policy import build_arena_universe_policy
+    from src.arena_data_quality import arena_report_authorized
+
+    clock = "2026-11-24T16:15:00Z"
+    journal = Journal(favorites=("SYNTH", "MISSING"))
+    policy = build_arena_universe_policy(journal.owner, "verified_only",
+        approved_at="2026-11-24T15:00:00Z", reference_time=clock)
+    journal.get_arena_universe_policy = lambda: policy
+    favorites_before = journal.favorites.copy(deep=True)
+    first = archive_saved_close_report(journal, reference_time=clock)
+    initial = deepcopy(journal.archived[first.report_id])
+    assert first.authorized is True and initial["arena_universe"]["pending_count"] == 1
+    assert initial["arena_universe"]["policy"] == policy
+    assert arena_report_authorized(initial, owner=journal.owner) is True
+
+    journal.observations = pd.DataFrame([observation(), observation("MISSING")])
+    second = archive_saved_close_report(journal, reference_time=clock)
+    recovered = journal.archived[second.report_id]
+    assert second.authorized is True and recovered["arena_universe"]["pending_count"] == 0
+    assert recovered["arena_quality"]["eligible_tickers"] == ["MISSING", "SYNTH"]
+    assert recovered["arena_quality"]["explicit_exclusions"] == []
+    assert journal.archived[first.report_id] == initial
+    pd.testing.assert_frame_equal(journal.favorites, favorites_before)
+
+
+def test_saved_archive_never_converts_failed_policy_read_into_a_strict_report():
+    journal = Journal()
+    def fail():
+        raise RuntimeError("policy storage unavailable")
+    journal.get_arena_universe_policy = fail
+    with pytest.raises(RuntimeError, match="storage unavailable"):
+        archive_saved_close_report(journal, reference_time="2026-11-24T16:15:00Z")
+    assert journal.archived == {}
+
+
 @pytest.mark.parametrize(("clock", "expected"), [
     # The two actual delayed starts on 24 November must recover the 23rd.
     ("2026-11-24T05:44:22Z", "2026-11-23"),

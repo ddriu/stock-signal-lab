@@ -35,7 +35,7 @@ _READ_METHODS = frozenset({
     "get_alert_preferences", "list_alert_states", "list_paper_simulations",
     "list_paper_daily_runs",
 })
-_UNCACHED_READ_METHODS = frozenset({"get_radar_review_checkpoint"})
+_UNCACHED_READ_METHODS = frozenset({"get_radar_review_checkpoint", "get_arena_universe_policy"})
 
 
 def _owner(journal: object) -> str:

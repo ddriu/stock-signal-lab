@@ -220,7 +220,8 @@ def build_arena_quality_manifest(
     return result
 
 
-def arena_report_authorized(report: Mapping[str, object], *, expected_session=None) -> bool:
+def arena_report_authorized(report: Mapping[str, object], *, expected_session=None, owner=None,
+                            universe_policy=None) -> bool:
     """Reject legacy/tampered reports and recheck the complete evidence contract."""
     try:
         if not isinstance(report, Mapping) or not isinstance(report.get("rows"), list):
@@ -234,6 +235,28 @@ def arena_report_authorized(report: Mapping[str, object], *, expected_session=No
                 or expected_session is not None and manifest.get("expected_session") != _day(expected_session)
                 or manifest.get("expected_session") != report.get("as_of")):
             return False
+        expected_policy = None
+        if universe_policy is not None:
+            from src.arena_universe_policy import normalize_arena_universe_policy
+
+            expected_policy = normalize_arena_universe_policy(universe_policy, owner=owner)
+            if (expected_policy["mode"] == "verified_only") != ("arena_universe" in report):
+                return False
+        if "arena_universe" in report:
+            from src.arena_universe import resolve_arena_universe
+
+            audit = report["arena_universe"]
+            if not isinstance(audit, Mapping) or audit.get("mode") != "verified_only":
+                return False
+            policy = audit.get("policy")
+            if not isinstance(policy, Mapping):
+                return False
+            rebuilt, expected_audit = resolve_arena_universe(report["rows"],
+                favorite_tickers=manifest.get("favorite_tickers"), expected_session=report.get("as_of"),
+                policy=policy, owner=owner if owner is not None else policy.get("owner"))
+            return (dict(manifest) == rebuilt and _canonical(dict(audit)) == _canonical(expected_audit)
+                    and (expected_policy is None or expected_audit["policy"] == expected_policy)
+                    and rebuilt["authorized"] is True)
         exclusions = {item["ticker"]: item["reason"] for item in manifest.get("explicit_exclusions", [])}
         rebuilt = build_arena_quality_manifest(report["rows"],
             favorite_tickers=manifest.get("favorite_tickers"), expected_session=report.get("as_of"), exclusions=exclusions)
