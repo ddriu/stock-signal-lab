@@ -111,7 +111,39 @@ def render_daily_score_page(journal: object, *, report_id: str | None = None) ->
         st.warning("Este informe no existe o no está disponible para tu usuario. No se mostrará otra versión como si fuera la del correo.")
         return
     st.caption(f"Precios y señales guardados: {report.get('as_of') or 'sin sesión guardada'}. Consulta de solo lectura; no son cotizaciones en tiempo real.")
-    if report_id:
+    if report.get("review_mode") == "saved_close_archive":
+        st.info("Informe del cierre preparado con análisis guardados. No acredita el envío de un correo "
+                "ni una actualización de las operaciones de Arena o del laboratorio.")
+        quality = report.get("arena_quality") or {}
+        errors = quality.get("errors") or []
+        if quality.get("authorized") is True:
+            st.caption("Controles de datos de Arena: superados para este cierre. Esto no levanta su pausa ni confirma operaciones.")
+        else:
+            st.warning(f"Arena: informe bloqueado por datos pendientes ({len(errors)} incidencias). "
+                       "Una nota alta en una empresa no habilita el conjunto del informe.")
+            if errors:
+                reasons = {
+                    "missing_analysis": "Falta el análisis del cierre",
+                    "calendar_unverified": "Calendario sin verificar",
+                    "analysis_session_mismatch": "Análisis de otra sesión",
+                    "price_missing": "Falta un precio utilizable",
+                    "price_session_mismatch": "Precio de otra sesión",
+                    "price_currency_unverified": "Moneda sin verificar",
+                    "price_identity_unverified": "Precio sin vínculo verificable con el análisis",
+                    "snapshot_identity_missing": "Identidad del análisis sin verificar",
+                    "observation_time_unverified": "Hora de registro sin verificar",
+                    "observation_before_close": "Registro anterior al cierre",
+                    "observation_after_reference": "Hora de registro posterior a la revisión",
+                    "growth_incomplete": "Datos de crecimiento incompletos",
+                    "quality_unverified": "Calidad de los datos pendiente",
+                }
+                with st.expander("Qué falta para los datos de Arena"):
+                    st.dataframe(pd.DataFrame([
+                        {"Valor": item.get("ticker") or "Informe",
+                         "Qué falta": reasons.get(item.get("code"), "Datos pendientes de verificar")}
+                        for item in errors if isinstance(item, Mapping)
+                    ]), hide_index=True, width="stretch")
+    elif report_id:
         st.info("Estás viendo exactamente el informe enlazado en el correo, no un cálculo posterior.")
     virtual_lines = virtual_tracking_lines(report.get("virtual_tracking"))
     if virtual_lines:

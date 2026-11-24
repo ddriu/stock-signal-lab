@@ -10,7 +10,7 @@ import inspect
 import sys
 from threading import RLock
 
-RUNTIME_COMPAT_VERSION = "radar-runtime-v1"
+RUNTIME_COMPAT_VERSION = "arena-report-runtime-v1"
 JOURNAL_RESOURCE_VERSION = "radar-checkpoints-v1"
 
 # Keep one lock for concurrent app reruns, including when this module itself
@@ -20,27 +20,44 @@ if "_RADAR_RUNTIME_LOCK" not in globals():
 
 
 ANALYSIS_MODULE_ORDER = (
-    "src.data_sources", "src.data_loader", "src.analysis_data_quality",
-    "src.analysis_policy", "src.growth_candidates", "src.daily_digest",
+    "src.instruments", "src.data_sources", "src.data_loader", "src.analysis_data_quality",
+    "src.analysis_policy", "src.growth_candidates", "src.portfolio_rotation", "src.arena_data_quality",
+    "src.daily_digest", "src.saved_close_report",
     "src.daily_digest_ui", "src.analysis_snapshots", "src.alert_runner",
 )
 _VERSIONS = {
+    "src.instruments": ("COMPANY_NAMES_VERSION", "company-names-v1"),
     "src.data_sources": ("FUNDAMENTAL_PROVENANCE_VERSION", "fundamental_provenance_v2"),
     "src.data_loader": ("FUNDAMENTAL_SNAPSHOT_VERSION", "dated_statement_fallback_v2"),
     "src.analysis_data_quality": ("QUALITY_PRESENTATION_VERSION", "dated_quality_coverage_v2"),
     "src.daily_digest": ("DIGEST_PRESENTATION_VERSION", "compact-mobile-v3"),
     "src.analysis_snapshots": ("PRIMARY_PERSISTENCE_VERSION", "independent-primary-storage-v1"),
     "src.alert_runner": ("ALERT_RUNNER_VERSION", "home-preview-v1"),
+    "src.saved_close_report": ("SAVED_CLOSE_REPORT_VERSION", "saved-close-report-v1"),
+}
+_SCOPE_VERSIONS = {
+    "src.instruments": ("INSTRUMENT_SCOPE_VERSION", "isin-market-scope-v1"),
+    "src.arena_data_quality": ("ARENA_SCOPE_VERSION", "isin-market-scope-v1"),
+    "src.daily_digest": ("DIGEST_SCOPE_VERSION", "isin-market-scope-v1"),
 }
 _SIGNATURES = {
     "src.analysis_policy": ("build_policy_snapshot", "enrich_analysis_rows"),
     "src.growth_candidates": ("build_growth_candidate_rows",),
 }
 _FUNCTIONS = {
+    "src.instruments": ("resolve_company_name", "is_isin_identifier"),
+    "src.arena_data_quality": ("build_arena_quality_manifest", "arena_report_authorized"),
+    "src.saved_close_report": ("archive_saved_close_report",),
     "src.daily_digest": ("daily_score_reading", "daily_score_coverage", "daily_score_sort_key", "daily_score_overview"),
     "src.daily_digest_ui": ("daily_score_reading", "daily_score_coverage", "daily_score_sort_key", "daily_score_overview"),
 }
 _BINDINGS = (
+    ("src.arena_data_quality", "is_isin_identifier", "src.instruments"),
+    ("src.daily_digest", "is_isin_identifier", "src.instruments"),
+    ("src.daily_digest", "build_arena_quality_manifest", "src.arena_data_quality"),
+    ("src.portfolio_rotation", "resolve_company_name", "src.instruments"),
+    ("src.saved_close_report", "build_daily_score_report", "src.daily_digest"),
+    ("src.saved_close_report", "seal_daily_score_report", "src.daily_digest"),
     ("src.data_loader", "download_sec_fundamental_snapshot", "src.data_sources"),
     ("src.analysis_policy", "assess_analysis_data_quality", "src.analysis_data_quality"),
     ("src.growth_candidates", "assess_analysis_data_quality", "src.analysis_data_quality"),
@@ -53,7 +70,7 @@ _BINDINGS = (
 
 
 def _incompatible_loaded_module() -> bool:
-    for name, (marker, expected) in _VERSIONS.items():
+    for name, (marker, expected) in (*_VERSIONS.items(), *_SCOPE_VERSIONS.items()):
         module = sys.modules.get(name)
         if module is not None and getattr(module, marker, None) != expected:
             return True
@@ -82,26 +99,21 @@ def _incompatible_loaded_module() -> bool:
 
 def prepare_analysis_runtime() -> tuple[str, ...]:
     """Repair the full dependency chain before app.py binds any of its APIs."""
-    if not _incompatible_loaded_module():
-        return ()
-    refreshed = []
-    # Preserve the existing company-name compatibility contract. A legacy
-    # instruments module must be repaired before reloading its consumers.
-    instruments = sys.modules.get("src.instruments")
-    if instruments is not None and (
-        getattr(instruments, "COMPANY_NAMES_VERSION", "") != "company-names-v1"
-        or not callable(getattr(instruments, "resolve_company_name", None))
-    ):
-        importlib.reload(instruments)
-        refreshed.append("src.instruments")
-    for name in ANALYSIS_MODULE_ORDER:
-        module = sys.modules.get(name)
-        if module is None:
-            importlib.import_module(name)
-        else:
-            importlib.reload(module)
-        refreshed.append(name)
-    return tuple(refreshed)
+    with _RADAR_RUNTIME_LOCK:
+        if not _incompatible_loaded_module():
+            return ()
+        refreshed = []
+        # Repair identifiers before importing consumers of their new APIs,
+        # then Arena quality before the digest and its saved-report bridge.
+        # Do not clear resources/session data or hide a missing export.
+        for name in ANALYSIS_MODULE_ORDER:
+            module = sys.modules.get(name)
+            if module is None:
+                importlib.import_module(name)
+            else:
+                importlib.reload(module)
+            refreshed.append(name)
+        return tuple(refreshed)
 
 
 def _takes_keyword(function, name: str) -> bool:

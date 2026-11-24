@@ -44,6 +44,9 @@ jobs:
           # false/0 remains a kill switch; unrelated owners are never tracked.
           MODEL_RESULTS_ENABLED: 'false'
           MODEL_RESULTS_OWNER: ${{ github.repository_owner }}
+          # A delayed schedule may archive this owner's already saved inputs.
+          # It still cannot send outside the delivery window or activate Arena.
+          REPORT_OWNER: ${{ github.repository_owner }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           EMAIL_SMTP_HOST: smtp.gmail.com
@@ -56,9 +59,9 @@ jobs:
         run: python -m scripts.run_alerts
 
       - name: Arena · preparar y enviar sus decisiones
-        # A delayed Stock step may be omitted while Arena's saved report is
-        # still usable before the next opening. The script checks that window.
-        if: ${{ !cancelled() && steps.stock.conclusion == 'success' }}
+        # Late recovery is archive-only: a fresh saved report must not silently
+        # turn an omitted delivery into model planning or an Arena email.
+        if: ${{ !cancelled() && steps.stock.conclusion == 'success' && steps.stock.outputs.status != 'omitted_outside_window' }}
         env:
           # Keep the first stage's market session even if analysis crosses
           # midnight or finishes after the scheduler's startup window.

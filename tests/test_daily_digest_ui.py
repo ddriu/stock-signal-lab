@@ -37,6 +37,28 @@ def test_archived_report_rejects_mutated_payload():
         load_daily_score_report(Journal(), report_id=report["report_id"])
 
 
+def test_saved_close_archive_is_not_presented_as_an_email_or_completed_arena_cycle():
+    script = '''
+import pandas as pd
+from src.daily_digest import build_daily_score_report, seal_daily_score_report
+from src.daily_digest_ui import render_daily_score_page
+report = build_daily_score_report(pd.DataFrame(), as_of="2026-11-23")
+report = seal_daily_score_report({**report, "review_mode": "saved_close_archive"})
+class Journal:
+    def get_daily_score_report(self, identifier):
+        return report
+    def __getattr__(self, name):
+        raise AssertionError("Forbidden read or mutation: " + name)
+render_daily_score_page(Journal(), report_id=report["report_id"])
+'''
+    page = AppTest.from_string(script, default_timeout=30).run()
+    assert not page.exception and not page.error
+    text = " ".join(item.value for item in page.info)
+    assert "análisis guardados" in text and "No acredita el envío" in text
+    assert "informe enlazado en el correo" not in text
+    assert any("Arena: informe bloqueado" in item.value for item in page.warning)
+
+
 def test_archived_virtual_summary_is_displayed_without_advancing_or_reading_any_ledger():
     script = '''
 import pandas as pd

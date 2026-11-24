@@ -390,10 +390,11 @@ def test_arena_cli_recovers_after_stock_window_before_next_open(monkeypatch, mai
     assert mail_case.posts[-1][1]["json"]["action"] == "confirm"
 
 
-def test_daily_workflow_does_not_block_arena_when_stock_window_is_closed():
+def test_daily_workflow_archive_only_recovery_never_runs_arena_or_its_mail():
     from pathlib import Path
     workflow = (Path(__file__).parents[1] / ".github/workflows/daily-alerts.yml").read_text()
-    assert "if: steps.stock.outputs.status != 'omitted_outside_window'" not in workflow
+    assert "steps.stock.outputs.status != 'omitted_outside_window'" in workflow
+    assert "!cancelled() && steps.stock.conclusion == 'success'" in workflow
 
 
 @pytest.mark.parametrize(("message", "code"), [
