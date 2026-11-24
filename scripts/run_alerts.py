@@ -7,6 +7,8 @@ import sys
 
 from src.alert_runner import run_daily_alerts
 from src.digest_schedule import daily_digest_session_date
+from src.saved_close_report import archive_saved_close_report
+from src.storage import create_journal
 
 
 def _stage_output(**values):
@@ -37,6 +39,33 @@ def configured_virtual_tracker():
     return track
 
 
+def _archive_delayed_report() -> bool:
+    """Recover only the configured repository owner's saved close, not mail."""
+    owner = os.getenv("REPORT_OWNER", "").strip()
+    repository_owner = os.getenv("GITHUB_REPOSITORY_OWNER", "").strip()
+    if not owner or not repository_owner or owner != repository_owner:
+        print("Archivo de cierre: omitido_sin_propietario_explicito; sin acceso a datos.")
+        return True
+    try:
+        journal = create_journal(owner)
+        if getattr(journal, "owner", None) != owner:
+            raise ValueError("Mismatched report owner")
+        result = archive_saved_close_report(journal)
+    except Exception as exc:
+        # Public Actions logs must never expose owners, tickers or source bodies.
+        print(f"::warning::No se pudo archivar el cierre guardado ({type(exc).__name__}). "
+              "No se intentó correo ni se activó Arena.", file=sys.stderr)
+        print("Archivo de cierre: archivo=error; sin envío.")
+        _stage_output(report_archive_status="error")
+        return False
+    # Per-owner coverage and incidents belong in the private archived report,
+    # not in this public repository's Actions output.
+    print(f"Archivo de cierre: archivo={result.status}. "
+          "Sólo datos guardados; sin envío ni activación de Arena.")
+    _stage_output(report_archive_status=result.status, report_archive_session=result.session)
+    return True
+
+
 def main() -> int:
     event_name = os.getenv("GITHUB_EVENT_NAME", "")
     session = None
@@ -44,8 +73,8 @@ def main() -> int:
         session = daily_digest_session_date()
         if session is None:
             # GitHub can start the recovery job hours after its scheduled slot.
-            # A deliberate safety skip is not an SMTP failure, nor a successful
-            # review. Do not access owners, advance simulations or try old mail.
+            # The delivery window remains strict. Saved report archival is a
+            # separate owner-scoped operation and requires no provider or SMTP.
             print("::warning::Ejecución programada omitida: arranque fuera de "
                   "la ventana 23:00–06:00 de Europe/Madrid. "
                   "No se ha analizado ni intentado enviar correo.",
@@ -53,7 +82,7 @@ def main() -> int:
             print("Estado: omitido_fuera_de_horario. "
                   "Sin revisión ni intento de envío; no se amplía la ventana de seguridad.")
             _stage_output(status="omitted_outside_window")
-            return 0
+            return 0 if _archive_delayed_report() else 1
 
     _stage_output(market_session=session.isoformat() if session is not None else "")
 

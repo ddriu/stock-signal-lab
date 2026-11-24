@@ -29,6 +29,8 @@ import app
 import src.instruments as instruments
 import src.growth_candidates as growth
 import src.portfolio_rotation as rotation
+import src.daily_digest as digest
+import src.daily_digest_ui as digest_ui
 
 presentation_modules = {
     "src.instruments": (instruments, "COMPANY_NAMES_VERSION"),
@@ -73,8 +75,16 @@ def tracked_reload(module):
 with patch.object(importlib, "reload", side_effect=tracked_reload):
     real_reload(app)
 
-expected = [name for name in presentation_modules if name in legacy_modules]
-assert [name for name in reloaded_names if name in presentation_modules] == expected
+# Compare the consumers' actual bindings before checking the dependency-aware
+# repair set. Reloading a source can stale an otherwise current consumer.
+for consumer in (growth, rotation, digest, digest_ui):
+    assert consumer.resolve_company_name is instruments.resolve_company_name, consumer.__name__
+
+if set(legacy_modules) & {"src.instruments", "src.growth_candidates"}:
+    expected = list(presentation_modules)
+else:
+    expected = [name for name in presentation_modules if name in legacy_modules]
+assert [name for name in reloaded_names if name in presentation_modules] == expected, (reloaded_names, expected)
 for module, marker in presentation_modules.values():
     assert getattr(module, marker) == "company-names-v1"
 
@@ -99,6 +109,12 @@ priorities = app.build_rotation_priorities(dashboard)
 assert [(row["Ticker"], row["Empresa"]) for row in priorities] == [
     ("NKE", "NIKE, Inc."),
 ]
+
+# Once the dependency chain is coherent, normal navigation must not reload it.
+reloaded_names.clear()
+with patch.object(importlib, "reload", side_effect=tracked_reload):
+    real_reload(app)
+assert reloaded_names == [], reloaded_names
 '''
     result = subprocess.run(
         [sys.executable, "-c", script],

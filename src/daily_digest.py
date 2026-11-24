@@ -17,11 +17,12 @@ import pandas as pd
 
 from src.analysis_policy import PRIMARY_STRATEGY_ID, decode_policy_note
 from src.analysis_data_quality import GROWTH_METRICS
-from src.instruments import resolve_analysis_ticker, resolve_company_name
+from src.instruments import is_isin_identifier, resolve_analysis_ticker, resolve_company_name
 from src.arena_data_quality import build_arena_quality_manifest
 
 DIGEST_VERSION = "daily-score-report-v2"
 DIGEST_PRESENTATION_VERSION = "compact-mobile-v3"
+DIGEST_SCOPE_VERSION = "isin-market-scope-v1"
 APP_URL = "https://stock-signal-lab-ddriu.streamlit.app/"
 _SUFFIX_CALENDARS = {
     ".MC": "XMAD", ".PA": "XPAR", ".AS": "XAMS", ".DE": "XETR",
@@ -88,6 +89,8 @@ def seal_daily_score_report(report: Mapping[str, object]) -> dict[str, object]:
 
 def _calendar_name(ticker: str) -> str:
     symbol = ticker.upper()
+    if is_isin_identifier(symbol):
+        return "no_verificado"
     for suffix, calendar in _SUFFIX_CALENDARS.items():
         if symbol.endswith(suffix):
             return calendar

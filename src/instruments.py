@@ -8,9 +8,12 @@ evita que cartera, favoritas, alertas e importaciones discrepen entre sí.
 from __future__ import annotations
 
 from collections.abc import Mapping
+import re
 
 
 COMPANY_NAMES_VERSION = "company-names-v1"
+INSTRUMENT_SCOPE_VERSION = "isin-market-scope-v1"
+_ISIN_IDENTIFIER = re.compile(r"[A-Z]{2}[A-Z0-9]{9}[0-9]\Z")
 
 
 ANALYSIS_TICKER_ALIASES: dict[str, str] = {
@@ -35,6 +38,17 @@ def normalize_instrument_key(value: object) -> str:
     """Normaliza un alias sin alterar sufijos de mercado significativos."""
 
     return " ".join(str(value or "").strip().upper().split())
+
+
+def is_isin_identifier(value: object) -> bool:
+    """Recognize ISIN-shaped identifiers, not a listing, market or currency.
+
+    This conservative scope check does not attest issuance/checksum validity
+    and never invents a provider ticker. An explicit registry alias may resolve
+    an identifier separately; an unresolved one is not a bare US stock symbol.
+    """
+
+    return bool(_ISIN_IDENTIFIER.fullmatch(normalize_instrument_key(value)))
 
 
 def resolve_analysis_ticker(value: object) -> str:

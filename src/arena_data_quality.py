@@ -13,9 +13,10 @@ import json
 import math
 import re
 
-from src.instruments import resolve_analysis_ticker
+from src.instruments import is_isin_identifier, resolve_analysis_ticker
 
 ARENA_QUALITY_VERSION = "arena-data-quality-v1"
+ARENA_SCOPE_VERSION = "isin-market-scope-v1"
 _US_SYMBOL = re.compile(r"[A-Z][A-Z0-9-]{0,11}\Z")
 _IDENTITY = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -129,7 +130,7 @@ def build_arena_quality_manifest(
         if ticker in explicit:
             excluded.append({"ticker": ticker, "code": "owner_excluded", "reason": explicit[ticker]})
             continue
-        if ticker == "SPY" or not _US_SYMBOL.fullmatch(ticker):
+        if ticker == "SPY" or is_isin_identifier(ticker) or not _US_SYMBOL.fullmatch(ticker):
             code = "benchmark_only" if ticker == "SPY" else "outside_us_market_scope"
             excluded.append({"ticker": ticker, "code": code, "reason": code})
             continue

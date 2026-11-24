@@ -34,7 +34,7 @@ from src.view_cache import get_or_build_view, invalidate_view_cache
 from src.portfolio_view_context import reconcile_home_views
 import src.runtime_compat as _analysis_runtime_module
 
-if getattr(_analysis_runtime_module, "RUNTIME_COMPAT_VERSION", "") != "radar-runtime-v1":
+if getattr(_analysis_runtime_module, "RUNTIME_COMPAT_VERSION", "") != "arena-report-runtime-v1":
     _analysis_runtime_module = importlib.reload(_analysis_runtime_module)
 prepare_analysis_runtime = _analysis_runtime_module.prepare_analysis_runtime
 
@@ -93,6 +93,7 @@ if getattr(_indicator_runtime_module, "PRICE_METADATA_VERSION", "") != "preserve
     _indicator_runtime_module = importlib.reload(_indicator_runtime_module)
 
 from src.alert_runner import run_daily_alerts
+from src.saved_close_report import archive_saved_close_report
 from src.analysis_snapshots import persist_analysis_batch_snapshots
 from src.radar_review import BATCH_SIZE as RADAR_BATCH_SIZE, RadarOutcome, RadarReview
 from src.entry_data_gate import ENTRY_DATA_REASONS, normalized_quote_currency_verified, verified_entry_prices
@@ -7318,6 +7319,62 @@ def _save_radar_checkpoint(journal, review: RadarReview) -> None:
         raise JournalStorageError("La revisión se ha actualizado desde otra pestaña.")
 
 
+def _archive_completed_radar_report(journal, review: RadarReview) -> None:
+    """Archive persisted closing evidence, never quotes, mail or Arena orders.
+
+    A report-store failure is independent of the already committed review. It
+    must not requeue confirmed symbols or mislabel a finished scan as paused.
+    """
+    if review.pending:
+        return
+    st.session_state.pop("_radar_review_report_result", None)
+    try:
+        result = archive_saved_close_report(journal, reference_time=datetime.now(timezone.utc))
+        st.session_state["_radar_review_report_result"] = {
+            "owner": journal.owner, "run_id": review.run_id,
+            "status": result.status, "session": result.session,
+            "report_id": result.report_id, "authorized": result.authorized,
+            "error_count": result.error_count,
+        }
+        st.session_state.pop("_radar_review_report_notice", None)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Archivo del cierre no completado: %s", type(exc).__name__)
+        st.session_state["_radar_review_report_notice"] = (
+            "La revisión terminó, pero no se pudo archivar el informe del cierre. "
+            "Los análisis guardados se conservan. Puedes reintentar solo el informe, "
+            "sin volver a consultar precios ni enviar correos."
+        )
+
+
+def _render_radar_report_status(journal, review: RadarReview | None, *, compatible: bool) -> None:
+    """A separate, explicit archive retry; passive navigation is read-only."""
+    if not review or not compatible or review.pending:
+        return
+    result = st.session_state.get("_radar_review_report_result")
+    if not isinstance(result, dict) or result.get("owner") != journal.owner or result.get("run_id") != review.run_id:
+        result = None
+    notice = st.session_state.get("_radar_review_report_notice")
+    if notice:
+        st.warning(notice)
+    elif result and result.get("report_id"):
+        session = result.get("session") or "sin fecha verificada"
+        if result.get("authorized") is True:
+            st.success(f"Informe del cierre {session} archivado; supera los controles de datos de Arena.")
+        else:
+            st.warning(f"Informe del cierre {session} archivado con {result.get('error_count', 0)} "
+                       "incidencias de datos; Arena no queda habilitada.")
+        st.caption("Archivar este informe no envía correos, no levanta la pausa de Arena ni ejecuta operaciones.")
+        st.link_button("Ver informe del cierre", f"?digest={result['report_id']}")
+    elif result and result.get("status") == "empty":
+        st.caption("No hay favoritas ni posiciones guardadas para preparar un informe del cierre.")
+    else:
+        st.caption("Puedes preparar el informe del último cierre con los análisis ya guardados, sin descargar de nuevo.")
+    if st.button("Reintentar solo el informe" if notice or result else "Preparar informe con datos guardados",
+                 key="radar_archive_report_retry"):
+        _archive_completed_radar_report(journal, review)
+        st.rerun()
+
+
 def _run_radar_batch(
     journal, review: RadarReview, worker: str, *, history_days: int,
     auto_adjust: bool, strategy: StrategyConfig, alpha_vantage_key: str = "",
@@ -7525,6 +7582,8 @@ def _radar_review_step(
                 break
         if progress_slot is None:
             progress.empty()
+        if processed and not review.pending:
+            _archive_completed_radar_report(journal, review)
         return review, True
     except Exception as exc:
         if start_requested or resume_requested:
@@ -16611,6 +16670,7 @@ def main(*, route: Route | None = None, pages=None) -> None:
                 render_automatic_review_status(
                     radar_review, compatible=radar_compatible, now=datetime.now(timezone.utc),
                 )
+                _render_radar_report_status(journal, radar_review, compatible=radar_compatible)
                 if st.session_state.get("download_errors"):
                     with st.expander("Detalles guardados de la última consulta"):
                         for error in st.session_state["download_errors"]:
